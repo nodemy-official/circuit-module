@@ -1,0 +1,37 @@
+{
+  "name": "@nodemy-official/circuit-module",
+  "version": "0.1.0",
+  "description": "Headless DC circuit model, editor operations, geometry, and simulation for Nodemy.",
+  "license": "UNLICENSED",
+  "private": false,
+  "type": "module",
+  "sideEffects": false,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nodemy-official/circuit-module.git"
+  },
+  "files": ["dist"],
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" },
+    "./model": { "types": "./dist/circuit-model.d.ts", "import": "./dist/circuit-model.js" },
+    "./geometry": { "types": "./dist/circuit-geometry.d.ts", "import": "./dist/circuit-geometry.js" },
+    "./edit": { "types": "./dist/circuit-edit.d.ts", "import": "./dist/circuit-edit.js" },
+    "./solver": { "types": "./dist/circuit-solver.d.ts", "import": "./dist/circuit-solver.js" },
+    "./package.json": "./package.json"
+  },
+  "publishConfig": {
+    "access": "restricted",
+    "registry": "https://npm.pkg.github.com"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "check": "tsc --noEmit && vitest run",
+    "test": "vitest run",
+    "prepack": "npm run build"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.11"
+  },
+  "engines": { "node": ">=22" }
+}
