@@ -1,0 +1,83 @@
+.circuit-board {
+  position: relative; width: 100%; min-width: 0; overflow: hidden;
+  border: 1px solid var(--circuit-board-frame, #e1e6ee); border-radius: 8px;
+  background: var(--circuit-board-paper, #fbfcfe);
+  color: #5d6a80; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Hiragino Sans", sans-serif;
+}
+.circuit-board__chrome {
+  position: absolute; right: 18px; bottom: 18px; z-index: 2;
+  padding: 4px; border: 1px solid #e0e5ed; border-radius: 7px;
+  background: #fff; box-shadow: 0 2px 6px #2c3c5610;
+}
+.circuit-board__controls { display: flex; align-items: center; gap: 2px; }
+.circuit-board__controls button {
+  display: grid; place-items: center; width: 30px; height: 30px; padding: 0;
+  border: 0; border-radius: 4px; background: transparent; color: #68768e; cursor: pointer;
+}
+.circuit-board__controls button:hover:not(:disabled) { background: #f0f3f9; color: #344868; }
+.circuit-board__controls button:focus-visible { outline: 2px solid var(--circuit-board-accent, #3265da); outline-offset: 2px; }
+.circuit-board__controls button:disabled { opacity: .3; cursor: default; }
+.circuit-board__controls button[aria-pressed="true"] { color: #4770bd; background: #f0f4fc; }
+.circuit-board__controls button.circuit-board__zoom-reset { width: 45px; }
+.circuit-board__controls output { color: #5d6b83; font: 11px/1 "SFMono-Regular", Consolas, monospace; font-variant-numeric: tabular-nums; }
+.circuit-board__control-divider { height: 15px; margin: 0 4px; border-left: 1px solid #e5e9f0; }
+.circuit-board__viewport { width: 100%; height: min(72vh, 720px); min-height: 360px; overflow: hidden; outline-offset: -3px; }
+.circuit-board__viewport:focus-visible { outline: 2px solid var(--circuit-board-accent, #3265da); }
+.circuit-board__surface { display: block; width: 100%; height: 100%; overflow: hidden; background: var(--circuit-board-paper, #fbfcfe); user-select: none; touch-action: none; }
+.circuit-board__background { cursor: grab; }
+.circuit-board__background:active { cursor: grabbing; }
+.circuit-board__surface--pan-ready :is(.circuit-board__part, .circuit-board__wire, .circuit-board__terminal, .circuit-board__background) { cursor: grab; }
+.circuit-board__surface--panning,
+.circuit-board__surface--panning :is(.circuit-board__part, .circuit-board__wire, .circuit-board__terminal, .circuit-board__background) { cursor: grabbing; }
+.circuit-board__surface--connecting .circuit-board__background { cursor: crosshair; }
+.circuit-board__paper { fill: var(--circuit-board-paper, #fbfcfe); }
+.circuit-board__minor-grid { fill: var(--circuit-board-grid, #d5dbe5); stroke: none; }
+.circuit-board__wire { cursor: pointer; outline: none; }
+.circuit-board__wire-hit { fill: none; stroke: transparent; stroke-width: 15; pointer-events: stroke; }
+.circuit-board__wire-line {
+  fill: none; stroke: var(--circuit-board-wire, #626f82); stroke-width: 2;
+  stroke-linecap: round; stroke-linejoin: round; pointer-events: none;
+  vector-effect: non-scaling-stroke; transition: stroke 100ms ease;
+}
+.circuit-board__wire:hover .circuit-board__wire-line { stroke: #426aa7; stroke-width: 2.5; }
+.circuit-board__wire--selected .circuit-board__wire-line,
+.circuit-board__wire:focus-visible .circuit-board__wire-line { stroke: var(--circuit-board-wire-selected, #3265da); stroke-width: 3; }
+.circuit-board__connection-preview { fill: none; stroke: var(--circuit-board-accent, #3265da); stroke-width: 2; stroke-dasharray: 5 5; stroke-linecap: round; stroke-linejoin: round; opacity: .65; pointer-events: none; vector-effect: non-scaling-stroke; }
+.circuit-board__part { cursor: grab; outline: none; }
+.circuit-board__part--dragging { cursor: grabbing; }
+.circuit-board__part-hit { fill: transparent; pointer-events: all; }
+.circuit-board__selection-halo { fill: var(--circuit-board-accent, #3265da); fill-opacity: 0; stroke: var(--circuit-board-accent, #3265da); stroke-opacity: 0; stroke-width: 1; transition: fill-opacity 100ms ease, stroke-opacity 100ms ease; pointer-events: none; vector-effect: non-scaling-stroke; }
+.circuit-board__part:hover .circuit-board__selection-halo { fill-opacity: .035; }
+.circuit-board__part--selected .circuit-board__selection-halo,
+.circuit-board__part:focus-visible .circuit-board__selection-halo { fill-opacity: .06; stroke-opacity: .65; }
+.circuit-board__symbol { fill: none; stroke: var(--circuit-board-ink, #303d51); stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
+.circuit-board__symbol > circle { fill: var(--circuit-board-part-fill, #fbfcfe); }
+.circuit-board__part-leads line { fill: none; stroke: var(--circuit-board-wire, #626f82); stroke-width: 2; stroke-linecap: round; vector-effect: non-scaling-stroke; }
+.circuit-board__polarity, .circuit-board__meter-letter { fill: var(--circuit-board-ink, #303d51); stroke: none; font-size: 11px; font-weight: 600; }
+.circuit-board__contact { fill: var(--circuit-board-ink, #303d51) !important; }
+.circuit-board__junction { fill: var(--circuit-board-ink, #303d51); stroke: var(--circuit-board-paper, #fbfcfe); stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+.circuit-board__part-label { fill: var(--circuit-board-label, #374357); font-size: 10px; font-weight: 500; pointer-events: none; paint-order: stroke; stroke: var(--circuit-board-paper, #fbfcfe); stroke-width: 4px; stroke-linejoin: round; }
+.circuit-board__part-detail { fill: var(--circuit-board-muted, #5e6d82); font: 9px "SFMono-Regular", Consolas, monospace; font-variant-numeric: tabular-nums; pointer-events: none; paint-order: stroke; stroke: var(--circuit-board-paper, #fbfcfe); stroke-width: 4px; }
+.circuit-board__terminals { pointer-events: none; }
+.circuit-board__terminal { cursor: crosshair; pointer-events: all; outline: none; }
+.circuit-board__terminal-hit { fill: transparent; pointer-events: all; }
+.circuit-board__terminal-dot { fill: var(--circuit-board-paper, #fbfcfe); stroke: var(--circuit-board-wire, #626f82); stroke-width: 1.5; vector-effect: non-scaling-stroke; transition: fill 100ms ease, stroke 100ms ease; }
+.circuit-board__terminal--connected .circuit-board__terminal-dot { fill: var(--circuit-board-wire, #626f82); }
+.circuit-board__terminal-ring { fill: none; stroke: var(--circuit-board-accent, #3265da); stroke-width: 1.5; vector-effect: non-scaling-stroke; pointer-events: none; }
+.circuit-board__terminal--pending .circuit-board__terminal-dot,
+.circuit-board__terminal:hover .circuit-board__terminal-dot,
+.circuit-board__terminal:focus-visible .circuit-board__terminal-dot { fill: var(--circuit-board-accent, #3265da); stroke: var(--circuit-board-paper, #fbfcfe); }
+.circuit-board__terminal:hover .circuit-board__terminal-hit,
+.circuit-board__terminal:focus-visible .circuit-board__terminal-hit { fill: #3265da13; }
+.circuit-board__terminal-label { fill: var(--circuit-board-accent, #3265da); font-size: 8px; font-weight: 500; opacity: 0; pointer-events: none; paint-order: stroke; stroke: var(--circuit-board-paper, #fbfcfe); stroke-width: 3px; }
+.circuit-board__terminal:hover .circuit-board__terminal-label,
+.circuit-board__terminal:focus-visible .circuit-board__terminal-label,
+.circuit-board__terminal--pending .circuit-board__terminal-label { opacity: 1; }
+@media (max-width: 520px) {
+  .circuit-board__chrome { right: 12px; bottom: 13px; padding: 4px; }
+  .circuit-board__controls button { width: 34px; height: 34px; }
+  .circuit-board__viewport { min-height: 320px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .circuit-board * { transition: none !important; }
+}

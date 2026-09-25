@@ -25,7 +25,7 @@ export const GRID = 20;
 export const MAJOR_EVERY = 5;
 /** Cells from a part's centre to each terminal. */
 export const PART_REACH = 2;
-/** Part footprints keep this many cells from the top and left edges of the board. */
+/** Legacy minimum sheet margin, retained for compatibility with existing consumers. */
 export const BOARD_MARGIN = 1;
 export const MIN_BOARD = { columns: 48, rows: 28 };
 
@@ -209,7 +209,7 @@ export function boardSize(document: CircuitDocument) {
 
 export function snapToGrid(point: Point): Point {
   return {
-    x: Math.max(BOARD_MARGIN, Math.round(point.x / GRID)),
-    y: Math.max(BOARD_MARGIN, Math.round(point.y / GRID)),
+    x: Math.round(point.x / GRID),
+    y: Math.round(point.y / GRID),
   };
 }

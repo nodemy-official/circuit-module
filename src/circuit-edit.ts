@@ -1,6 +1,4 @@
 import {
-  BOARD_MARGIN,
-  footprint,
   nextRotation,
   partsConflict,
   routeEnd,
@@ -53,18 +51,12 @@ export function nextLabel(document: CircuitDocument, kind: CircuitPartKind) {
   return `${base}${number}`;
 }
 
-function insideBoard(part: CircuitPart) {
-  const rect = footprint(part);
-  return rect.minX >= BOARD_MARGIN && rect.minY >= BOARD_MARGIN;
-}
-
 /** Whether the candidates fit among the document's other parts. */
 export function canPlace(document: CircuitDocument, candidates: readonly CircuitPart[]) {
   const moving = new Set(candidates.map((part) => part.id));
   const others = document.parts.filter((part) => !moving.has(part.id));
   return candidates.every(
     (candidate, index) =>
-      insideBoard(candidate) &&
       !others.some((other) => partsConflict(candidate, other)) &&
       !candidates.slice(index + 1).some((other) => partsConflict(candidate, other)),
   );

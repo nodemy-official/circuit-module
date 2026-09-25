@@ -12,7 +12,7 @@ import {
   removeSelection,
   rotateParts,
 } from "./circuit-edit.js";
-import { routeEnd, routeWire, terminalPoint } from "./circuit-geometry.js";
+import { routeEnd, routeWire, snapToGrid, terminalPoint } from "./circuit-geometry.js";
 import { createExampleCircuit, type CircuitDocument } from "./circuit-model.js";
 
 const empty: CircuitDocument = { title: "", parts: [], wires: [] };
@@ -34,9 +34,15 @@ describe("placing parts", () => {
     expect(addPart(document, "resistor", { x: 13, y: 5 }).ok).toBe(true);
   });
 
-  it("keeps parts on the sheet", () => {
-    expect(addPart(empty, "battery", { x: 2, y: 5 }).ok).toBe(false);
+  it("allows parts across the former sheet boundary", () => {
+    expect(addPart(empty, "battery", { x: 2, y: 5 }).ok).toBe(true);
     expect(addPart(empty, "battery", { x: 3, y: 5 }).ok).toBe(true);
+  });
+
+  it("allows placing parts at negative world coordinates", () => {
+    const placed = addPart(empty, "battery", { x: -4, y: -6 });
+    expect(placed.ok).toBe(true);
+    expect(placed.ok && placed.document.parts[0]).toMatchObject({ x: -4, y: -6 });
   });
 
   it("finds the nearest free spot", () => {
@@ -53,6 +59,20 @@ describe("moving and rotating", () => {
     const moved = moveParts(document, ["part-1", "part-4"], 0, 2);
     expect(moved.ok && moved.document.parts.find((part) => part.id === "part-1")?.y).toBe(7);
     expect(moveParts(document, ["part-1"], 12, 0).ok).toBe(false);
+  });
+
+  it("allows moving parts across the origin into negative coordinates", () => {
+    const document: CircuitDocument = {
+      title: "",
+      parts: [{ id: "battery", kind: "battery", x: 1, y: 1, label: "電池" }],
+      wires: [],
+    };
+    const moved = moveParts(document, ["battery"], -5, -7);
+    expect(moved.ok && moved.document.parts[0]).toMatchObject({ x: -4, y: -6 });
+  });
+
+  it("snaps pointer positions to negative grid cells", () => {
+    expect(snapToGrid({ x: -61, y: -101 })).toEqual({ x: -3, y: -5 });
   });
 
   it("turns terminals with the part", () => {

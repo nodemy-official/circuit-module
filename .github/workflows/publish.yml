@@ -17,6 +17,7 @@ jobs:
       - run: bun ci
       - run: bun run check
       - run: bun run build
+      - run: bun run build-storybook
       - run: npm pack --dry-run --ignore-scripts
 
   publish:
