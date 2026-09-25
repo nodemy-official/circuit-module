@@ -1,6 +1,6 @@
 # @nodemy-official/circuit-module
 
-Nodemy の直流回路エディタ向け headless モジュールです。React、DOM、CSS に依存せず、回路のデータ型、編集操作、格子幾何、直流回路解析を提供します。
+直流回路エディタ向けの headless モジュールです。React、DOM、CSS に依存せず、回路のデータ型、編集操作、格子幾何、直流回路解析を提供します。
 
 ## 導入
 

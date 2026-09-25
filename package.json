@@ -1,15 +1,11 @@
 {
   "name": "@nodemy-official/circuit-module",
   "version": "0.1.0",
-  "description": "Headless DC circuit model, editor operations, geometry, and simulation for Nodemy.",
+  "description": "Headless DC circuit model, editor operations, geometry, and simulation.",
   "license": "UNLICENSED",
   "private": false,
   "type": "module",
   "sideEffects": false,
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/nodemy-official/circuit-module.git"
-  },
   "files": ["dist"],
   "exports": {
     ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" },
