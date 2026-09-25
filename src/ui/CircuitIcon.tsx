@@ -1,4 +1,5 @@
-import type { ReactNode } from "react";
+import type { ComponentPropsWithoutRef, ReactNode } from "react";
+import type { CircuitStyleProps } from "./style-props.js";
 
 export type CircuitIconName =
   | "cursor"
@@ -23,21 +24,25 @@ export type CircuitIconName =
   | "arrowLeft"
   | "arrowRight"
   | "sample"
+  | "copy"
+  | "cut"
+  | "paste"
+  | "duplicate"
+  | "selectAll"
   | "download";
 
-export interface CircuitIconProps {
+export interface CircuitIconProps extends Omit<ComponentPropsWithoutRef<"svg">, "children" | "style"> {
   name: CircuitIconName;
   size?: number;
-  className?: string;
+  style?: CircuitStyleProps["style"];
 }
 
 /** A small, consistent 24 × 24 line icon set for circuit editor controls. */
-export function CircuitIcon({ name, size = 18, className }: CircuitIconProps) {
+export function CircuitIcon({ name, size = 18, width, height, ...svgProps }: CircuitIconProps) {
   return (
     <svg
-      className={className}
-      width={size}
-      height={size}
+      width={width ?? size}
+      height={height ?? size}
       viewBox="0 0 24 24"
       fill="none"
       stroke="currentColor"
@@ -46,6 +51,7 @@ export function CircuitIcon({ name, size = 18, className }: CircuitIconProps) {
       strokeLinejoin="round"
       aria-hidden="true"
       focusable="false"
+      {...svgProps}
     >
       {glyphs[name]}
     </svg>
@@ -124,4 +130,9 @@ const glyphs: Record<CircuitIconName, ReactNode> = {
     <path d="M12 3v12m-5-5 5 5 5-5" />
     <path d="M5 17v3h14v-3" />
   </>,
+  copy: <><rect x="8" y="8" width="12" height="12" rx="2" /><path d="M15 4H4v11" /></>,
+  cut: <><circle cx="6" cy="6" r="3" /><circle cx="6" cy="18" r="3" /><path d="m8 8 12 12M8 16 20 4" /></>,
+  paste: <><path d="M9 5H5v16h14V5h-4" /><rect x="9" y="3" width="6" height="4" rx="1" /></>,
+  duplicate: <><rect x="7" y="7" width="14" height="14" rx="2" /><path d="M16 3H3v13m11-5v6m-3-3h6" /></>,
+  selectAll: <><path d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5" /><rect x="7" y="7" width="10" height="10" rx="1" /></>,
 };

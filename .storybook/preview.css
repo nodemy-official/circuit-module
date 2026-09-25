@@ -1,0 +1,14 @@
+:root[data-theme="light"] {
+  color-scheme: light;
+  background: oklch(1 0 0);
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  background: oklch(0.23 0.015 260);
+}
+
+.storybook-theme {
+  color: var(--circuit-ink);
+  background: var(--circuit-surface);
+}

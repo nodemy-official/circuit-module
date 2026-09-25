@@ -1,26 +1,28 @@
+@import "./potential.css";
+@layer circuit {
 .circuit-board {
   position: relative; width: 100%; min-width: 0; overflow: hidden;
   border: 1px solid var(--circuit-board-frame, #e1e6ee); border-radius: 8px;
   background: var(--circuit-board-paper, #fbfcfe);
-  color: #5d6a80; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Hiragino Sans", sans-serif;
+  color: var(--circuit-board-muted, #5d6a80); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Hiragino Sans", sans-serif;
 }
 .circuit-board__chrome {
   position: absolute; right: 18px; bottom: 18px; z-index: 2;
-  padding: 4px; border: 1px solid #e0e5ed; border-radius: 7px;
-  background: #fff; box-shadow: 0 2px 6px #2c3c5610;
+  padding: 4px; border: 1px solid var(--circuit-board-frame, #e0e5ed); border-radius: 7px;
+  background: var(--circuit-board-part-fill, #fff); box-shadow: 0 2px 6px #2c3c5610;
 }
 .circuit-board__controls { display: flex; align-items: center; gap: 2px; }
 .circuit-board__controls button {
   display: grid; place-items: center; width: 30px; height: 30px; padding: 0;
-  border: 0; border-radius: 4px; background: transparent; color: #68768e; cursor: pointer;
+  border: 0; border-radius: 4px; background: transparent; color: var(--circuit-board-muted, #68768e); cursor: pointer;
 }
-.circuit-board__controls button:hover:not(:disabled) { background: #f0f3f9; color: #344868; }
+.circuit-board__controls button:hover:not(:disabled) { background: var(--circuit-board-paper, #f0f3f9); color: var(--circuit-board-ink, #344868); }
 .circuit-board__controls button:focus-visible { outline: 2px solid var(--circuit-board-accent, #3265da); outline-offset: 2px; }
 .circuit-board__controls button:disabled { opacity: .3; cursor: default; }
-.circuit-board__controls button[aria-pressed="true"] { color: #4770bd; background: #f0f4fc; }
+.circuit-board__controls button[aria-pressed="true"] { color: var(--circuit-board-accent, #4770bd); background: var(--circuit-accent-soft, #f0f4fc); }
 .circuit-board__controls button.circuit-board__zoom-reset { width: 45px; }
-.circuit-board__controls output { color: #5d6b83; font: 11px/1 "SFMono-Regular", Consolas, monospace; font-variant-numeric: tabular-nums; }
-.circuit-board__control-divider { height: 15px; margin: 0 4px; border-left: 1px solid #e5e9f0; }
+.circuit-board__controls output { color: var(--circuit-board-muted, #5d6b83); font: 11px/1 "SFMono-Regular", Consolas, monospace; font-variant-numeric: tabular-nums; }
+.circuit-board__control-divider { height: 15px; margin: 0 4px; border-left: 1px solid var(--circuit-board-frame, #e5e9f0); }
 .circuit-board__viewport { width: 100%; height: min(72vh, 720px); min-height: 360px; overflow: hidden; outline-offset: -3px; }
 .circuit-board__viewport:focus-visible { outline: 2px solid var(--circuit-board-accent, #3265da); }
 .circuit-board__surface { display: block; width: 100%; height: 100%; overflow: hidden; background: var(--circuit-board-paper, #fbfcfe); user-select: none; touch-action: none; }
@@ -39,10 +41,75 @@
   stroke-linecap: round; stroke-linejoin: round; pointer-events: none;
   vector-effect: non-scaling-stroke; transition: stroke 100ms ease;
 }
-.circuit-board__wire:hover .circuit-board__wire-line { stroke: #426aa7; stroke-width: 2.5; }
+.circuit-board__wire:hover .circuit-board__wire-line { stroke: var(--circuit-board-accent, #426aa7); stroke-width: 2.5; }
 .circuit-board__wire--selected .circuit-board__wire-line,
 .circuit-board__wire:focus-visible .circuit-board__wire-line { stroke: var(--circuit-board-wire-selected, #3265da); stroke-width: 3; }
+.circuit-board__wire[data-reconnecting="true"] .circuit-board__wire-line { opacity: .3; stroke-dasharray: 4 4; }
+.circuit-board__wire[data-route-editable="true"] { cursor: move; }
+.circuit-board__wire[data-route-dragging="true"] .circuit-board__wire-line { stroke: var(--circuit-board-wire-selected, #3265da); stroke-width: 3; }
+.circuit-board__wire-segment-handle { outline: none; cursor: ew-resize; }
+.circuit-board__wire-segment-handle[data-orientation="horizontal"] { cursor: ns-resize; }
+.circuit-board__wire-segment-hit { fill: transparent; pointer-events: all; }
+.circuit-board__wire-segment-dot { fill: var(--circuit-board-paper, #fbfcfe); stroke: var(--circuit-board-wire-selected, #3265da); stroke-width: 1.5; pointer-events: none; vector-effect: non-scaling-stroke; }
+.circuit-board__wire-segment-handle:hover .circuit-board__wire-segment-dot,
+.circuit-board__wire-segment-handle:focus-visible .circuit-board__wire-segment-dot { fill: var(--circuit-board-wire-selected, #3265da); stroke-width: 2.5; }
+.circuit-board__surface--pan-ready :is(.circuit-board__wire, .circuit-board__wire-segment-handle) { cursor: grab; }
+.circuit-board__surface--panning :is(.circuit-board__wire, .circuit-board__wire-segment-handle) { cursor: grabbing; }
+.circuit-board[data-show-flow="true"] { display: flex; flex-direction: column; }
+.circuit-board[data-show-flow="true"] .circuit-board__viewport { flex: 1 1 auto; }
+.circuit-board__flow-legend {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 6px 16px; flex-shrink: 0;
+  padding: 10px 16px; border-bottom: 1px solid var(--circuit-board-frame, #e1e6ee);
+  background: var(--circuit-board-part-fill, #fbfcfe); color: var(--circuit-board-label, #374357); font-size: 12px;
+}
+.circuit-board__flow-display { min-width: 0; margin: 0; padding: 0; border: 0; }
+.circuit-board__flow-display legend { margin-bottom: 4px; padding: 0; font-size: 11px; }
+.circuit-board__flow-display-options { display: flex; flex-wrap: wrap; gap: 4px; }
+.circuit-board__flow-display-option {
+  display: inline-flex; align-items: center; gap: 4px; padding: 5px 7px;
+  border: 1px solid var(--circuit-board-frame, #e1e6ee); border-radius: 5px;
+  background: var(--circuit-board-paper, #fbfcfe); white-space: nowrap; cursor: pointer;
+}
+.circuit-board__flow-display-option[data-selected="true"] { border-color: var(--circuit-board-accent, #3265da); }
+.circuit-board__flow-display-option input { margin: 0; accent-color: var(--circuit-board-accent, #3265da); }
+.circuit-board__flow-display-option input:focus-visible { outline: 2px solid var(--circuit-board-accent, #3265da); outline-offset: 2px; }
+.circuit-board__flow-keys { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 16px; }
+.circuit-board__flow-key { display: inline-flex; align-items: center; gap: 3px; font-weight: 600; white-space: nowrap; }
+.circuit-board__flow-key[data-flow="current"] { color: var(--circuit-board-current, #b6600b); }
+.circuit-board__flow-key[data-flow="electron"] { color: var(--circuit-board-electron, #176fc1); }
+.circuit-board__flow-explanation { font-size: 11px; }
+.circuit-board__flow-note { flex-basis: 100%; margin: 0; color: var(--circuit-board-muted, #5e6d82); font-size: 11px; }
+.circuit-board__flow-pause {
+  margin-left: auto; padding: 5px 8px; border: 1px solid var(--circuit-board-frame, #e1e6ee); border-radius: 5px;
+  background: var(--circuit-board-paper, #fbfcfe); color: inherit; font: inherit; font-size: 11px; white-space: nowrap; cursor: pointer;
+}
+.circuit-board__flow-pause:hover:not(:disabled) { border-color: var(--circuit-board-muted, #5e6d82); }
+.circuit-board__flow-pause:focus-visible { outline: 2px solid var(--circuit-board-accent, #3265da); outline-offset: 2px; }
+.circuit-board__flow-pause:disabled { opacity: .5; cursor: default; }
+.circuit-board__flow { pointer-events: none; }
+.circuit-board__flow-particle {
+  offset-anchor: 0px 0px; offset-rotate: auto;
+  animation-name: circuit-flow-travel; animation-timing-function: linear; animation-iteration-count: infinite;
+}
+.circuit-board__flow-glyph { transform: scale(var(--circuit-board-flow-scale, 1)); transform-origin: 0 0; }
+.circuit-board__current-arrow { fill: var(--circuit-board-current, #b6600b); stroke: var(--circuit-board-paper, #fbfcfe); stroke-width: 1; stroke-linejoin: round; }
+.circuit-board__electron { fill: var(--circuit-board-electron, #176fc1); stroke: var(--circuit-board-paper, #fbfcfe); stroke-width: 1; }
+.circuit-board__electron-minus { fill: none; stroke: var(--circuit-on-accent, #fff); stroke-width: 1.2; stroke-linecap: round; }
+.circuit-board__electron-arrow { fill: none; stroke: var(--circuit-board-electron, #176fc1); stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+.circuit-board[data-flow-paused="true"] .circuit-board__flow-particle { animation-play-state: paused; }
+@keyframes circuit-flow-travel {
+  from { offset-distance: 0%; }
+  to { offset-distance: 100%; }
+}
+.circuit-board__wire-handle { cursor: grab; outline: none; }
+.circuit-board__wire-handle:active { cursor: grabbing; }
+.circuit-board__wire-handle-hit { fill: transparent; pointer-events: all; }
+.circuit-board__wire-handle-dot { fill: var(--circuit-board-paper, #fbfcfe); stroke: var(--circuit-board-accent, #3265da); stroke-width: 2.5; vector-effect: non-scaling-stroke; pointer-events: none; }
+.circuit-board__wire-handle:hover .circuit-board__wire-handle-dot,
+.circuit-board__wire-handle:focus-visible .circuit-board__wire-handle-dot { fill: var(--circuit-board-accent, #3265da); stroke-width: 4; }
+.circuit-board__connection-target { fill: var(--circuit-board-accent, #3265da); fill-opacity: .12; stroke: var(--circuit-board-accent, #3265da); stroke-width: 2; vector-effect: non-scaling-stroke; pointer-events: none; }
 .circuit-board__connection-preview { fill: none; stroke: var(--circuit-board-accent, #3265da); stroke-width: 2; stroke-dasharray: 5 5; stroke-linecap: round; stroke-linejoin: round; opacity: .65; pointer-events: none; vector-effect: non-scaling-stroke; }
+.circuit-board__selection-rect { fill: var(--circuit-board-accent, #3265da); fill-opacity: .08; stroke: var(--circuit-board-accent, #3265da); stroke-width: 1; stroke-dasharray: 4 3; pointer-events: none; vector-effect: non-scaling-stroke; }
 .circuit-board__part { cursor: grab; outline: none; }
 .circuit-board__part--dragging { cursor: grabbing; }
 .circuit-board__part-hit { fill: transparent; pointer-events: all; }
@@ -52,12 +119,15 @@
 .circuit-board__part:focus-visible .circuit-board__selection-halo { fill-opacity: .06; stroke-opacity: .65; }
 .circuit-board__symbol { fill: none; stroke: var(--circuit-board-ink, #303d51); stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
 .circuit-board__symbol > circle { fill: var(--circuit-board-part-fill, #fbfcfe); }
+.circuit-board__bulb-glass[data-lit="true"] { fill: rgb(var(--circuit-board-bulb-color, 250 196 66) / var(--circuit-board-bulb-opacity, .15)); }
 .circuit-board__part-leads line { fill: none; stroke: var(--circuit-board-wire, #626f82); stroke-width: 2; stroke-linecap: round; vector-effect: non-scaling-stroke; }
 .circuit-board__polarity, .circuit-board__meter-letter { fill: var(--circuit-board-ink, #303d51); stroke: none; font-size: 11px; font-weight: 600; }
-.circuit-board__contact { fill: var(--circuit-board-ink, #303d51) !important; }
+.circuit-board__symbol > .circuit-board__contact { fill: var(--circuit-board-ink, #303d51); }
 .circuit-board__junction { fill: var(--circuit-board-ink, #303d51); stroke: var(--circuit-board-paper, #fbfcfe); stroke-width: 1.5; vector-effect: non-scaling-stroke; }
-.circuit-board__part-label { fill: var(--circuit-board-label, #374357); font-size: 10px; font-weight: 500; pointer-events: none; paint-order: stroke; stroke: var(--circuit-board-paper, #fbfcfe); stroke-width: 4px; stroke-linejoin: round; }
-.circuit-board__part-detail { fill: var(--circuit-board-muted, #5e6d82); font: 9px "SFMono-Regular", Consolas, monospace; font-variant-numeric: tabular-nums; pointer-events: none; paint-order: stroke; stroke: var(--circuit-board-paper, #fbfcfe); stroke-width: 4px; }
+.circuit-board__part-label { fill: var(--circuit-board-label, #374357); font-weight: 500; pointer-events: none; paint-order: stroke; stroke: var(--circuit-board-paper, #fbfcfe); stroke-width: 4px; stroke-linejoin: round; }
+.circuit-board__part-detail { fill: var(--circuit-board-muted, #5e6d82); font-family: "SFMono-Regular", Consolas, monospace; font-variant-numeric: tabular-nums; pointer-events: none; paint-order: stroke; stroke: var(--circuit-board-paper, #fbfcfe); stroke-width: 4px; }
+.circuit-board__meter-reading { fill: var(--circuit-board-accent, #3265da); font-weight: 700; }
+.circuit-board__meter-reading:not([data-meter-status="connected"]) { fill: var(--circuit-board-muted, #5e6d82); font-weight: 500; }
 .circuit-board__terminals { pointer-events: none; }
 .circuit-board__terminal { cursor: crosshair; pointer-events: all; outline: none; }
 .circuit-board__terminal-hit { fill: transparent; pointer-events: all; }
@@ -68,16 +138,26 @@
 .circuit-board__terminal:hover .circuit-board__terminal-dot,
 .circuit-board__terminal:focus-visible .circuit-board__terminal-dot { fill: var(--circuit-board-accent, #3265da); stroke: var(--circuit-board-paper, #fbfcfe); }
 .circuit-board__terminal:hover .circuit-board__terminal-hit,
-.circuit-board__terminal:focus-visible .circuit-board__terminal-hit { fill: #3265da13; }
+.circuit-board__terminal:focus-visible .circuit-board__terminal-hit { fill: var(--circuit-board-accent, #3265da); fill-opacity: .075; }
 .circuit-board__terminal-label { fill: var(--circuit-board-accent, #3265da); font-size: 8px; font-weight: 500; opacity: 0; pointer-events: none; paint-order: stroke; stroke: var(--circuit-board-paper, #fbfcfe); stroke-width: 3px; }
 .circuit-board__terminal:hover .circuit-board__terminal-label,
 .circuit-board__terminal:focus-visible .circuit-board__terminal-label,
 .circuit-board__terminal--pending .circuit-board__terminal-label { opacity: 1; }
+.circuit-board__terminal[data-selected="true"] .circuit-board__terminal-dot { stroke: var(--circuit-board-accent, #3265da); stroke-width: 2.5; }
+.circuit-board__terminal[data-selected="true"] .circuit-board__terminal-label { opacity: 1; }
+.circuit-board[data-read-only="true"] :is(.circuit-board__wire, .circuit-board__part, .circuit-board__terminal) { pointer-events: none; }
+.circuit-board[data-switch-interactive="true"] .circuit-board__part[data-kind="switch"] { pointer-events: all; cursor: pointer; }
+.circuit-board[data-read-only="true"] .circuit-board__terminals { opacity: 0; }
 @media (max-width: 520px) {
+  .circuit-board__flow-legend { padding: 8px 12px; gap: 5px 10px; }
+  .circuit-board__flow-keys { gap: 5px 10px; }
   .circuit-board__chrome { right: 12px; bottom: 13px; padding: 4px; }
   .circuit-board__controls button { width: 34px; height: 34px; }
   .circuit-board__viewport { min-height: 320px; }
 }
 @media (prefers-reduced-motion: reduce) {
-  .circuit-board * { transition: none !important; }
+  .circuit-board * { transition: none; }
+  .circuit-board__flow-particle { animation: none; }
+  .circuit-board__flow-pause { display: none; }
+}
 }

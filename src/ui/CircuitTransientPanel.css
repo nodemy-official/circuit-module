@@ -1,0 +1,52 @@
+@layer circuit {
+  .circuit-transient { margin-top: 14px; }
+  .circuit-transient summary { cursor: pointer; font-size: 12px; font-weight: 600; padding: 5px 0; }
+  .circuit-transient p, .circuit-transient li { font-size: 11px; line-height: 1.7; color: var(--circuit-muted, #5e6d82); }
+  .circuit-transient label.circuit-transient__initial { display: flex; align-items: center; gap: 6px; }
+  .circuit-transient input[type="checkbox"] { margin: 0; }
+  .circuit-transient [role="alert"] { color: var(--circuit-danger, #b33232); }
+  .circuit-transient__parts { min-width: 0; margin: 12px 0; padding: 10px; border: 1px solid var(--circuit-line, #dce2eb); border-radius: 6px; }
+  .circuit-transient__parts legend, .circuit-transient__time-controls legend { padding: 0 4px; font-size: 11px; font-weight: 600; }
+  .circuit-transient__part-options { display: flex; flex-wrap: wrap; gap: 6px; }
+  .circuit-transient label.circuit-transient__part-option { display: inline-flex; align-items: center; gap: 5px; margin: 0; padding: 5px 7px; border: 1px solid var(--circuit-line, #dce2eb); border-radius: 5px; font-size: 11px; }
+  .circuit-transient__part-option input { accent-color: var(--circuit-board-accent, #3265da); }
+  .circuit-transient__part-option[data-selected="true"] { border-color: var(--circuit-board-accent, #3265da); background: color-mix(in srgb, var(--circuit-board-accent, #3265da) 8%, transparent); }
+  .circuit-transient__selection-note { margin: 6px 0 0; }
+  .circuit-transient__comparison-key { display: flex; flex-wrap: wrap; gap: 12px; margin: 12px 0 2px; font-size: 11px; }
+  .circuit-transient__comparison-key span { display: inline-flex; align-items: center; gap: 5px; }
+  .circuit-transient__comparison-key span::before { width: 18px; border-top: 2px solid var(--circuit-board-accent, #3265da); content: ""; }
+  .circuit-transient__comparison-key [data-source="baseline"]::before { border-top-style: dashed; }
+  .circuit-transient__legend { display: flex; flex-wrap: wrap; gap: 6px 12px; margin: 8px 0; padding: 0; list-style: none; }
+  .circuit-transient__legend li { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; }
+  .circuit-transient__swatch { width: 18px; border-top: 2px solid var(--circuit-board-accent, #3265da); }
+  .circuit-transient__legend [data-series-index="1"] .circuit-transient__swatch { border-color: #bd4c16; }
+  .circuit-transient__legend [data-series-index="2"] .circuit-transient__swatch { border-color: #16805b; }
+  .circuit-transient__plots { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr)); gap: 12px; }
+  .circuit-waveform { min-width: 0; margin-top: 12px; font-variant-numeric: tabular-nums; }
+  .circuit-waveform__heading { margin: 0; font-size: 12px; }
+  .circuit-waveform svg { display: block; width: 100%; overflow: visible; }
+  .circuit-waveform text { fill: currentColor; font: 16px sans-serif; }
+  .circuit-waveform__axis { fill: none; stroke: var(--circuit-muted, #a4adbc); stroke-width: 1; }
+  .circuit-waveform__grid { fill: none; stroke: var(--circuit-line, #dce2eb); stroke-width: 1; stroke-dasharray: 3 3; }
+  .circuit-waveform__trace { fill: none; stroke: var(--circuit-board-accent, #3265da); stroke-width: 1.8; stroke-linejoin: round; }
+  .circuit-waveform [data-series-index="1"] .circuit-waveform__trace { stroke: #bd4c16; }
+  .circuit-waveform [data-series-index="2"] .circuit-waveform__trace { stroke: #16805b; }
+  .circuit-waveform__trace[data-source="baseline"] { stroke-dasharray: 5 4; opacity: 0.75; }
+  .circuit-waveform__series-dot { fill: var(--circuit-board-accent, #3265da); stroke: var(--circuit-surface, #fff); stroke-width: 1; }
+  .circuit-waveform [data-series-index="1"] .circuit-waveform__series-dot { fill: #bd4c16; }
+  .circuit-waveform [data-series-index="2"] .circuit-waveform__series-dot { fill: #16805b; }
+  .circuit-waveform__series-dot[data-source="baseline"] { fill: var(--circuit-surface, #fff); }
+  .circuit-waveform__cursor { fill: none; stroke: var(--circuit-current, #e19439); stroke-width: 1; stroke-dasharray: 3 2; }
+  .circuit-transient__time-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin: 8px 0 12px; padding: 8px; border: 1px solid var(--circuit-line, #dce2eb); border-radius: 6px; }
+  .circuit-transient__time-controls legend { flex-basis: 100%; }
+  .circuit-transient__time-controls .circuit-button { padding: 6px 9px; font-size: 11px; }
+  .circuit-transient__time-controls label { margin: 4px 0 0; font-size: 11px; }
+  .circuit-transient__time-controls input[type="range"] { flex: 1 1 100px; min-width: 75px; margin: 4px; accent-color: var(--circuit-board-accent, #3265da); }
+  .circuit-transient__time-output { font-size: 11px; font-variant-numeric: tabular-nums; }
+  .circuit-transient__readings { display: block; width: 100%; max-width: 100%; overflow-x: auto; border-collapse: collapse; font-size: 10px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .circuit-transient__readings caption { padding: 5px; text-align: left; font-size: 11px; font-weight: 600; }
+  .circuit-transient__readings th, .circuit-transient__readings td { padding: 5px 4px; border: 1px solid var(--circuit-line, #dce2eb); text-align: right; }
+  .circuit-transient__readings th { font-weight: 600; }
+  .circuit-transient__readings th:first-child { text-align: left; }
+  .circuit-transient__reading-reference { display: block; color: var(--circuit-muted, #5e6d82); font-size: 9px; font-weight: 400; white-space: normal; }
+}

@@ -1,0 +1,18 @@
+@import "./CircuitTransientPanel.css";
+@import "./learning-panels.css";
+@import "./comparison.css";
+
+@layer circuit {
+  .circuit-learning-section { margin-top: 14px; }
+  .circuit-learning-section > summary { padding: 5px 0; cursor: pointer; font-size: 12px; font-weight: 600; }
+  .circuit-simulation { padding: 16px; border-bottom: 1px solid var(--circuit-line, #e5e9f0); }
+  .circuit-simulation label { display: block; margin: 10px 0 5px; font-size: 12px; }
+  .circuit-simulation :is(select, input[type="number"]) {
+    box-sizing: border-box; width: 100%; min-width: 0; padding: 7px 8px;
+    border: 1px solid var(--circuit-control-line, #d9e0eb); border-radius: 5px; color: inherit; background: var(--circuit-surface, #fff); font: inherit; font-size: 12px;
+  }
+  .circuit-simulation p { font-size: 11px; line-height: 1.7; color: var(--circuit-muted, #5e6d82); }
+  .circuit-simulation :is(select, input):focus-visible { outline: 2px solid var(--circuit-board-accent, #3265da); outline-offset: 1px; }
+  .circuit-analysis__mode { margin: 6px 0; font-size: 11px; color: var(--circuit-muted, #5e6d82); }
+  .circuit-sample-select { box-sizing: border-box; display: block; width: 100%; margin-top: 8px; padding: 10px; border: 1px solid var(--circuit-control-line, #d9e0eb); border-radius: 5px; background: var(--circuit-surface, #fff); color: inherit; font: inherit; }
+}

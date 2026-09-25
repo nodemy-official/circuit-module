@@ -1,6 +1,15 @@
 export * from "./CircuitAnalysisPanel.js";
+export * from "./CircuitDiagnosticsPanel.js";
+export * from "./CircuitSimulationPanel.js";
+export * from "./CircuitTransientPanel.js";
+export * from "./CircuitEnergyPanel.js";
+export * from "./CircuitAcPanel.js";
+export * from "./CircuitComparisonPanel.js";
 export * from "./CircuitBoard.js";
 export * from "./CircuitEditor.js";
 export * from "./CircuitInspector.js";
+export * from "./CircuitIcon.js";
+export * from "./CircuitMeterReadout.js";
 export * from "./CircuitPalette.js";
 export * from "./useCircuitEditor.js";
+export type { CircuitCSSProperties, CircuitStyleProps } from "./style-props.js";

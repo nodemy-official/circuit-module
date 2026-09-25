@@ -1,12 +1,12 @@
 {
   "name": "@nodemy-official/circuit-module",
   "version": "0.1.0",
-  "description": "DC circuit model, editing, simulation, and optional React editor UI.",
+  "description": "Headless circuit editing, DC/AC and transient simulation, and composable unstyled React UI.",
   "license": "UNLICENSED",
   "private": false,
   "type": "module",
   "sideEffects": ["./dist/ui/*.css"],
-  "files": ["dist"],
+  "files": ["dist", "docs"],
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -28,10 +28,38 @@
       "types": "./dist/circuit-solver.d.ts",
       "import": "./dist/circuit-solver.js"
     },
+    "./analog-solver": {
+      "types": "./dist/analog-solver.d.ts",
+      "import": "./dist/analog-solver.js"
+    },
+    "./transient-solver": {
+      "types": "./dist/transient-solver.d.ts",
+      "import": "./dist/transient-solver.js"
+    },
+    "./examples": {
+      "types": "./dist/circuit-examples.d.ts",
+      "import": "./dist/circuit-examples.js"
+    },
+    "./serialization": {
+      "types": "./dist/circuit-serialization.d.ts",
+      "import": "./dist/circuit-serialization.js"
+    },
+    "./diagnostics": {
+      "types": "./dist/circuit-diagnostics.d.ts",
+      "import": "./dist/circuit-diagnostics.js"
+    },
     "./ui": {
       "types": "./dist/ui/index.d.ts",
       "import": "./dist/ui/index.js"
     },
+    "./ui/preset": {
+      "types": "./dist/ui/preset.d.ts",
+      "import": "./dist/ui/preset.js"
+    },
+    "./ui/styles.css": "./dist/ui/styles.css",
+    "./ui/board.css": "./dist/ui/ui.css",
+    "./ui/editor.css": "./dist/ui/editor.css",
+    "./ui/simulation.css": "./dist/ui/simulation.css",
     "./package.json": "./package.json"
   },
   "publishConfig": {
@@ -40,21 +68,29 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json && cp src/ui/*.css dist/ui/",
-    "check": "tsc --noEmit && vitest run",
+    "check": "biome lint . && tsc --noEmit && vitest run",
+    "lint": "biome lint .",
+    "format": "biome format --write .",
     "storybook": "storybook dev -p 6006",
     "build-storybook": "storybook build",
     "test": "vitest run",
     "prepack": "npm run build"
   },
+  "dependencies": {
+    "@base-ui/react": "^1.8.0"
+  },
   "devDependencies": {
+    "@biomejs/biome": "2.5.14",
     "@storybook/addon-docs": "^10.4.0",
     "@storybook/react-vite": "^10.4.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
+    "jsdom": "^30.1.1",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "storybook": "^10.4.0",
     "typescript": "^5.9.3",
+    "ultracite": "7.12.0",
     "vitest": "^4.1.11"
   },
   "peerDependencies": {
@@ -62,8 +98,12 @@
     "react-dom": "^18.0.0 || ^19.0.0"
   },
   "peerDependenciesMeta": {
-    "react": { "optional": true },
-    "react-dom": { "optional": true }
+    "react": {
+      "optional": true
+    },
+    "react-dom": {
+      "optional": true
+    }
   },
   "engines": {
     "node": ">=22"

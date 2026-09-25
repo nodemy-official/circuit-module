@@ -3,10 +3,16 @@ import {
   type CircuitDocument,
   type CircuitEndpoint,
   type CircuitPart,
+  type CircuitTerminal,
 } from "./circuit-model.js";
+import { analyzeExtendedCircuit } from "./circuit-analog-adapter.js";
+import { meterStatuses, type MeterStatus } from "./meter-status.js";
 
 export type CircuitStatus = "empty" | "idle" | "open" | "closed" | "short" | "invalid";
 export type CircuitIssueSeverity = "error" | "warning" | "info";
+
+/** Maximum number of part terminals accepted by the dense nodal-analysis solver. */
+export const MAX_CIRCUIT_ANALYSIS_TERMINALS = 512;
 
 export interface CircuitIssue {
   severity: CircuitIssueSeverity;
@@ -15,26 +21,53 @@ export interface CircuitIssue {
 }
 
 export interface CircuitPartReading {
-  /** Potential of terminal A minus terminal B. */
+  /** A−B voltage; BJT/MOS use A−C, op-amps use output−GND. AC values are RMS magnitudes. */
   voltageVolts: number;
-  /** Current through the part from terminal A to terminal B. */
+  /** Current entering terminal A (op-amp: output C). Signed in DC; RMS magnitude in AC. */
   currentAmps: number;
-  /** Power consumed by the part; for a battery, power it delivers. */
+  /** Real power absorbed; independent voltage/current sources report delivered power. */
   powerWatts: number;
-  /** 0–1 brightness for bulbs, relative to the rated power. */
+  /** 0–1 brightness for bulbs (rated power) and DC LEDs (rated current). */
   brightness?: number;
+  /** Present for AC analysis. Voltage/current values are then RMS magnitudes. */
+  voltagePhaseDegrees?: number;
+  currentPhaseDegrees?: number;
+  /** Reactive power; positive means inductive absorption. */
+  reactivePowerVars?: number;
+  /** Terminal potentials relative to the reference, and currents entering the device. */
+  terminalVoltages?: Partial<Record<CircuitTerminal, number>>;
+  terminalCurrents?: Partial<Record<CircuitTerminal, number>>;
+  /** AC terminal phasor angles, paired with the RMS terminal magnitudes. */
+  terminalVoltagePhasesDegrees?: Partial<Record<CircuitTerminal, number>>;
+  terminalCurrentPhasesDegrees?: Partial<Record<CircuitTerminal, number>>;
+  /**
+   * Measurement validity for ammeters and voltmeters. `unconnected` means a lead lacks a wire;
+   * `floating` means the voltage reference is indeterminate or an ammeter current is bypassed.
+   */
+  meterStatus?: MeterStatus;
+}
+
+export interface CircuitAnalysisOptions {
+  /** Auto chooses AC when the document contains an AC source, DC otherwise. */
+  mode?: "auto" | "dc" | "ac";
+  /** AC frequency; defaults to the first AC source's frequency, or 1 kHz. */
+  frequencyHz?: number;
 }
 
 export interface CircuitAnalysis {
   status: CircuitStatus;
-  /** Current supplied by the only battery; null when it cannot be stated as one value. */
+  /** Magnitude of current at the only independent source; null for multiple sources or unsolved circuits. */
   currentAmps: number | null;
   message: string;
   bulbPowerWatts: Record<string, number>;
   parts: Record<string, CircuitPartReading>;
-  /** Current through each wire in its from → to direction. */
+  /** Signed current from → to. Only the legacy DC solver supplies wire-current estimates. */
   wireCurrents: Record<string, number>;
   issues: CircuitIssue[];
+  mode?: "dc" | "ac";
+  frequencyHz?: number;
+  /** Present when these readings represent a transient sample rather than steady state. */
+  timeSeconds?: number;
 }
 
 /** Resistance used for wires, closed switches and ammeters, which are ideal conductors. */
@@ -43,6 +76,8 @@ const IDEAL_OHMS = 1e-6;
 const SHORT_OHMS = 1e-3;
 // Ideal conductors leave rounding noise far below this; anything smaller reads as no current.
 const CURRENT_EPSILON = 1e-7;
+/** Suppresses voltage residual from the legacy 1 µΩ conductance approximation. */
+const VOLTAGE_EPSILON = 1e-7;
 const OVERLOAD_RATIO = 1.5;
 
 interface Conductance {
@@ -82,24 +117,27 @@ const positive = (value: number | undefined) =>
 
 function partValueIssue(part: CircuitPart): string | null {
   if (part.kind === "battery") {
-    if (!positive(part.voltageVolts)) return `${part.label}の電圧は0より大きい数値にしてください。`;
+    if (!positive(part.voltageVolts)) { return `${part.label}の電圧は0より大きい数値にしてください。`; }
     const internal = part.internalResistanceOhms ?? 0;
-    if (!Number.isFinite(internal) || internal < 0)
+    if (!Number.isFinite(internal) || internal < 0) {
       return `${part.label}の内部抵抗は0以上の数値にしてください。`;
+    }
   }
-  if ((part.kind === "resistor" || part.kind === "bulb") && !positive(part.resistanceOhms))
+  if ((part.kind === "resistor" || part.kind === "bulb") && !positive(part.resistanceOhms)) {
     return `${part.label}の抵抗値は0より大きい数値にしてください。`;
-  if (part.kind === "bulb" && part.ratedPowerWatts !== undefined && !positive(part.ratedPowerWatts))
+  }
+  if (part.kind === "bulb" && part.ratedPowerWatts !== undefined && !positive(part.ratedPowerWatts)) {
     return `${part.label}の定格電力は0より大きい数値にしてください。`;
+  }
   return null;
 }
 
 function documentIssue(document: CircuitDocument): string | null {
   const ids = new Set(document.parts.map((part) => part.id));
-  if (ids.size !== document.parts.length) return "部品 ID が重複しています。";
+  if (ids.size !== document.parts.length) { return "部品 ID が重複しています。"; }
   for (const part of document.parts) {
     const issue = partValueIssue(part);
-    if (issue) return issue;
+    if (issue) { return issue; }
   }
   const kinds = new Map(document.parts.map((part) => [part.id, part.kind]));
   const valid = (endpoint: CircuitEndpoint) => {
@@ -108,11 +146,12 @@ function documentIssue(document: CircuitDocument): string | null {
   };
   const wireIds = new Set<string>();
   for (const wire of document.wires) {
-    if (wireIds.has(wire.id)) return "導線 ID が重複しています。";
+    if (wireIds.has(wire.id)) { return "導線 ID が重複しています。"; }
     wireIds.add(wire.id);
-    if (!valid(wire.from) || !valid(wire.to)) return "導線の接続先を確認してください。";
-    if (wire.from.partId === wire.to.partId && wire.from.terminal === wire.to.terminal)
+    if (!valid(wire.from) || !valid(wire.to)) { return "導線の接続先を確認してください。"; }
+    if (wire.from.partId === wire.to.partId && wire.from.terminal === wire.to.terminal) {
       return "同じ端子同士をつなぐ導線があります。";
+    }
   }
   return null;
 }
@@ -122,7 +161,7 @@ const key = ({ partId, terminal }: CircuitEndpoint) => `${partId}:${terminal}`;
 function indexTerminals(parts: readonly CircuitPart[]) {
   const index = new Map<string, number>();
   for (const part of parts) {
-    for (const terminal of terminalsOf(part.kind)) index.set(`${part.id}:${terminal}`, index.size);
+    for (const terminal of terminalsOf(part.kind)) { index.set(`${part.id}:${terminal}`, index.size); }
   }
   return index;
 }
@@ -177,15 +216,16 @@ function buildNetwork(
       continue;
     }
     const ohms = partOhms(part, switchStates);
-    if (ohms !== null)
+    if (ohms !== null) {
       conductances.push({ a: node(part.id, "a"), b: node(part.id, "b"), g: 1 / ohms });
+    }
   }
   return { conductances, sources };
 }
 
 function findRoot(parent: number[], node: number): number {
   let root = node;
-  while (parent[root] !== root) root = parent[root];
+  while (parent[root] !== root) { root = parent[root]; }
   parent[node] = root;
   return root;
 }
@@ -193,9 +233,9 @@ function findRoot(parent: number[], node: number): number {
 /** One reference node per connected group, so every group has a solvable system. */
 function referenceNodes(size: number, conductances: readonly Conductance[]) {
   const parent = Array.from({ length: size }, (_, index) => index);
-  for (const { a, b } of conductances) parent[findRoot(parent, a)] = findRoot(parent, b);
+  for (const { a, b } of conductances) { parent[findRoot(parent, a)] = findRoot(parent, b); }
   const references = new Set<number>();
-  for (let node = 0; node < size; node += 1) references.add(findRoot(parent, node));
+  for (let node = 0; node < size; node += 1) { references.add(findRoot(parent, node)); }
   return references;
 }
 
@@ -209,7 +249,7 @@ function hasExternalBatteryPath(
 ) {
   const adjacent = Array.from({ length: size }, () => [] as number[]);
   for (const { a, b, batteryId: edgeBatteryId } of conductances) {
-    if (edgeBatteryId === batteryId) continue;
+    if (edgeBatteryId === batteryId) { continue; }
     adjacent[a]?.push(b);
     adjacent[b]?.push(a);
   }
@@ -217,9 +257,9 @@ function hasExternalBatteryPath(
   const pending = [start];
   while (pending.length > 0) {
     const node = pending.pop();
-    if (node === goal) return true;
+    if (node === goal) { return true; }
     for (const next of adjacent[node ?? -1] ?? []) {
-      if (visited.has(next)) continue;
+      if (visited.has(next)) { continue; }
       visited.add(next);
       pending.push(next);
     }
@@ -230,7 +270,7 @@ function hasExternalBatteryPath(
 function pivotRow(matrix: number[][], column: number) {
   let pivot = column;
   for (let row = column + 1; row < matrix.length; row += 1) {
-    if (Math.abs(matrix[row][column]) > Math.abs(matrix[pivot][column])) pivot = row;
+    if (Math.abs(matrix[row][column]) > Math.abs(matrix[pivot][column])) { pivot = row; }
   }
   return pivot;
 }
@@ -243,17 +283,17 @@ function solveLinear(matrix: number[][], rhs: number[]): number[] | null {
     [matrix[column], matrix[pivot]] = [matrix[pivot], matrix[column]];
     [rhs[column], rhs[pivot]] = [rhs[pivot], rhs[column]];
     const lead = matrix[column][column];
-    if (Math.abs(lead) < 1e-18) return null;
+    if (Math.abs(lead) < 1e-18) { return null; }
     for (let row = column + 1; row < size; row += 1) {
       const factor = matrix[row][column] / lead;
-      for (let k = column; k < size; k += 1) matrix[row][k] -= factor * matrix[column][k];
+      for (let k = column; k < size; k += 1) { matrix[row][k] -= factor * matrix[column][k]; }
       rhs[row] -= factor * rhs[column];
     }
   }
   const solution = Array.from({ length: size }, () => 0);
   for (let row = size - 1; row >= 0; row -= 1) {
     let sum = rhs[row];
-    for (let k = row + 1; k < size; k += 1) sum -= matrix[row][k] * solution[k];
+    for (let k = row + 1; k < size; k += 1) { sum -= matrix[row][k] * solution[k]; }
     solution[row] = sum / matrix[row][row];
   }
   return solution;
@@ -267,14 +307,15 @@ function nodeVoltages(
 ) {
   const references = referenceNodes(size, conductances);
   const unknowns = new Map<number, number>();
-  for (let node = 0; node < size; node += 1)
-    if (!references.has(node)) unknowns.set(node, unknowns.size);
+  for (let node = 0; node < size; node += 1) {
+    if (!references.has(node)) { unknowns.set(node, unknowns.size); }
+  }
   const matrix = Array.from({ length: unknowns.size }, () =>
     Array.from({ length: unknowns.size }, () => 0),
   );
   const rhs = Array.from({ length: unknowns.size }, () => 0);
   const add = (row: number | undefined, column: number | undefined, value: number) => {
-    if (row !== undefined && column !== undefined) matrix[row][column] += value;
+    if (row !== undefined && column !== undefined) { matrix[row][column] += value; }
   };
   for (const { a, b, g } of conductances) {
     const ia = unknowns.get(a);
@@ -287,11 +328,11 @@ function nodeVoltages(
   for (const { into, from, amps } of sources) {
     const ii = unknowns.get(into);
     const ifrom = unknowns.get(from);
-    if (ii !== undefined) rhs[ii] += amps;
-    if (ifrom !== undefined) rhs[ifrom] -= amps;
+    if (ii !== undefined) { rhs[ii] += amps; }
+    if (ifrom !== undefined) { rhs[ifrom] -= amps; }
   }
   const solution = solveLinear(matrix, rhs);
-  if (!solution) return null;
+  if (!solution) { return null; }
   return Array.from({ length: size }, (_, node) => {
     const unknown = unknowns.get(node);
     return unknown === undefined ? 0 : solution[unknown];
@@ -300,7 +341,7 @@ function nodeVoltages(
 
 function readPart(
   part: CircuitPart,
-  voltage: (partId: string, terminal: "a" | "b") => number,
+  voltage: (partId: string, terminal: CircuitTerminal) => number,
   switchStates: Record<string, boolean>,
 ): CircuitPartReading {
   const voltageVolts = part.kind === "junction" ? 0 : voltage(part.id, "a") - voltage(part.id, "b");
@@ -312,7 +353,7 @@ function readPart(
   const currentAmps = ohms === null ? 0 : voltageVolts / ohms;
   const powerWatts =
     part.kind === "resistor" || part.kind === "bulb" ? voltageVolts * currentAmps : 0;
-  if (part.kind !== "bulb") return { voltageVolts, currentAmps, powerWatts };
+  if (part.kind !== "bulb") { return { voltageVolts, currentAmps, powerWatts }; }
   const rated = part.ratedPowerWatts ?? 2;
   return { voltageVolts, currentAmps, powerWatts, brightness: Math.min(1, powerWatts / rated) };
 }
@@ -327,14 +368,18 @@ function readAll(
   voltages: number[],
   switchStates: Record<string, boolean>,
 ) {
-  const voltage = (partId: string, terminal: "a" | "b") =>
+  const meterStatusByPart = meterStatuses(document, { mode: "dc", switchStates });
+  const voltage = (partId: string, terminal: CircuitTerminal) =>
     voltages[index.get(`${partId}:${terminal}`) ?? -1] ?? 0;
   const parts: Record<string, CircuitPartReading> = {};
   for (const part of document.parts) {
     const reading = readPart(part, voltage, switchStates);
     parts[part.id] = {
       ...reading,
-      voltageVolts: Math.abs(reading.voltageVolts) < 1e-9 ? 0 : reading.voltageVolts,
+      terminalVoltages: Object.fromEntries(terminalsOf(part.kind).map((terminal) => [terminal, voltage(part.id, terminal)])),
+      terminalCurrents: part.kind === "junction" ? { a: 0 } : { a: tidy(reading.currentAmps), b: -tidy(reading.currentAmps) },
+      ...(meterStatusByPart[part.id] ? { meterStatus: meterStatusByPart[part.id] } : {}),
+      voltageVolts: Math.abs(reading.voltageVolts) < VOLTAGE_EPSILON ? 0 : reading.voltageVolts,
       currentAmps: tidy(reading.currentAmps),
       powerWatts: tidy(reading.powerWatts),
     };
@@ -354,7 +399,7 @@ function shortedBattery(
 ) {
   return batteries.find((battery) => {
     const reading = parts[battery.id];
-    if (!reading || Math.abs(reading.currentAmps) < CURRENT_EPSILON) return false;
+    if (!reading || Math.abs(reading.currentAmps) < CURRENT_EPSILON) { return false; }
     return Math.abs(reading.voltageVolts / reading.currentAmps) < SHORT_OHMS;
   });
 }
@@ -385,7 +430,7 @@ function collectIssues(document: CircuitDocument, parts: Record<string, CircuitP
         message: `${part.label}に定格の${OVERLOAD_RATIO}倍を超える電力がかかっています。`,
       });
     }
-    if (part.kind === "voltmeter" || part.kind === "ammeter") continue;
+    if (part.kind === "voltmeter" || part.kind === "ammeter") { continue; }
     const loose = terminalsOf(part.kind).filter(
       (terminal) => !connected.has(`${part.id}:${terminal}`),
     );
@@ -407,26 +452,42 @@ function closedMessage(batteries: readonly CircuitPart[]) {
 }
 
 /**
- * Solves a DC network of batteries, resistors, bulbs, switches and meters by nodal analysis.
- * Series, parallel and mixed circuits are supported; short circuits are reported, not solved.
+ * Solves a DC operating point or sinusoidal AC steady state. Existing seven-part
+ * DC documents retain their original solver and wire-current behavior.
  */
 export function analyzeCircuit(
   document: CircuitDocument,
   switchStates: Record<string, boolean> = {},
+  options: CircuitAnalysisOptions = {},
 ): CircuitAnalysis {
-  if (document.parts.length === 0) return result("empty", "部品を配置して回路を作成してください。");
+  const legacyKinds = new Set(["battery", "resistor", "bulb", "switch", "ammeter", "voltmeter", "junction"]);
+  if (options.mode === "ac" || document.parts.some((part) => !legacyKinds.has(part.kind))) {
+    return analyzeExtendedCircuit(document, switchStates, options);
+  }
+  if (document.parts.length === 0) { return result("empty", "部品を配置して回路を作成してください。"); }
   const invalid = documentIssue(document);
-  if (invalid)
+  if (invalid) {
     return result("invalid", invalid, { issues: [{ severity: "error", message: invalid }] });
+  }
+  const terminalCount = document.parts.reduce(
+    (count, part) => count + terminalsOf(part.kind).length,
+    0,
+  );
+  if (terminalCount > MAX_CIRCUIT_ANALYSIS_TERMINALS) {
+    const message =
+      `端子数が解析上限の${MAX_CIRCUIT_ANALYSIS_TERMINALS}端子を超えています。` +
+      "部品を減らすか、回路を分けて解析してください。";
+    return result("invalid", message, { issues: [{ severity: "error", message }] });
+  }
   const index = indexTerminals(document.parts);
   const { conductances, sources } = buildNetwork(document, index, switchStates);
   const voltages = nodeVoltages(index.size, conductances, sources);
-  if (!voltages) return result("invalid", "回路を計算できませんでした。接続を確認してください。");
+  if (!voltages) { return result("invalid", "回路を計算できませんでした。接続を確認してください。"); }
   const { parts, wireCurrents } = readAll(document, index, voltages, switchStates);
   const issues = collectIssues(document, parts);
   const batteries = document.parts.filter((part) => part.kind === "battery");
   const readings = { parts, wireCurrents, issues };
-  if (batteries.length === 0) return result("idle", "電池を置くと電流を計算します。", readings);
+  if (batteries.length === 0) { return result("idle", "電池を置くと電流を計算します。", readings); }
   const shorted = shortedBattery(batteries, parts);
   if (shorted) {
     const message = `${shorted.label}が短絡しています。抵抗か電球を直列に入れてください。`;

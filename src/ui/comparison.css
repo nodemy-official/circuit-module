@@ -1,0 +1,126 @@
+@layer circuit {
+  .circuit-comparison {
+    margin: 14px 0;
+    border-top: 1px solid var(--circuit-line, #e5e9f0);
+    color: var(--circuit-ink, #344868);
+    font-size: 12px;
+  }
+  .circuit-comparison > summary {
+    padding: 10px 0;
+    font-weight: 650;
+    cursor: pointer;
+  }
+  .circuit-comparison > summary:focus-visible,
+  .circuit-comparison button:focus-visible,
+  .circuit-comparison input:focus-visible {
+    outline: 2px solid var(--circuit-board-accent, #3265da);
+    outline-offset: 2px;
+  }
+  .circuit-comparison__content { padding: 0 0 12px; }
+  .circuit-comparison__empty { display: grid; gap: 8px; justify-items: start; }
+  .circuit-comparison__empty p,
+  .circuit-comparison__note,
+  .circuit-comparison__power-note,
+  .circuit-comparison__baseline {
+    margin: 0;
+    color: var(--circuit-muted, #5e6d82);
+    font-size: 11px;
+    line-height: 1.6;
+  }
+  .circuit-comparison__toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .circuit-comparison__actions { display: flex; flex-wrap: wrap; gap: 6px; }
+  .circuit-comparison button {
+    padding: 6px 9px;
+    border: 1px solid var(--circuit-control-line, #d9e0eb);
+    border-radius: 5px;
+    background: var(--circuit-surface, #fff);
+    color: inherit;
+    font: inherit;
+    cursor: pointer;
+  }
+  .circuit-comparison button:hover { border-color: var(--circuit-board-accent, #3265da); }
+  .circuit-comparison__notice {
+    margin: 10px 0;
+    padding: 8px 10px;
+    border-left: 3px solid var(--circuit-current, #e19439);
+    background: var(--circuit-accent-soft, #f7f8fb);
+    line-height: 1.55;
+  }
+  .circuit-comparison__note { margin: 8px 0; }
+  .circuit-comparison__metric {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px 12px;
+    margin: 10px 0 6px;
+    padding: 0;
+    border: 0;
+  }
+  .circuit-comparison__metric legend { margin-bottom: 5px; font-weight: 600; }
+  .circuit-comparison__metric label { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
+  .circuit-comparison__metric input { margin: 0; accent-color: var(--circuit-board-accent, #3265da); }
+  .circuit-comparison__power-note { margin: 4px 0 8px; }
+  .circuit-comparison__table-wrap { width: 100%; overflow-x: auto; }
+  .circuit-comparison table {
+    width: 100%;
+    min-width: 510px;
+    border-collapse: collapse;
+    font-variant-numeric: tabular-nums;
+  }
+  .circuit-comparison th,
+  .circuit-comparison td {
+    padding: 7px 8px;
+    border-bottom: 1px solid var(--circuit-line, #e5e9f0);
+    text-align: right;
+    vertical-align: middle;
+    white-space: nowrap;
+  }
+  .circuit-comparison thead th { color: var(--circuit-muted, #5e6d82); font-size: 10px; font-weight: 600; }
+  .circuit-comparison tbody th { max-width: 190px; text-align: left; white-space: normal; }
+  .circuit-comparison tbody th > span { display: block; overflow-wrap: anywhere; }
+  .circuit-comparison tbody th small { display: block; margin-top: 3px; color: var(--circuit-muted, #5e6d82); font-size: 10px; font-weight: 400; }
+  .circuit-comparison tbody tr[data-changed="true"] { background: var(--circuit-accent-soft, #f0f4fc); }
+  .circuit-comparison tbody tr[data-changed="true"] th { box-shadow: inset 3px 0 var(--circuit-board-accent, #3265da); }
+  .circuit-comparison tbody th .circuit-comparison__changed { color: var(--circuit-board-accent, #3265da); font-weight: 650; }
+  .circuit-comparison__delta-value { display: inline-block; min-width: 56px; }
+  .circuit-comparison__bar {
+    position: relative;
+    display: inline-block;
+    width: 104px;
+    height: 10px;
+    margin-left: 6px;
+    overflow: hidden;
+    border-radius: 5px;
+    background: var(--circuit-line, #edf0f5);
+    vertical-align: middle;
+  }
+  .circuit-comparison__bar-center {
+    position: absolute;
+    z-index: 1;
+    top: 0;
+    bottom: 0;
+    left: 50%;
+    width: 1px;
+    background: var(--circuit-muted, #8a96a8);
+  }
+  .circuit-comparison__bar-fill {
+    position: absolute;
+    top: 2px;
+    height: 6px;
+    border-radius: 3px;
+    background: var(--circuit-board-accent, #3265da);
+  }
+  .circuit-comparison__bar[data-direction="increase"] .circuit-comparison__bar-fill { left: 50%; }
+  .circuit-comparison__bar[data-direction="decrease"] .circuit-comparison__bar-fill { right: 50%; background: var(--circuit-current, #d47722); }
+  .circuit-comparison__bar[data-direction="unchanged"] .circuit-comparison__bar-fill { display: none; }
+  @media (max-width: 520px) {
+    .circuit-comparison__toolbar { align-items: flex-start; }
+    .circuit-comparison__bar { width: 74px; }
+  }
+}

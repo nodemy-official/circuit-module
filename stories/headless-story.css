@@ -1,0 +1,244 @@
+.headless-workbench {
+  --circuit-ink: #e6edf7;
+  --circuit-muted: #91a1b7;
+  --circuit-line: #2a3b52;
+  --circuit-accent: #fb923c;
+  --circuit-accent-strong: #fdba74;
+  --circuit-accent-soft: #322719;
+  --circuit-board-paper: #111d2c;
+  --circuit-board-frame: #30445e;
+  --circuit-board-grid: #2b415b;
+  --circuit-board-wire: #9aadc3;
+  --circuit-board-wire-selected: #fb923c;
+  --circuit-board-accent: #fb923c;
+  --circuit-board-ink: #e7eef8;
+  --circuit-board-label: #f3f6fb;
+  --circuit-board-muted: #afbdd0;
+  --circuit-board-part-fill: #1a2c42;
+  box-sizing: border-box;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  padding: 26px clamp(16px, 3vw, 42px) 18px;
+  background: #0b1421;
+  color: var(--circuit-ink);
+  font: 14px/1.5 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+.headless-workbench *,
+.headless-workbench *::before,
+.headless-workbench *::after { box-sizing: border-box; }
+.headless-workbench button,
+.headless-workbench input { font: inherit; }
+.headless-workbench button { color: inherit; cursor: pointer; }
+.headless-workbench button:disabled { opacity: .42; cursor: default; }
+
+.headless-workbench__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  margin: 0 0 22px;
+}
+.headless-workbench__eyebrow {
+  margin: 0 0 4px;
+  color: #8ca2bd;
+  font-size: 10px;
+  font-weight: 750;
+  letter-spacing: .16em;
+}
+.headless-workbench__header h1 { margin: 0; font-size: clamp(20px, 2vw, 27px); font-weight: 650; letter-spacing: -.025em; }
+.headless-workbench__actions { display: flex; align-items: center; gap: 8px; }
+.headless-workbench__actions > button,
+.headless-workbench__board-controls button {
+  min-height: 34px;
+  padding: 0 11px;
+  border: 1px solid #344a65;
+  border-radius: 7px;
+  background: #152338;
+  color: #d7e2f1;
+}
+.headless-workbench__actions > button:hover:not(:disabled),
+.headless-workbench__board-controls button:hover:not(:disabled) { border-color: #fca760; background: #202d3e; }
+.headless-workbench__controls-host { display: flex; align-items: center; }
+.headless-workbench__board-controls { display: flex; align-items: center; gap: 5px; }
+.headless-workbench__board-controls output { min-width: 45px; color: #becbdd; text-align: center; font-variant-numeric: tabular-nums; }
+.headless-workbench__board-controls button[aria-pressed="true"] { border-color: #fb923c; color: #ffc38e; }
+
+.headless-workbench__layout {
+  display: grid;
+  grid-template-columns: minmax(210px, 250px) minmax(0, 1fr) minmax(245px, 290px);
+  align-items: start;
+  gap: 16px;
+  flex: 1;
+  min-height: 0;
+}
+.headless-workbench__palette-column,
+.headless-workbench__details {
+  min-width: 0;
+  padding: 18px;
+  border: 1px solid #24364c;
+  border-radius: 12px;
+  background: #111d2d;
+}
+.headless-workbench__palette-column { max-height: 620px; overflow: auto; }
+.headless-workbench__palette,
+.headless-workbench__inspector,
+.headless-workbench__analysis { min-width: 0; color: var(--circuit-ink); }
+.headless-workbench .circuit-panel__heading { margin: 0 0 15px; }
+.headless-workbench .circuit-panel__heading h2 { color: #e6edf7; font-size: 13px; }
+.headless-workbench .circuit-panel__heading p { color: #91a1b7; }
+.headless-workbench__palette .circuit-palette__search { display: flex; align-items: center; gap: 8px; min-height: 38px; margin: 0 0 20px; padding: 0 10px; border: 1px solid #344860; border-radius: 7px; color: #a9b8ca; }
+.headless-workbench__search { width: 100%; min-width: 0; border: 0; outline: 0; background: transparent; color: #edf3fc; }
+.headless-workbench__search::placeholder { color: #8295ad; }
+.headless-workbench .circuit-palette__categories { display: grid; gap: 18px; }
+.headless-workbench .circuit-palette__category-title { margin: 0 0 6px; color: #94a8c1; font-size: 10px; font-weight: 700; letter-spacing: .08em; }
+.headless-workbench .circuit-palette__list { display: grid; gap: 4px; }
+.headless-workbench__part-choice { display: flex; align-items: center; gap: 9px; width: 100%; min-height: 48px; padding: 7px 8px; border: 1px solid transparent; border-radius: 7px; background: transparent; color: #dce6f3; text-align: left; }
+.headless-workbench__part-choice:hover { border-color: #394f6a; background: #19283a; }
+.headless-workbench__part-icon { display: grid; width: 34px; height: 28px; flex: 0 0 34px; place-items: center; color: #f8ad6a; }
+.headless-workbench__part-icon svg { width: 32px; height: 24px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.headless-workbench__part-icon text { fill: currentColor; stroke: none; font-size: 12px; text-anchor: middle; }
+.headless-workbench .circuit-palette__text { display: grid; min-width: 0; flex: 1; gap: 2px; }
+.headless-workbench .circuit-palette__text strong { color: #edf3fb; font-size: 12px; font-weight: 600; }
+.headless-workbench .circuit-palette__description { color: #91a1b7; font-size: 10px; }
+.headless-workbench .circuit-palette__shortcut { padding: 1px 5px; border: 1px solid #3b5069; border-radius: 4px; color: #aab9cc; font-size: 10px; }
+.headless-workbench .circuit-palette__empty { display: grid; gap: 8px; color: #9aabc0; font-size: 12px; }
+.headless-workbench__hint { margin: 18px 3px 0; color: #8ea1b9; font-size: 11px; line-height: 1.8; }
+
+.headless-workbench__canvas-column { min-width: 0; position: relative; }
+.headless-workbench__board {
+  width: 100%;
+  overflow: hidden;
+  border: 1px solid #30445e;
+  border-radius: 12px;
+  background: var(--circuit-board-paper);
+  color: #b2c0d3;
+}
+.headless-workbench__surface { display: block; width: 100%; height: 100%; overflow: hidden; background: var(--circuit-board-paper); user-select: none; touch-action: none; }
+.headless-workbench__surface:focus-visible { outline: 2px solid #fb923c; outline-offset: -3px; }
+.headless-workbench__background { cursor: grab; }
+.headless-workbench__background:active { cursor: grabbing; }
+.headless-workbench__surface.circuit-board__surface--pan-ready :is(.circuit-board__part, .circuit-board__wire, .circuit-board__terminal, .headless-workbench__background) { cursor: grab; }
+.headless-workbench__surface.circuit-board__surface--panning,
+.headless-workbench__surface.circuit-board__surface--panning :is(.circuit-board__part, .circuit-board__wire, .circuit-board__terminal, .headless-workbench__background) { cursor: grabbing; }
+.headless-workbench__surface.circuit-board__surface--connecting .headless-workbench__background { cursor: crosshair; }
+.headless-workbench__paper { fill: var(--circuit-board-paper); }
+.headless-workbench__minor-grid { fill: var(--circuit-board-grid); stroke: none; }
+.headless-workbench__wire-hit { fill: none; stroke: transparent; stroke-width: 15; pointer-events: stroke; }
+.headless-workbench__board .circuit-board__wire { cursor: pointer; outline: none; }
+.headless-workbench__wire-line { fill: none; stroke: var(--circuit-board-wire); stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; pointer-events: none; vector-effect: non-scaling-stroke; }
+.circuit-board__wire--selected .headless-workbench__wire-line,
+.circuit-board__wire:focus-visible .headless-workbench__wire-line { stroke: var(--circuit-board-wire-selected); stroke-width: 3.5; }
+.headless-workbench__wire-handle { cursor: grab; }
+.headless-workbench__wire-handle-hit { fill: transparent; stroke: transparent; stroke-width: 18; pointer-events: all; }
+.headless-workbench__wire-handle-dot { fill: var(--circuit-board-paper); stroke: var(--circuit-board-accent); stroke-width: 2; vector-effect: non-scaling-stroke; }
+.headless-workbench__wire-handle:hover .headless-workbench__wire-handle-dot,
+.headless-workbench__wire-handle:focus-visible .headless-workbench__wire-handle-dot { fill: var(--circuit-board-accent); stroke: var(--circuit-board-paper); }
+.headless-workbench__wire-segment-handle { cursor: ns-resize; outline: none; }
+.headless-workbench__wire-segment-handle[data-orientation="vertical"] { cursor: ew-resize; }
+.headless-workbench__wire-segment-hit { fill: transparent; stroke: transparent; pointer-events: all; }
+.headless-workbench__wire-segment-dot { fill: var(--circuit-board-paper); stroke: var(--circuit-board-accent); stroke-width: 1.8; vector-effect: non-scaling-stroke; }
+.headless-workbench__wire-segment-handle:hover .headless-workbench__wire-segment-dot,
+.headless-workbench__wire-segment-handle:focus-visible .headless-workbench__wire-segment-dot { fill: var(--circuit-board-accent); stroke: var(--circuit-board-paper); }
+.headless-workbench__wire-route-reset-button { margin-top: 12px; padding: 6px 9px; border: 1px solid #394e67; border-radius: 6px; background: #17263a; color: #dce6f3; font-size: 11px; }
+.headless-workbench__wire-route-reset-button:hover { border-color: #fb923c; background: #1c2d42; }
+.headless-workbench__connection-preview { fill: none; stroke: var(--circuit-board-accent); stroke-width: 2.5; stroke-dasharray: 6 5; stroke-linecap: round; stroke-linejoin: round; opacity: .9; pointer-events: none; vector-effect: non-scaling-stroke; }
+.headless-workbench__connection-target { fill: var(--circuit-board-accent); stroke: var(--circuit-board-paper); stroke-width: 2; pointer-events: none; vector-effect: non-scaling-stroke; }
+.headless-workbench__selection-rect { fill: rgb(251 146 60 / .12); stroke: var(--circuit-board-accent); stroke-width: 1; stroke-dasharray: 4 3; pointer-events: none; vector-effect: non-scaling-stroke; }
+.headless-workbench__board .circuit-board__part { cursor: grab; outline: none; }
+.headless-workbench__board .circuit-board__part--dragging { cursor: grabbing; }
+.headless-workbench__part-hit { fill: transparent; pointer-events: all; }
+.headless-workbench__selection-halo { fill: #fb923c; fill-opacity: 0; stroke: #fb923c; stroke-opacity: 0; stroke-width: 1; pointer-events: none; vector-effect: non-scaling-stroke; }
+.headless-workbench__board .circuit-board__part:hover .headless-workbench__selection-halo { fill-opacity: .06; }
+.circuit-board__part--selected .headless-workbench__selection-halo,
+.circuit-board__part:focus-visible .headless-workbench__selection-halo { fill-opacity: .12; stroke-opacity: .95; }
+.headless-workbench__symbol { fill: none; stroke: var(--circuit-board-ink); stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
+.headless-workbench__symbol > circle { fill: var(--circuit-board-part-fill); }
+.headless-workbench__board .circuit-board__polarity,
+.headless-workbench__board .circuit-board__meter-letter { fill: var(--circuit-board-ink); stroke: none; font-size: 11px; font-weight: 650; }
+.headless-workbench__board .circuit-board__contact { fill: var(--circuit-board-ink); stroke: none; }
+.headless-workbench__board .circuit-board__junction { fill: var(--circuit-board-accent); stroke: var(--circuit-board-paper); stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+.headless-workbench__board .circuit-board__bulb-glass { fill: var(--circuit-board-part-fill); }
+.headless-workbench__board .circuit-board__bulb-glass[data-lit="true"] { fill: rgb(251 146 60 / var(--circuit-board-bulb-opacity, .2)); }
+.headless-workbench__part-leads line { fill: none; stroke: var(--circuit-board-wire); stroke-width: 2; vector-effect: non-scaling-stroke; }
+.headless-workbench__part-label { fill: var(--circuit-board-label); font-size: 11px; font-weight: 600; pointer-events: none; paint-order: stroke; stroke: var(--circuit-board-paper); stroke-width: 4px; stroke-linejoin: round; }
+.headless-workbench__part-detail { fill: var(--circuit-board-muted); font: 10px ui-monospace, monospace; pointer-events: none; paint-order: stroke; stroke: var(--circuit-board-paper); stroke-width: 4px; }
+.headless-workbench__board .circuit-board__terminals { pointer-events: none; }
+.headless-workbench__board .circuit-board__terminal { cursor: crosshair; pointer-events: all; outline: none; }
+.headless-workbench__terminal-hit { fill: transparent; pointer-events: all; }
+.headless-workbench__terminal-dot { fill: var(--circuit-board-paper); stroke: var(--circuit-board-wire); stroke-width: 1.7; vector-effect: non-scaling-stroke; }
+.circuit-board__terminal--connected .headless-workbench__terminal-dot { fill: var(--circuit-board-wire); }
+.headless-workbench__terminal-ring { fill: none; stroke: var(--circuit-board-accent); stroke-width: 1.6; vector-effect: non-scaling-stroke; pointer-events: none; }
+.circuit-board__terminal--pending .headless-workbench__terminal-dot,
+.circuit-board__terminal:hover .headless-workbench__terminal-dot,
+.circuit-board__terminal:focus-visible .headless-workbench__terminal-dot { fill: var(--circuit-board-accent); stroke: var(--circuit-board-paper); }
+.circuit-board__terminal:hover .headless-workbench__terminal-hit,
+.circuit-board__terminal:focus-visible .headless-workbench__terminal-hit { fill: rgb(251 146 60 / .16); }
+.headless-workbench__terminal-label { fill: var(--circuit-board-accent); font-size: 8px; opacity: 0; pointer-events: none; paint-order: stroke; stroke: var(--circuit-board-paper); stroke-width: 3px; }
+.circuit-board__terminal:hover .headless-workbench__terminal-label,
+.circuit-board__terminal:focus-visible .headless-workbench__terminal-label,
+.circuit-board__terminal--pending .headless-workbench__terminal-label { opacity: 1; }
+.headless-workbench__connection,
+.headless-workbench__error { margin: 12px 2px 0; font-size: 12px; }
+.headless-workbench__connection { color: #ffc28f; }
+.headless-workbench__error { color: #ff9e9e; }
+
+.headless-workbench__details { display: grid; gap: 23px; }
+.headless-workbench__inspector .circuit-inspector__selection { display: flex; align-items: center; gap: 9px; padding: 12px 0; border-top: 1px solid #2a3b52; }
+.headless-workbench__inspector .circuit-inspector__selection strong { color: #f0f4fa; font-size: 14px; }
+.headless-workbench__inspector .circuit-inspector__selection span { margin-left: auto; color: #95a6bc; font-size: 11px; }
+.headless-workbench__fields { display: grid; gap: 13px; }
+.headless-workbench .circuit-field { display: grid; grid-template-columns: minmax(62px, .8fr) minmax(0, 1.3fr); align-items: center; gap: 9px; color: #acbbce; font-size: 11px; }
+.headless-workbench .circuit-field > input,
+.headless-workbench .circuit-field__input { width: 100%; min-width: 0; min-height: 34px; border: 1px solid #344860; border-radius: 6px; background: #0c1725; color: #edf3fc; }
+.headless-workbench .circuit-field > input { padding: 6px 8px; }
+.headless-workbench .circuit-field__input { display: flex; align-items: center; overflow: hidden; }
+.headless-workbench .circuit-field__input input { width: 100%; min-width: 0; padding: 6px 8px; border: 0; outline: 0; background: transparent; color: #edf3fc; }
+.headless-workbench .circuit-field__input small { padding: 0 8px 0 2px; color: #9cacc0; }
+.headless-workbench .circuit-field:focus-within > input,
+.headless-workbench .circuit-field__input:focus-within { border-color: #fb923c; }
+.headless-workbench .circuit-switch { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.headless-workbench .circuit-switch > span { display: grid; gap: 3px; }
+.headless-workbench .circuit-switch strong { font-size: 11px; }
+.headless-workbench .circuit-switch small { color: #91a1b7; font-size: 10px; }
+.headless-workbench .circuit-inspector__readings { margin-top: 20px; padding-top: 14px; border-top: 1px solid #2a3b52; }
+.headless-workbench .circuit-inspector__readings h3 { margin: 0 0 9px; color: #9eafc5; font-size: 10px; text-transform: uppercase; letter-spacing: .1em; }
+.headless-workbench .circuit-inspector__readings dl { display: grid; gap: 8px; margin: 0; }
+.headless-workbench .circuit-inspector__readings dl > div { display: flex; justify-content: space-between; gap: 12px; color: #a9b8cb; font-size: 11px; }
+.headless-workbench .circuit-inspector__readings dd { display: flex; gap: 5px; margin: 0; color: #f5f7fb; font-variant-numeric: tabular-nums; }
+.headless-workbench .circuit-inspector__actions { display: flex; gap: 8px; margin-top: 14px; }
+.headless-workbench .circuit-inspector__actions button { padding: 6px 9px; border: 1px solid #394e67; border-radius: 6px; background: #17263a; font-size: 11px; }
+.headless-workbench .circuit-inspector__actions button.danger { color: #ffaaaa; }
+.headless-workbench__wire-reconnect { display: grid; gap: 6px; margin-top: 10px; }
+.headless-workbench__wire-reconnect-button { width: 100%; padding: 6px 8px; border: 1px solid #394e67; border-radius: 6px; background: #17263a; color: #dce6f3; text-align: left; font-size: 10px; }
+.headless-workbench__wire-reconnect-button:hover { border-color: #fb923c; background: #1c2d42; }
+.headless-workbench__wire-reconnect-hint { margin: 7px 0 0; color: #91a1b7; font-size: 10px; line-height: 1.7; }
+.headless-workbench .circuit-inspector__empty { display: grid; gap: 8px; padding: 15px 0; color: #d8e2ef; }
+.headless-workbench .circuit-inspector__empty p { margin: 0; color: #95a6bc; font-size: 11px; }
+
+.headless-workbench .circuit-analysis__state { display: flex; align-items: center; gap: 7px; padding: 9px 10px; border: 1px solid #344860; border-radius: 7px; color: #c6d2e1; font-size: 11px; }
+.headless-workbench .circuit-analysis__state strong { margin-left: auto; color: #f0f4fa; }
+.headless-workbench .circuit-analysis__state[data-status="closed"] { border-color: #286b57; background: #102b29; }
+.headless-workbench .circuit-analysis__reason { margin: 9px 0 13px; color: #97a8bd; font-size: 10px; line-height: 1.7; }
+.headless-workbench .circuit-analysis__metric,
+.headless-workbench .circuit-analysis__counts { display: flex; justify-content: space-between; gap: 12px; margin-top: 8px; color: #aab9cb; font-size: 11px; }
+.headless-workbench .circuit-analysis__metric strong { color: #fff; font-size: 16px; font-variant-numeric: tabular-nums; }
+.headless-workbench .circuit-analysis__metric small { padding-left: 4px; color: #aab9cb; font-size: 10px; }
+.headless-workbench .circuit-analysis__counts strong { margin-right: 4px; color: #edf3fa; }
+.headless-workbench .circuit-analysis__issues { display: grid; gap: 6px; margin: 12px 0 0; padding-left: 17px; color: #ffb4a7; font-size: 10px; }
+.headless-workbench__footer { display: flex; justify-content: space-between; gap: 16px; padding: 12px 2px 0; color: #7f92ab; font-size: 10px; }
+
+@media (max-width: 980px) {
+  .headless-workbench__layout { grid-template-columns: minmax(190px, 230px) minmax(0, 1fr); }
+  .headless-workbench__details { grid-column: 1 / -1; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+}
+@media (max-width: 680px) {
+  .headless-workbench { padding: 18px 12px; }
+  .headless-workbench__header { align-items: flex-start; flex-direction: column; gap: 13px; }
+  .headless-workbench__actions { flex-wrap: wrap; }
+  .headless-workbench__layout { grid-template-columns: minmax(0, 1fr); }
+  .headless-workbench__palette-column { max-height: 360px; }
+  .headless-workbench__details { grid-column: auto; grid-template-columns: minmax(0, 1fr); }
+  .headless-workbench__footer { flex-direction: column; gap: 3px; }
+}
