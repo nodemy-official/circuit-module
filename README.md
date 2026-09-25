@@ -51,4 +51,4 @@ npm run build
 npm pack --dry-run
 ```
 
-配布先は `https://npm.pkg.github.com` に限定しています。GitHub Release を公開すると、Actions がテスト・ビルドを確認してから `GITHUB_TOKEN` でパッケージを公開します。Release の前に `package.json` の version と tag を一致させてください。ライセンス表記は抽出元に合わせて `UNLICENSED` です。
+配布先は `https://npm.pkg.github.com` に限定しています。GitHub Release を公開すると、Actions がテスト・ビルドを確認してから `GITHUB_TOKEN` で公開パッケージを発行します。Release の前に `package.json` の version と tag を一致させてください。ライセンス表記は抽出元に合わせて `UNLICENSED` です。
