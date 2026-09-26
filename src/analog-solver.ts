@@ -80,8 +80,12 @@ const THERMAL_VOLTAGE = 0.025_85;
 const GMIN_SIEMENS = 1e-12;
 const MIN_POTENTIOMETER_SEGMENT_OHMS = 1e-6;
 const MAX_NEWTON_ITERATIONS = 100;
-const NEWTON_CURRENT_TOLERANCE_AMPS = 1e-9;
-const NEWTON_VOLTAGE_TOLERANCE_VOLTS = 1e-9;
+const NEWTON_CURRENT_TOLERANCE_AMPS = Number.MIN_VALUE;
+const NEWTON_VOLTAGE_TOLERANCE_VOLTS = 1e-12;
+const NEWTON_RELATIVE_TOLERANCE = 1e-10;
+const PHYSICAL_CURRENT_TOLERANCE_AMPS = 1e-9;
+const PHYSICAL_VOLTAGE_TOLERANCE_VOLTS = 1e-9;
+const PHYSICAL_RELATIVE_TOLERANCE = 1e-10;
 const EXPONENT_MIN = -60;
 const EXPONENT_MAX = 80;
 const OP_AMP_OUTPUT_RESISTANCE_OHMS = 20;
@@ -145,11 +149,20 @@ function result(
   };
 }
 
+function setRecordValue<T>(record: Record<string, T>, key: string, value: T) {
+  Object.defineProperty(record, key, {
+    configurable: true,
+    enumerable: true,
+    value,
+    writable: true,
+  });
+}
+
 function documentWithCatalogDefaults(document: CircuitDocument): CircuitDocument {
   return {
     ...document,
     parts: document.parts.map((part) => {
-      if (!(part.kind in circuitPartCatalog)) { return part; }
+      if (!Object.hasOwn(circuitPartCatalog, part.kind)) { return part; }
       const values: Record<string, unknown> = {
         ...circuitPartCatalog[part.kind].defaults,
         ...part,
@@ -269,7 +282,7 @@ function documentIssue(document: CircuitDocument, voltageOverrides: Record<strin
 function validateParts(document: CircuitDocument) {
   let terminalCount = 0;
   for (const part of document.parts) {
-    if (!(part.kind in circuitPartCatalog)) { return `${part.label}の部品種類を認識できません。`; }
+    if (!Object.hasOwn(circuitPartCatalog, part.kind)) { return `${part.label}の部品種類を認識できません。`; }
     terminalCount += terminalsOf(part.kind).length;
     const issue = validationIssue(part);
     if (issue) { return issue; }
@@ -503,12 +516,12 @@ function currentSourcePathIssue(
 }
 
 function sourceVoltageForDc(part: CircuitPart, overrides: Record<string, number>) {
-  if (overrides[part.id] !== undefined) { return overrides[part.id] ?? 0; }
+  if (Object.hasOwn(overrides, part.id)) { return overrides[part.id] ?? 0; }
   return part.kind === "battery" ? (part.voltageVolts ?? 0) : (part.offsetVolts ?? 0);
 }
 
 function frequencyMatches(first: number, second: number) {
-  return Math.abs(first - second) <= Math.max(1e-9, Math.max(Math.abs(first), Math.abs(second)) * 1e-9);
+  return Math.abs(first - second) <= Math.max(Math.abs(first), Math.abs(second)) * 1e-9;
 }
 
 interface BranchSpec {
@@ -637,13 +650,13 @@ function diodeCurrentAndSlope(voltage: number, saturationCurrent: number, ideali
   if (rawExponent < EXPONENT_MIN) {
     const exponential = Math.exp(EXPONENT_MIN);
     return {
-      current: saturationCurrent * (exponential - 1),
+      current: saturationCurrent * Math.expm1(EXPONENT_MIN),
       slope: (saturationCurrent * exponential) / scale,
     };
   }
   const exponential = Math.exp(rawExponent);
   return {
-    current: saturationCurrent * (exponential - 1),
+    current: saturationCurrent * Math.expm1(rawExponent),
     slope: (saturationCurrent * exponential) / scale,
   };
 }
@@ -934,7 +947,7 @@ function potentiometerSegments(part: CircuitPart) {
 }
 
 function isSwitchClosed(part: CircuitPart, switchStates: Record<string, boolean>) {
-  return switchStates[part.id] ?? part.initiallyClosed ?? false;
+  return (Object.hasOwn(switchStates, part.id) ? switchStates[part.id] : undefined) ?? part.initiallyClosed ?? false;
 }
 
 function stampDcPassivePart(
@@ -969,6 +982,34 @@ function stampDcNonlinearPart(
   if (model) { stampNonlinear(matrix, residual, layout, part, model); }
 }
 
+function gminAnchorNodes(document: CircuitDocument, layout: MnaLayout, mode: AnalogAnalysisMode) {
+  // One anchor per conductive network avoids adding a parallel leakage at each nonlinear terminal.
+  const parent = Array.from({ length: layout.topology.nodeCount }, (_, index) => index);
+  const switchStates = Object.fromEntries(document.parts
+    .filter((part) => part.kind === "switch")
+    .map((part) => [part.id, layout.branchByPartId.has(part.id)]));
+  for (const part of document.parts) {
+    unionPartConduction(part, layout.topology, parent, switchStates);
+    if (mode === "ac" && part.kind === "capacitor") {
+      joinConductiveNodes(
+        parent,
+        nodeForTerminal(layout.topology, part, "a"),
+        nodeForTerminal(layout.topology, part, "b"),
+      );
+    }
+  }
+
+  const referenceRoot = findRoot(parent, layout.topology.referenceNode);
+  const anchorByRoot = new Map<number, number>();
+  for (let node = 0; node < layout.topology.nodeCount; node += 1) {
+    const root = findRoot(parent, node);
+    if (!anchorByRoot.has(root)) { anchorByRoot.set(root, node); }
+  }
+  return [...anchorByRoot]
+    .filter(([root]) => root !== referenceRoot)
+    .map(([, node]) => node);
+}
+
 function assembleDc(
   document: CircuitDocument,
   layout: MnaLayout,
@@ -978,8 +1019,7 @@ function assembleDc(
   const matrix = new Float64Array(layout.size * layout.size);
   const residual = new Float64Array(layout.size);
   if (includeGmin) {
-    for (let node = 0; node < layout.topology.nodeCount; node += 1) {
-      if (node === layout.topology.referenceNode) { continue; }
+    for (const node of gminAnchorNodes(document, layout, "dc")) {
       stampConductance(matrix, residual, layout, state, node, layout.topology.referenceNode, GMIN_SIEMENS);
     }
   }
@@ -993,15 +1033,97 @@ function assembleDc(
   return { matrix, residual };
 }
 
-function residualScore(layout: MnaLayout, residual: Float64Array) {
+function residualTolerances(
+  layout: MnaLayout,
+  assembly: DcAssembly,
+  state: Float64Array,
+  currentTolerance = NEWTON_CURRENT_TOLERANCE_AMPS,
+  voltageTolerance = NEWTON_VOLTAGE_TOLERANCE_VOLTS,
+  relativeTolerance = NEWTON_RELATIVE_TOLERANCE,
+): number[] | null {
+  const tolerances: number[] = [];
+  for (let row = 0; row < layout.size; row += 1) {
+    let equationScale = 0;
+    for (let column = 0; column < layout.size; column += 1) {
+      const term = (assembly.matrix[row * layout.size + column] ?? 0) * (state[column] ?? 0);
+      if (!Number.isFinite(term)) { return null; }
+      equationScale += Math.abs(term);
+      if (!Number.isFinite(equationScale)) { return null; }
+    }
+    // Keep an initially zero state relative to the source current or voltage that drives it.
+    const residualScale = Math.abs(assembly.residual[row] ?? 0);
+    if (!Number.isFinite(residualScale)) { return null; }
+    equationScale = Math.max(equationScale, residualScale);
+    const absoluteTolerance = row < layout.topology.nodeUnknownCount
+      ? currentTolerance
+      : voltageTolerance;
+    const tolerance = absoluteTolerance + relativeTolerance * equationScale;
+    if (!Number.isFinite(tolerance) || tolerance <= 0) { return null; }
+    tolerances.push(tolerance);
+  }
+  return tolerances;
+}
+
+function residualScore(layout: MnaLayout, assembly: DcAssembly, tolerances: number[] | null) {
+  if (!tolerances) { return Number.POSITIVE_INFINITY; }
   let score = 0;
   for (let row = 0; row < layout.size; row += 1) {
-    const tolerance = row < layout.topology.nodeUnknownCount
-      ? NEWTON_CURRENT_TOLERANCE_AMPS
-      : NEWTON_VOLTAGE_TOLERANCE_VOLTS;
-    score = Math.max(score, Math.abs(residual[row] ?? 0) / tolerance);
+    const residual = Math.abs(assembly.residual[row] ?? 0);
+    if (!Number.isFinite(residual)) { return Number.POSITIVE_INFINITY; }
+    score = Math.max(score, residual / (tolerances[row] ?? 0));
   }
   return score;
+}
+
+function linearDcSeed(document: CircuitDocument, layout: MnaLayout) {
+  // Seed independent voltage biases before retrying a singular off-state nonlinear Jacobian.
+  const state = new Float64Array(layout.size);
+  const matrix = new Float64Array(layout.size * layout.size);
+  const residual = new Float64Array(layout.size);
+  for (let node = 0; node < layout.topology.nodeCount; node += 1) {
+    if (node !== layout.topology.referenceNode) {
+      stampConductance(matrix, residual, layout, state, node, layout.topology.referenceNode, GMIN_SIEMENS);
+    }
+  }
+  for (const part of document.parts) {
+    if (part.kind !== "current-source") { stampDcPassivePart(matrix, residual, layout, state, part); }
+    const branch = layout.branchByPartId.get(part.id);
+    if (branch) { addVoltageBranch(matrix, residual, layout, state, branch); }
+  }
+  const rhs = Float64Array.from(residual, (value) => -value);
+  return solveRealLinearSystem(layout.size, matrix, rhs);
+}
+
+function solveDcNewtonStep(
+  document: CircuitDocument,
+  layout: MnaLayout,
+  state: Float64Array,
+  assembly: DcAssembly,
+  tolerances: number[] | null,
+  score: number,
+) {
+  const rhs = Float64Array.from(assembly.residual, (value) => -value);
+  const delta = solveRealLinearSystem(layout.size, assembly.matrix, rhs);
+  if (!delta) { return { nextState: undefined, singular: true }; }
+
+  let step = 1;
+  let nextState: Float64Array<ArrayBuffer> | undefined;
+  for (let search = 0; search < 14; search += 1) {
+    const candidate = state.slice();
+    for (let index = 0; index < layout.size; index += 1) {
+      candidate[index] = (state[index] ?? 0) + step * (delta[index] ?? 0);
+    }
+    const candidateAssembly = assembleDc(document, layout, candidate);
+    // Compare candidates using this iteration's scale so an exponential current cannot
+    // increase its own tolerance and make a divergent step appear better.
+    const candidateScore = residualScore(layout, candidateAssembly, tolerances);
+    if (candidateScore < score || candidateScore <= 1 || step <= 1 / 8192) {
+      nextState = candidate;
+      break;
+    }
+    step *= 0.5;
+  }
+  return { nextState, singular: false };
 }
 
 function solveDc(
@@ -1009,37 +1131,34 @@ function solveDc(
   layout: MnaLayout,
 ): { state?: Float64Array; converged: boolean; singular: boolean; gminDominates?: boolean } {
   let state = new Float64Array(layout.size);
+  let usedLinearSeed = false;
   if (layout.size === 0) { return { state, converged: true, singular: false }; }
 
   for (let iteration = 0; iteration < MAX_NEWTON_ITERATIONS; iteration += 1) {
     const assembled = assembleDc(document, layout, state);
-    const score = residualScore(layout, assembled.residual);
-    if (score <= 1) { return validatePhysicalDcSolution(document, layout, state); }
-    const rhs = Float64Array.from(assembled.residual, (value) => -value);
-    const delta = solveRealLinearSystem(layout.size, assembled.matrix, rhs);
-    if (!delta) { return { converged: false, singular: true }; }
-
-    let step = 1;
-    let next: Float64Array<ArrayBuffer> | undefined;
-    for (let search = 0; search < 14; search += 1) {
-      const candidate = state.slice();
-      for (let index = 0; index < layout.size; index += 1) {
-        candidate[index] = (state[index] ?? 0) + step * (delta[index] ?? 0);
-      }
-      const candidateScore = residualScore(
-        layout,
-        assembleDc(document, layout, candidate).residual,
-      );
-      if (candidateScore < score || candidateScore <= 1 || step <= 1 / 8192) {
-        next = candidate;
-        break;
-      }
-      step *= 0.5;
+    const tolerances = residualTolerances(layout, assembled, state);
+    const score = residualScore(layout, assembled, tolerances);
+    const hasInitialResidual = iteration === 0 && assembled.residual.some((value) => value !== 0);
+    if (score <= 1 && !hasInitialResidual) {
+      return validatePhysicalDcSolution(document, layout, state);
     }
-    if (!next) { return { converged: false, singular: false }; }
-    state = next;
+    const step = solveDcNewtonStep(document, layout, state, assembled, tolerances, score);
+    if (!step.nextState) {
+      if (step.singular && iteration === 0 && !usedLinearSeed) {
+        const seed = linearDcSeed(document, layout);
+        if (seed?.some((value, index) => value !== (state[index] ?? 0))) {
+          state.set(seed);
+          usedLinearSeed = true;
+          continue;
+        }
+      }
+      return { converged: false, singular: step.singular };
+    }
+    state = step.nextState;
   }
-  const finalScore = residualScore(layout, assembleDc(document, layout, state).residual);
+  const finalAssembly = assembleDc(document, layout, state);
+  const finalTolerances = residualTolerances(layout, finalAssembly, state);
+  const finalScore = residualScore(layout, finalAssembly, finalTolerances);
   return finalScore <= 1
     ? validatePhysicalDcSolution(document, layout, state)
     : { converged: false, singular: false };
@@ -1050,9 +1169,18 @@ function validatePhysicalDcSolution(
   layout: MnaLayout,
   state: Float64Array,
 ): { state?: Float64Array; converged: boolean; singular: boolean; gminDominates?: boolean } {
+  const physicalAssembly = assembleDc(document, layout, state, false);
   const physicalScore = residualScore(
     layout,
-    assembleDc(document, layout, state, false).residual,
+    physicalAssembly,
+    residualTolerances(
+      layout,
+      physicalAssembly,
+      state,
+      PHYSICAL_CURRENT_TOLERANCE_AMPS,
+      PHYSICAL_VOLTAGE_TOLERANCE_VOLTS,
+      PHYSICAL_RELATIVE_TOLERANCE,
+    ),
   );
   if (physicalScore > 1) {
     return { converged: false, singular: false, gminDominates: true };
@@ -1129,12 +1257,12 @@ function stampComplexAdmittance(
 }
 
 function stampAcReferenceGmin(
+  document: CircuitDocument,
   matrixReal: Float64Array,
   matrixImaginary: Float64Array,
   layout: MnaLayout,
 ) {
-  for (let node = 0; node < layout.topology.nodeCount; node += 1) {
-    if (node === layout.topology.referenceNode) { continue; }
+  for (const node of gminAnchorNodes(document, layout, "ac")) {
     stampComplexAdmittance(
       matrixReal,
       matrixImaginary,
@@ -1249,7 +1377,7 @@ function solveAc(
   const rhsReal = new Float64Array(layout.size);
   const rhsImaginary = new Float64Array(layout.size);
   const omega = 2 * Math.PI * frequencyHz;
-  stampAcReferenceGmin(matrixReal, matrixImaginary, layout);
+  stampAcReferenceGmin(document, matrixReal, matrixImaginary, layout);
 
   for (const part of document.parts) {
     stampAcPassivePart(matrixReal, matrixImaginary, layout, part, omega);
@@ -1406,16 +1534,27 @@ function primaryCurrent(part: CircuitPart, values: ComplexValue[]) {
   return part.kind === "op-amp" ? (values[2] ?? complex()) : (values[0] ?? complex());
 }
 
-function componentPower(voltageValues: ComplexValue[], currentValues: ComplexValue[]) {
+function componentPower(
+  part: CircuitPart,
+  voltageValues: ComplexValue[],
+  currentValues: ComplexValue[],
+) {
   let power = complex();
+  const reference = part.kind === "op-amp"
+    ? complex()
+    : (voltageValues.at(-1) ?? complex());
   for (let index = 0; index < voltageValues.length; index += 1) {
+    const voltage = voltageValues[index] ?? complex();
+    const relativeVoltage = part.kind === "op-amp"
+      ? voltage
+      : voltageDifference(voltage, reference);
     power = {
       real:
         power.real +
-        (complexMultiply(voltageValues[index] ?? complex(), complexConjugate(currentValues[index] ?? complex())).real),
+        complexMultiply(relativeVoltage, complexConjugate(currentValues[index] ?? complex())).real,
       imaginary:
         power.imaginary +
-        (complexMultiply(voltageValues[index] ?? complex(), complexConjugate(currentValues[index] ?? complex())).imaginary),
+        complexMultiply(relativeVoltage, complexConjugate(currentValues[index] ?? complex())).imaginary,
     };
   }
   return power;
@@ -1453,7 +1592,7 @@ function makeReadings(
     );
     const voltage = primaryVoltage(part, terminalVoltages);
     const current = primaryCurrent(part, terminalCurrents);
-    const power = componentPower(terminalVoltages, terminalCurrents);
+    const power = componentPower(part, terminalVoltages, terminalCurrents);
     const terminalVoltageMap: Partial<Record<CircuitTerminal, ComplexValue>> = {};
     const terminalCurrentMap: Partial<Record<CircuitTerminal, ComplexValue>> = {};
     const terminals = terminalsOf(part.kind);
@@ -1476,9 +1615,26 @@ function makeReadings(
       const rated = part.ratedPowerWatts ?? 2;
       reading.brightness = Math.min(1, Math.max(0, power.real / rated));
     }
-    parts[part.id] = reading;
+    setRecordValue(parts, part.id, reading);
   }
   return parts;
+}
+
+function hasOnlyFiniteReadings(
+  parts: Record<string, AnalogCircuitPartReading>,
+  nodeVoltages: Record<string, ComplexValue>,
+) {
+  const finiteComplex = (value: ComplexValue) =>
+    Number.isFinite(value.real) && Number.isFinite(value.imaginary);
+  for (const reading of Object.values(parts)) {
+    if (!finiteComplex(reading.voltage) || !finiteComplex(reading.current) || !finiteComplex(reading.power)) {
+      return false;
+    }
+    if (reading.brightness !== undefined && !Number.isFinite(reading.brightness)) { return false; }
+    if (Object.values(reading.terminalVoltages).some((value) => !value || !finiteComplex(value))) { return false; }
+    if (Object.values(reading.terminalCurrents).some((value) => !value || !finiteComplex(value))) { return false; }
+  }
+  return Object.values(nodeVoltages).every(finiteComplex);
 }
 
 function frequencyFor(document: CircuitDocument, requested: number | undefined) {
@@ -1578,10 +1734,15 @@ function dcResult(
     solution.state,
     options.switchStates ?? {},
   );
+  const nodeVoltages = makeNodeVoltages(prepared.layout, values);
+  if (!hasOnlyFiniteReadings(readings, nodeVoltages)) {
+    const message = "計算結果に有限でない電圧・電流・電力が含まれています。部品の値を確認してください。";
+    return result("invalid", mode, message, { issues: [{ severity: "error", message }] });
+  }
   const message = "直流動作点を計算しました。";
   return result("valid", mode, message, {
     parts: readings,
-    nodeVoltages: makeNodeVoltages(prepared.layout, values),
+    nodeVoltages,
     issues: initialIssues,
   });
 }
@@ -1603,6 +1764,16 @@ function prepareAcBias(
       frequencyHz,
       issues: [returnPathIssue],
     });
+  }
+  const requiresOperatingPoint = document.parts.some((part) =>
+    part.kind === "diode" || part.kind === "led" ||
+    part.kind === "npn-transistor" || part.kind === "pnp-transistor" ||
+    part.kind === "nmos" || part.kind === "pmos" || part.kind === "op-amp"
+  );
+  if (!requiresOperatingPoint) {
+    // Linear small-signal stamps do not depend on a DC operating point. Avoid rejecting
+    // valid AC networks because their unrelated DC model has redundant ideal branches.
+    return { topology, state: new Float64Array(0) };
   }
   const dcLayoutResult = buildLayout(
     document,
@@ -1690,18 +1861,27 @@ function acResult(document: CircuitDocument, options: AnalogStepOptions): Analog
   if ("status" in solution) { return solution; }
 
   const issues = analysisIssuesForAc(document, frequencyHz);
+  const readings = makeReadings(
+    document,
+    solution.layout,
+    solution.values,
+    "ac",
+    frequencyHz,
+    bias.state,
+    options.switchStates ?? {},
+  );
+  const nodeVoltages = makeNodeVoltages(solution.layout, solution.values);
+  if (!hasOnlyFiniteReadings(readings, nodeVoltages)) {
+    const message = "計算結果に有限でない電圧・電流・電力が含まれています。部品の値を確認してください。";
+    return result("invalid", "ac", message, {
+      frequencyHz,
+      issues: [{ severity: "error", message }],
+    });
+  }
   return result("valid", "ac", `${frequencyHz} Hz の小信号交流解析を計算しました。`, {
     frequencyHz,
-    parts: makeReadings(
-      document,
-      solution.layout,
-      solution.values,
-      "ac",
-      frequencyHz,
-      bias.state,
-      options.switchStates ?? {},
-    ),
-    nodeVoltages: makeNodeVoltages(solution.layout, solution.values),
+    parts: readings,
+    nodeVoltages,
     issues,
   });
 }

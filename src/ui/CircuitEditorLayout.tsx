@@ -1,25 +1,22 @@
-import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type FocusEvent, type HTMLAttributes, type KeyboardEvent, type MouseEvent, type RefObject } from "react";
-import { circuitPartCatalog, circuitPartKinds, endpointName, type CircuitDocument, type CircuitPart, type CircuitPartKind } from "../circuit-model.js";
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type FocusEvent, type HTMLAttributes, type KeyboardEvent, type MouseEvent, type RefObject } from "react";
+import { circuitPartCatalog, circuitPartKinds, type CircuitDocument, type CircuitPart, type CircuitPartKind } from "../circuit-model.js";
 import type { Point } from "../circuit-geometry.js";
 import { circuitExampleCatalog, type CircuitExampleKind } from "../circuit-examples.js";
 import { analyzeCircuit } from "../circuit-solver.js";
 import { analysisAtTransientFrame, type CircuitTransientFrame } from "../circuit-visualization.js";
 import { CircuitAnalysisPanel } from "./CircuitAnalysisPanel.js";
 import { CircuitSimulationPanel } from "./CircuitSimulationPanel.js";
-import { measurementLabels } from "./measurement-labels.js";
-import { CircuitDiagnosticsPanel } from "./CircuitDiagnosticsPanel.js";
 import { useCircuitFiles } from "./editor-files.js";
 import type { CircuitAnalysisPanelProps } from "./CircuitAnalysisPanel.js";
 import { CircuitBoard } from "./CircuitBoard.js";
 import type { CircuitBoardProps } from "./CircuitBoard.js";
 import { CircuitIcon } from "./CircuitIcon.js";
-import { CircuitMeterReadout, getMeterDisplay } from "./CircuitMeterReadout.js";
-import { CircuitInspector } from "./CircuitInspector.js";
 import type { CircuitInspectorProps } from "./CircuitInspector.js";
-import { CircuitPalette, CircuitPartIcon } from "./CircuitPalette.js";
+import { CircuitPalette } from "./CircuitPalette.js";
 import type { CircuitPaletteProps } from "./CircuitPalette.js";
 import { CircuitPreviewDialog } from "./circuit-preview-dialog.js";
 import { Button } from "./primitives.js";
+import { EditorAnalysisStatus, EditorSidebar, type EditorSidebarTab } from "./EditorSidebar.js";
 import { useCircuitEditorContext } from "./CircuitEditor.js";
 import type { CircuitStyleProps } from "./style-props.js";
 
@@ -289,110 +286,6 @@ function EditorLeftSidebar({
   );
 }
 
-function EditorFloatingResults({
-  id,
-  editor,
-  part,
-  preview,
-  previewDocument,
-  previewAnalysis,
-  resultsMinimized,
-  setResultsMinimized,
-  analysisProps,
-  formatReading,
-}: {
-  id: string;
-  editor: EditorContext;
-  part: CircuitPart | undefined;
-  preview: boolean;
-  previewDocument: CircuitDocument | null;
-  previewAnalysis: ReturnType<typeof analyzeCircuit> | null;
-  resultsMinimized: boolean;
-  setResultsMinimized: (minimized: boolean | ((current: boolean) => boolean)) => void;
-  analysisProps?: Partial<CircuitAnalysisPanelProps>;
-  formatReading: (value: number | undefined, unit: string) => string;
-}) {
-  const document = previewDocument ?? editor.document;
-  const analysis = previewAnalysis ?? editor.analysis;
-  const readingParts = preview ? document.parts.filter((item) => item.kind !== "junction" && item.kind !== "ground") : [];
-  const selectedReading = !preview && part ? analysis.parts[part.id] : undefined;
-  const selectedMeter = !preview && part ? getMeterDisplay(part.kind, selectedReading, analysis.status) : undefined;
-  const selectedLabels = measurementLabels(part?.kind ?? "resistor");
-  const resultsRef = useRef<HTMLDivElement>(null);
-  const [readingCorner, setReadingCorner] = useState<"top" | "bottom">("bottom");
-
-  useLayoutEffect(() => {
-    if (preview || !part) { return; }
-    const canvas = resultsRef.current?.closest<HTMLElement>(".circuit-editor__canvas");
-    const board = canvas?.querySelector<SVGSVGElement>(".circuit-board__surface");
-    if (!canvas || !board) { return; }
-    const measure = () => {
-      const node = Array.from(canvas.querySelectorAll<SVGGraphicsElement>(".circuit-board__part[data-part-id]"))
-        .find((element) => element.dataset.partId === part.id);
-      if (!node) { return; }
-      const canvasRect = canvas.getBoundingClientRect();
-      const nodeRect = node.getBoundingClientRect();
-      if (canvasRect.height === 0 || nodeRect.height === 0) { return; }
-      setReadingCorner(nodeRect.top + nodeRect.height / 2 < canvasRect.top + canvasRect.height / 2 ? "bottom" : "top");
-    };
-    measure();
-    const mutations = new MutationObserver(measure);
-    mutations.observe(board, { attributes: true, subtree: true, attributeFilter: ["viewBox", "transform"] });
-    const resize = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(measure);
-    resize?.observe(canvas);
-    return () => { mutations.disconnect(); resize?.disconnect(); };
-  }, [preview, part?.id]);
-
-  return (
-    <>
-    <div ref={resultsRef} className="circuit-editor__floating-results" data-minimized={resultsMinimized}>
-      <button type="button" className="circuit-editor__results-toggle" aria-label={resultsMinimized ? "解析パネルを展開" : "解析パネルを最小化"} aria-expanded={!resultsMinimized} aria-controls={`${id}-floating-results`} onClick={() => setResultsMinimized((value) => !value)}>
-        <span>解析</span><CircuitIcon name="chevron" size={15} />
-      </button>
-      <div id={`${id}-floating-results`} className="circuit-editor__results-content" hidden={resultsMinimized}>
-        <CircuitAnalysisPanel analysis={analysis} partCount={document.parts.length} wireCount={document.wires.length} {...analysisProps} showReason={false} />
-        {readingParts.map((readingPart) => {
-          const reading = analysis.parts[readingPart.id];
-          const labels = measurementLabels(readingPart.kind);
-          const meter = getMeterDisplay(readingPart.kind, reading, analysis.status);
-          if (!reading && !meter) { return null; }
-          return (
-            <section className="circuit-editor__floating-readings" aria-label="選択部品の計測値" key={readingPart.id}>
-              <h2>{readingPart.label}の計測値</h2>
-              {meter
-                ? <CircuitMeterReadout kind={readingPart.kind} reading={reading} analysisStatus={analysis.status} />
-                : reading && <dl className="circuit-editor__floating-reading" data-part-id={readingPart.id}>
-                    <div data-measurement="voltage"><dt>{labels.voltage}</dt><dd>{formatReading(reading.voltageVolts, "V")}</dd></div>
-                    <div data-measurement="current"><dt>{labels.current}</dt><dd>{formatReading(reading.currentAmps, "A")}</dd></div>
-                    <div data-measurement="power"><dt>電力</dt><dd>{formatReading(reading.powerWatts, "W")}</dd></div>
-                    {analysis.mode === "ac" && <>
-                      <div><dt>電圧位相</dt><dd>{formatReading(reading.voltagePhaseDegrees, "°")}</dd></div>
-                      <div><dt>電流位相</dt><dd>{formatReading(reading.currentPhaseDegrees, "°")}</dd></div>
-                    </>}
-                  </dl>}
-            </section>
-          );
-        })}
-      </div>
-    </div>
-    {part && (selectedReading || selectedMeter) && <section className="circuit-editor__floating-readings circuit-editor__selected-readings" aria-label="選択部品の計測値" data-corner={readingCorner} hidden={resultsMinimized}>
-      <h2>{part.label}の計測値</h2>
-      {selectedMeter
-        ? <CircuitMeterReadout kind={part.kind} reading={selectedReading} analysisStatus={analysis.status} />
-        : selectedReading && <dl className="circuit-editor__floating-reading" data-part-id={part.id}>
-            <div data-measurement="voltage"><dt>{selectedLabels.voltage}</dt><dd>{formatReading(selectedReading.voltageVolts, "V")}</dd></div>
-            <div data-measurement="current"><dt>{selectedLabels.current}</dt><dd>{formatReading(selectedReading.currentAmps, "A")}</dd></div>
-            <div data-measurement="power"><dt>電力</dt><dd>{formatReading(selectedReading.powerWatts, "W")}</dd></div>
-            {analysis.mode === "ac" && <>
-              <div><dt>電圧位相</dt><dd>{formatReading(selectedReading.voltagePhaseDegrees, "°")}</dd></div>
-              <div><dt>電流位相</dt><dd>{formatReading(selectedReading.currentPhaseDegrees, "°")}</dd></div>
-            </>}
-          </dl>}
-    </section>}
-    </>
-  );
-}
-
 function EditorCanvasNotices({
   preview,
   editor,
@@ -425,15 +318,20 @@ function EditorCanvasFooter({
   part,
   wire,
   tool,
+  analysis,
+  onOpenAnalysis,
 }: {
   editor: EditorContext;
   preview: boolean;
   part: CircuitPart | undefined;
   wire: EditorContext["document"]["wires"][number] | undefined;
   tool: EditorTool;
+  analysis: EditorContext["analysis"];
+  onOpenAnalysis: () => void;
 }) {
   return (
     <footer className="circuit-editor__canvas-footer">
+      <EditorAnalysisStatus analysis={analysis} diagnosticCount={editor.diagnostics.length} onOpen={onOpenAnalysis} />
       <span className="circuit-editor__selection-status" role="status">{selectionStatus(preview, editor, part, wire, tool)}</span>
       <span className="circuit-editor__canvas-hint">{preview ? <><kbd>Esc</kbd> 編集に戻る</> : <><kbd>Space</kbd> ドラッグで移動</>}</span>
       <span className="circuit-editor__document-count">部品 {editor.document.parts.length}<span> / </span>導線 {editor.document.wires.length}</span>
@@ -441,74 +339,7 @@ function EditorCanvasFooter({
   );
 }
 
-function EditorSidebarContent({
-  editor,
-  part,
-  wire,
-  selected,
-  inspectorProps,
-  onClose,
-  endpointLabel,
-}: {
-  editor: EditorContext;
-  part: CircuitPart | undefined;
-  wire: EditorContext["document"]["wires"][number] | undefined;
-  selected: boolean;
-  inspectorProps?: Partial<CircuitInspectorProps>;
-  onClose: () => void;
-  endpointLabel: (endpoint: NonNullable<EditorContext["document"]["wires"][number]>["from"]) => string;
-}) {
-  const multipleSelected = editor.selection.parts.length + editor.selection.wires.length > 1;
-  const reading = part && getMeterDisplay(part.kind) ? editor.analysis.parts[part.id] : undefined;
-  return (
-    <>
-      <button type="button" className="circuit-editor__panel-close circuit-icon-button" aria-label="プロパティパネルを閉じる" onClick={onClose}><CircuitIcon name="close" /></button>
-      {multipleSelected ? <section className="circuit-editor__multi-selection" aria-label="複数選択">
-        <h2>複数選択</h2><p>部品 {editor.selection.parts.length} 個・導線 {editor.selection.wires.length} 本</p>
-        <p>ドラッグでまとめて移動できます。Shiftを押しながらクリックすると選択を切り替えます。</p>
-        <button type="button" className="circuit-button" onClick={editor.clearSelection}>選択を解除</button>
-      </section> : <CircuitInspector part={part} wire={wire} wireLabel={wire ? `${endpointLabel(wire.from)} → ${endpointLabel(wire.to)}` : undefined} wireEndpoints={wire ? { from: endpointLabel(wire.from), to: endpointLabel(wire.to) } : undefined} onReconnect={wire ? (end) => editor.startReconnect(wire.id, end) : undefined} onResetWireRoute={wire ? () => editor.resetWireRoute(wire.id) : undefined} onChange={editor.updatePart} onRotate={editor.rotateSelected} onDelete={editor.removeSelected} {...inspectorProps} reading={reading} analysisStatus={editor.analysis.status} />}
-      <CircuitDiagnosticsPanel diagnostics={editor.diagnostics} onSelect={editor.selectRange} />
-      {!selected && editor.document.parts.length > 0 && <section className="circuit-editor__outline" aria-label="回路内の部品"><h2>回路内の部品<span>{editor.document.parts.length}</span></h2><div>{editor.document.parts.map((item) => <button type="button" key={item.id} onClick={() => editor.selectPart(item.id)}><CircuitPartIcon kind={item.kind} /><span>{item.label}</span><CircuitIcon name="chevron" size={14} /></button>)}</div></section>}
-    </>
-  );
-}
-
-function EditorRightSidebar({
-  id,
-  preview,
-  editor,
-  part,
-  wire,
-  selected,
-  inspectorProps,
-  onClose,
-  endpointLabel,
-  onFrameChange,
-}: {
-  id: string;
-  preview: boolean;
-  editor: EditorContext;
-  part: CircuitPart | undefined;
-  wire: EditorContext["document"]["wires"][number] | undefined;
-  selected: boolean;
-  inspectorProps?: Partial<CircuitInspectorProps>;
-  onClose: () => void;
-  endpointLabel: (endpoint: NonNullable<EditorContext["document"]["wires"][number]>["from"]) => string;
-  onFrameChange: (frame: CircuitTransientFrame | null) => void;
-}) {
-  if (preview) { return null; }
-  return (
-    <aside className="circuit-editor__right" id={`${id}-properties`} aria-label="プロパティ">
-      <CircuitSimulationPanel document={editor.document} analysis={editor.analysis} options={editor.analysisOptions} onChange={editor.setAnalysisOptions} onFrameChange={onFrameChange} />
-
-      <EditorSidebarContent editor={editor} part={part} wire={wire} selected={selected} inspectorProps={inspectorProps} onClose={onClose} endpointLabel={endpointLabel} />
-    </aside>
-  );
-}
-
 function EditorCenter({
-  id,
   editor,
   boardVersion,
   preview,
@@ -519,20 +350,17 @@ function EditorCenter({
   wire,
   selected,
   boardProps,
-  analysisProps,
   helpDialogRef,
-  resultsMinimized,
   selectTool,
-  setResultsMinimized,
   onViewportCenterChange,
   onAddBattery,
   onSwitchToggle,
   onInspectPart,
-  formatReading,
   sampledAnalysis,
   onFrameChange,
+  onEditSelection,
+  onOpenAnalysis,
 }: {
-  id: string;
   editor: EditorContext;
   boardVersion: number;
   preview: boolean;
@@ -543,18 +371,16 @@ function EditorCenter({
   wire: EditorContext["document"]["wires"][number] | undefined;
   selected: boolean;
   boardProps?: Partial<CircuitBoardProps>;
-  analysisProps?: Partial<CircuitAnalysisPanelProps>;
   helpDialogRef: RefObject<HTMLDialogElement | null>;
-  resultsMinimized: boolean;
   selectTool: (tool: EditorTool) => void;
-  setResultsMinimized: (minimized: boolean | ((current: boolean) => boolean)) => void;
   onViewportCenterChange: (point: Point) => void;
   onAddBattery: () => void;
   onSwitchToggle: (partId: string) => void;
   onInspectPart: (partId: string) => void;
-  formatReading: (value: number | undefined, unit: string) => string;
   sampledAnalysis: ReturnType<typeof analyzeCircuit> | null;
   onFrameChange: (frame: CircuitTransientFrame | null) => void;
+  onEditSelection: () => void;
+  onOpenAnalysis: () => void;
 }) {
   return (
     <section className="circuit-editor__center" aria-label={preview ? "プレビュー領域" : "編集領域"}>
@@ -573,9 +399,9 @@ function EditorCenter({
           pendingEndpoint={editor.pendingEndpoint}
           pendingWire={editor.pendingWire}
           panMode={preview || tool === "pan"}
-          onSelectPart={editor.selectPart}
-          onSelectWire={editor.selectWire}
-          onSelectRange={editor.selectRange}
+          onSelectPart={(partId, additive) => { editor.selectPart(partId, additive); onEditSelection(); }}
+          onSelectWire={(wireId, additive) => { editor.selectWire(wireId, additive); onEditSelection(); }}
+          onSelectRange={(selection, additive) => { editor.selectRange(selection, additive); onEditSelection(); }}
           onTerminalClick={editor.chooseTerminal}
           onConnectionStart={editor.startConnection}
           onReconnectStart={editor.startReconnect}
@@ -597,10 +423,9 @@ function EditorCenter({
           onInspectPart={preview ? onInspectPart : boardProps?.onInspectPart}
           readOnly={preview || boardProps?.readOnly === true}
           fitOnResize={preview || boardProps?.fitOnResize === true}
-          compactControls={preview || boardProps?.compactControls === true}
+          compactControls={preview || (boardProps?.compactControls ?? true)}
           panOnScroll={boardProps?.panOnScroll ?? !preview}
         />
-        {!preview && <EditorFloatingResults id={id} editor={editor} part={part} preview={preview} previewDocument={previewDocument} previewAnalysis={sampledAnalysis ?? previewAnalysis} resultsMinimized={resultsMinimized} setResultsMinimized={setResultsMinimized} analysisProps={analysisProps} formatReading={formatReading} />}
         <EditorCanvasNotices preview={preview} editor={editor} onAddBattery={onAddBattery} />
       </div>
       {preview && previewAnalysis ? (
@@ -608,7 +433,7 @@ function EditorCenter({
           <CircuitAnalysisPanel analysis={sampledAnalysis ?? previewAnalysis} showReason={false} className="circuit-editor__preview-summary" />
           <span className="circuit-editor__preview-hint">部品をダブルクリックして値を調整</span>
         </div>
-      ) : <EditorCanvasFooter editor={editor} preview={preview} part={part} wire={wire} tool={tool} />}
+      ) : <EditorCanvasFooter editor={editor} preview={preview} part={part} wire={wire} tool={tool} analysis={sampledAnalysis ?? editor.analysis} onOpenAnalysis={onOpenAnalysis} />}
       {preview && previewDocument && previewAnalysis && <details className="circuit-editor__learning">
         <summary>学習ビュー<span>時間波形・エネルギー・比較</span></summary>
         <CircuitSimulationPanel document={previewDocument} baselineDocument={editor.document} analysis={previewAnalysis} options={editor.analysisOptions} onChange={editor.setAnalysisOptions} onFrameChange={onFrameChange} />
@@ -632,7 +457,7 @@ function EditorMobileNav({
     <nav className="circuit-editor__mobile-nav" aria-label="エディターパネル">
       <button type="button" data-panel-trigger="parts" aria-expanded={panel === "parts"} className={panel === "parts" ? "is-active" : ""} onClick={() => setPanel(panel === "parts" ? null : "parts")}><CircuitIcon name="layers" /><span>部品</span></button>
       <button type="button" aria-pressed={panel === null} className={panel === null ? "is-active" : ""} onClick={() => { setPanel(null); focusBoard(); }}><CircuitIcon name="circuit" /><span>回路図</span></button>
-      <button type="button" data-panel-trigger="properties" aria-expanded={panel === "properties"} className={panel === "properties" ? "is-active" : ""} onClick={() => setPanel(panel === "properties" ? null : "properties")}><CircuitIcon name="sliders" /><span>プロパティ</span>{selected && <span className="circuit-editor__mobile-selection" />}</button>
+      <button type="button" data-panel-trigger="properties" aria-expanded={panel === "properties"} className={panel === "properties" ? "is-active" : ""} onClick={() => setPanel(panel === "properties" ? null : "properties")}><CircuitIcon name="sliders" /><span>詳細</span>{selected && <span className="circuit-editor__mobile-selection" />}</button>
     </nav>
   );
 }
@@ -708,7 +533,7 @@ export function CircuitEditorLayout({
   const id = useId();
   const [boardVersion, setBoardVersion] = useState(0);
   const [tool, setTool] = useState<"select" | "pan">("select");
-  const [resultsMinimized, setResultsMinimized] = useState(false);
+  const [sidebarTab, setSidebarTab] = useState<EditorSidebarTab>("properties");
   const [previewDocument, setPreviewDocument] = useState<CircuitDocument | null>(() => previewOnly
     ? { ...editor.document, parts: editor.document.parts.map((item) => ({ ...item })) }
     : null);
@@ -735,11 +560,11 @@ export function CircuitEditorLayout({
   const files = useCircuitFiles(editor, () => {
     setPreviewDocument(null);
     setBoardVersion((version) => version + 1);
+    setSidebarTab("properties");
     setTool("select");
     setPanel(null);
     focusBoard();
   });
-  const formatReading = (value: number | undefined, unit: string) => value === undefined || !Number.isFinite(value) ? "—" : `${value !== 0 && Math.abs(value) < 0.01 ? value.toPrecision(3) : value.toFixed(2)} ${unit}`;
 
   function resetPreview(partId?: string) {
     setPreviewDocument((current) => !partId || !current
@@ -785,7 +610,7 @@ export function CircuitEditorLayout({
     const frame = requestAnimationFrame(() => {
       const selector = (panel ?? previous) === "parts" ? ".circuit-editor__left" : ".circuit-editor__right";
       const sidebar = rootRef.current?.querySelector<HTMLElement>(selector);
-      if (panel) { sidebar?.querySelector<HTMLElement>("button")?.focus(); }
+      if (panel) { sidebar?.querySelector<HTMLElement>(panel === "properties" ? '[role="tab"][aria-selected="true"]' : "button")?.focus({ preventScroll: true }); }
       else if (previous && (sidebar?.contains(globalThis.document.activeElement) || globalThis.document.activeElement === globalThis.document.body)) {
         rootRef.current?.querySelector<HTMLElement>(`[data-panel-trigger="${previous}"]`)?.focus();
       }
@@ -799,6 +624,7 @@ export function CircuitEditorLayout({
 
   function addPart(kind: CircuitPartKind) {
     editor.add(kind, viewportCenter.current);
+    setSidebarTab("properties");
     setTool("select");
     setPanel(null);
     focusBoard();
@@ -821,10 +647,11 @@ export function CircuitEditorLayout({
     handleEditorShortcut(event, selected, part, editor, addPart, selectTool, helpDialogRef);
   }
 
-  const endpointLabel = (endpoint: NonNullable<typeof wire>["from"]) => {
-    const endpointPart = editor.document.parts.find((item) => item.id === endpoint.partId);
-    return endpointPart ? endpointName(endpointPart, endpoint.terminal) : "接続先なし";
-  };
+  function openAnalysis() {
+    setSidebarTab("analysis");
+    if (window.matchMedia("(max-width: 900px)").matches) { setPanel("properties"); }
+    requestAnimationFrame(() => rootRef.current?.querySelector<HTMLElement>('[data-sidebar-tab="analysis"]')?.focus({ preventScroll: true }));
+  }
 
   function onBlur(event: FocusEvent<HTMLElement>) {
     onRootBlur?.(event);
@@ -847,6 +674,7 @@ export function CircuitEditorLayout({
   function resetSample(kind: CircuitExampleKind) {
     editor.openExample(kind);
     setBoardVersion((version) => version + 1);
+    setSidebarTab("properties");
     setTool("select");
     setPanel(null);
     resetDialogRef.current?.close();
@@ -875,7 +703,6 @@ export function CircuitEditorLayout({
         {panel && <button type="button" className="circuit-editor__backdrop" onClick={() => setPanel(null)} aria-label="パネルを閉じる" />}
         {!previewOnly && <EditorLeftSidebar paletteProps={paletteProps} onAdd={addPart} onClose={() => setPanel(null)} onOpenHelp={() => helpDialogRef.current?.showModal()} />}
         <EditorCenter
-          id={id}
           editor={editor}
           boardVersion={boardVersion}
           preview={preview}
@@ -886,29 +713,26 @@ export function CircuitEditorLayout({
           wire={wire}
           selected={selected}
           boardProps={boardProps}
-          analysisProps={analysisProps}
           helpDialogRef={helpDialogRef}
-          resultsMinimized={resultsMinimized}
           selectTool={selectTool}
-          setResultsMinimized={setResultsMinimized}
           onViewportCenterChange={(point) => { viewportCenter.current = point; }}
           onAddBattery={() => addPart("battery")}
           onSwitchToggle={togglePreviewSwitch}
           onInspectPart={openPreviewDialog}
-          formatReading={formatReading}
           sampledAnalysis={sampledAnalysis}
           onFrameChange={onFrameChange}
+          onEditSelection={() => setSidebarTab("properties")}
+          onOpenAnalysis={openAnalysis}
         />
-        {!previewOnly && <EditorRightSidebar
+        {!previewOnly && !preview && <EditorSidebar
           id={id}
-          preview={preview}
           editor={editor}
-          part={part}
-          wire={wire}
-          selected={selected}
+          tab={sidebarTab}
+          onTabChange={setSidebarTab}
           inspectorProps={inspectorProps}
+          analysisProps={analysisProps}
+          sampledAnalysis={sampledAnalysis}
           onClose={() => setPanel(null)}
-          endpointLabel={endpointLabel}
           onFrameChange={onFrameChange}
         />}
       </div>

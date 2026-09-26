@@ -58,6 +58,8 @@ export type CircuitInspectorSlot =
 export interface CircuitInspectorProps extends Omit<ComponentPropsWithoutRef<"section">, "children" | "onChange" | "part" | "style"> {
   part?: CircuitPart;
   reading?: CircuitPartReading;
+  /** Time in seconds for transient readings; omitted for steady-state analysis. */
+  readingTimeSeconds?: number;
   analysisStatus?: CircuitAnalysis["status"];
   wire?: CircuitWire;
   /** Human-readable connection, for example "電池の−端子 → 抵抗の端子A". */
@@ -75,6 +77,9 @@ export interface CircuitInspectorProps extends Omit<ComponentPropsWithoutRef<"se
 }
 
 const format = (value: number | undefined) => value === undefined || !Number.isFinite(value) ? "—" : Number(value.toPrecision(4)).toString();
+const formatTimeNote = (timeSeconds?: number) => timeSeconds === undefined || !Number.isFinite(timeSeconds)
+  ? undefined
+  : `時間カーソル ${format(timeSeconds)} s の瞬時値です。`;
 const terminalLabel = (terminal: CircuitWire["from"]["terminal"]) => `端子${terminal.toUpperCase()}`;
 
 interface InspectorShell {
@@ -279,19 +284,23 @@ function InspectorFields({
 function InspectorReadings({
   kind,
   reading,
+  readingTimeSeconds,
   analysisStatus,
   slotProps,
 }: {
   kind: CircuitPart["kind"];
   reading?: CircuitPartReading;
+  readingTimeSeconds?: number;
   analysisStatus?: CircuitAnalysis["status"];
   slotProps?: CircuitInspectorProps["slotProps"];
 }) {
   const meterDisplay = getMeterDisplay(kind, reading, analysisStatus);
+  const timeNote = formatTimeNote(readingTimeSeconds);
   if (meterDisplay) {
     return (
       <div {...circuitSlot("circuit-inspector__readings", slotProps?.readings)}>
         <h3 {...circuitSlot(undefined, slotProps?.readingsTitle)}>計測値</h3>
+        {timeNote && <p {...circuitSlot("circuit-inspector__reading-note", slotProps?.readingNote)}>{timeNote}</p>}
         <CircuitMeterReadout kind={kind} reading={reading} analysisStatus={analysisStatus} />
       </div>
     );
@@ -303,7 +312,7 @@ function InspectorReadings({
     <div {...circuitSlot("circuit-inspector__readings", slotProps?.readings)}>
       <h3 {...circuitSlot(undefined, slotProps?.readingsTitle)}>計測値</h3>
       <p {...circuitSlot("circuit-inspector__reading-note", slotProps?.readingNote)}>
-        {isAc ? "交流の電圧・電流は実効値です。位相は角度で表示します。" : "直流の電圧・電流は端子の向きに対する符号付き値です。"}
+        {timeNote ?? (isAc ? "交流の電圧・電流は実効値です。位相は角度で表示します。" : "直流の電圧・電流は端子の向きに対する符号付き値です。")}
       </p>
       <dl {...circuitSlot(undefined, slotProps?.readingList)}>
         <div {...circuitSlot(undefined, slotProps?.readingRow)} data-measurement="voltage">
@@ -341,6 +350,7 @@ function PartInspector({
   shell,
   part,
   reading,
+  readingTimeSeconds,
   analysisStatus,
   onChange,
   onRotate,
@@ -349,6 +359,7 @@ function PartInspector({
   shell: InspectorShell;
   part: CircuitPart;
   reading?: CircuitPartReading;
+  readingTimeSeconds?: number;
   analysisStatus?: CircuitAnalysis["status"];
   onChange?: CircuitInspectorProps["onChange"];
   onRotate?: () => void;
@@ -362,7 +373,7 @@ function PartInspector({
         <span {...circuitSlot(undefined, slotProps?.selectionLabel)}>{part.label || "名称未設定"}</span>
       </div>
       <InspectorFields part={part} onChange={onChange} slotProps={slotProps} />
-      <InspectorReadings kind={part.kind} reading={reading} analysisStatus={analysisStatus} slotProps={slotProps} />
+      <InspectorReadings kind={part.kind} reading={reading} readingTimeSeconds={readingTimeSeconds} analysisStatus={analysisStatus} slotProps={slotProps} />
       <div {...circuitSlot("circuit-inspector__actions", slotProps?.actions)}>
         <button {...circuitSlot(undefined, slotProps?.rotateButton)} type="button" onClick={onRotate} disabled={!onRotate || part.kind === "junction"}>
           <CircuitIcon name="rotate" {...circuitSlot(undefined, slotProps?.rotateIcon)} />回転
@@ -379,6 +390,7 @@ function PartInspector({
 export function CircuitInspector({
   part,
   reading,
+  readingTimeSeconds,
   analysisStatus,
   wire,
   wireLabel,
@@ -407,5 +419,5 @@ export function CircuitInspector({
   if (!part && !wire) { return <EmptyInspector shell={shell} />; }
   if (!part && wire) { return <WireInspector shell={shell} wire={wire} wireLabel={wireLabel} wireEndpoints={wireEndpoints} onReconnect={onReconnect} onResetWireRoute={onResetWireRoute} onDelete={onDelete} />; }
   if (!part) { return null; }
-  return <PartInspector shell={shell} part={part} reading={reading} analysisStatus={analysisStatus} onChange={onChange} onRotate={onRotate} onDelete={onDelete} />;
+  return <PartInspector shell={shell} part={part} reading={reading} readingTimeSeconds={readingTimeSeconds} analysisStatus={analysisStatus} onChange={onChange} onRotate={onRotate} onDelete={onDelete} />;
 }

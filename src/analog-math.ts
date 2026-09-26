@@ -21,11 +21,56 @@ export const complexMultiply = (left: ComplexValue, right: ComplexValue): Comple
   imaginary: left.real * right.imaginary + left.imaginary * right.real,
 });
 
+function rescaleQuotient(value: number, numeratorScale: number, denominatorScale: number) {
+  if (value === 0) { return value; }
+  const ratio = numeratorScale / denominatorScale;
+  return Number.isFinite(ratio) && ratio !== 0
+    ? value * ratio
+    : (value * numeratorScale) / denominatorScale;
+}
+
 export const complexDivide = (left: ComplexValue, right: ComplexValue): ComplexValue => {
-  const denominator = right.real * right.real + right.imaginary * right.imaginary;
+  if (right.imaginary === 0 && right.real !== 0) {
+    return complex(left.real / right.real, left.imaginary / right.real);
+  }
+  if (right.real === 0 && right.imaginary !== 0) {
+    return complex(left.imaginary / right.imaginary, -left.real / right.imaginary);
+  }
+  // Normalize both operands before multiplying: squaring a finite phasor can
+  // overflow or underflow even when the quotient is near unity.
+  const numeratorScale = Math.max(Math.abs(left.real), Math.abs(left.imaginary)) || 1;
+  const denominatorScale = Math.max(Math.abs(right.real), Math.abs(right.imaginary));
+  const leftReal = left.real / numeratorScale;
+  const leftImaginary = left.imaginary / numeratorScale;
+  const rightReal = right.real / denominatorScale;
+  const rightImaginary = right.imaginary / denominatorScale;
+  // A normalized minor component can underflow even though its contribution to
+  // the quotient is representable. Divide the large numerator before multiplying
+  // by that component; the omitted squared ratio is below floating-point range.
+  if (rightImaginary === 0 && right.imaginary !== 0) {
+    const real = left.real / right.real;
+    const imaginary = left.imaginary / right.real;
+    return complex(real + (imaginary / right.real) * right.imaginary,
+      imaginary - (real / right.real) * right.imaginary);
+  }
+  if (rightReal === 0 && right.real !== 0) {
+    const real = left.real / right.imaginary;
+    const imaginary = left.imaginary / right.imaginary;
+    return complex(imaginary + (real / right.imaginary) * right.real,
+      -real + (imaginary / right.imaginary) * right.real);
+  }
+  const denominator = rightReal * rightReal + rightImaginary * rightImaginary;
   return {
-    real: (left.real * right.real + left.imaginary * right.imaginary) / denominator,
-    imaginary: (left.imaginary * right.real - left.real * right.imaginary) / denominator,
+    real: rescaleQuotient(
+      (leftReal * rightReal + leftImaginary * rightImaginary) / denominator,
+      numeratorScale,
+      denominatorScale,
+    ),
+    imaginary: rescaleQuotient(
+      (leftImaginary * rightReal - leftReal * rightImaginary) / denominator,
+      numeratorScale,
+      denominatorScale,
+    ),
   };
 };
 
@@ -48,7 +93,7 @@ function complexPivotRow(
   let pivotMagnitude = 0;
   for (let row = column; row < size; row += 1) {
     const index = row * size + column;
-    const magnitude = Math.hypot(matrixReal[index] ?? 0, matrixImaginary[index] ?? 0);
+    const magnitude = Math.max(Math.abs(matrixReal[index] ?? 0), Math.abs(matrixImaginary[index] ?? 0));
     if (magnitude > pivotMagnitude) {
       pivot = row;
       pivotMagnitude = magnitude;
@@ -95,11 +140,11 @@ function eliminateComplexRow(
   const rowLead = row * size + pivotColumn;
   const leadReal = matrixReal[pivotIndex] ?? 0;
   const leadImaginary = matrixImaginary[pivotIndex] ?? 0;
-  const leadMagnitudeSquared = leadReal * leadReal + leadImaginary * leadImaginary;
   const valueReal = matrixReal[rowLead] ?? 0;
   const valueImaginary = matrixImaginary[rowLead] ?? 0;
-  const factorReal = (valueReal * leadReal + valueImaginary * leadImaginary) / leadMagnitudeSquared;
-  const factorImaginary = (valueImaginary * leadReal - valueReal * leadImaginary) / leadMagnitudeSquared;
+  const factor = complexDivide(complex(valueReal, valueImaginary), complex(leadReal, leadImaginary));
+  const factorReal = factor.real;
+  const factorImaginary = factor.imaginary;
 
   for (let column = pivotColumn + 1; column < size; column += 1) {
     const index = row * size + column;
@@ -146,16 +191,18 @@ function backSubstituteComplex(
     const diagonal = row * size + row;
     const leadReal = matrixReal[diagonal] ?? 0;
     const leadImaginary = matrixImaginary[diagonal] ?? 0;
-    const denominator = leadReal * leadReal + leadImaginary * leadImaginary;
-    solution[row] = {
-      real: (sumReal * leadReal + sumImaginary * leadImaginary) / denominator,
-      imaginary: (sumImaginary * leadReal - sumReal * leadImaginary) / denominator,
-    };
+    solution[row] = complexDivide(complex(sumReal, sumImaginary), complex(leadReal, leadImaginary));
   }
   return solution;
 }
 
-/** Solves a dense complex matrix using Gaussian elimination with partial pivoting. */
+function validSystem(size: number, matrix: Float64Array, rhs: Float64Array) {
+  return Number.isSafeInteger(size) && size >= 0 &&
+    matrix.length === size * size && rhs.length === size &&
+    matrix.every(Number.isFinite) && rhs.every(Number.isFinite);
+}
+
+/** Solves a dense complex matrix in place; returns null for singular or nonfinite systems. */
 export function solveComplexLinearSystem(
   size: number,
   matrixReal: Float64Array,
@@ -163,9 +210,12 @@ export function solveComplexLinearSystem(
   rhsReal: Float64Array,
   rhsImaginary: Float64Array,
 ): ComplexValue[] | null {
+  if (!validSystem(size, matrixReal, rhsReal) || !validSystem(size, matrixImaginary, rhsImaginary)) {
+    return null;
+  }
   for (let column = 0; column < size; column += 1) {
     const { pivot, magnitude } = complexPivotRow(size, matrixReal, matrixImaginary, column);
-    if (magnitude < 1e-24) { return null; }
+    if (magnitude === 0 || !Number.isFinite(magnitude)) { return null; }
     if (pivot !== column) {
       swapComplexRows(size, matrixReal, matrixImaginary, rhsReal, rhsImaginary, column, pivot);
     }
@@ -233,15 +283,16 @@ function backSubstituteReal(size: number, matrix: Float64Array, rhs: Float64Arra
   return solution;
 }
 
-/** Solves a dense real matrix using Gaussian elimination with partial pivoting. */
+/** Solves a dense real matrix in place; returns null for singular or nonfinite systems. */
 export function solveRealLinearSystem(
   size: number,
   matrix: Float64Array,
   rhs: Float64Array,
 ): Float64Array | null {
+  if (!validSystem(size, matrix, rhs)) { return null; }
   for (let column = 0; column < size; column += 1) {
     const { pivot, magnitude } = realPivotRow(size, matrix, column);
-    if (magnitude < 1e-24) { return null; }
+    if (magnitude === 0 || !Number.isFinite(magnitude)) { return null; }
     if (pivot !== column) {
       swapRealRows(size, matrix, rhs, column, pivot);
     }
@@ -249,5 +300,6 @@ export function solveRealLinearSystem(
       eliminateRealRow(size, matrix, rhs, column, row);
     }
   }
-  return backSubstituteReal(size, matrix, rhs);
+  const solution = backSubstituteReal(size, matrix, rhs);
+  return solution.every(Number.isFinite) ? solution : null;
 }

@@ -40,6 +40,32 @@ function rcCircuit(initialVoltageVolts = 0): CircuitDocument {
   };
 }
 
+function parallelCapacitorsCircuit(linkKind: "switch" | "ammeter"): CircuitDocument {
+  const link = linkKind === "switch"
+    ? part("link", "switch", { initiallyClosed: true })
+    : part("link", "ammeter");
+  return {
+    title: "Parallel capacitors through an ideal link",
+    parts: [
+      part("source", "battery", { voltageVolts: 1 }),
+      part("resistor", "resistor", { resistanceOhms: 1000 }),
+      part("capacitor-1", "capacitor", { capacitanceFarads: 1e-3, initialVoltageVolts: 0 }),
+      link,
+      part("capacitor-2", "capacitor", { capacitanceFarads: 1e-3, initialVoltageVolts: 0 }),
+      part("ground", "ground"),
+    ],
+    wires: [
+      wire("wire-source-r", "source", "a", "resistor", "a"),
+      wire("wire-r-c1", "resistor", "b", "capacitor-1", "a"),
+      wire("wire-c1-link", "capacitor-1", "a", "link", "a"),
+      wire("wire-link-c2", "link", "b", "capacitor-2", "a"),
+      wire("wire-c1-ground", "capacitor-1", "b", "ground", "a"),
+      wire("wire-c2-ground", "capacitor-2", "b", "ground", "a"),
+      wire("wire-source-ground", "source", "b", "ground", "a"),
+    ],
+  };
+}
+
 describe("simulateTransient", () => {
   it("charges an RC circuit with backward Euler and includes both endpoints", () => {
     const document = rcCircuit();
@@ -113,6 +139,49 @@ describe("simulateTransient", () => {
     expect(result.samples[0]?.parts.capacitor?.currentAmps).toBeCloseTo(-0.001, 8);
   });
 
+  it("splits parallel capacitor initial current by capacitance and satisfies node KCL", () => {
+    const document = rcCircuit(2);
+    document.parts.push(part("capacitor-2", "capacitor", {
+      capacitanceFarads: 3e-3,
+      initialVoltageVolts: 2,
+    }));
+    document.wires.push(
+      wire("wire-parallel-a", "capacitor", "a", "capacitor-2", "a"),
+      wire("wire-parallel-b", "capacitor", "b", "capacitor-2", "b"),
+    );
+    const result = simulateTransient(document, { durationSeconds: 0.01, timeStepSeconds: 0.01 });
+    const initial = result.samples[0]?.parts;
+    const firstCurrent = initial?.capacitor?.currentAmps ?? Number.NaN;
+    const secondCurrent = initial?.["capacitor-2"]?.currentAmps ?? Number.NaN;
+
+    expect(result.status, result.message).toBe("valid");
+    expect(firstCurrent).toBeCloseTo(-0.000_25, 10);
+    expect(secondCurrent).toBeCloseTo(3 * firstCurrent, 10);
+    expect(
+      (initial?.resistor?.terminalCurrents?.b ?? Number.NaN) +
+        (initial?.capacitor?.terminalCurrents?.a ?? Number.NaN) +
+        (initial?.["capacitor-2"]?.terminalCurrents?.a ?? Number.NaN),
+    ).toBeCloseTo(0, 10);
+  });
+
+  it("keeps split initial capacitor currents finite when current and capacitance are large", () => {
+    const document = parallelCapacitorsCircuit("switch");
+    Object.assign(document.parts.find(({ id }) => id === "source"), { voltageVolts: 1e150 });
+    Object.assign(document.parts.find(({ id }) => id === "resistor"), { resistanceOhms: 1 });
+    Object.assign(document.parts.find(({ id }) => id === "capacitor-1"), { capacitanceFarads: 1e200 });
+    Object.assign(document.parts.find(({ id }) => id === "capacitor-2"), { capacitanceFarads: 1e200 });
+
+    const result = simulateTransient(document, { durationSeconds: 0.1, timeStepSeconds: 0.1 });
+    const firstCurrent = result.samples[0]?.parts["capacitor-1"]?.currentAmps ?? Number.NaN;
+    const secondCurrent = result.samples[0]?.parts["capacitor-2"]?.currentAmps ?? Number.NaN;
+
+    expect(result.status, result.message).toBe("valid");
+    expect(Number.isFinite(firstCurrent)).toBe(true);
+    expect(Number.isFinite(secondCurrent)).toBe(true);
+    expect(firstCurrent / 1e150).toBeCloseTo(0.5, 12);
+    expect(secondCurrent / 1e150).toBeCloseTo(0.5, 12);
+  });
+
   it("satisfies inductor initial current exactly at t=0", () => {
     const document: CircuitDocument = {
       title: "Inductor initial current",
@@ -152,6 +221,309 @@ describe("simulateTransient", () => {
     expect(result.status, result.message).toBe("valid");
     expect(result.samples[1]?.parts.inductor?.currentAmps).toBeCloseTo(1 / 1100, 7);
     expect(result.samples.at(-1)?.parts.inductor?.currentAmps).toBeCloseTo(0.01, 5);
+  });
+
+  it("follows backward-Euler KVL and KCL in a series RLC circuit", () => {
+    const resistance = 10;
+    const inductance = 0.2;
+    const capacitance = 0.01;
+    const sourceVoltage = 3;
+    const timeStep = 0.01;
+    const steps = 8;
+    const document: CircuitDocument = {
+      title: "Series RLC",
+      parts: [
+        part("source", "battery", { voltageVolts: sourceVoltage }),
+        part("resistor", "resistor", { resistanceOhms: resistance }),
+        part("inductor", "inductor", { inductanceHenries: inductance, initialCurrentAmps: 0 }),
+        part("capacitor", "capacitor", { capacitanceFarads: capacitance, initialVoltageVolts: 0 }),
+        part("ground", "ground"),
+      ],
+      wires: [
+        wire("wire-source-r", "source", "a", "resistor", "a"),
+        wire("wire-r-l", "resistor", "b", "inductor", "a"),
+        wire("wire-l-c", "inductor", "b", "capacitor", "a"),
+        wire("wire-c-ground", "capacitor", "b", "ground", "a"),
+        wire("wire-source-ground", "source", "b", "ground", "a"),
+      ],
+    };
+    const result = simulateTransient(document, {
+      durationSeconds: steps * timeStep,
+      timeStepSeconds: timeStep,
+    });
+
+    expect(result.status, result.message).toBe("valid");
+    let previousCurrent = 0;
+    let capacitorVoltage = 0;
+    for (let index = 1; index <= steps; index += 1) {
+      const inductiveResistance = inductance / timeStep;
+      const capacitiveResistance = timeStep / capacitance;
+      const expectedCurrent = (sourceVoltage - capacitorVoltage + inductiveResistance * previousCurrent) /
+        (resistance + inductiveResistance + capacitiveResistance);
+      capacitorVoltage += expectedCurrent * capacitiveResistance;
+      const sample = result.samples[index];
+
+      expect(sample?.parts.resistor?.currentAmps).toBeCloseTo(expectedCurrent, 10);
+      expect(sample?.parts.inductor?.currentAmps).toBeCloseTo(expectedCurrent, 10);
+      expect(sample?.parts.capacitor?.currentAmps).toBeCloseTo(expectedCurrent, 10);
+      expect(sample?.parts.resistor?.voltageVolts).toBeCloseTo(resistance * expectedCurrent, 10);
+      expect(sample?.parts.capacitor?.voltageVolts).toBeCloseTo(capacitorVoltage, 10);
+      expect(sample?.parts.inductor?.voltageVolts).toBeCloseTo(
+        inductance / timeStep * (expectedCurrent - previousCurrent),
+        10,
+      );
+      expect(
+        sourceVoltage - (sample?.parts.resistor?.voltageVolts ?? 0) -
+          (sample?.parts.inductor?.voltageVolts ?? 0) - (sample?.parts.capacitor?.voltageVolts ?? 0),
+      ).toBeCloseTo(0, 10);
+      previousCurrent = expectedCurrent;
+    }
+  });
+
+  it("uses the actual shorter final time step for the capacitor state update", () => {
+    const result = simulateTransient(rcCircuit(), { durationSeconds: 0.025, timeStepSeconds: 0.01 });
+
+    expect(result.status, result.message).toBe("valid");
+    const first = 1 / 101;
+    const second = (first + 0.01) / 1.01;
+    const final = (second + 0.005) / 1.005;
+    expect(result.samples.at(-1)?.parts.capacitor?.voltageVolts).toBeCloseTo(final, 12);
+    expect(result.samples.at(-1)?.parts.capacitor?.currentAmps).toBeCloseTo(
+      0.001 / 0.005 * (final - second),
+      12,
+    );
+  });
+
+  it("lets a switch stop and resume RC charging according to the supplied state", () => {
+    const document: CircuitDocument = {
+      title: "Switched RC",
+      parts: [
+        part("source", "battery", { voltageVolts: 1 }),
+        part("switch", "switch"),
+        part("resistor", "resistor", { resistanceOhms: 100 }),
+        part("capacitor", "capacitor", { capacitanceFarads: 0.01, initialVoltageVolts: 0 }),
+        part("ground", "ground"),
+      ],
+      wires: [
+        wire("wire-source-switch", "source", "a", "switch", "a"),
+        wire("wire-switch-r", "switch", "b", "resistor", "a"),
+        wire("wire-r-c", "resistor", "b", "capacitor", "a"),
+        wire("wire-c-ground", "capacitor", "b", "ground", "a"),
+        wire("wire-source-ground", "source", "b", "ground", "a"),
+      ],
+    };
+    const closed = simulateTransient(document, {
+      durationSeconds: 0.1,
+      timeStepSeconds: 0.1,
+      switchStates: { switch: true },
+    });
+    const open = simulateTransient(document, {
+      durationSeconds: 0.1,
+      timeStepSeconds: 0.1,
+      switchStates: { switch: false },
+    });
+
+    expect(closed.status, closed.message).toBe("valid");
+    expect(closed.samples[1]?.parts.capacitor?.voltageVolts).toBeCloseTo(1 / 11, 10);
+    expect(open.status, open.message).toBe("valid");
+    expect(open.samples[1]?.parts.capacitor?.voltageVolts).toBeCloseTo(0, 12);
+    expect(open.samples[1]?.parts.resistor?.currentAmps).toBeCloseTo(0, 12);
+  });
+
+  it("shares the initial current of equal-voltage capacitors connected by a closed switch", () => {
+    const document = parallelCapacitorsCircuit("switch");
+    const result = simulateTransient(document, { durationSeconds: 0.01, timeStepSeconds: 0.01 });
+    const initial = result.samples[0]?.parts;
+    const currentAt = (partId: string, terminal: "a" | "b") =>
+      initial?.[partId]?.terminalCurrents?.[terminal] ?? Number.NaN;
+
+    expect(result.status, result.message).toBe("valid");
+    expect(initial?.["capacitor-1"]?.currentAmps).toBeCloseTo(0.0005, 9);
+    expect(initial?.["capacitor-2"]?.currentAmps).toBeCloseTo(0.0005, 9);
+    expect(initial?.link?.currentAmps).toBeCloseTo(0.0005, 9);
+    expect(currentAt("resistor", "b") + currentAt("capacitor-1", "a") + currentAt("link", "a"))
+      .toBeCloseTo(0, 10);
+    expect(currentAt("link", "b") + currentAt("capacitor-2", "a")).toBeCloseTo(0, 10);
+  });
+
+  it("shares initial capacitor current through a connected ammeter and preserves terminal KCL", () => {
+    const result = simulateTransient(parallelCapacitorsCircuit("ammeter"), {
+      durationSeconds: 0.01,
+      timeStepSeconds: 0.01,
+    });
+    const initial = result.samples[0]?.parts;
+    const currentAt = (partId: string, terminal: "a" | "b") =>
+      initial?.[partId]?.terminalCurrents?.[terminal] ?? Number.NaN;
+
+    expect(result.status, result.message).toBe("valid");
+    expect(initial?.link?.meterStatus).toBe("connected");
+    expect(initial?.["capacitor-1"]?.currentAmps).toBeCloseTo(0.0005, 9);
+    expect(initial?.["capacitor-2"]?.currentAmps).toBeCloseTo(0.0005, 9);
+    expect(initial?.link?.currentAmps).toBeCloseTo(0.0005, 9);
+    expect(currentAt("resistor", "b") + currentAt("capacitor-1", "a") + currentAt("link", "a"))
+      .toBeCloseTo(0, 10);
+    expect(currentAt("link", "b") + currentAt("capacitor-2", "a")).toBeCloseTo(0, 10);
+  });
+
+  it("respects an open switch override when grouping initial capacitor constraints", () => {
+    const document = parallelCapacitorsCircuit("switch");
+    const result = simulateTransient(document, {
+      durationSeconds: 0.01,
+      timeStepSeconds: 0.01,
+      switchStates: { link: false },
+    });
+    const initial = result.samples[0]?.parts;
+
+    expect(result.status, result.message).toBe("valid");
+    expect(initial?.["capacitor-1"]?.currentAmps).toBeCloseTo(0.001, 9);
+    expect(initial?.["capacitor-2"]?.currentAmps).toBeCloseTo(0, 12);
+    expect(initial?.link?.currentAmps).toBeCloseTo(0, 12);
+    expect(initial?.link?.voltageVolts).toBeCloseTo(0, 12);
+  });
+
+  it("keeps a wire-bypassed ammeter marked floating at the initial sample", () => {
+    const document: CircuitDocument = {
+      title: "Wire-bypassed ammeter during transient analysis",
+      parts: [
+        part("source", "battery", { voltageVolts: 1 }),
+        part("resistor", "resistor", { resistanceOhms: 1000 }),
+        part("capacitor", "capacitor", { capacitanceFarads: 1e-3, initialVoltageVolts: 0 }),
+        part("ammeter", "ammeter"),
+        part("ground", "ground"),
+      ],
+      wires: [
+        wire("wire-source-r", "source", "a", "resistor", "a"),
+        wire("wire-r-c", "resistor", "b", "capacitor", "a"),
+        wire("wire-c-ground", "capacitor", "b", "ground", "a"),
+        wire("wire-source-ground", "source", "b", "ground", "a"),
+        wire("wire-meter-a", "ammeter", "a", "resistor", "b"),
+        wire("wire-meter-b", "ammeter", "b", "resistor", "b"),
+      ],
+    };
+    const result = simulateTransient(document, { durationSeconds: 0.01, timeStepSeconds: 0.01 });
+
+    expect(result.status, result.message).toBe("valid");
+    expect(result.samples[0]?.parts.ammeter?.meterStatus).toBe("floating");
+  });
+
+  it("preserves op-amp load current through a closed switch in the initial sample", () => {
+    const document: CircuitDocument = {
+      title: "Op-amp load through a switch",
+      parts: [
+        part("input", "battery", { voltageVolts: 5 }),
+        part("opamp", "op-amp"),
+        part("resistor", "resistor", { resistanceOhms: 1000 }),
+        part("switch", "switch", { initiallyClosed: true }),
+        part("ground", "ground"),
+      ],
+      wires: [
+        wire("wire-input-positive", "input", "a", "opamp", "a"),
+        wire("wire-input-ground", "input", "b", "ground", "a"),
+        wire("wire-opamp-load", "opamp", "c", "resistor", "a"),
+        wire("wire-load-switch", "resistor", "b", "switch", "a"),
+        wire("wire-switch-ground", "switch", "b", "ground", "a"),
+      ],
+    };
+    const result = simulateTransient(document, { durationSeconds: 0.01, timeStepSeconds: 0.01 });
+
+    expect(result.status, result.message).toBe("valid");
+    expect(result.samples[0]?.parts.switch?.currentAmps).toBeCloseTo(15 / 1020, 8);
+  });
+
+  it.each(["constructor", "toString", "__proto__"])(
+    "does not treat inherited switch state properties as a closed switch for id %s",
+    (switchId) => {
+      const document: CircuitDocument = {
+        title: "Switch with prototype-like id",
+        parts: [
+          part("source", "battery", { voltageVolts: 1 }),
+          part(switchId, "switch", { initiallyClosed: false }),
+          part("resistor", "resistor", { resistanceOhms: 100 }),
+          part("capacitor", "capacitor", { capacitanceFarads: 0.01, initialVoltageVolts: 0 }),
+          part("ground", "ground"),
+        ],
+        wires: [
+          wire("wire-source-switch", "source", "a", switchId, "a"),
+          wire("wire-switch-r", switchId, "b", "resistor", "a"),
+          wire("wire-r-c", "resistor", "b", "capacitor", "a"),
+          wire("wire-c-ground", "capacitor", "b", "ground", "a"),
+          wire("wire-source-ground", "source", "b", "ground", "a"),
+        ],
+      };
+      const result = simulateTransient(document, {
+        durationSeconds: 0.1,
+        timeStepSeconds: 0.1,
+        switchStates: {},
+      });
+
+      expect(result.status, result.message).toBe("valid");
+      expect(result.samples[1]?.parts.capacitor?.voltageVolts).toBeCloseTo(0, 12);
+      expect(result.samples[1]?.parts.resistor?.currentAmps).toBeCloseTo(0, 12);
+    },
+  );
+
+  it("keeps generated history-source ids unique when an existing wire uses the generated id", () => {
+    const document = rcCircuit();
+    document.wires[0] = { ...document.wires[0]!, id: "__transient_capacitor_history" };
+    const result = simulateTransient(document, { durationSeconds: 0.01, timeStepSeconds: 0.01 });
+
+    expect(result.status, result.message).toBe("valid");
+    expect(result.samples[1]?.parts.capacitor?.voltageVolts).toBeCloseTo(1 / 101, 10);
+  });
+
+  it("retains inductor history when its id is a prototype property name", () => {
+    const prototypeId = "__proto__";
+    const document: CircuitDocument = {
+      title: "Prototype-like inductor id",
+      parts: [
+        part("source", "battery", { voltageVolts: 3 }),
+        part("resistor", "resistor", { resistanceOhms: 5 }),
+        part(prototypeId, "inductor", { inductanceHenries: 0.2, initialCurrentAmps: 0.2 }),
+        part("ground", "ground"),
+      ],
+      wires: [
+        wire("wire-source-r", "source", "a", "resistor", "a"),
+        wire("wire-r-l", "resistor", "b", prototypeId, "a"),
+        wire("wire-l-ground", prototypeId, "b", "ground", "a"),
+        wire("wire-source-ground", "source", "b", "ground", "a"),
+      ],
+    };
+    const result = simulateTransient(document, { durationSeconds: 0.1, timeStepSeconds: 0.1 });
+    const expectedCurrent = (3 + 0.2 / 0.1 * 0.2) / (5 + 0.2 / 0.1);
+
+    expect(result.status, result.message).toBe("valid");
+    expect(result.samples[1]?.parts[prototypeId]?.currentAmps).toBeCloseTo(expectedCurrent, 10);
+  });
+
+  it("decays an initial inductor current by the backward-Euler RL factor", () => {
+    const resistance = 8;
+    const inductance = 2;
+    const timeStep = 0.1;
+    const initialCurrent = 0.5;
+    const document: CircuitDocument = {
+      title: "RL natural response",
+      parts: [
+        part("inductor", "inductor", { inductanceHenries: inductance, initialCurrentAmps: initialCurrent }),
+        part("resistor", "resistor", { resistanceOhms: resistance }),
+      ],
+      wires: [
+        wire("wire-a", "inductor", "a", "resistor", "a"),
+        wire("wire-b", "inductor", "b", "resistor", "b"),
+      ],
+    };
+    const result = simulateTransient(document, { durationSeconds: 0.4, timeStepSeconds: timeStep });
+
+    expect(result.status, result.message).toBe("valid");
+    let expectedCurrent = initialCurrent;
+    for (let index = 1; index <= 4; index += 1) {
+      expectedCurrent /= 1 + resistance * timeStep / inductance;
+      expect(result.samples[index]?.parts.inductor?.currentAmps).toBeCloseTo(expectedCurrent, 11);
+      expect(result.samples[index]?.parts.resistor?.currentAmps).toBeCloseTo(-expectedCurrent, 11);
+      expect(result.samples[index]?.parts.inductor?.voltageVolts).toBeCloseTo(
+        inductance / timeStep * (expectedCurrent - (result.samples[index - 1]?.parts.inductor?.currentAmps ?? 0)),
+        10,
+      );
+    }
   });
 
   it("starts from the DC operating point when requested", () => {
@@ -196,6 +568,42 @@ describe("simulateTransient", () => {
     expect(result.samples[100]?.parts.source?.voltageVolts).toBeCloseTo(-Math.SQRT2 * 5, 8);
   });
 
+  it("applies AC phase and offset at every sample and reports the corresponding load power", () => {
+    const rmsVoltage = 2;
+    const frequency = 50;
+    const phaseDegrees = 90;
+    const offsetVolts = 1.25;
+    const resistance = 20;
+    const document: CircuitDocument = {
+      title: "Offset AC input",
+      parts: [
+        part("source", "ac-source", {
+          voltageVolts: rmsVoltage,
+          frequencyHz: frequency,
+          phaseDegrees,
+          offsetVolts,
+        }),
+        part("load", "resistor", { resistanceOhms: resistance }),
+        part("ground", "ground"),
+      ],
+      wires: [
+        wire("wire-source-load", "source", "a", "load", "a"),
+        wire("wire-load-ground", "load", "b", "ground", "a"),
+        wire("wire-source-ground", "source", "b", "ground", "a"),
+      ],
+    };
+    const result = simulateTransient(document, { durationSeconds: 0.01, timeStepSeconds: 0.0025 });
+
+    expect(result.status, result.message).toBe("valid");
+    for (const sample of result.samples) {
+      const angle = 2 * Math.PI * frequency * sample.timeSeconds + phaseDegrees * Math.PI / 180;
+      const expectedVoltage = offsetVolts + Math.SQRT2 * rmsVoltage * Math.cos(angle);
+      expect(sample.parts.source.voltageVolts).toBeCloseTo(expectedVoltage, 9);
+      expect(sample.parts.load.currentAmps).toBeCloseTo(expectedVoltage / resistance, 9);
+      expect(sample.parts.load.powerWatts).toBeCloseTo(expectedVoltage ** 2 / resistance, 9);
+    }
+  });
+
   it("rectifies the AC waveform with a nonlinear diode", () => {
     const document: CircuitDocument = {
       title: "Half-wave rectifier",
@@ -235,6 +643,23 @@ describe("simulateTransient", () => {
 
     expect(result.status).toBe("invalid");
     expect(result.message).toContain("初期電圧");
+  });
+
+  it("rejects even a tiny initial-voltage mismatch between parallel capacitors", () => {
+    const document = rcCircuit();
+    document.parts.push(part("capacitor-2", "capacitor", {
+      capacitanceFarads: 1e-6,
+      initialVoltageVolts: 1e-9,
+    }));
+    document.wires.push(
+      wire("wire-parallel-a", "capacitor", "a", "capacitor-2", "a"),
+      wire("wire-parallel-b", "capacitor", "b", "capacitor-2", "b"),
+    );
+    const result = simulateTransient(document, { durationSeconds: 0.01, timeStepSeconds: 0.001 });
+
+    expect(result.status).toBe("invalid");
+    expect(result.message).toContain("初期電圧");
+    expect(result.samples).toHaveLength(0);
   });
 
   it("returns invalid for malformed input documents instead of throwing", () => {
@@ -285,6 +710,32 @@ describe("simulateTransient", () => {
       expect(simulateTransient(explicitNull, { durationSeconds: 0.01, timeStepSeconds: 0.001 }).status)
         .toBe("invalid");
     }
+  });
+
+  it("rejects invalid source values before transient source overrides can mask them", () => {
+    const invalidBattery = rcCircuit();
+    Object.assign(invalidBattery.parts[0], { voltageVolts: 0 });
+    expect(simulateTransient(invalidBattery, { durationSeconds: 0.01, timeStepSeconds: 0.01 }).status)
+      .toBe("invalid");
+
+    const invalidAcSource = rcCircuit();
+    Object.assign(invalidAcSource.parts[0], {
+      kind: "ac-source",
+      frequencyHz: 50,
+      voltageVolts: Number.NaN,
+    });
+    expect(simulateTransient(invalidAcSource, { durationSeconds: 0.01, timeStepSeconds: 0.01 }).status)
+      .toBe("invalid");
+  });
+
+  it("rejects a time step whose capacitor companion values overflow", () => {
+    const result = simulateTransient(rcCircuit(), {
+      durationSeconds: Number.MIN_VALUE,
+      timeStepSeconds: Number.MIN_VALUE,
+    });
+
+    expect(result.status).toBe("invalid");
+    expect(result.samples).toHaveLength(1);
   });
 
   it("rejects invalid, oversized, and excessively expensive analyses before solving", () => {

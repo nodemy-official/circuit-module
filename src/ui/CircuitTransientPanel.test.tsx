@@ -23,16 +23,18 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-function mount(document: CircuitDocument = createCircuitExample("charging"), baselineDocument?: CircuitDocument, onFrameChange?: (frame: CircuitTransientFrame | null) => void) {
+function mount(document: CircuitDocument = createCircuitExample("charging"), baselineDocument?: CircuitDocument, onFrameChange?: (frame: CircuitTransientFrame | null) => void, active = true) {
   const container = window.document.createElement("div");
   window.document.body.append(container);
   const root = createRoot(container);
   let currentDocument = document;
   let currentBaseline = baselineDocument;
-  const render = (nextDocument = currentDocument, nextBaseline = currentBaseline) => {
+  let currentActive = active;
+  const render = (nextDocument = currentDocument, nextBaseline = currentBaseline, nextActive = currentActive) => {
     currentDocument = nextDocument;
     currentBaseline = nextBaseline;
-    act(() => root.render(<CircuitTransientPanel document={currentDocument} baselineDocument={currentBaseline} onFrameChange={onFrameChange} />));
+    currentActive = nextActive;
+    act(() => root.render(<CircuitTransientPanel document={currentDocument} baselineDocument={currentBaseline} onFrameChange={onFrameChange} active={currentActive} />));
   };
   render();
   const record = { root, container };
@@ -40,6 +42,9 @@ function mount(document: CircuitDocument = createCircuitExample("charging"), bas
   return {
     container,
     render,
+    setActive(nextActive: boolean) {
+      render(currentDocument, currentBaseline, nextActive);
+    },
     unmount() {
       act(() => root.unmount());
       const index = mounted.indexOf(record);
@@ -120,6 +125,51 @@ describe("CircuitTransientPanel synchronized waveforms", () => {
     expect(buttonWithText(ui.container, "再生").getAttribute("aria-pressed")).toBe("false");
     click(buttonWithText(ui.container, "先頭へ"));
     expect(slider?.dataset.sampleIndex).toBe("0");
+  });
+
+  it("stops inactive playback while keeping the result and cursor, without resuming on activation", () => {
+    vi.useFakeTimers();
+    const frames: Array<CircuitTransientFrame | null> = [];
+    const ui = mount(createCircuitExample("charging"), undefined, (frame) => frames.push(frame));
+    click(buttonWithText(ui.container, "波形を計算"));
+
+    const slider = ui.container.querySelector<HTMLInputElement>('.circuit-transient__time-controls input[type="range"]');
+    if (!slider) { throw new Error("Missing common time cursor"); }
+    setRangeValue(slider, 80);
+    click(buttonWithText(ui.container, "再生"));
+    act(() => vi.advanceTimersByTime(100));
+    expect(Number(slider.dataset.sampleIndex)).toBeGreaterThan(80);
+
+    ui.setActive(false);
+    const pausedIndex = Number(slider.dataset.sampleIndex);
+    expect(buttonWithText(ui.container, "再生").getAttribute("aria-pressed")).toBe("false");
+    expect(pausedIndex).toBeGreaterThan(80);
+    expect(ui.container.querySelector(".circuit-waveform__trace")).not.toBeNull();
+    expect(ui.container.querySelector(".circuit-transient__readings tbody tr")).not.toBeNull();
+    expect(frames.at(-1)?.sampleIndex).toBe(pausedIndex);
+
+    act(() => vi.advanceTimersByTime(150));
+    expect(Number(slider.dataset.sampleIndex)).toBe(pausedIndex);
+    ui.setActive(true);
+    act(() => vi.advanceTimersByTime(150));
+    expect(Number(slider.dataset.sampleIndex)).toBe(pausedIndex);
+    expect(buttonWithText(ui.container, "再生").getAttribute("aria-pressed")).toBe("false");
+    expect(frames.at(-1)?.sampleIndex).toBe(pausedIndex);
+  });
+
+  it("opens by default when requested and still allows the user to close the waveform details", () => {
+    const container = window.document.createElement("div");
+    window.document.body.append(container);
+    const root = createRoot(container);
+    mounted.push({ root, container });
+    act(() => root.render(<CircuitTransientPanel document={createCircuitExample("charging")} defaultOpen />));
+    const details = container.querySelector<HTMLDetailsElement>("details.circuit-transient");
+    expect(details?.open).toBe(true);
+    if (!details) { throw new Error("Missing waveform details"); }
+    click(details.querySelector("summary")!);
+    expect(details.open).toBe(false);
+    act(() => root.render(<CircuitTransientPanel document={createCircuitExample("charging")} defaultOpen />));
+    expect(details.open).toBe(false);
   });
 
   it("does not overlay a baseline part when the component kind changed", () => {

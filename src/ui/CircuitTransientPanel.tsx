@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState, type ComponentPropsWithoutRef } from "react";
+import { useEffect, useId, useRef, useState, type ComponentPropsWithoutRef, type Dispatch, type SetStateAction } from "react";
 import type { CircuitDocument } from "../circuit-model.js";
 import type { CircuitTransientFrame } from "../circuit-visualization.js";
 import { simulateTransient, type TransientAnalysis, type TransientSample } from "../transient-solver.js";
@@ -8,6 +8,7 @@ const format = (value: number | undefined) =>
   value === undefined || !Number.isFinite(value) ? "—" : Number(value.toPrecision(4)).toString();
 const MAX_WAVEFORM_PARTS = 3;
 const PLAYBACK_INTERVAL_MS = 50;
+type ValidTransientAnalysis = TransientAnalysis & { status: "valid" };
 
 type Quantity = "voltageVolts" | "currentAmps";
 type WaveformPart = CircuitDocument["parts"][number];
@@ -23,6 +24,20 @@ function defaultPartIds(parts: readonly WaveformPart[]) {
   const resistive = parts.filter((part) => part.kind === "resistor" || part.kind === "bulb" || part.kind === "potentiometer");
   const remaining = parts.filter((part) => !storage.includes(part) && !resistive.includes(part));
   return [...storage, ...resistive, ...remaining].slice(0, MAX_WAVEFORM_PARTS).map((part) => part.id);
+}
+
+function canPlayTransient(active: boolean, playing: boolean, analysis: TransientAnalysis | null): analysis is ValidTransientAnalysis {
+  return active && playing && analysis?.status === "valid" && analysis.samples.length > 1;
+}
+
+function useStopPlaybackWhenInactive(
+  active: boolean,
+  analysis: TransientAnalysis | null,
+  setPlaying: Dispatch<SetStateAction<boolean>>,
+) {
+  useEffect(() => {
+    if (!active || analysis?.status !== "valid") { setPlaying(false); }
+  }, [active, analysis, setPlaying]);
 }
 
 function valuesFor(samples: readonly TransientSample[], partId: string, quantity: Quantity) {
@@ -281,6 +296,10 @@ export interface CircuitTransientPanelProps extends Omit<ComponentPropsWithoutRe
   document: CircuitDocument;
   baselineDocument?: CircuitDocument;
   onFrameChange?: (frame: CircuitTransientFrame | null) => void;
+  /** Pause playback while a containing tab is inactive, retaining the current result and cursor. */
+  active?: boolean;
+  /** Initial open state used when this panel is shown without its surrounding settings. */
+  defaultOpen?: boolean;
 }
 
 /** Bounded transient analysis with synchronized multi-part waveforms and an optional baseline comparison. */
@@ -288,6 +307,9 @@ export function CircuitTransientPanel({
   document,
   baselineDocument,
   onFrameChange,
+  active = true,
+  defaultOpen = false,
+  open: openProp = defaultOpen,
   className = "",
   ...props
 }: CircuitTransientPanelProps) {
@@ -377,9 +399,7 @@ export function CircuitTransientPanel({
     setSampleIndex(index);
   };
 
-  useEffect(() => {
-    if (current?.status !== "valid") { setPlaying(false); }
-  }, [current]);
+  useStopPlaybackWhenInactive(active, current, setPlaying);
 
   useEffect(() => {
     if (current?.status !== "valid" || !cursorSample) {
@@ -392,7 +412,7 @@ export function CircuitTransientPanel({
   useEffect(() => () => { onFrameChangeRef.current?.(null); }, []);
 
   useEffect(() => {
-    if (!playing || current?.status !== "valid" || current.samples.length < 2) { return; }
+    if (!canPlayTransient(active, playing, current)) { return; }
     const finalIndex = current.samples.length - 1;
     const increment = Math.max(1, Math.ceil(finalIndex / 200));
     const timer = window.setInterval(() => {
@@ -402,10 +422,10 @@ export function CircuitTransientPanel({
       if (nextIndex >= finalIndex) { setPlaying(false); }
     }, PLAYBACK_INTERVAL_MS);
     return () => window.clearInterval(timer);
-  }, [playing, current]);
+  }, [active, playing, current]);
 
   const stale = Boolean(result && !resultMatches);
-  return <details {...props} className={`circuit-transient ${className}`}>
+  return <details {...props} open={openProp} className={`circuit-transient ${className}`}>
     <summary>時間波形・過渡解析</summary>
     <label htmlFor={`${id}-duration`}>解析時間 (s)</label>
     <input id={`${id}-duration`} type="number" min="0" step="any" value={duration} onChange={(event) => numberChange(event.target.valueAsNumber, setDuration)} />

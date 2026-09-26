@@ -361,4 +361,285 @@ describe("analyzeCircuit", () => {
     expect(result.issues).toEqual([{ severity: "error", message: result.message }]);
     expect(result.parts).toEqual({});
   });
+
+  it("solves a balanced bridge and preserves terminal and power readings", () => {
+    const document: CircuitDocument = {
+      title: "平衡ブリッジ",
+      parts: [
+        part("battery", "battery", { voltageVolts: 10 }),
+        part("top", "junction"),
+        part("left", "junction"),
+        part("right", "junction"),
+        part("bottom", "junction"),
+        part("r1", "resistor", { resistanceOhms: 100 }),
+        part("r2", "resistor", { resistanceOhms: 100 }),
+        part("r3", "resistor", { resistanceOhms: 100 }),
+        part("r4", "resistor", { resistanceOhms: 100 }),
+        part("bridge", "resistor", { resistanceOhms: 100 }),
+      ],
+      wires: [
+        wire("w1", "battery", "a", "top", "a"),
+        wire("w2", "top", "a", "r1", "a"),
+        wire("w3", "top", "a", "r3", "a"),
+        wire("w4", "r1", "b", "left", "a"),
+        wire("w5", "r3", "b", "right", "a"),
+        wire("w6", "left", "a", "r2", "a"),
+        wire("w7", "right", "a", "r4", "a"),
+        wire("w8", "left", "a", "bridge", "a"),
+        wire("w9", "bridge", "b", "right", "a"),
+        wire("w10", "r2", "b", "bottom", "a"),
+        wire("w11", "r4", "b", "bottom", "a"),
+        wire("w12", "bottom", "a", "battery", "b"),
+      ],
+    };
+
+    const result = analyzeCircuit(document);
+    const branchCurrent = Math.abs(result.parts.r1.currentAmps);
+
+    expect(result.status).toBe("closed");
+    expect(result.currentAmps).toBeCloseTo(0.1, 5);
+    expect(branchCurrent).toBeCloseTo(0.05, 5);
+    expect(Math.abs(result.parts.r2.currentAmps)).toBeCloseTo(branchCurrent, 5);
+    expect(Math.abs(result.parts.r3.currentAmps)).toBeCloseTo(branchCurrent, 5);
+    expect(Math.abs(result.parts.r4.currentAmps)).toBeCloseTo(branchCurrent, 5);
+    expect(result.parts.bridge.currentAmps).toBeCloseTo(0, 8);
+    expect(result.parts.r1.voltageVolts).toBeCloseTo(5, 5);
+    expect(result.parts.r1.terminalVoltages!.a! - result.parts.r1.terminalVoltages!.b!)
+      .toBeCloseTo(result.parts.r1.voltageVolts, 8);
+    expect(
+      result.parts.r1.powerWatts + result.parts.r2.powerWatts +
+        result.parts.r3.powerWatts + result.parts.r4.powerWatts,
+    ).toBeCloseTo(result.parts.battery.powerWatts, 5);
+  });
+
+  it("keeps low currents and their terminal readings instead of rounding them to zero", () => {
+    const document: CircuitDocument = {
+      title: "微小電流",
+      parts: [
+        part("battery", "battery", { voltageVolts: 9 }),
+        part("load", "resistor", { resistanceOhms: 100_000_000 }),
+      ],
+      wires: [
+        wire("w1", "battery", "a", "load", "a"),
+        wire("w2", "load", "b", "battery", "b"),
+      ],
+    };
+
+    const result = analyzeCircuit(document);
+    const expectedCurrent = 9 / 100_000_000;
+
+    expect(result.status).toBe("closed");
+    expect(result.currentAmps).toBeCloseTo(expectedCurrent, 12);
+    expect(result.parts.load.currentAmps).toBeCloseTo(expectedCurrent, 12);
+    expect(result.parts.battery.currentAmps).toBeCloseTo(-expectedCurrent, 12);
+    expect(result.wireCurrents.w1).toBeCloseTo(expectedCurrent, 12);
+    expect(result.parts.load.terminalCurrents?.a).toBeCloseTo(expectedCurrent, 12);
+    expect(result.parts.load.powerWatts).toBeCloseTo(expectedCurrent ** 2 * 100_000_000, 12);
+  });
+
+  it("preserves a low current measured by a series ammeter", () => {
+    const document: CircuitDocument = {
+      title: "微小電流の直列計測",
+      parts: [
+        part("battery", "battery", { voltageVolts: 9 }),
+        part("ammeter", "ammeter"),
+        part("load", "resistor", { resistanceOhms: 100_000_000 }),
+      ],
+      wires: [
+        wire("w1", "battery", "a", "ammeter", "a"),
+        wire("w2", "ammeter", "b", "load", "a"),
+        wire("w3", "load", "b", "battery", "b"),
+      ],
+    };
+
+    const result = analyzeCircuit(document);
+
+    expect(result.status).toBe("closed");
+    expect(result.parts.ammeter.currentAmps).toBeCloseTo(9 / 100_000_000, 12);
+    expect(result.parts.ammeter.currentAmps).not.toBe(0);
+  });
+
+  it("preserves a low source voltage and the resulting small current", () => {
+    const document: CircuitDocument = {
+      title: "微小電圧",
+      parts: [
+        part("battery", "battery", { voltageVolts: 1e-8 }),
+        part("load", "resistor", { resistanceOhms: 10 }),
+      ],
+      wires: [
+        wire("w1", "battery", "a", "load", "a"),
+        wire("w2", "load", "b", "battery", "b"),
+      ],
+    };
+
+    const result = analyzeCircuit(document);
+
+    expect(result.parts.load.voltageVolts).toBeCloseTo(1e-8, 14);
+    expect(result.parts.load.currentAmps).toBeCloseTo(1e-9, 14);
+    expect(result.parts.battery.voltageVolts).toBeCloseTo(1e-8, 14);
+  });
+
+  it("solves unequal parallel batteries and balances source and load power", () => {
+    const document: CircuitDocument = {
+      title: "異なる電池の並列",
+      parts: [
+        part("strong", "battery", { voltageVolts: 10, internalResistanceOhms: 1 }),
+        part("weak", "battery", { voltageVolts: 5, internalResistanceOhms: 2 }),
+        part("load", "resistor", { resistanceOhms: 4 }),
+        part("positive", "junction"),
+        part("negative", "junction"),
+      ],
+      wires: [
+        wire("w1", "strong", "a", "positive", "a"),
+        wire("w2", "weak", "a", "positive", "a"),
+        wire("w3", "load", "a", "positive", "a"),
+        wire("w4", "strong", "b", "negative", "a"),
+        wire("w5", "weak", "b", "negative", "a"),
+        wire("w6", "load", "b", "negative", "a"),
+      ],
+    };
+
+    const result = analyzeCircuit(document);
+    const loadCurrent = 50 / 28;
+
+    expect(result.status).toBe("closed");
+    expect(result.currentAmps).toBeNull();
+    expect(result.parts.load.currentAmps).toBeCloseTo(loadCurrent, 5);
+    expect(result.parts.strong.currentAmps).toBeCloseTo(-20 / 7, 5);
+    expect(result.parts.weak.currentAmps).toBeCloseTo(15 / 14, 5);
+    const wireLoss = Object.values(result.wireCurrents).reduce(
+      (loss, current) => loss + current ** 2 * 1e-6,
+      0,
+    );
+    expect(wireLoss).toBeCloseTo(25e-6, 9);
+    expect(result.parts.strong.powerWatts + result.parts.weak.powerWatts)
+      .toBeCloseTo(result.parts.load.powerWatts + wireLoss, 7);
+  });
+
+  it("treats inherited switch-state keys as absent and stores special IDs safely", () => {
+    const openSwitch: CircuitDocument = {
+      title: "継承キーのスイッチ状態",
+      parts: [
+        part("battery", "battery", { voltageVolts: 9 }),
+        part("toString", "switch", { initiallyClosed: false }),
+        part("load", "resistor", { resistanceOhms: 10 }),
+      ],
+      wires: [
+        wire("w1", "battery", "a", "toString", "a"),
+        wire("w2", "toString", "b", "load", "a"),
+        wire("w3", "load", "b", "battery", "b"),
+      ],
+    };
+    const specialIds: CircuitDocument = {
+      title: "特殊な辞書キー",
+      parts: [
+        part("__proto__", "battery", { voltageVolts: 6 }),
+        part("load", "resistor", { resistanceOhms: 6 }),
+      ],
+      wires: [
+        wire("__proto__", "__proto__", "a", "load", "a"),
+        wire("constructor", "load", "b", "__proto__", "b"),
+      ],
+    };
+
+    const openResult = analyzeCircuit(openSwitch);
+    const specialResult = analyzeCircuit(specialIds);
+
+    expect(openResult.status).toBe("open");
+    expect(openResult.parts.toString.currentAmps).toBe(0);
+    expect(specialResult.status).toBe("closed");
+    expect(Object.hasOwn(specialResult.parts, "__proto__")).toBe(true);
+    expect(Object.hasOwn(specialResult.wireCurrents, "__proto__")).toBe(true);
+    expect(Object.hasOwn(specialResult.wireCurrents, "constructor")).toBe(true);
+  });
+
+  it("rejects finite inputs whose Norton equivalent overflows", () => {
+    const document: CircuitDocument = {
+      title: "Norton電流のオーバーフロー",
+      parts: [
+        part("battery", "battery", { voltageVolts: 1e308 }),
+        part("load", "resistor", { resistanceOhms: 10 }),
+      ],
+      wires: [
+        wire("w1", "battery", "a", "load", "a"),
+        wire("w2", "load", "b", "battery", "b"),
+      ],
+    };
+
+    const result = analyzeCircuit(document);
+
+    expect(result.status).toBe("invalid");
+    expect(result.parts).toEqual({});
+    expect(result.wireCurrents).toEqual({});
+    expect(result.issues).toEqual([{ severity: "error", message: result.message }]);
+  });
+
+  it("rejects finite inputs whose calculated power exceeds the numeric range", () => {
+    const document: CircuitDocument = {
+      title: "電力計算のオーバーフロー",
+      parts: [
+        part("battery", "battery", { voltageVolts: 1e308, internalResistanceOhms: 1e100 }),
+        part("load", "resistor", { resistanceOhms: 10 }),
+      ],
+      wires: [
+        wire("w1", "battery", "a", "load", "a"),
+        wire("w2", "load", "b", "battery", "b"),
+      ],
+    };
+
+    const result = analyzeCircuit(document);
+
+    expect(result.status).toBe("invalid");
+    expect(result.parts).toEqual({});
+    expect(result.wireCurrents).toEqual({});
+  });
+
+  it("keeps an open resistor branch at exactly zero current in a branched circuit", () => {
+    const document = createExampleCircuit();
+    const branchedCircuit: CircuitDocument = {
+      ...document,
+      parts: [
+        ...document.parts,
+        part("branch", "junction"),
+        part("open-resistor", "resistor", { resistanceOhms: 10 }),
+      ],
+      wires: [
+        ...document.wires,
+        wire("branch-wire-a", "part-2", "b", "branch", "a"),
+        wire("branch-wire-b", "branch", "a", "open-resistor", "a"),
+      ],
+    };
+
+    const result = analyzeCircuit(branchedCircuit);
+
+    expect(result.status).toBe("closed");
+    expect(result.wireCurrents["branch-wire-a"]).toBe(0);
+    expect(result.wireCurrents["branch-wire-b"]).toBe(0);
+  });
+
+  it("reads zero volts across a resistor with its series switch turned off", () => {
+    const document: CircuitDocument = {
+      title: "スイッチ開放時の電圧計",
+      parts: [
+        part("source", "battery", { voltageVolts: 9 }),
+        part("ammeter", "ammeter"),
+        part("resistor", "resistor", { resistanceOhms: 30 }),
+        part("switch", "switch", { initiallyClosed: true }),
+        part("voltmeter", "voltmeter"),
+      ],
+      wires: [
+        wire("w1", "source", "a", "ammeter", "a"),
+        wire("w2", "ammeter", "b", "resistor", "a"),
+        wire("w3", "resistor", "b", "switch", "a"),
+        wire("w4", "switch", "b", "source", "b"),
+        wire("w5", "voltmeter", "a", "resistor", "a"),
+        wire("w6", "voltmeter", "b", "resistor", "b"),
+      ],
+    };
+
+    const result = analyzeCircuit(document, { switch: false });
+
+    expect(result.parts.ammeter.currentAmps).toBe(0);
+    expect(result.parts.voltmeter.voltageVolts).toBe(0);
+  });
 });

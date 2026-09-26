@@ -23,6 +23,12 @@ function openPartPreview(canvasElement: HTMLElement, partId: string) {
   part.dispatchEvent(new MouseEvent("dblclick", { bubbles: true, cancelable: true, detail: 2 }));
 }
 
+function openSidebarTab(canvasElement: HTMLElement, tab: "analysis" | "waveforms") {
+  const trigger = canvasElement.querySelector<HTMLButtonElement>(`[data-sidebar-tab="${tab}"]`);
+  if (!trigger) { throw new Error(`サイドバーの${tab}タブが見つかりません。`); }
+  trigger.click();
+}
+
 const shortCircuitDocument: CircuitDocument = {
   title: "短絡の確認",
   parts: [{
@@ -132,6 +138,18 @@ export const Interactive: Story = {
   render: () => <CircuitEditor><CircuitEditorLayout /></CircuitEditor>,
 };
 
+export const AnalysisTab: Story = {
+  name: "解析タブ",
+  render: () => <CircuitEditor><CircuitEditorLayout /></CircuitEditor>,
+  play: ({ canvasElement }) => openSidebarTab(canvasElement, "analysis"),
+};
+
+export const WaveformsTab: Story = {
+  name: "波形タブ",
+  render: () => <CircuitEditor initialDocument={createCircuitExample("charging")}><CircuitEditorLayout /></CircuitEditor>,
+  play: ({ canvasElement }) => openSidebarTab(canvasElement, "waveforms"),
+};
+
 export const Preview: Story = {
   name: "プレビュー",
   render: () => <CircuitEditor><CircuitEditorLayout /></CircuitEditor>,
@@ -217,7 +235,7 @@ export const Charging: Story = {
   parameters: {
     docs: {
       description: {
-        story: "「電位を色で表示」を有効にして、抵抗やコンデンサの端子電位を見比べます。「解析の設定」から「時間波形・過渡解析」を開き、「波形を計算」を押して部品を2〜3個選びます。共通の「時間カーソル」を動かすか「再生」すると、同時刻の数値と回路図上の状態が同期します。値を変更して比べるときは「プレビュー」を開き、基板の下にある「学習ビュー」で変更前後の波形と計測値を確認します。",
+        story: "回路図上部の「表示設定」から「電位を色で表示」を有効にして、抵抗やコンデンサの端子電位を見比べます。右側の「解析」タブでは定常解析の結果と接続チェックを確認できます。「波形」タブで「波形を計算」を押し、部品を2〜3個選びます。共通の「時間カーソル」を動かすか「再生」すると、同時刻の数値と回路図上の状態が同期します。部品を選ぶと右側の「プロパティ」タブで値を編集できます。変更前後を比べるときは「プレビュー」を開き、基板下の「学習ビュー」で波形と計測値を確認します。",
       },
     },
   },

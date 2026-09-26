@@ -4,7 +4,19 @@ import type { CircuitAnalysis, CircuitAnalysisOptions, CircuitPartReading } from
 
 const sourceKinds = new Set(["battery", "ac-source", "current-source"]);
 const magnitude = (value: ComplexValue) => Math.hypot(value.real, value.imaginary);
-const phase = (value: ComplexValue) => magnitude(value) < 1e-15 ? 0 : Math.atan2(value.imaginary, value.real) * 180 / Math.PI;
+const phase = (value: ComplexValue) =>
+  value.real === 0 && value.imaginary === 0
+    ? 0
+    : Math.atan2(value.imaginary, value.real) * 180 / Math.PI;
+
+function setRecordValue<T>(record: Record<string, T>, property: string, value: T) {
+  Object.defineProperty(record, property, {
+    configurable: true,
+    enumerable: true,
+    value,
+    writable: true,
+  });
+}
 
 function terminalValues(values: Partial<Record<CircuitTerminal, ComplexValue>>, ac: boolean) {
   return Object.fromEntries(Object.entries(values).map(([terminal, value]) =>
@@ -47,8 +59,36 @@ export function analyzeExtendedCircuit(
   const analog = analyzeAnalogCircuit(document, { mode, frequencyHz, switchStates });
   const parts: Record<string, CircuitPartReading> = {};
   for (const part of document.parts) {
+    if (!Object.hasOwn(analog.parts, part.id)) { continue; }
     const reading = analog.parts[part.id];
-    if (reading) { parts[part.id] = adaptReading(part, reading, mode === "ac"); }
+    if (reading) { setRecordValue(parts, part.id, adaptReading(part, reading, mode === "ac")); }
+  }
+  const finiteReadings = Object.values(parts).every((reading) => [
+    reading.voltageVolts,
+    reading.currentAmps,
+    reading.powerWatts,
+    reading.brightness,
+    reading.voltagePhaseDegrees,
+    reading.currentPhaseDegrees,
+    reading.reactivePowerVars,
+    ...Object.values(reading.terminalVoltages ?? {}),
+    ...Object.values(reading.terminalCurrents ?? {}),
+    ...Object.values(reading.terminalVoltagePhasesDegrees ?? {}),
+    ...Object.values(reading.terminalCurrentPhasesDegrees ?? {}),
+  ].every((value) => value === undefined || Number.isFinite(value)));
+  if (!finiteReadings) {
+    const message = "回路の計算結果が数値の範囲を超えました。電圧・電流・抵抗値を確認してください。";
+    return {
+      status: "invalid",
+      message,
+      mode,
+      ...(mode === "ac" ? { frequencyHz } : {}),
+      currentAmps: null,
+      parts: {},
+      bulbPowerWatts: {},
+      wireCurrents: {},
+      issues: [{ severity: "error", message }],
+    };
   }
   const sources = document.parts.filter((part) => sourceKinds.has(part.kind));
   const status = analog.status === "valid"

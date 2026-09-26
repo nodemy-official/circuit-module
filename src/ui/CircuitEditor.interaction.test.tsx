@@ -106,6 +106,10 @@ async function keyDownAndWait(target: Element, key: string) {
   });
 }
 
+async function waitForAnimationFrame() {
+  await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+}
+
 function changeNumber(target: Element, value: string) {
   if (!(target instanceof HTMLInputElement)) { throw new Error("Expected a number input"); }
   const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
@@ -152,6 +156,28 @@ function previewTab(container: ParentNode, name: "部品" | "解析設定"): HTM
 function activePreviewPanel(container: ParentNode): HTMLElement {
   const target = previewDialog(container).querySelector<HTMLElement>('[role="tabpanel"]:not([hidden])');
   if (!target) { throw new Error("Missing active preview tab panel"); }
+  return target;
+}
+
+function sidebarTab(container: ParentNode, name: "プロパティ" | "解析" | "波形"): HTMLButtonElement {
+  const target = [...container.querySelectorAll<HTMLButtonElement>('.circuit-editor__right [role="tab"]')]
+    .find((tab) => tab.textContent?.trim().includes(name));
+  if (!target) { throw new Error(`Missing sidebar tab: ${name}`); }
+  return target;
+}
+
+function sidebarPanel(container: ParentNode, name: "プロパティ" | "解析" | "波形"): HTMLElement {
+  const tab = sidebarTab(container, name);
+  const panelId = tab.getAttribute("aria-controls");
+  const target = [...container.querySelectorAll<HTMLElement>('.circuit-editor__right [role="tabpanel"]')]
+    .find((panel) => panel.id === panelId);
+  if (!target) { throw new Error(`Missing sidebar panel: ${name}`); }
+  return target;
+}
+
+function activeSidebarPanel(container: ParentNode): HTMLElement {
+  const target = container.querySelector<HTMLElement>('.circuit-editor__right [role="tabpanel"]:not([hidden])');
+  if (!target) { throw new Error("Missing active sidebar panel"); }
   return target;
 }
 
@@ -219,48 +245,102 @@ function focus(target: Element) {
   act(() => target.focus());
 }
 
-describe("CircuitEditor junction interactions", () => {
-  it("places selected readings in the farther left corner as the board moves", async () => {
-    let nodeTop = 70;
-    const originalRect = Element.prototype.getBoundingClientRect;
-    vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {
-      if (this.classList.contains("circuit-editor__canvas")) { return new DOMRect(0, 0, 800, 600); }
-      if (this.classList.contains("circuit-board__part") && this.getAttribute("data-part-id") === "part-2") {
-        return new DOMRect(350, nodeTop, 40, 40);
-      }
-      return originalRect.call(this);
-    });
+describe("CircuitEditor interactions", () => {
+  it("keeps analysis and selected part readings in the right sidebar tabs", () => {
     const ui = mount(createExampleCircuit());
-    click(required(ui.container, '.circuit-board__part[data-part-id="part-2"]'));
-    expect(required(ui.container, '.circuit-editor__selected-readings').getAttribute('data-corner')).toBe('bottom');
+    expect(required(ui.container, '.circuit-editor__right').getAttribute("aria-label")).toBe("回路の詳細");
+    expect(sidebarTab(ui.container, "プロパティ").getAttribute("aria-selected")).toBe("true");
+    expect(ui.container.querySelector('.circuit-editor__canvas .circuit-editor__floating-results')).toBeNull();
+    expect(ui.container.querySelector('.circuit-editor__canvas .circuit-editor__selected-readings')).toBeNull();
 
-    nodeTop = 490;
-    await act(async () => {
-      required(ui.container, '.circuit-board__part[data-part-id="part-2"]').setAttribute('transform', 'translate(0 1)');
-      await Promise.resolve();
-    });
-    expect(required(ui.container, '.circuit-editor__selected-readings').getAttribute('data-corner')).toBe('top');
+    click(sidebarTab(ui.container, "解析"));
+    expect(sidebarTab(ui.container, "解析").getAttribute("aria-selected")).toBe("true");
+    expect(required(activeSidebarPanel(ui.container), ".circuit-analysis").getAttribute("data-status")).toBe("closed");
+    expect(ui.container.querySelector('.circuit-editor__canvas .circuit-analysis')).toBeNull();
+
+    click(required(ui.container, '.circuit-board__part[data-part-id="part-2"]'));
+    expect(sidebarTab(ui.container, "プロパティ").getAttribute("aria-selected")).toBe("true");
+    expect(required(activeSidebarPanel(ui.container), '.circuit-inspector__readings [data-measurement="voltage"] dd').textContent).toContain("V");
+    expect(required(activeSidebarPanel(ui.container), '.circuit-inspector__readings [data-measurement="current"] dd').textContent).toContain("A");
+
+    click(sidebarTab(ui.container, "解析"));
+    click(required(ui.container, '[data-wire-id="wire-3"]'));
+    expect(sidebarTab(ui.container, "プロパティ").getAttribute("aria-selected")).toBe("true");
+    expect(required(activeSidebarPanel(ui.container), ".circuit-inspector__wire-detail").textContent).toContain("接続先");
   });
 
-  it("shows analysis and selected part readings on the canvas", () => {
+  it("supports keyboard navigation across the sidebar tabs", async () => {
     const ui = mount(createExampleCircuit());
-    expect(required(ui.container, '.circuit-editor__canvas .circuit-analysis').getAttribute('data-status')).toBe('closed');
-    expect(ui.container.querySelector('.circuit-editor__floating-results .circuit-analysis__reason')).toBeNull();
-    click(required(ui.container, '.circuit-board__part[data-part-id="part-2"]'));
-    expect(required(ui.container, '.circuit-editor__canvas [aria-label="選択部品の計測値"] [data-measurement="voltage"] dd').textContent).toContain('V');
-    expect(required(ui.container, '.circuit-editor__canvas [aria-label="選択部品の計測値"] [data-measurement="current"] dd').textContent).toContain('A');
-    expect(ui.container.querySelector('.circuit-editor__right .circuit-analysis')).toBeNull();
-    expect(ui.container.querySelector('.circuit-editor__right .circuit-inspector__readings')).toBeNull();
-    const toggle = required(ui.container, '[aria-label="解析パネルを最小化"]');
-    expect(toggle.getAttribute('aria-expanded')).toBe('true');
-    click(toggle);
-    expect(required(ui.container, '.circuit-editor__floating-results').getAttribute('data-minimized')).toBe('true');
-    expect(required(ui.container, '.circuit-editor__results-content').hasAttribute('hidden')).toBe(true);
-    const expand = required(ui.container, '[aria-label="解析パネルを展開"]');
-    expect(expand.getAttribute('aria-expanded')).toBe('false');
-    click(expand);
-    expect(required(ui.container, '.circuit-editor__results-content').hasAttribute('hidden')).toBe(false);
-    expect(required(ui.container, '.circuit-editor__canvas [aria-label="選択部品の計測値"] [data-measurement="current"] dd').textContent).toContain('A');
+    const properties = sidebarTab(ui.container, "プロパティ");
+    focus(properties);
+    await keyDownAndWait(properties, "ArrowRight");
+    expect(sidebarTab(ui.container, "解析").getAttribute("aria-selected")).toBe("true");
+    await keyDownAndWait(sidebarTab(ui.container, "解析"), "ArrowRight");
+    expect(sidebarTab(ui.container, "波形").getAttribute("aria-selected")).toBe("true");
+  });
+
+  it("retains waveform results and cursor position when changing sidebar tabs", () => {
+    const ui = mount(createCircuitExample("charging"));
+    click(sidebarTab(ui.container, "波形"));
+    const waveforms = sidebarPanel(ui.container, "波形");
+    const calculate = [...waveforms.querySelectorAll<HTMLButtonElement>("button")]
+      .find((button) => button.textContent?.trim() === "波形を計算");
+    if (!calculate) { throw new Error("Missing waveform calculate button"); }
+    click(calculate);
+
+    const cursor = required(waveforms, '.circuit-transient__time-controls input[type="range"]');
+    if (!(cursor instanceof HTMLInputElement)) { throw new Error("Expected the waveform time cursor"); }
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+    if (!setter) { throw new Error("Missing input value setter"); }
+    act(() => {
+      setter.call(cursor, "160");
+      cursor.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    expect(cursor.getAttribute("data-sample-index")).toBe("160");
+
+    click(sidebarTab(ui.container, "解析"));
+    expect(waveforms.querySelector(".circuit-waveform")).not.toBeNull();
+    click(sidebarTab(ui.container, "波形"));
+    expect(required(activeSidebarPanel(ui.container), '.circuit-transient__time-controls input[type="range"]').getAttribute("data-sample-index")).toBe("160");
+  });
+
+  it("opens the analysis tab from the footer status control", () => {
+    const ui = mount(createExampleCircuit());
+    click(required(ui.container, ".circuit-editor__analysis-status"));
+    expect(sidebarTab(ui.container, "解析").getAttribute("aria-selected")).toBe("true");
+    expect(required(activeSidebarPanel(ui.container), ".circuit-analysis")).not.toBeNull();
+  });
+
+  it("opens the mobile detail panel from analysis status and returns focus when closed", async () => {
+    Object.defineProperty(window, "matchMedia", {
+      configurable: true,
+      value: (media: string) => ({
+        matches: media === "(max-width: 900px)",
+        media,
+        onchange: null,
+        addListener() {},
+        removeListener() {},
+        addEventListener() {},
+        removeEventListener() {},
+        dispatchEvent() { return false; },
+      }),
+    });
+    const ui = mount(createExampleCircuit());
+    const detailsTrigger = required(ui.container, '[data-panel-trigger="properties"]');
+    click(required(ui.container, ".circuit-editor__analysis-status"));
+    expect(required(ui.container, ".circuit-editor").getAttribute("data-panel")).toBe("properties");
+    expect(sidebarTab(ui.container, "解析").getAttribute("aria-selected")).toBe("true");
+    await act(async () => {
+      await waitForAnimationFrame();
+      await waitForAnimationFrame();
+    });
+
+    click(required(ui.container, '[aria-label="詳細パネルを閉じる"]'));
+    expect(required(ui.container, ".circuit-editor").getAttribute("data-panel")).toBe("none");
+    await act(async () => {
+      await waitForAnimationFrame();
+    });
+    expect(document.activeElement).toBe(detailsTrigger);
   });
 
   it("opens the overview from the toolbar, exposes analysis settings, and filters a selected part", () => {

@@ -67,7 +67,8 @@ function joinWiresAndGrounds(
 }
 
 function isSwitchClosed(part: CircuitPart, switchStates: Record<string, boolean>) {
-  return switchStates[part.id] ?? part.initiallyClosed ?? false;
+  const override = Object.hasOwn(switchStates, part.id) ? switchStates[part.id] : undefined;
+  return override ?? part.initiallyClosed ?? false;
 }
 
 function joinAcross(nodes: DisjointSet, index: Map<string, number>, part: CircuitPart, terminals: CircuitTerminal[]) {
@@ -88,7 +89,7 @@ export function meterStatuses(
   options: MeterStatusOptions = {},
 ): Record<string, MeterStatus> {
   const meters = document.parts.filter((part) => part.kind === "ammeter" || part.kind === "voltmeter");
-  if (meters.length === 0) { return {}; }
+  if (meters.length === 0) { return Object.create(null); }
   const index = terminalIndex(document);
   const referenceNode = index.size;
   const electricalNodes = new DisjointSet(index.size + 1);
@@ -99,7 +100,7 @@ export function meterStatuses(
   }
   joinElectricalParts(document, index, electricalNodes, referenceNode, options);
 
-  const statuses: Record<string, MeterStatus> = {};
+  const statuses: Record<string, MeterStatus> = Object.create(null);
   const wired = wiredTerminalSet(document);
   for (const part of meters) {
     statuses[part.id] = meterStatusForPart(

@@ -74,10 +74,9 @@ export interface CircuitAnalysis {
 const IDEAL_OHMS = 1e-6;
 /** Below this external resistance a battery counts as short-circuited. */
 const SHORT_OHMS = 1e-3;
-// Ideal conductors leave rounding noise far below this; anything smaller reads as no current.
+// Avoid division by zero while classifying battery short circuits.
 const CURRENT_EPSILON = 1e-7;
-/** Suppresses voltage residual from the legacy 1 µΩ conductance approximation. */
-const VOLTAGE_EPSILON = 1e-7;
+const ROUNDING_GUARD = 4 * Number.EPSILON;
 const OVERLOAD_RATIO = 1.5;
 
 interface Conductance {
@@ -167,7 +166,10 @@ function indexTerminals(parts: readonly CircuitPart[]) {
 }
 
 function isClosed(part: CircuitPart, switchStates: Record<string, boolean>) {
-  return switchStates[part.id] ?? part.initiallyClosed ?? false;
+  const override = Object.hasOwn(switchStates, part.id)
+    ? switchStates[part.id]
+    : undefined;
+  return override ?? part.initiallyClosed ?? false;
 }
 
 /** Ohms between the part's terminals, or null when no current can pass. */
@@ -331,12 +333,17 @@ function nodeVoltages(
     if (ii !== undefined) { rhs[ii] += amps; }
     if (ifrom !== undefined) { rhs[ifrom] -= amps; }
   }
+  if (
+    matrix.some((row) => row.some((value) => !Number.isFinite(value))) ||
+    rhs.some((value) => !Number.isFinite(value))
+  ) { return null; }
   const solution = solveLinear(matrix, rhs);
-  if (!solution) { return null; }
-  return Array.from({ length: size }, (_, node) => {
+  if (!solution || solution.some((value) => !Number.isFinite(value))) { return null; }
+  const voltages = Array.from({ length: size }, (_, node) => {
     const unknown = unknowns.get(node);
     return unknown === undefined ? 0 : solution[unknown];
   });
+  return voltages.every((value) => Number.isFinite(value)) ? voltages : null;
 }
 
 function readPart(
@@ -358,8 +365,287 @@ function readPart(
   return { voltageVolts, currentAmps, powerWatts, brightness: Math.min(1, powerWatts / rated) };
 }
 
-function tidy(value: number) {
-  return Math.abs(value) < CURRENT_EPSILON ? 0 : value;
+function tidy(value: number, uncertainty = 0) {
+  return value === 0 || (Number.isFinite(value) && Number.isFinite(uncertainty) && Math.abs(value) <= uncertainty)
+    ? 0
+    : value;
+}
+
+function setRecordValue<T>(record: Record<string, T>, property: string, value: T) {
+  Object.defineProperty(record, property, {
+    configurable: true,
+    enumerable: true,
+    value,
+    writable: true,
+  });
+}
+
+interface BranchEdge {
+  kind: "wire" | "part";
+  id: string;
+  from: number;
+  to: number;
+}
+
+interface AdjacentBranch {
+  edge: BranchEdge;
+  other: number;
+}
+
+interface BranchTopology {
+  adjacent: Map<number, AdjacentBranch[]>;
+  componentByNode: Map<number, number>;
+  components: number[][];
+  edgesByComponent: Map<number, BranchEdge[]>;
+}
+
+function branchEdges(
+  document: CircuitDocument,
+  index: Map<string, number>,
+  switchStates: Record<string, boolean>,
+): BranchEdge[] {
+  return [
+    ...document.wires.map((wire) => ({
+      kind: "wire" as const,
+      id: wire.id,
+      from: index.get(key(wire.from)) ?? -1,
+      to: index.get(key(wire.to)) ?? -1,
+    })),
+    ...document.parts
+      .filter((part) =>
+        part.kind === "battery" ||
+        part.kind === "ammeter" ||
+        (part.kind === "switch" && isClosed(part, switchStates)),
+      )
+      .map((part) => ({
+        kind: "part" as const,
+        id: part.id,
+        from: index.get(`${part.id}:a`) ?? -1,
+        to: index.get(`${part.id}:b`) ?? -1,
+      })),
+  ];
+}
+
+function branchAdjacency(edges: readonly BranchEdge[]) {
+  const adjacent = new Map<number, AdjacentBranch[]>();
+  for (const edge of edges) {
+    const fromEntries = adjacent.get(edge.from) ?? [];
+    fromEntries.push({ edge, other: edge.to });
+    adjacent.set(edge.from, fromEntries);
+    const toEntries = adjacent.get(edge.to) ?? [];
+    toEntries.push({ edge, other: edge.from });
+    adjacent.set(edge.to, toEntries);
+  }
+  return adjacent;
+}
+
+function nodeComponents(size: number, adjacent: Map<number, AdjacentBranch[]>) {
+  const componentByNode = new Map<number, number>();
+  const components: number[][] = [];
+  for (let start = 0; start < size; start += 1) {
+    if (componentByNode.has(start)) { continue; }
+    const component = components.length;
+    const nodes = [start];
+    componentByNode.set(start, component);
+    for (const node of nodes) {
+      for (const entry of adjacent.get(node) ?? []) {
+        if (componentByNode.has(entry.other)) { continue; }
+        componentByNode.set(entry.other, component);
+        nodes.push(entry.other);
+      }
+    }
+    components.push(nodes);
+  }
+  return { componentByNode, components };
+}
+
+function branchTopology(size: number, edges: readonly BranchEdge[]): BranchTopology {
+  const adjacent = branchAdjacency(edges);
+  const { componentByNode, components } = nodeComponents(size, adjacent);
+  const edgesByComponent = new Map<number, BranchEdge[]>();
+  for (const edge of edges) {
+    const component = componentByNode.get(edge.from);
+    if (component === undefined) { continue; }
+    const entries = edgesByComponent.get(component) ?? [];
+    entries.push(edge);
+    edgesByComponent.set(component, entries);
+  }
+  return { adjacent, componentByNode, components, edgesByComponent };
+}
+
+function conductanceIncidentEdges(
+  size: number,
+  conductances: readonly Conductance[],
+): { incidentEdges: number[][]; active: boolean[] } {
+  const incidentEdges = Array.from({ length: size }, () => [] as number[]);
+  const active = conductances.map(({ a, b }, edgeIndex) => {
+    if (a === b) { return false; }
+    incidentEdges[a]?.push(edgeIndex);
+    incidentEdges[b]?.push(edgeIndex);
+    return true;
+  });
+  return { incidentEdges, active };
+}
+
+function danglingEdgeOrder(
+  conductances: readonly Conductance[],
+  incidentEdges: readonly number[][],
+  active: boolean[],
+  protectedNodes: Set<number>,
+) {
+  const remainingDegree = incidentEdges.map((edges) => edges.length);
+  const queue: number[] = [];
+  for (let node = 0; node < incidentEdges.length; node += 1) {
+    if (remainingDegree[node] === 1 && !protectedNodes.has(node)) { queue.push(node); }
+  }
+  const removedEdges: { child: number; parent: number }[] = [];
+  for (const child of queue) {
+    if (remainingDegree[child] !== 1 || protectedNodes.has(child)) { continue; }
+    const edgeIndex = incidentEdges[child]?.find((candidate) => active[candidate]);
+    if (edgeIndex === undefined) { continue; }
+    const edge = conductances[edgeIndex];
+    if (!edge) { continue; }
+    const parent = edge.a === child ? edge.b : edge.a;
+    active[edgeIndex] = false;
+    remainingDegree[child] -= 1;
+    remainingDegree[parent] = (remainingDegree[parent] ?? 0) - 1;
+    removedEdges.push({ child, parent });
+    if (remainingDegree[parent] === 1 && !protectedNodes.has(parent)) { queue.push(parent); }
+  }
+  return removedEdges;
+}
+
+function refineDanglingPotentials(
+  size: number,
+  conductances: readonly Conductance[],
+  sources: readonly CurrentSource[],
+  voltages: number[],
+) {
+  const { incidentEdges, active } = conductanceIncidentEdges(size, conductances);
+  const protectedNodes = new Set<number>();
+  for (const source of sources) {
+    protectedNodes.add(source.into);
+    protectedNodes.add(source.from);
+  }
+  const removedEdges = danglingEdgeOrder(conductances, incidentEdges, active, protectedNodes);
+  for (const { child, parent } of removedEdges.reverse()) {
+    voltages[child] = voltages[parent] ?? 0;
+  }
+}
+
+function knownTerminalCurrents(
+  document: CircuitDocument,
+  index: Map<string, number>,
+  parts: Record<string, CircuitPartReading>,
+  switchStates: Record<string, boolean>,
+) {
+  const knownCurrentByNode = new Map<number, number>();
+  for (const part of document.parts) {
+    if (
+      part.kind === "battery" ||
+      part.kind === "ammeter" ||
+      (part.kind === "switch" && isClosed(part, switchStates))
+    ) { continue; }
+    const reading = parts[part.id];
+    if (!reading) { continue; }
+    for (const terminal of terminalsOf(part.kind)) {
+      const node = index.get(`${part.id}:${terminal}`);
+      if (node === undefined) { continue; }
+      const current = reading.terminalCurrents?.[terminal] ?? 0;
+      knownCurrentByNode.set(node, (knownCurrentByNode.get(node) ?? 0) + current);
+    }
+  }
+  return knownCurrentByNode;
+}
+
+function componentIsBalanced(nodes: readonly number[], currents: Map<number, number>) {
+  const total = nodes.reduce((sum, node) => sum + (currents.get(node) ?? 0), 0);
+  const scale = nodes.reduce((sum, node) => sum + Math.abs(currents.get(node) ?? 0), 0);
+  return Math.abs(total) <= Number.EPSILON * 32 * scale;
+}
+
+function rootedTree(root: number, adjacent: Map<number, AdjacentBranch[]>) {
+  const parent = new Map<number, { node: number; edge: BranchEdge }>();
+  const order = [root];
+  for (const node of order) {
+    for (const entry of adjacent.get(node) ?? []) {
+      if (entry.other === parent.get(node)?.node || parent.has(entry.other) || entry.other === root) {
+        continue;
+      }
+      parent.set(entry.other, { node, edge: entry.edge });
+      order.push(entry.other);
+    }
+  }
+  return { parent, order };
+}
+
+function branchCurrentsForTree(
+  root: number,
+  nodes: readonly number[],
+  order: readonly number[],
+  parent: Map<number, { node: number; edge: BranchEdge }>,
+  knownCurrentByNode: Map<number, number>,
+) {
+  const subtreeCurrent = new Map(nodes.map((node) => [node, knownCurrentByNode.get(node) ?? 0]));
+  const currents = new Map<BranchEdge, number>();
+  for (const node of [...order].reverse()) {
+    if (node === root) { continue; }
+    const relation = parent.get(node);
+    if (!relation) { continue; }
+    const current = subtreeCurrent.get(node) ?? 0;
+    currents.set(relation.edge, relation.edge.from === relation.node ? current : -current);
+    subtreeCurrent.set(relation.node, (subtreeCurrent.get(relation.node) ?? 0) + current);
+  }
+  return currents;
+}
+
+function storeBranchCurrents(
+  currents: Map<BranchEdge, number>,
+  parts: Record<string, CircuitPartReading>,
+  wireCurrents: Record<string, number>,
+  partKindsById: Map<string, CircuitPart["kind"]>,
+) {
+  for (const [edge, currentAmps] of currents) {
+    const signedCurrent = currentAmps === 0 ? 0 : currentAmps;
+    if (edge.kind === "wire") {
+      setRecordValue(wireCurrents, edge.id, signedCurrent);
+      continue;
+    }
+    const reading = parts[edge.id];
+    if (!reading) { continue; }
+    setRecordValue(parts, edge.id, {
+      ...reading,
+      currentAmps: signedCurrent,
+      terminalCurrents: { a: signedCurrent, b: -signedCurrent },
+      ...(partKindsById.get(edge.id) === "battery"
+        ? { powerWatts: -reading.voltageVolts * signedCurrent }
+        : {}),
+    });
+  }
+}
+
+/** Reconstructs branch currents in acyclic wire/source/conductor networks using KCL. */
+function refineTreeBranchCurrents(
+  document: CircuitDocument,
+  index: Map<string, number>,
+  parts: Record<string, CircuitPartReading>,
+  wireCurrents: Record<string, number>,
+  switchStates: Record<string, boolean>,
+) {
+  const topology = branchTopology(index.size, branchEdges(document, index, switchStates));
+  const known = knownTerminalCurrents(document, index, parts, switchStates);
+  const partKindsById = new Map(document.parts.map((part) => [part.id, part.kind]));
+  for (let id = 0; id < topology.components.length; id += 1) {
+    const nodes = topology.components[id];
+    const edges = topology.edgesByComponent.get(id) ?? [];
+    const root = nodes?.[0];
+    if (!nodes || root === undefined || edges.length !== nodes.length - 1) { continue; }
+    if (!componentIsBalanced(nodes, known)) { continue; }
+    const { parent, order } = rootedTree(root, topology.adjacent);
+    if (order.length !== nodes.length) { continue; }
+    const currents = branchCurrentsForTree(root, nodes, order, parent, known);
+    storeBranchCurrents(currents, parts, wireCurrents, partKindsById);
+  }
 }
 
 function readAll(
@@ -373,24 +659,63 @@ function readAll(
     voltages[index.get(`${partId}:${terminal}`) ?? -1] ?? 0;
   const parts: Record<string, CircuitPartReading> = {};
   for (const part of document.parts) {
+    const terminalA = voltage(part.id, "a");
+    const terminalB = voltage(part.id, "b");
+    const sourceVoltage = part.kind === "battery" ? Math.abs(part.voltageVolts ?? 0) : 0;
+    const potentialScale = Math.max(Math.abs(terminalA), Math.abs(terminalB), sourceVoltage);
+    const ohms = part.kind === "battery" ? batteryOhms(part) : partOhms(part, switchStates);
+    const currentUncertainty = ohms === null
+      ? 0
+      : ROUNDING_GUARD * potentialScale / ohms;
     const reading = readPart(part, voltage, switchStates);
-    parts[part.id] = {
+    const voltageUncertainty = ROUNDING_GUARD * Math.max(Math.abs(terminalA), Math.abs(terminalB));
+    const currentAmps = tidy(reading.currentAmps, currentUncertainty);
+    setRecordValue(parts, part.id, {
       ...reading,
       terminalVoltages: Object.fromEntries(terminalsOf(part.kind).map((terminal) => [terminal, voltage(part.id, terminal)])),
-      terminalCurrents: part.kind === "junction" ? { a: 0 } : { a: tidy(reading.currentAmps), b: -tidy(reading.currentAmps) },
+      terminalCurrents: part.kind === "junction" ? { a: 0 } : { a: currentAmps, b: -currentAmps },
       ...(meterStatusByPart[part.id] ? { meterStatus: meterStatusByPart[part.id] } : {}),
-      voltageVolts: Math.abs(reading.voltageVolts) < VOLTAGE_EPSILON ? 0 : reading.voltageVolts,
-      currentAmps: tidy(reading.currentAmps),
-      powerWatts: tidy(reading.powerWatts),
-    };
+      voltageVolts: tidy(reading.voltageVolts, voltageUncertainty),
+      currentAmps,
+      powerWatts: tidy(
+        reading.powerWatts,
+        Math.abs(reading.voltageVolts) * currentUncertainty +
+          Math.abs(reading.currentAmps) * voltageUncertainty,
+      ),
+    });
   }
   const wireCurrents: Record<string, number> = {};
   for (const wire of document.wires) {
     const from = voltage(wire.from.partId, wire.from.terminal);
     const to = voltage(wire.to.partId, wire.to.terminal);
-    wireCurrents[wire.id] = tidy((from - to) / IDEAL_OHMS);
+    const currentUncertainty = ROUNDING_GUARD * Math.max(Math.abs(from), Math.abs(to)) / IDEAL_OHMS;
+    setRecordValue(wireCurrents, wire.id, tidy((from - to) / IDEAL_OHMS, currentUncertainty));
   }
+  refineTreeBranchCurrents(document, index, parts, wireCurrents, switchStates);
   return { parts, wireCurrents };
+}
+
+function hasOnlyFiniteReadings(
+  parts: Record<string, CircuitPartReading>,
+  wireCurrents: Record<string, number>,
+) {
+  for (const reading of Object.values(parts)) {
+    const values = [
+      reading.voltageVolts,
+      reading.currentAmps,
+      reading.powerWatts,
+      reading.brightness,
+      reading.voltagePhaseDegrees,
+      reading.currentPhaseDegrees,
+      reading.reactivePowerVars,
+      ...Object.values(reading.terminalVoltages ?? {}),
+      ...Object.values(reading.terminalCurrents ?? {}),
+      ...Object.values(reading.terminalVoltagePhasesDegrees ?? {}),
+      ...Object.values(reading.terminalCurrentPhasesDegrees ?? {}),
+    ];
+    if (values.some((value) => value !== undefined && !Number.isFinite(value))) { return false; }
+  }
+  return Object.values(wireCurrents).every(Number.isFinite);
 }
 
 function shortedBattery(
@@ -482,8 +807,16 @@ export function analyzeCircuit(
   const index = indexTerminals(document.parts);
   const { conductances, sources } = buildNetwork(document, index, switchStates);
   const voltages = nodeVoltages(index.size, conductances, sources);
-  if (!voltages) { return result("invalid", "回路を計算できませんでした。接続を確認してください。"); }
+  if (!voltages) {
+    const message = "回路を計算できませんでした。接続と部品の数値を確認してください。";
+    return result("invalid", message, { issues: [{ severity: "error", message }] });
+  }
+  refineDanglingPotentials(index.size, conductances, sources, voltages);
   const { parts, wireCurrents } = readAll(document, index, voltages, switchStates);
+  if (!hasOnlyFiniteReadings(parts, wireCurrents)) {
+    const message = "回路の計算結果が数値の範囲を超えました。電圧・電流・抵抗値を確認してください。";
+    return result("invalid", message, { issues: [{ severity: "error", message }] });
+  }
   const issues = collectIssues(document, parts);
   const batteries = document.parts.filter((part) => part.kind === "battery");
   const readings = { parts, wireCurrents, issues };

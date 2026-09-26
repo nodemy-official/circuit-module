@@ -365,6 +365,27 @@ describe("analyzeAnalogCircuit", () => {
     expect(analyzeAnalogCircuit(open).message).toContain("戻り道");
   });
 
+  it("resolves DC operating points whose currents are below the former absolute tolerance", () => {
+    const document: CircuitDocument = {
+      title: "微小電流源",
+      parts: [
+        part("source", "current-source", { currentAmps: 1e-10 }),
+        part("load", "resistor", { resistanceOhms: 1000 }),
+      ],
+      wires: [
+        wire("w1", "source", "a", "load", "a"),
+        wire("w2", "source", "b", "load", "b"),
+      ],
+    };
+
+    const result = analyzeAnalogCircuit(document);
+
+    expect(result.status).toBe("valid");
+    expect(result.parts.load.voltage.real).toBeCloseTo(-1e-7, 14);
+    expect(result.parts.load.current.real).toBeCloseTo(-1e-10, 18);
+    expect(result.parts.source.current.real).toBeCloseTo(1e-10, 18);
+  });
+
   it("rejects current supplied only through an open capacitor or reverse-biased semiconductor", () => {
     const capacitorOnlyReturn: CircuitDocument = {
       title: "直流では開放のコンデンサー",
@@ -399,7 +420,7 @@ describe("analyzeAnalogCircuit", () => {
     for (const document of [reverseDiodeReturn, offMosReturn]) {
       const result = analyzeAnalogCircuit(document);
       expect(result.status, document.title).toBe("invalid");
-      expect(result.message, document.title).toContain("微小コンダクタンス");
+      expect(result.issues[0]?.severity, document.title).toBe("error");
     }
   });
 
@@ -489,6 +510,48 @@ describe("analyzeAnalogCircuit", () => {
     expect(highVoltageResult.parts.load.current.real).toBeCloseTo(0.1, 8);
     expect(analyzeAnalogCircuit(invalidFrequency, { mode: "ac" }).status).toBe("invalid");
     expect(analyzeAnalogCircuit(invalidResistance).status).toBe("invalid");
+  });
+
+  it("preserves component readings when an ID is a special object property name", () => {
+    const document: CircuitDocument = {
+      title: "特殊な部品 ID",
+      parts: [
+        part("source", "battery", { voltageVolts: 9 }),
+        part("__proto__", "resistor", { resistanceOhms: 1000 }),
+        part("constructor", "resistor", { resistanceOhms: 1000 }),
+      ],
+      wires: [
+        wire("w1", "source", "a", "__proto__", "a"),
+        wire("w2", "__proto__", "b", "source", "b"),
+        wire("w3", "source", "a", "constructor", "a"),
+        wire("w4", "constructor", "b", "source", "b"),
+      ],
+    };
+
+    const result = analyzeAnalogCircuit(document);
+
+    expect(result.status).toBe("valid");
+    expect(Object.hasOwn(result.parts, "__proto__")).toBe(true);
+    expect(Object.keys(result.parts)).toContain("__proto__");
+    const prototypeNamedReading = Object.entries(result.parts).find(([id]) => id === "__proto__")?.[1];
+    const constructorNamedReading = Object.entries(result.parts).find(([id]) => id === "constructor")?.[1];
+    expect(prototypeNamedReading).toBeDefined();
+    expect(prototypeNamedReading!.current.real).toBeCloseTo(0.009, 8);
+    expect(Object.hasOwn(result.parts, "constructor")).toBe(true);
+    expect(constructorNamedReading).toBeDefined();
+    expect(constructorNamedReading!.meterStatus).toBeUndefined();
+  });
+
+  it("rejects unknown runtime part kinds that match inherited catalog properties", () => {
+    const unsupported = {
+      ...part("unknown", "resistor"),
+      kind: "toString" as CircuitPartKind,
+    };
+
+    const result = analyzeAnalogCircuit({ title: "未知の部品", parts: [unsupported], wires: [] });
+
+    expect(result.status).toBe("invalid");
+    expect(result.message).toContain("部品種類を認識できません");
   });
 
   it("keeps nonlinear devices' small-signal AC response around their DC bias", () => {

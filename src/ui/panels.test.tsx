@@ -222,6 +222,26 @@ describe("headless panel styling contract", () => {
     expect(markup).toContain('data-measurement="reactive-power"');
   });
 
+  it("labels transient readings with the shared time cursor for parts and meters", () => {
+    const ammeter = defaultPart("ammeter", "meter-a");
+    const markup = renderToStaticMarkup(
+      <>
+        <CircuitInspector part={defaultPart("resistor", "resistor-1")} reading={reading} readingTimeSeconds={0.004} />
+        <CircuitInspector
+          part={defaultPart("ac-source", "ac-source-1")}
+          reading={{ ...reading, voltagePhaseDegrees: 15, currentPhaseDegrees: -20 }}
+          readingTimeSeconds={0.004}
+        />
+        <CircuitInspector part={ammeter} reading={reading} analysisStatus="closed" readingTimeSeconds={0.004} />
+      </>,
+    );
+
+    expect(markup.match(/時間カーソル 0\.004 s の瞬時値です。/g)).toHaveLength(3);
+    expect(markup).not.toContain("直流の電圧・電流は端子の向きに対する符号付き値です。");
+    expect(markup).not.toContain("交流の電圧・電流は実効値です。");
+    expect(markup).toContain("+500 mA");
+  });
+
   it("exposes new component values in preview controls and AC phase measurements", () => {
     const acSource = defaultPart("ac-source", "ac-1");
     const capacitor = defaultPart("capacitor", "c-1");

@@ -51,6 +51,19 @@ function buttonWithText(container: ParentNode, text: string) {
 function click(element: Element) { act(() => element.dispatchEvent(new MouseEvent("click", { bubbles: true }))); }
 
 describe("analysis controls and waveform integration", () => {
+  it("shows waveform learning controls without steady-state settings in the Waveforms tab", () => {
+    const ui = mount("charging");
+    click(required(ui.container, '[data-sidebar-tab="waveforms"]'));
+
+    const transient = ui.container.querySelector<HTMLDetailsElement>(".circuit-editor__right .circuit-transient");
+    if (!transient) { throw new Error("Missing waveform details"); }
+    const simulation = transient.closest(".circuit-simulation");
+    expect(transient.open).toBe(true);
+    expect(simulation?.firstElementChild?.classList.contains("circuit-panel__heading")).not.toBe(true);
+    expect(simulation?.querySelector("select")).toBeNull();
+    expect(simulation?.getAttribute("aria-label")).toBe("解析結果と学習ビュー");
+  });
+
   it("changes AC/DC analysis from the controls without modifying the circuit", () => {
     const ui = mount("ac");
     const original = ui.editor.document;

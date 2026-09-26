@@ -20,6 +20,8 @@ export type CircuitIconName =
   | "circuit"
   | "layers"
   | "sliders"
+  | "activity"
+  | "waveform"
   | "check"
   | "arrowLeft"
   | "arrowRight"
@@ -116,6 +118,8 @@ const glyphs: Record<CircuitIconName, ReactNode> = {
     <circle cx="15" cy="18" r="2" />
   </>,
   check: <path d="m5 12 4.5 4.5L19 7" />,
+  activity: <path d="M3 12h4l3-8 4 16 3-8h4" />,
+  waveform: <path d="M3 12c3-12 6-12 9 0s6 12 9 0" />,
   arrowLeft: <>
     <path d="M19 12H5m7 7-7-7 7-7" />
   </>,
