@@ -87,7 +87,7 @@ export function CircuitPreviewDialog({
                         </Button>
                       </li>
                     ))}
-                  </ul> : <p className="circuit-preview__empty">まだ部品がありません。編集に戻って部品を追加してください。</p>}
+                  </ul> : <p className="circuit-preview__empty">この回路にはまだ部品がありません。</p>}
                 </TabsContent>
                 <TabsContent value="analysis">
                   <CircuitSimulationPanel document={document} analysis={analysis} options={options} onChange={onOptionsChange} showLearningPanels={false} />

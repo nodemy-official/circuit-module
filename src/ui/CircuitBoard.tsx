@@ -106,11 +106,15 @@ export interface CircuitBoardProps extends Omit<ComponentPropsWithoutRef<"div">,
   readOnly?: boolean;
   /** Refit the camera when the viewport resizes and when this option is enabled. */
   fitOnResize?: boolean;
+  /** Allow wheel panning. Disable in document blocks to preserve page scrolling; Ctrl/⌘ + wheel still zooms. */
+  panOnScroll?: boolean;
   analysis?: CircuitAnalysis;
   /** Show current, electron flow, or both on wires, with a display selector, legend, and pause control. Requires analysis. */
   showFlow?: boolean;
   /** Offer node potential colors, voltage probes, and terminal-current conservation. */
   showPotentials?: boolean;
+  /** Collapse flow and potential settings into a disclosure for inline previews. */
+  compactControls?: boolean;
   /** Visible center in grid cells, useful when choosing where to add new parts. */
   onViewportCenterChange?: (point: Point) => void;
   /** Custom SVG art centered at (0, 0). The standard symbol is used when omitted. */
@@ -782,6 +786,25 @@ function wireTitle(from: string, to: string, editable: boolean) {
   return `${from} と ${to} をつなぐ導線${editable ? "。区間をドラッグして経路を移動できます。" : ""}`;
 }
 
+function shouldHandleWheel(event: WheelEvent, panOnScroll: boolean) {
+  return panOnScroll || event.ctrlKey || event.metaKey;
+}
+
+function BoardDisplaySettings({ compact, showFlow, showPotentials, children }: {
+  compact: boolean;
+  showFlow: boolean;
+  showPotentials: boolean;
+  children: ReactNode;
+}) {
+  if (!compact || !(showFlow || showPotentials)) { return children; }
+  return (
+    <details className="circuit-board__display-settings">
+      <summary><CircuitIcon name="sliders" size={14} />表示設定<CircuitIcon name="chevron" size={12} /></summary>
+      <div className="circuit-board__display-settings-content">{children}</div>
+    </details>
+  );
+}
+
 export function CircuitBoard({
   document,
   selection,
@@ -806,9 +829,11 @@ export function CircuitBoard({
   panMode = false,
   readOnly = false,
   fitOnResize = false,
+  panOnScroll = true,
   analysis,
   showFlow = false,
   showPotentials = false,
+  compactControls = false,
   onViewportCenterChange,
   renderPart,
   slotProps,
@@ -967,6 +992,7 @@ export function CircuitBoard({
     const viewport = viewportRef.current;
     if (!viewport) { return; }
     const onWheel = (event: WheelEvent) => {
+      if (!shouldHandleWheel(event, panOnScroll)) { return; }
       event.preventDefault();
       const factor = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? viewport.clientHeight : 1;
       if (event.ctrlKey || event.metaKey) {
@@ -982,7 +1008,7 @@ export function CircuitBoard({
     };
     viewport.addEventListener("wheel", onWheel, { passive: false });
     return () => viewport.removeEventListener("wheel", onWheel);
-  }, []);
+  }, [panOnScroll]);
 
   useEffect(() => {
     const onKeyDown = (event: globalThis.KeyboardEvent) => {
@@ -1588,11 +1614,14 @@ export function CircuitBoard({
     fit: () => updateCamera(fitCamera(document, size.width, size.height)),
   };
   const wasDragged = (): boolean => draggedRef.current;
+  const visualControls = <>
+    {showFlow && <CircuitFlowLegend analysis={analysis} hasFlow={hasFlow} display={flowDisplay} onDisplayChange={setFlowDisplay} paused={flowPaused} onTogglePause={() => setFlowPaused((paused) => !paused)} slotProps={slotProps} />}
+    <CircuitPotentialControls visible={showPotentials} view={potentialView} timeSeconds={analysis?.timeSeconds} />
+  </>;
 
   return (
     <section aria-label={`${document.title} 回路基板`} {...rootProps} {...circuitSlot(["circuit-board", className].filter(Boolean).join(" "), slotProps?.root, style)} data-read-only={readOnly} data-switch-interactive={readOnly && Boolean(onSwitchToggle)} data-show-flow={showFlow} data-flow-display={flowDisplay} data-flow-paused={flowPaused}>
-      {showFlow && <CircuitFlowLegend analysis={analysis} hasFlow={hasFlow} display={flowDisplay} onDisplayChange={setFlowDisplay} paused={flowPaused} onTogglePause={() => setFlowPaused((paused) => !paused)} slotProps={slotProps} />}
-      <CircuitPotentialControls visible={showPotentials} view={potentialView} timeSeconds={analysis?.timeSeconds} />
+      <BoardDisplaySettings compact={compactControls} showFlow={showFlow} showPotentials={showPotentials}>{visualControls}</BoardDisplaySettings>
       {renderControls === undefined ? (
         <div {...circuitSlot("circuit-board__chrome", slotProps?.chrome)}>
           <div {...circuitSlot("circuit-board__controls", slotProps?.controls)} role="group" aria-label="キャンバス表示操作">

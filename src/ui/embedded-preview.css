@@ -1,0 +1,100 @@
+@layer circuit {
+  .circuit-editor[data-preview="true"] {
+    container: circuit-preview / inline-size;
+    width: 100%; min-width: 0; height: auto; min-height: 0;
+    gap: 0; padding: var(--circuit-space-6);
+    overflow: visible;
+    font-family: var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+  }
+  .circuit-editor[data-preview="true"][data-embedded="true"] { padding: var(--circuit-space-4); }
+  .circuit-editor[data-preview="true"][data-embedded="false"] { height: 100svh; overflow: hidden; }
+  .circuit-editor[data-preview="true"] .circuit-editor__header {
+    z-index: auto; flex: none; min-height: var(--circuit-control-height); gap: var(--circuit-space-3); margin: 0 0 var(--circuit-space-4); padding: 0;
+    border: 0;
+  }
+  .circuit-editor[data-preview="true"] :is(.circuit-editor__identity, .circuit-editor__header-divider) { display: none; }
+  .circuit-editor[data-preview="true"] .circuit-editor__document-name { min-width: 0; }
+  .circuit-editor[data-preview="true"] .circuit-editor__document-name > span {
+    max-width: none; color: var(--circuit-ink); font-size: 13px; font-weight: 600;
+  }
+  .circuit-editor[data-preview="true"] .circuit-editor__header-actions { gap: var(--circuit-space-2); }
+  .circuit-editor[data-preview="true"] :is(.circuit-editor__preview-panel-toggle, .circuit-editor__preview-toggle) {
+    min-height: var(--circuit-control-height); padding: var(--circuit-space-2) var(--circuit-space-3); border-radius: 5px; font-size: 12px; font-weight: 500;
+  }
+  .circuit-editor[data-preview="true"] .circuit-editor__preview-toggle { border-color: transparent; }
+  .circuit-editor[data-preview="true"] .circuit-editor__preview-toggle kbd { display: none; }
+  .circuit-editor[data-preview="true"] .circuit-editor__workspace { flex: none; }
+  .circuit-editor[data-preview="true"][data-embedded="false"] .circuit-editor__workspace { flex: 1; }
+  .circuit-editor[data-preview="true"] .circuit-editor__center { gap: var(--circuit-space-4); }
+  .circuit-editor[data-preview="true"] .circuit-editor__canvas {
+    flex: none; height: var(--circuit-preview-height, clamp(260px, 48cqi, 380px));
+    min-width: 0; border-radius: 6px; overflow: hidden;
+  }
+  .circuit-editor[data-preview="true"][data-embedded="false"] .circuit-editor__canvas { flex: 1; height: auto; }
+  .circuit-editor[data-preview="true"] .circuit-board { border-radius: 6px; }
+  .circuit-editor[data-preview="true"] .circuit-board__viewport { flex: 1; height: 100%; min-height: 0; }
+  .circuit-editor[data-preview="true"] .circuit-board__chrome {
+    right: var(--circuit-space-3); bottom: var(--circuit-space-3); padding: var(--circuit-space-1); border-radius: 5px;
+    box-shadow: none;
+  }
+  .circuit-editor[data-preview="true"] .circuit-board__controls button { width: var(--circuit-control-height-compact); height: var(--circuit-control-height-compact); }
+  .circuit-editor[data-preview="true"] .circuit-board__controls button.circuit-board__zoom-reset { width: calc(var(--circuit-control-height-compact) + var(--circuit-space-4)); }
+  .circuit-editor__preview-footer { display: flex; align-items: center; flex-wrap: wrap; gap: var(--circuit-space-2) var(--circuit-space-6); padding: 0; }
+  .circuit-editor__preview-summary { display: flex; align-items: center; flex-wrap: wrap; gap: var(--circuit-space-2) var(--circuit-space-4); min-width: 0; }
+  .circuit-editor__preview-summary :is(.circuit-panel__heading, .circuit-analysis__state-label) { display: none; }
+  .circuit-editor__preview-summary .circuit-analysis__state { gap: var(--circuit-space-2); margin: 0; padding: 0; border: 0; background: transparent; font-size: 11px; }
+  .circuit-editor__preview-summary .circuit-analysis__state > svg { width: 13px; height: 13px; }
+  .circuit-editor__preview-summary .circuit-analysis__metric {
+    display: flex; align-items: baseline; gap: var(--circuit-space-2); padding: 0; margin: 0;
+    border: 0; border-radius: 0; background: transparent;
+  }
+  .circuit-editor__preview-summary .circuit-analysis__metric > span { margin: 0; color: var(--circuit-muted); font-size: 11px; }
+  .circuit-editor__preview-summary .circuit-analysis__metric > strong { gap: var(--circuit-space-1); margin: 0; color: var(--circuit-ink); font-size: 13px; line-height: 1.5; }
+  .circuit-editor__preview-summary .circuit-analysis__metric small { margin-left: 0; font-size: 11px; }
+  .circuit-editor__preview-summary .circuit-analysis__mode { margin: 0; color: var(--circuit-muted); font-size: 11px; }
+  .circuit-editor__preview-summary .circuit-analysis__issues { flex-basis: 100%; margin: 0; }
+  .circuit-editor__preview-footer .circuit-editor__preview-hint { display: block; margin-left: auto; font-size: 11px; }
+  .circuit-editor[data-preview="true"] .circuit-board__part[aria-haspopup="dialog"] { cursor: pointer; }
+  .circuit-editor[data-preview="true"] .circuit-board__part[aria-haspopup="dialog"]:is(:hover, :focus-visible) .circuit-board__selection-halo { fill-opacity: .07; stroke-opacity: .8; }
+
+  @container circuit-preview (max-width: 480px) {
+    .circuit-editor__header { flex-wrap: wrap; }
+    .circuit-editor__header-actions { flex-wrap: wrap; }
+    .circuit-editor__preview-footer .circuit-editor__preview-hint { width: 100%; margin-left: 0; }
+    .circuit-editor__learning > summary > span { display: none; }
+    .circuit-editor[data-preview="true"] :is(.circuit-editor__preview-panel-toggle, .circuit-editor__preview-toggle) { min-height: var(--circuit-control-height-touch); }
+    .circuit-editor[data-preview="true"] .circuit-board__controls button { width: var(--circuit-control-height-compact); height: var(--circuit-control-height-compact); }
+  }
+
+  @container circuit-preview (max-width: 360px) {
+    .circuit-editor[data-preview="true"] .circuit-board__controls { gap: 0; }
+    .circuit-editor[data-preview="true"] .circuit-board__control-divider { display: none; }
+  }
+
+  @media (max-width: 600px) {
+    .circuit-editor[data-preview="true"] { padding: var(--circuit-space-4); }
+    .circuit-editor[data-preview="true"] :is(.circuit-editor__preview-panel-toggle, .circuit-editor__preview-toggle) {
+      min-height: var(--circuit-control-height-touch);
+    }
+    .circuit-editor[data-preview="true"] .circuit-board__controls button {
+      min-width: var(--circuit-control-height-touch);
+      min-height: var(--circuit-control-height-touch);
+    }
+    .circuit-editor[data-preview="true"] .circuit-board__controls button.circuit-board__zoom-reset {
+      width: var(--circuit-control-height-touch);
+    }
+  }
+}
+
+/* Learning panels already use unlayered styles; keep the embedded output in document flow. */
+.circuit-editor[data-preview="true"][data-embedded="true"] .circuit-editor__learning {
+  max-height: none; overflow: visible; border-color: var(--circuit-line);
+}
+.circuit-editor[data-preview="true"] .circuit-editor__learning > summary {
+  padding: var(--circuit-space-3) 0; color: var(--circuit-muted); font-size: 12px; font-weight: 500;
+}
+.circuit-editor[data-preview="true"] .circuit-editor__learning > summary > span {
+  margin-left: var(--circuit-space-3); font-size: 11px; font-weight: 400;
+}
+.circuit-editor[data-preview="true"] .circuit-editor__learning[open] > summary { padding-bottom: var(--circuit-space-4); }
+.circuit-editor[data-preview="true"] .circuit-editor__learning > .circuit-simulation { padding: 0; border: 0; }

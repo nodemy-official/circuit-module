@@ -1,0 +1,16 @@
+@layer circuit {
+  /* Shared by every preset entry point; inherited overrides also work on a host. */
+  :root {
+    --circuit-space-1: 4px;
+    --circuit-space-2: 8px;
+    --circuit-space-3: 12px;
+    --circuit-space-4: 16px;
+    --circuit-space-5: 20px;
+    --circuit-space-6: 24px;
+    --circuit-space-8: 32px;
+
+    --circuit-control-height: 36px;
+    --circuit-control-height-compact: 32px;
+    --circuit-control-height-touch: 44px;
+  }
+}

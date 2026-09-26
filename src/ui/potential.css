@@ -1,23 +1,27 @@
-.circuit-potential { padding: .65rem 1rem; color: var(--circuit-board-ink, #243142); background: var(--circuit-board-part-fill, #fff); border-bottom: 1px solid var(--circuit-board-frame, #dde3eb); font-size: .8rem; }
-.circuit-potential__toggle { display: inline-flex; align-items: center; gap: .5rem; cursor: pointer; }
-.circuit-potential__time { margin-inline-start: 1rem; font-variant-numeric: tabular-nums; }
-.circuit-potential details { margin-top: .4rem; max-height: 36vh; overflow: auto; }
-.circuit-potential summary { cursor: pointer; font-weight: 600; }
-.circuit-potential p { margin: .6rem 0; line-height: 1.6; }
-.circuit-potential__fields { display: grid; grid-template-columns: minmax(8rem, auto) minmax(0, 1fr); align-items: center; gap: .5rem; max-width: 38rem; }
-.circuit-potential__fields select, .circuit-potential__fields input { box-sizing: border-box; width: 100%; min-width: 0; font: inherit; padding: .4rem; border: 1px solid var(--circuit-board-frame, #dde3eb); border-radius: .35rem; background: var(--circuit-board-part-fill, #fff); color: inherit; }
-.circuit-potential__difference { display: block; margin-block: .8rem; font-weight: 700; font-size: 1rem; }
-.circuit-potential__legend { display: flex; gap: 1rem; flex-wrap: wrap; }
-.circuit-potential__legend span { display: inline-flex; gap: .4rem; align-items: center; }
+.circuit-potential { padding: var(--circuit-space-3) var(--circuit-space-4); color: var(--circuit-board-ink, #243142); background: var(--circuit-board-part-fill, #fff); border-bottom: 1px solid var(--circuit-board-frame, #dde3eb); font-size: .8rem; }
+.circuit-potential__toggle { display: inline-flex; align-items: center; gap: var(--circuit-space-2); min-height: var(--circuit-control-height-compact); cursor: pointer; }
+.circuit-potential__time { margin-inline-start: var(--circuit-space-4); font-variant-numeric: tabular-nums; }
+.circuit-potential details { margin-top: var(--circuit-space-2); max-height: 36vh; overflow: auto; }
+.circuit-potential summary { display: flex; align-items: center; min-height: var(--circuit-control-height-compact); padding: var(--circuit-space-1) 0; cursor: pointer; font-weight: 600; }
+.circuit-potential p { margin: var(--circuit-space-2) 0; line-height: 1.6; }
+.circuit-potential__fields { display: grid; grid-template-columns: minmax(8rem, auto) minmax(0, 1fr); align-items: center; gap: var(--circuit-space-3); max-width: 38rem; }
+.circuit-potential__fields select, .circuit-potential__fields input { box-sizing: border-box; width: 100%; min-width: 0; min-height: var(--circuit-control-height); font: inherit; padding: var(--circuit-space-1) var(--circuit-space-2); border: 1px solid var(--circuit-board-frame, #dde3eb); border-radius: .35rem; background: var(--circuit-board-part-fill, #fff); color: inherit; }
+.circuit-potential__difference { display: block; margin-block: var(--circuit-space-3); font-weight: 700; font-size: 1rem; }
+.circuit-potential__legend { display: flex; gap: var(--circuit-space-2) var(--circuit-space-4); flex-wrap: wrap; margin: var(--circuit-space-4) 0; }
+.circuit-potential__legend span { display: inline-flex; gap: var(--circuit-space-2); align-items: center; }
 .circuit-potential__legend i { display: inline-block; width: 1.5rem; height: .7rem; border-radius: .3rem; }
-.circuit-potential__currents { padding: 0; list-style: none; max-width: 38rem; }
-.circuit-potential__currents li { display: grid; grid-template-columns: minmax(0, 1fr) 4rem minmax(6rem, auto); align-items: center; gap: .5rem; padding: .3rem 0; }
+.circuit-potential__currents { margin: var(--circuit-space-3) 0 0; padding: 0; list-style: none; max-width: 38rem; }
+.circuit-potential__currents li { display: grid; grid-template-columns: minmax(0, 1fr) 4rem minmax(6rem, auto); align-items: center; gap: var(--circuit-space-2); padding: var(--circuit-space-1) 0; }
 .circuit-potential__currents svg { width: 100%; height: 1.25rem; color: #19857d; }
 .circuit-potential__currents strong { text-align: end; font-variant-numeric: tabular-nums; }
 .circuit-potential-overlay text { fill: var(--circuit-board-ink, #172c46); font: 600 11px system-ui, sans-serif; paint-order: stroke; stroke: var(--circuit-board-part-fill, #fff); stroke-width: 4px; stroke-linejoin: round; }
 .circuit-editor__learning { flex: 0 0 auto; max-height: 45vh; overflow: auto; border-top: 1px solid var(--circuit-line, #dde3eb); background: var(--circuit-surface, #fff); }
-.circuit-editor__learning > summary { padding: .7rem 1rem; font-size: .8rem; font-weight: 600; cursor: pointer; }
-.circuit-editor__learning > .circuit-simulation { padding: .5rem 1rem 1rem; }
+.circuit-editor__learning > summary { padding: var(--circuit-space-3) var(--circuit-space-4); font-size: .8rem; font-weight: 600; cursor: pointer; }
+.circuit-editor__learning > .circuit-simulation { padding: 0 var(--circuit-space-4) var(--circuit-space-4); }
 .circuit-board:has(> .circuit-potential) { display: flex; flex-direction: column; }
 .circuit-board:has(> .circuit-potential) > .circuit-board__viewport { flex: 1; min-height: 180px; }
-@media (max-width: 600px) { .circuit-potential__fields { grid-template-columns: minmax(0, 1fr); } .circuit-potential__time { display: block; margin: .4rem 0 0; } }
+@media (max-width: 600px) { .circuit-potential__fields { grid-template-columns: minmax(0, 1fr); } .circuit-potential__time { display: block; margin: var(--circuit-space-1) 0 0; } }
+@media (pointer: coarse) {
+  .circuit-potential__toggle { min-height: var(--circuit-control-height-touch); }
+  .circuit-potential summary { min-height: var(--circuit-control-height-touch); }
+}
