@@ -280,6 +280,67 @@ describe("analyzeAnalogCircuit", () => {
     expect(result.parts.switch.voltage.real).toBeCloseTo(9, 8);
   });
 
+  it("rejects non-boolean switch state overrides instead of treating strings as true", () => {
+    const document: CircuitDocument = {
+      title: "不正なスイッチ状態",
+      parts: [
+        part("battery", "battery"),
+        part("switch", "switch", { initiallyClosed: false }),
+        part("load", "resistor", { resistanceOhms: 10 }),
+      ],
+      wires: [
+        wire("w1", "battery", "a", "switch", "a"),
+        wire("w2", "switch", "b", "load", "a"),
+        wire("w3", "load", "b", "battery", "b"),
+      ],
+    };
+
+    const result = analyzeAnalogCircuit(document, {
+      mode: "dc",
+      switchStates: { switch: "false" } as unknown as Record<string, boolean>,
+    });
+
+    expect(result.status).toBe("invalid");
+    expect(result.message).toContain("スイッチ状態");
+  });
+
+  it.each([
+    { label: "文字列", value: "false" },
+    { label: "配列", value: [] },
+    { label: "Map", value: new Map() },
+  ])("rejects a switch state container with an invalid shape ($label)", ({ value }) => {
+    const document: CircuitDocument = {
+      title: "不正なスイッチ状態の形式",
+      parts: [part("switch", "switch")],
+      wires: [],
+    };
+
+    const result = analyzeAnalogCircuit(document, {
+      mode: "dc",
+      switchStates: value as unknown as Record<string, boolean>,
+    });
+
+    expect(result.status).toBe("invalid");
+    expect(result.message).toContain("スイッチ状態");
+  });
+
+  it.each(["dc", "ac"] as const)("rejects explicit null switch states in %s analysis", (mode) => {
+    const document: CircuitDocument = {
+      title: "nullのスイッチ状態",
+      parts: [part("switch", "switch"), part("ground", "ground")],
+      wires: [],
+    };
+
+    const result = analyzeAnalogCircuit(document, {
+      mode,
+      frequencyHz: 1000,
+      switchStates: null as unknown as Record<string, boolean>,
+    });
+
+    expect(result.status).toBe("invalid");
+    expect(result.message).toContain("スイッチ状態");
+  });
+
   it("solves a series RC network as an RMS complex phasor", () => {
     const document: CircuitDocument = {
       title: "RCローパス",
@@ -312,6 +373,21 @@ describe("analyzeAnalogCircuit", () => {
     expect(result.parts.source.voltage.real).toBeCloseTo(5, 8);
   });
 
+  it("defaults source-free AC analysis to one kilohertz", () => {
+    const document: CircuitDocument = {
+      title: "電源がない交流回路",
+      parts: [part("load", "resistor", { resistanceOhms: 1000 })],
+      wires: [],
+    };
+
+    const result = analyzeAnalogCircuit(document, { mode: "ac" });
+
+    expect(result.status, result.message).toBe("valid");
+    expect(result.frequencyHz).toBe(1000);
+    expect(result.parts.load.voltage.real).toBe(0);
+    expect(result.parts.load.current.real).toBe(0);
+  });
+
   it("uses the RMS source phase and computes reactive element current", () => {
     const document: CircuitDocument = {
       title: "交流電源とコイル",
@@ -337,6 +413,28 @@ describe("analyzeAnalogCircuit", () => {
     expect(result.parts.inductor.current.real).toBeCloseTo(2, 8);
     expect(result.parts.inductor.current.imaginary).toBeCloseTo(0, 8);
     expect(result.parts.inductor.power.imaginary).toBeGreaterThan(0);
+  });
+
+  it("does not require a DC-only current source to have a return path in linear AC analysis", () => {
+    const document: CircuitDocument = {
+      title: "交流回路と未接続の直流電流源",
+      parts: [
+        part("source", "ac-source", { voltageVolts: 5, frequencyHz: 1000 }),
+        part("load", "resistor", { resistanceOhms: 1000 }),
+        part("dc-source", "current-source", { currentAmps: 0.01 }),
+      ],
+      wires: [
+        wire("w1", "source", "a", "load", "a"),
+        wire("w2", "load", "b", "source", "b"),
+      ],
+    };
+
+    const result = analyzeAnalogCircuit(document, { mode: "ac" });
+
+    expect(result.status, result.message).toBe("valid");
+    expect(result.parts.load.voltage.real).toBeCloseTo(5, 8);
+    expect(result.parts.load.current.real).toBeCloseTo(0.005, 8);
+    expect(result.parts["dc-source"].current.real).toBe(0);
   });
 
   it("solves a DC current source and rejects one with no return path", () => {
@@ -482,6 +580,19 @@ describe("analyzeAnalogCircuit", () => {
     expect(result.issues[0]).toMatchObject({ severity: "error", partId: "battery" });
   });
 
+  it("does not ignore a nonzero ideal source when its short-circuit voltage is tiny", () => {
+    const document: CircuitDocument = {
+      title: "微小電圧の電源短絡",
+      parts: [part("battery", "battery", { voltageVolts: 1e-13 })],
+      wires: [wire("short", "battery", "a", "battery", "b")],
+    };
+
+    const result = analyzeAnalogCircuit(document);
+
+    expect(result.status).toBe("invalid");
+    expect(result.message).toContain("短絡");
+  });
+
   it("solves linear circuits above the old Newton step size and rejects non-finite values", () => {
     const highVoltage: CircuitDocument = {
       title: "高電圧の線形回路",
@@ -619,6 +730,69 @@ describe("analyzeAnalogCircuit", () => {
     expect(opAmpResult.status).toBe("valid");
     expect(opAmpResult.parts.opamp.terminalVoltages.c.real).toBeCloseTo(15 * (1000 / 1020), 6);
   });
+
+  it.each([
+    { resistance: 1e-10, position: 0 },
+    { resistance: 1000, position: 0 },
+    { resistance: 1000, position: 1e-12 },
+    { resistance: 1000, position: 1 - 1e-12 },
+    { resistance: 1e-10, position: 1 },
+  ])("conserves endpoint and near-endpoint potentiometer currents at R=$resistance, position=$position", ({
+    resistance,
+    position,
+  }) => {
+    const document: CircuitDocument = {
+      title: "ポテンショメータの端点",
+      parts: [
+        part("source", "battery", { voltageVolts: 1 }),
+        part("pot", "potentiometer", { resistanceOhms: resistance, wiperPosition: position }),
+        part("ground", "ground"),
+      ],
+      wires: [
+        wire("w1", "source", "a", "pot", "a"),
+        wire("w2", "source", "b", "ground", "a"),
+        wire("w3", "pot", "b", "ground", "a"),
+      ],
+    };
+
+    const result = analyzeAnalogCircuit(document);
+    const current = 1 / resistance;
+    const pot = result.parts.pot;
+
+    expect(result.status, result.message).toBe("valid");
+    expect(pot.terminalVoltages.c?.real).toBeCloseTo(1 - position, 10);
+    expect(pot.terminalCurrents.a?.real).toBeCloseTo(current, 10);
+    expect(pot.terminalCurrents.b?.real).toBeCloseTo(-current, 10);
+    expect(pot.terminalCurrents.c?.real).toBeCloseTo(0, 12);
+    expect(pot.power.real + result.parts.source.power.real).toBeCloseTo(0, 10);
+  });
+
+  it.each([0, 1e-12, 0.25, 1 - 1e-12, 1])(
+    "solves AC potentiometer segments and conserves power at position=%s",
+    (position) => {
+      const document: CircuitDocument = {
+        title: "交流ポテンショメータ",
+        parts: [
+          part("source", "ac-source", { voltageVolts: 1, frequencyHz: 1000 }),
+          part("pot", "potentiometer", { resistanceOhms: 1000, wiperPosition: position }),
+        ],
+        wires: [
+          wire("w1", "source", "a", "pot", "a"),
+          wire("w2", "source", "b", "pot", "b"),
+        ],
+      };
+
+      const result = analyzeAnalogCircuit(document, { mode: "ac" });
+      const pot = result.parts.pot;
+
+      expect(result.status, result.message).toBe("valid");
+      expect(pot.terminalVoltages.c?.real).toBeCloseTo(-position, 10);
+      expect(pot.terminalCurrents.a?.real).toBeCloseTo(0.001, 10);
+      expect(pot.terminalCurrents.b?.real).toBeCloseTo(-0.001, 10);
+      expect(pot.terminalCurrents.c?.real).toBeCloseTo(0, 12);
+      expect(pot.power.real + result.parts.source.power.real).toBeCloseTo(0, 10);
+    },
+  );
 
   it("respects PNP and PMOS high-side current polarities", () => {
     const pnpCircuit: CircuitDocument = {

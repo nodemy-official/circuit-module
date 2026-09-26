@@ -67,4 +67,17 @@ describe("analyzeExtendedCircuit", () => {
     expect(result.parts.voltmeter.currentAmps).toBe(0);
     expect(result.parts.voltmeter.currentPhaseDegrees).toBe(0);
   });
+
+  it("returns invalid instead of throwing when switch states are explicitly null", () => {
+    const document: CircuitDocument = {
+      title: "nullのスイッチ状態",
+      parts: [part("switch", "switch"), part("ground", "ground")],
+      wires: [],
+    };
+
+    const result = analyzeCircuit(document, null as unknown as Record<string, boolean>);
+
+    expect(result.status).toBe("invalid");
+    expect(result.message).toContain("スイッチ状態");
+  });
 });

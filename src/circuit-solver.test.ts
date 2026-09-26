@@ -288,6 +288,17 @@ describe("analyzeCircuit", () => {
     expect(result.currentAmps).toBeNull();
   });
 
+  it("detects a short even when a very small source voltage drives less than 100 nA", () => {
+    const result = analyzeCircuit({
+      title: "微小電圧の短絡",
+      parts: [part("source", "battery", { voltageVolts: 1e-16 })],
+      wires: [wire("short", "source", "a", "source", "b")],
+    });
+
+    expect(result.status).toBe("short");
+    expect(result.issues[0]).toMatchObject({ severity: "error", partId: "source" });
+  });
+
   it("rejects invalid values and dangling wires", () => {
     expect(
       analyzeCircuit({
@@ -317,6 +328,18 @@ describe("analyzeCircuit", () => {
       severity: "error",
       message: "導線 ID が重複しています。",
     });
+  });
+
+  it("rejects malformed switch states instead of interpreting strings as closed contacts", () => {
+    const document = createExampleCircuit();
+    const switchPart = document.parts.find((item) => item.kind === "switch")!;
+    const malformed = { [switchPart.id]: "false" } as unknown as Record<string, boolean>;
+
+    expect(analyzeCircuit(document, malformed).status).toBe("invalid");
+    expect(analyzeCircuit(document, [] as unknown as Record<string, boolean>).status).toBe("invalid");
+    expect(analyzeCircuit(document, { missing: true }).status).toBe("invalid");
+    switchPart.initiallyClosed = "false" as unknown as boolean;
+    expect(analyzeCircuit(document).status).toBe("invalid");
   });
 
   it("accepts exactly the public terminal limit and rejects one terminal over it", () => {
@@ -459,6 +482,37 @@ describe("analyzeCircuit", () => {
     expect(result.parts.ammeter.currentAmps).not.toBe(0);
   });
 
+  it.each([1e6, 1e8, 1e10, 1e12, 1e20])("keeps equal series resistors balanced at %s ohms", (resistanceOhms) => {
+    const document: CircuitDocument = {
+      title: "高抵抗の分圧回路",
+      parts: [
+        part("battery", "battery", { voltageVolts: 9 }),
+        part("r1", "resistor", { resistanceOhms }),
+        part("r2", "resistor", { resistanceOhms }),
+        part("meter", "ammeter"),
+      ],
+      wires: [
+        wire("w1", "battery", "a", "r1", "a"),
+        wire("w2", "r1", "b", "r2", "a"),
+        wire("w3", "r2", "b", "meter", "a"),
+        wire("w4", "meter", "b", "battery", "b"),
+      ],
+    };
+    const result = analyzeCircuit(document);
+    const expectedCurrent = 9 / (2 * resistanceOhms + 6e-6);
+
+    expect(result.status).toBe("closed");
+    for (const id of ["r1", "r2"]) {
+      expect(result.parts[id].voltageVolts).toBeCloseTo(expectedCurrent * resistanceOhms, 8);
+      expect(result.parts[id].currentAmps / expectedCurrent).toBeCloseTo(1, 10);
+    }
+    expect(result.parts.battery.currentAmps / expectedCurrent).toBeCloseTo(-1, 10);
+    expect(result.parts.meter.currentAmps / expectedCurrent).toBeCloseTo(1, 10);
+    for (const current of Object.values(result.wireCurrents)) {
+      expect(current / expectedCurrent).toBeCloseTo(1, 10);
+    }
+  });
+
   it("preserves a low source voltage and the resulting small current", () => {
     const document: CircuitDocument = {
       title: "微小電圧",
@@ -553,9 +607,30 @@ describe("analyzeCircuit", () => {
     expect(Object.hasOwn(specialResult.wireCurrents, "constructor")).toBe(true);
   });
 
-  it("rejects finite inputs whose Norton equivalent overflows", () => {
+  it("returns a whole-circuit current only for one open battery", () => {
+    const singleOpen = analyzeCircuit({
+      title: "開いた単一電源",
+      parts: [part("battery", "battery", { voltageVolts: 9 })],
+      wires: [],
+    });
+    const multipleOpen = analyzeCircuit({
+      title: "開いた複数電源",
+      parts: [
+        part("battery-a", "battery", { voltageVolts: 9 }),
+        part("battery-b", "battery", { voltageVolts: 3 }),
+      ],
+      wires: [],
+    });
+
+    expect(singleOpen.status).toBe("open");
+    expect(singleOpen.currentAmps).toBe(0);
+    expect(multipleOpen.status).toBe("open");
+    expect(multipleOpen.currentAmps).toBeNull();
+  });
+
+  it("rejects finite source voltages whose resulting power overflows", () => {
     const document: CircuitDocument = {
-      title: "Norton電流のオーバーフロー",
+      title: "供給電力のオーバーフロー",
       parts: [
         part("battery", "battery", { voltageVolts: 1e308 }),
         part("load", "resistor", { resistanceOhms: 10 }),

@@ -40,6 +40,20 @@ function required<T extends Element>(container: ParentNode, selector: string): T
 }
 
 describe("CircuitEnergyPanel", () => {
+  it("shows a valid transient frame when the steady analysis is invalid", () => {
+    const document = createCircuitExample("charging");
+    const transient = simulateTransient(document, { durationSeconds: 0.001, timeStepSeconds: 0.0001 });
+    expect(transient.status).toBe("valid");
+    const analysis = { ...analyzeCircuit(document), status: "invalid" as const, message: "定常解析に失敗" };
+    const markup = renderToStaticMarkup(
+      <CircuitEnergyPanel document={document} analysis={analysis} frame={{ analysis: transient, sampleIndex: 5 }} />,
+    );
+
+    expect(markup).toContain('data-state="transient"');
+    expect(markup).toContain("過渡解析 · t =");
+    expect(markup).not.toContain("定常解析に失敗");
+  });
+
   it("uses passive transient power signs and integrates resistor dissipation through the selected sample", () => {
     const document = createCircuitExample("charging");
     const transient = simulateTransient(document, { durationSeconds: 0.002, timeStepSeconds: 0.000_02 });

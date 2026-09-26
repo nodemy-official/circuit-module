@@ -27,6 +27,8 @@ export interface TransientPartReading {
   terminalVoltages?: Partial<Record<CircuitTerminal, number>>;
   terminalCurrents?: Partial<Record<CircuitTerminal, number>>;
   meterStatus?: MeterStatus;
+  /** Effective switch position used for this sampled transient state. */
+  switchClosed?: boolean;
 }
 
 export interface TransientSample {
@@ -102,6 +104,7 @@ function deduplicateIssues(issues: readonly CircuitIssue[]): CircuitIssue[] {
 }
 
 function stepCount(duration: number, timeStep: number): number | null {
+  if (duration <= timeStep) { return 1; }
   const ratio = duration / timeStep;
   if (!Number.isFinite(ratio) || ratio <= 0) { return null; }
   const nearest = Math.round(ratio);
@@ -110,14 +113,30 @@ function stepCount(duration: number, timeStep: number): number | null {
   return count <= MAX_TRANSIENT_STEPS ? count : null;
 }
 
-function hasValidOptions(options: TransientAnalysisOptions): boolean {
-  return Number.isFinite(options.durationSeconds) && options.durationSeconds > 0 &&
-    Number.isFinite(options.timeStepSeconds) && options.timeStepSeconds > 0 &&
-    (options.startFromOperatingPoint === undefined || typeof options.startFromOperatingPoint === "boolean");
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function validateOptions(options: unknown): string | null {
+  if (!isRecord(options)) { return "解析条件はオブジェクトで指定してください。"; }
+  const duration = options.durationSeconds;
+  const timeStep = options.timeStepSeconds;
+  if (typeof duration !== "number" || !Number.isFinite(duration) || duration <= 0 ||
+      typeof timeStep !== "number" || !Number.isFinite(timeStep) || timeStep <= 0) {
+    return "解析時間と時間刻みは、有限な正の数値で指定してください。";
+  }
+  if (options.startFromOperatingPoint !== undefined && typeof options.startFromOperatingPoint !== "boolean") {
+    return "直流動作点から開始する設定は真偽値で指定してください。";
+  }
+  if (options.switchStates !== undefined) {
+    if (!isRecord(options.switchStates)) {
+      return "スイッチ状態は部品 ID ごとの真偽値で指定してください。";
+    }
+    if (Object.values(options.switchStates).some((state) => typeof state !== "boolean")) {
+      return "スイッチ状態は部品 ID ごとの真偽値で指定してください。";
+    }
+  }
+  return null;
 }
 
 function validatePartShape(value: unknown, index: number, parts: Map<string, Record<string, unknown>>) {
@@ -371,7 +390,8 @@ function exceedsLimits(document: CircuitDocument, steps: number): string | null 
     return `過渡解析の端子数が上限の${MAX_CIRCUIT_ANALYSIS_TERMINALS}端子を超えています。`;
   }
   const capacitorCount = document.parts.filter((part) => part.kind === "capacitor").length;
-  const dimensionBound = Math.max(1, terminalCount + document.parts.length + capacitorCount * 3);
+  const potentiometerCount = document.parts.filter((part) => part.kind === "potentiometer").length;
+  const dimensionBound = Math.max(1, terminalCount + document.parts.length + capacitorCount * 3 + potentiometerCount);
   if (dimensionBound ** 3 * steps > MAX_TRANSIENT_SOLVER_WORK) {
     return "過渡解析の演算量が上限を超えています。部品数または時間分割数を減らしてください。";
   }
@@ -559,6 +579,7 @@ function createSample(
   analysis: ReturnType<typeof solveAnalogStep>,
   previousState: StoredState | null,
   dt: number,
+  switchStates: Record<string, boolean> = {},
 ): { sample?: TransientSample; state?: StoredState; reason?: string } {
   const parts = Object.create(null) as Record<string, TransientPartReading>;
   const capacitorVoltages = new Map<string, number>();
@@ -566,6 +587,7 @@ function createSample(
   for (const part of document.parts) {
     const result = samplePart(part, analysis.parts[part.id], previousState, dt);
     if ("reason" in result) { return { reason: result.reason }; }
+    if (part.kind === "switch") { result.reading.switchClosed = isSwitchClosed(part, switchStates); }
     parts[part.id] = result.reading;
     if (result.capacitorVoltage !== undefined) { capacitorVoltages.set(part.id, result.capacitorVoltage); }
     if (result.inductorCurrent !== undefined) { inductorCurrents.set(part.id, result.inductorCurrent); }
@@ -608,7 +630,7 @@ function initializeTransient(
     const context = useOperatingPoint ? "直流動作点" : "初期状態";
     return { reason: `${context}を満たす回路を計算できません。 ${analysis.message}`, issues: analysis.issues };
   }
-  const measured = createSample(document, analysis, null, options.timeStepSeconds);
+  const measured = createSample(document, analysis, null, options.timeStepSeconds, options.switchStates);
   if (!measured.sample || !measured.state) {
     return { reason: measured.reason ?? "初期波形を作成できませんでした。", issues: analysis.issues };
   }
@@ -860,7 +882,7 @@ function solveNextStep(
   if (analysis.status !== "valid") {
     return { analysis, reason: `t=${timeSeconds} s の解析に失敗しました。${analysis.message}` };
   }
-  const measured = createSample(document, analysis, state, dt);
+  const measured = createSample(document, analysis, state, dt, options.switchStates);
   if (!measured.sample || !measured.state) {
     return { analysis, reason: `t=${timeSeconds} s の波形を作成できませんでした。${measured.reason ?? ""}` };
   }
@@ -911,9 +933,8 @@ export function simulateTransient(
     if (shapeIssue) { return invalid(shapeIssue); }
     const reactiveIssue = validateReactiveValues(document);
     if (reactiveIssue) { return invalid(reactiveIssue); }
-    if (!hasValidOptions(options)) {
-      return invalid("解析時間と時間刻みは、有限な正の数値で指定してください。");
-    }
+    const optionsIssue = validateOptions(options);
+    if (optionsIssue) { return invalid(optionsIssue); }
     if (!document.parts.length) { return invalid("過渡解析には部品が必要です。"); }
     const steps = stepCount(options.durationSeconds, options.timeStepSeconds);
     if (steps === null) {

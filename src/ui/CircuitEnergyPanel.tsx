@@ -240,7 +240,7 @@ export function CircuitEnergyPanel({ document, analysis, frame }: CircuitEnergyP
     : new Map<string, Array<number | null>>(), [resistiveParts, transient]);
   const maximumDissipatedJoules = useMemo(() => maximumDissipation(dissipatedByPart), [dissipatedByPart]);
 
-  if (!canShowSteady || (frame && !sample)) {
+  if ((!usingTransient && !canShowSteady) || (frame && !sample)) {
     const message = frame?.analysis.status === "valid"
       ? "選択した時刻の過渡サンプルがありません。波形を再計算してください。"
       : frame ? frame.analysis.message : analysis.message || "解析結果が有効になると、電力と蓄積エネルギーを表示します。";

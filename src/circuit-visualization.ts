@@ -1,4 +1,4 @@
-import { endpointName, terminalsOf, type CircuitDocument, type CircuitEndpoint, type CircuitPart } from "./circuit-model.js";
+import { endpointName, terminalsOf, type CircuitDocument, type CircuitEndpoint, type CircuitPart, type CircuitTerminal } from "./circuit-model.js";
 import type { CircuitAnalysis, CircuitPartReading } from "./circuit-solver.js";
 import type { TransientAnalysis } from "./transient-solver.js";
 
@@ -32,13 +32,10 @@ export const circuitEndpointKey = (endpoint: CircuitEndpoint) => JSON.stringify(
 const sourceKinds = new Set(["battery", "ac-source", "current-source"]);
 const finite = (value: number | undefined): value is number => value !== undefined && Number.isFinite(value);
 
-/** Adapt a sampled state without re-solving it as a DC operating point. */
-export function analysisAtTransientFrame(document: CircuitDocument, frame: CircuitTransientFrame): CircuitAnalysis | null {
-  if (frame.analysis.status !== "valid") { return null; }
-  const sample = frame.analysis.samples[frame.sampleIndex];
-  if (!sample) { return null; }
-  const parts: Record<string, CircuitPartReading> = {};
+function transientFrameParts(document: CircuitDocument, sample: TransientAnalysis["samples"][number]) {
+  const parts = Object.create(null) as Record<string, CircuitPartReading>;
   for (const part of document.parts) {
+    if (!Object.hasOwn(sample.parts, part.id)) { continue; }
     const reading = sample.parts[part.id];
     if (!reading) { continue; }
     const powerWatts = reading.powerWatts * (sourceKinds.has(part.kind) ? -1 : 1);
@@ -46,8 +43,18 @@ export function analysisAtTransientFrame(document: CircuitDocument, frame: Circu
       : part.kind === "led" ? Math.max(0, Math.min(1, reading.currentAmps / (part.ratedCurrentAmps ?? 0.02))) : undefined;
     parts[part.id] = { ...reading, powerWatts, ...(brightness === undefined ? {} : { brightness }) };
   }
+  return parts;
+}
+
+/** Adapt a sampled state without re-solving it as a DC operating point. */
+export function analysisAtTransientFrame(document: CircuitDocument, frame: CircuitTransientFrame): CircuitAnalysis | null {
+  if (frame.analysis.status !== "valid") { return null; }
+  const sample = frame.analysis.samples[frame.sampleIndex];
+  if (!sample) { return null; }
+  const parts = transientFrameParts(document, sample);
   const sources = document.parts.filter((part) => sourceKinds.has(part.kind));
-  const sourceCurrent = sources.length === 1 ? parts[sources[0].id]?.currentAmps : undefined;
+  const hasOpAmp = document.parts.some((part) => part.kind === "op-amp");
+  const sourceCurrent = sources.length === 1 && !hasOpAmp ? parts[sources[0].id]?.currentAmps : undefined;
   return {
     status: "closed", mode: "dc", timeSeconds: sample.timeSeconds, currentAmps: finite(sourceCurrent) ? Math.abs(sourceCurrent) : null,
     message: `過渡解析：${formatCircuitQuantity(sample.timeSeconds, "s")} の瞬時値`,
@@ -75,9 +82,69 @@ function phasor(value: number, degrees = 0) {
   return { real: value * Math.cos(radians), imaginary: value * Math.sin(radians) };
 }
 
-function connectsReference(part: CircuitPart, analysis: CircuitAnalysis) {
-  if (part.kind === "voltmeter" || (part.kind === "switch" && !part.initiallyClosed)) { return false; }
-  return !(part.kind === "capacitor" && analysis.mode !== "ac" && analysis.timeSeconds === undefined);
+function referenceTerminalGroups(part: CircuitPart, analysis: CircuitAnalysis): CircuitTerminal[][] {
+  switch (part.kind) {
+    case "battery":
+    case "ac-source":
+    case "resistor":
+    case "bulb":
+    case "ammeter":
+    case "diode":
+    case "led":
+    case "inductor":
+      return [["a", "b"]];
+    case "switch":
+      return (analysis.parts[part.id]?.switchClosed ?? part.initiallyClosed ?? false) ? [["a", "b"]] : [];
+    case "capacitor":
+      return analysis.mode === "ac" || analysis.timeSeconds !== undefined ? [["a", "b"]] : [];
+    case "potentiometer":
+    case "npn-transistor":
+    case "pnp-transistor":
+      return [["a", "b", "c"]];
+    case "nmos":
+    case "pmos":
+      return [["a", "c"]];
+    default:
+      // Ideal current sources, voltmeters, MOS gates, and op-amp inputs do not
+      // establish a voltage reference between their terminals.
+      return [];
+  }
+}
+
+function potentialReferenceGroups(
+  document: CircuitDocument,
+  endpoints: CircuitEndpoint[],
+  analysis: CircuitAnalysis,
+) {
+  const references = nodeGroups(endpoints.map(circuitEndpointKey));
+  const firstGround = document.parts.find((part) => part.kind === "ground");
+  const solverReference = firstGround
+    ? circuitEndpointKey({ partId: firstGround.id, terminal: "a" })
+    : endpoints[0] ? circuitEndpointKey(endpoints[0]) : undefined;
+  for (const wire of document.wires) {
+    references.union(circuitEndpointKey(wire.from), circuitEndpointKey(wire.to));
+  }
+  for (const ground of document.parts.filter((part) => part.kind === "ground").slice(1)) {
+    const first = circuitEndpointKey({ partId: firstGround?.id ?? ground.id, terminal: "a" });
+    references.union(first, circuitEndpointKey({ partId: ground.id, terminal: "a" }));
+  }
+  for (const part of document.parts) {
+    if (part.kind === "op-amp") {
+      if (solverReference) {
+        references.union(circuitEndpointKey({ partId: part.id, terminal: "c" }), solverReference);
+      }
+      continue;
+    }
+    for (const group of referenceTerminalGroups(part, analysis)) {
+      const first = group[0];
+      if (!first) { continue; }
+      const firstKey = circuitEndpointKey({ partId: part.id, terminal: first });
+      for (const terminal of group.slice(1)) {
+        references.union(firstKey, circuitEndpointKey({ partId: part.id, terminal }));
+      }
+    }
+  }
+  return references;
 }
 
 function nodeReading(endpoints: CircuitEndpoint[], document: CircuitDocument, analysis: CircuitAnalysis) {
@@ -125,21 +192,15 @@ export function circuitNodes(document: CircuitDocument, analysis: CircuitAnalysi
   const endpoints = document.parts.flatMap((part) => terminalsOf(part.kind).map((terminal) => ({ partId: part.id, terminal })));
   const keys = endpoints.map(circuitEndpointKey);
   const nets = nodeGroups(keys);
-  const references = nodeGroups(keys);
+  const references = potentialReferenceGroups(document, endpoints, analysis);
   for (const wire of document.wires) {
     nets.union(circuitEndpointKey(wire.from), circuitEndpointKey(wire.to));
-    references.union(circuitEndpointKey(wire.from), circuitEndpointKey(wire.to));
   }
   const grounds = document.parts.filter((part) => part.kind === "ground");
   for (const ground of grounds.slice(1)) {
     const first = circuitEndpointKey({ partId: grounds[0].id, terminal: "a" });
     const next = circuitEndpointKey({ partId: ground.id, terminal: "a" });
-    nets.union(first, next); references.union(first, next);
-  }
-  for (const part of document.parts) {
-    if (!connectsReference(part, analysis)) { continue; }
-    const first = circuitEndpointKey({ partId: part.id, terminal: "a" });
-    for (const terminal of terminalsOf(part.kind)) { references.union(first, circuitEndpointKey({ partId: part.id, terminal })); }
+    nets.union(first, next);
   }
   const grouped = new Map<string, CircuitEndpoint[]>();
   for (const endpoint of endpoints) {
@@ -174,7 +235,7 @@ export function circuitPotential(node: CircuitNode | undefined, reference: Circu
   const real = first.real - second.real;
   const imaginary = first.imaginary - second.imaginary;
   const volts = Math.hypot(real, imaginary);
-  return { volts, phaseDegrees: volts < 1e-12 ? 0 : Math.atan2(imaginary, real) * 180 / Math.PI };
+  return { volts, phaseDegrees: volts === 0 ? 0 : Math.atan2(imaginary, real) * 180 / Math.PI };
 }
 
 export function circuitPotentialColor(volts: number, scale: number) {

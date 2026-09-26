@@ -25,7 +25,7 @@
 | N・PチャネルMOSFET | `thresholdVolts` 2 V、`transconductanceAmpsPerVoltSquared` 0.02 A/V²、`channelLengthModulation` 0.01 1/V |
 | オペアンプ | `openLoopGain` 100000、`positiveRailVolts` +15 V、`negativeRailVolts` −15 V |
 
-電池、抵抗、電球、スイッチ、電流計、電圧計、接続点の従来7種類は既存の直流解析経路で処理します。この7種類だけを使う既存回路では、従来の解析結果と導線電流の推定を維持します。その他の部品や交流モードはアナログ解析経路を使います。
+電池、抵抗、電球、スイッチ、電流計、電圧計、接続点の従来7種類は既存の直流解析経路で処理します。この7種類だけを使う既存回路では、導線・閉スイッチ・電流計の1e−6 Ω近似を維持し、電池の内部抵抗には1e−6 Ωの下限を適用します。高抵抗回路でも電位差や微小電流を桁落ちで失わないよう計算します。その他の部品や交流モードはアナログ解析経路を使います。
 
 ## 定常解析
 
@@ -42,6 +42,8 @@ console.log(capacitor.voltageVolts, capacitor.voltagePhaseDegrees);
 ```
 
 交流結果の `voltageVolts` と `currentAmps` は実効値の大きさで、符号を持ちません。`voltagePhaseDegrees` と `currentPhaseDegrees` が基準に対する位相、`reactivePowerVars` が無効電力です。`analyzeCircuit()` の `powerWatts` は受動部品で吸収を正、独立電源で供給を正にします。損失のない理想コンデンサ・コイルの定常解析では有効電力を0 Wとして扱います。直流結果は電圧・電流が符号付きです。部品の主計測値は、BJTでコレクタ−エミッタ、MOSFETでドレイン−ソース、オペアンプで出力−GND、可変抵抗でA−B間を表します。個々の端子値は `terminalVoltages` と `terminalCurrents` で参照できます。
+
+スイッチ部品の `CircuitPartReading` と `TransientPartReading` には `switchClosed` が付き、解析で使った閉・開状態を示します。`analyzeCircuit()` の `switchStates` 引数、または `simulateTransient()` の `options.switchStates` に指定した上書きを優先し、上書きがない場合は部品の `initiallyClosed` を使います。過渡解析では各サンプルのスイッチ状態を参照できます。
 
 低レベルAPIでは電力の符号規約が異なります。`analyzeAnalogCircuit()` / `solveAnalogStep()` の `power.real` と、`simulateTransient()` が返す各サンプルの `powerWatts` はすべての部品で吸収を正とし、電源などが供給すると負になります。直流・過渡結果の電圧と電流は符号付きで、通常はA−B電圧とA端子へ流入する電流を表します。BJTはC−E・C端子へ流入、MOSFETはD−S・D端子へ流入、オペアンプは出力−GND電圧・出力端子へ流入する電流です。
 

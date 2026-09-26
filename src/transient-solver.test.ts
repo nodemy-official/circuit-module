@@ -330,6 +330,30 @@ describe("simulateTransient", () => {
     expect(open.samples[1]?.parts.resistor?.currentAmps).toBeCloseTo(0, 12);
   });
 
+  it("rejects malformed switch states instead of treating truthy values as closed", () => {
+    const result = simulateTransient(parallelCapacitorsCircuit("switch"), {
+      durationSeconds: 0.01,
+      timeStepSeconds: 0.01,
+      switchStates: { link: "false" } as unknown as Record<string, boolean>,
+    });
+
+    expect(result.status).toBe("invalid");
+    expect(result.message).toContain("スイッチ状態");
+    expect(result.samples).toHaveLength(0);
+  });
+
+  it("rejects a non-object switch state map", () => {
+    const result = simulateTransient(parallelCapacitorsCircuit("switch"), {
+      durationSeconds: 0.01,
+      timeStepSeconds: 0.01,
+      switchStates: null as unknown as Record<string, boolean>,
+    });
+
+    expect(result.status).toBe("invalid");
+    expect(result.message).toContain("スイッチ状態");
+    expect(result.samples).toHaveLength(0);
+  });
+
   it("shares the initial current of equal-voltage capacitors connected by a closed switch", () => {
     const document = parallelCapacitorsCircuit("switch");
     const result = simulateTransient(document, { durationSeconds: 0.01, timeStepSeconds: 0.01 });
@@ -546,6 +570,30 @@ describe("simulateTransient", () => {
     expect(result.samples.map(({ timeSeconds }) => timeSeconds)).toEqual([0, 0.01, 0.02, 0.025]);
   });
 
+  it("keeps one final sample when the positive duration is smaller than the requested step", () => {
+    const durationSeconds = Number.MIN_VALUE;
+    const document: CircuitDocument = {
+      title: "Duration shorter than one step",
+      parts: [
+        part("source", "battery", { voltageVolts: 1 }),
+        part("load", "resistor", { resistanceOhms: 1 }),
+        part("ground", "ground"),
+      ],
+      wires: [
+        wire("wire-source-load", "source", "a", "load", "a"),
+        wire("wire-load-ground", "load", "b", "ground", "a"),
+        wire("wire-source-ground", "source", "b", "ground", "a"),
+      ],
+    };
+    const result = simulateTransient(document, {
+      durationSeconds,
+      timeStepSeconds: Number.MAX_VALUE,
+    });
+
+    expect(result.status, result.message).toBe("valid");
+    expect(result.samples.map(({ timeSeconds }) => timeSeconds)).toEqual([0, durationSeconds]);
+  });
+
   it("uses the AC source RMS setting as a peak-valued time waveform", () => {
     const document: CircuitDocument = {
       title: "AC input",
@@ -736,6 +784,19 @@ describe("simulateTransient", () => {
 
     expect(result.status).toBe("invalid");
     expect(result.samples).toHaveLength(1);
+  });
+
+  it("counts both potentiometer segment currents when bounding solver work", () => {
+    const document: CircuitDocument = {
+      title: "可変抵抗の過渡計算量",
+      parts: Array.from({ length: 16 }, (_, index) => part(`pot-${index}`, "potentiometer")),
+      wires: [],
+    };
+    const result = simulateTransient(document, { durationSeconds: 1.6, timeStepSeconds: 0.001 });
+
+    expect(result.status).toBe("invalid");
+    expect(result.message).toContain("演算量");
+    expect(result.samples).toEqual([]);
   });
 
   it("rejects invalid, oversized, and excessively expensive analyses before solving", () => {

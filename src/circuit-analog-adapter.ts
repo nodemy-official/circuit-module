@@ -1,5 +1,5 @@
 import { analyzeAnalogCircuit, type ComplexValue, type AnalogCircuitPartReading } from "./analog-solver.js";
-import type { CircuitDocument, CircuitPart, CircuitTerminal } from "./circuit-model.js";
+import { circuitPartCatalog, type CircuitDocument, type CircuitPart, type CircuitTerminal } from "./circuit-model.js";
 import type { CircuitAnalysis, CircuitAnalysisOptions, CircuitPartReading } from "./circuit-solver.js";
 
 const sourceKinds = new Set(["battery", "ac-source", "current-source"]);
@@ -24,7 +24,18 @@ function terminalValues(values: Partial<Record<CircuitTerminal, ComplexValue>>, 
   ));
 }
 
-function adaptReading(part: CircuitPart, reading: AnalogCircuitPartReading, ac: boolean): CircuitPartReading {
+function switchClosedState(part: CircuitPart, switchStates: Record<string, boolean>) {
+  if (part.kind !== "switch") { return; }
+  const override = Object.hasOwn(switchStates, part.id) ? switchStates[part.id] : undefined;
+  return override ?? part.initiallyClosed ?? circuitPartCatalog.switch.defaults.initiallyClosed ?? false;
+}
+
+function adaptReading(
+  part: CircuitPart,
+  reading: AnalogCircuitPartReading,
+  ac: boolean,
+  switchStates: Record<string, boolean>,
+): CircuitPartReading {
   const powerWatts = part.kind === "capacitor" || part.kind === "inductor" ? 0
     : reading.power.real * (sourceKinds.has(part.kind) ? -1 : 1);
   const result: CircuitPartReading = {
@@ -34,6 +45,7 @@ function adaptReading(part: CircuitPart, reading: AnalogCircuitPartReading, ac: 
     terminalVoltages: terminalValues(reading.terminalVoltages, ac),
     terminalCurrents: terminalValues(reading.terminalCurrents, ac),
     ...(reading.meterStatus ? { meterStatus: reading.meterStatus } : {}),
+    ...(part.kind === "switch" ? { switchClosed: switchClosedState(part, switchStates) } : {}),
   };
   if (ac) {
     result.voltagePhaseDegrees = phase(reading.voltage);
@@ -61,7 +73,7 @@ export function analyzeExtendedCircuit(
   for (const part of document.parts) {
     if (!Object.hasOwn(analog.parts, part.id)) { continue; }
     const reading = analog.parts[part.id];
-    if (reading) { setRecordValue(parts, part.id, adaptReading(part, reading, mode === "ac")); }
+    if (reading) { setRecordValue(parts, part.id, adaptReading(part, reading, mode === "ac", switchStates)); }
   }
   const finiteReadings = Object.values(parts).every((reading) => [
     reading.voltageVolts,
