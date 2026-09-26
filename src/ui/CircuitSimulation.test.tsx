@@ -50,6 +50,15 @@ function buttonWithText(container: ParentNode, text: string) {
 
 function click(element: Element) { act(() => element.dispatchEvent(new MouseEvent("click", { bubbles: true }))); }
 
+function changeNumber(input: HTMLInputElement, value: string) {
+  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+  if (!setter) { throw new Error("Missing input value setter"); }
+  act(() => {
+    setter.call(input, value);
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+}
+
 describe("analysis controls and waveform integration", () => {
   it("shows waveform learning controls without steady-state settings in the Waveforms tab", () => {
     const ui = mount("charging");
@@ -79,6 +88,35 @@ describe("analysis controls and waveform integration", () => {
     expect(ui.editor.document).toBe(original);
     click(required(ui.container, ".circuit-editor__preview-toggle"));
     expect(ui.container.textContent).not.toContain("交流 1000 Hz");
+  });
+
+  it("applies the selected analysis frequency and preserves it when changing modes", () => {
+    const ui = mount("ac");
+    const original = ui.editor.document;
+    const label = Array.from(ui.container.querySelectorAll("label"))
+      .find((item) => item.textContent?.includes("解析周波数"));
+    if (!label) { throw new Error("Missing AC frequency setting"); }
+    const input = ui.container.querySelector<HTMLInputElement>(`#${label.htmlFor}`);
+    if (!input) { throw new Error("Missing AC frequency input"); }
+
+    changeNumber(input, "2000");
+    expect(ui.editor.analysis.frequencyHz).toBe(2000);
+    expect(ui.editor.analysis.issues.some((issue) => issue.message.includes("解析周波数と異なる"))).toBe(true);
+    expect(ui.editor.document).toBe(original);
+    expect(input.value).toBe("2000");
+
+    const mode = required(ui.container, ".circuit-simulation select") as HTMLSelectElement;
+    act(() => {
+      mode.value = "dc";
+      mode.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    expect(ui.editor.analysis.mode).toBe("dc");
+    act(() => {
+      mode.value = "ac";
+      mode.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    expect(ui.editor.analysis.frequencyHz).toBe(2000);
+    expect(ui.container.querySelector<HTMLInputElement>(`#${label.htmlFor}`)?.value).toBe("2000");
   });
 
   it("computes charging waveforms and hides stale results after a component edit", () => {

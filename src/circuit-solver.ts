@@ -243,13 +243,211 @@ function findRoot(parent: number[], node: number): number {
   return root;
 }
 
-/** One reference node per connected group, so every group has a solvable system. */
-function referenceNodes(size: number, conductances: readonly Conductance[]) {
+/** Finds the connected group for every terminal in the conductance graph. */
+function conductiveComponents(size: number, conductances: readonly Conductance[]) {
   const parent = Array.from({ length: size }, (_, index) => index);
   for (const { a, b } of conductances) { parent[findRoot(parent, a)] = findRoot(parent, b); }
+  return parent.map((_, node) => findRoot(parent, node));
+}
+
+/** One reference node per connected group, so every group has a solvable system. */
+function referenceNodes(size: number, conductances: readonly Conductance[]) {
+  const components = conductiveComponents(size, conductances);
   const references = new Set<number>();
-  for (let node = 0; node < size; node += 1) { references.add(findRoot(parent, node)); }
+  for (const component of components) { references.add(component); }
   return references;
+}
+
+interface SourceConstraintEdge {
+  from: number;
+  to: number;
+  /** V(to) − V(from) when the ideal source constraints are consistent. */
+  voltage: number;
+}
+
+interface SourceConstraintTree {
+  parent: number[];
+  depth: number[];
+  offset: number[];
+  component: number[];
+  inconsistent: Set<number>;
+}
+
+function sourceConstraintEdges(
+  document: CircuitDocument,
+  index: Map<string, number>,
+  switchStates: Record<string, boolean>,
+): SourceConstraintEdge[] {
+  const edges: SourceConstraintEdge[] = document.wires.map((wire) => ({
+    from: index.get(key(wire.from)) ?? -1,
+    to: index.get(key(wire.to)) ?? -1,
+    voltage: 0,
+  }));
+  for (const part of document.parts) {
+    if (part.kind === "battery") {
+      edges.push({
+        from: index.get(`${part.id}:a`) ?? -1,
+        to: index.get(`${part.id}:b`) ?? -1,
+        voltage: -(part.voltageVolts ?? 0),
+      });
+    } else if (part.kind === "ammeter" || (part.kind === "switch" && isClosed(part, switchStates))) {
+      edges.push({
+        from: index.get(`${part.id}:a`) ?? -1,
+        to: index.get(`${part.id}:b`) ?? -1,
+        voltage: 0,
+      });
+    }
+  }
+  return edges;
+}
+
+function sourceVoltageDifference(tree: SourceConstraintTree, from: number, to: number) {
+  let a = from;
+  let b = to;
+  let value = 0;
+  let correction = 0;
+  let scale = 0;
+  const add = (term: number) => {
+    const next = value + term;
+    correction += Math.abs(value) >= Math.abs(term) ? (value - next) + term : (term - next) + value;
+    value = next;
+    scale += Math.abs(term);
+  };
+  while (a !== b) {
+    if ((tree.depth[a] ?? -1) >= (tree.depth[b] ?? -1)) {
+      if (tree.parent[a] !== -1) { add(tree.offset[a] ?? 0); }
+      a = tree.parent[a] ?? -1;
+    } else {
+      if (tree.parent[b] !== -1) { add(-(tree.offset[b] ?? 0)); }
+      b = tree.parent[b] ?? -1;
+    }
+  }
+  return { value: value + correction, scale };
+}
+
+function sourceConstraintTree(
+  size: number,
+  edges: readonly SourceConstraintEdge[],
+): SourceConstraintTree {
+  const adjacent = Array.from({ length: size }, () => [] as { node: number; voltage: number }[]);
+  for (const edge of edges) {
+    adjacent[edge.from]?.push({ node: edge.to, voltage: edge.voltage });
+    adjacent[edge.to]?.push({ node: edge.from, voltage: -edge.voltage });
+  }
+  const parent = Array.from({ length: size }, () => -1);
+  const depth = Array.from({ length: size }, () => 0);
+  const offset = Array.from({ length: size }, () => 0);
+  const component = Array.from({ length: size }, () => -1);
+  for (let root = 0; root < size; root += 1) {
+    if (component[root] !== -1) { continue; }
+    component[root] = root;
+    const pending = [root];
+    for (const node of pending) {
+      for (const edge of adjacent[node] ?? []) {
+        if (component[edge.node] !== -1) { continue; }
+        component[edge.node] = root;
+        parent[edge.node] = node;
+        depth[edge.node] = depth[node] + 1;
+        offset[edge.node] = edge.voltage;
+        pending.push(edge.node);
+      }
+    }
+  }
+  const tree = { parent, depth, offset, component, inconsistent: new Set<number>() };
+  for (const edge of edges) {
+    const difference = sourceVoltageDifference(tree, edge.from, edge.to);
+    const residual = difference.value + edge.voltage;
+    const uncertainty = ROUNDING_GUARD * (difference.scale + Math.abs(edge.voltage));
+    if (Math.abs(residual) > uncertainty) {
+      const group = component[edge.from];
+      if (group !== undefined) { tree.inconsistent.add(group); }
+    }
+  }
+  return tree;
+}
+
+/** Groups terminals joined by zero-voltage constraints, excluding battery edges. */
+function zeroVoltageSourceRails(size: number, edges: readonly SourceConstraintEdge[]) {
+  const parent = Array.from({ length: size }, (_, node) => node);
+  for (const edge of edges) {
+    if (edge.voltage !== 0) { continue; }
+    parent[findRoot(parent, edge.from)] = findRoot(parent, edge.to);
+  }
+  return parent.map((_, node) => findRoot(parent, node));
+}
+
+interface PassiveNeighbor {
+  node: number;
+  resistance: number;
+}
+
+interface DistanceEntry {
+  node: number;
+  distance: number;
+}
+
+function pushDistance(heap: DistanceEntry[], entry: DistanceEntry) {
+  let index = heap.length;
+  heap.push(entry);
+  while (index > 0) {
+    const parent = Math.floor((index - 1) / 2);
+    if ((heap[parent]?.distance ?? Number.POSITIVE_INFINITY) <= entry.distance) { break; }
+    heap[index] = heap[parent]!;
+    index = parent;
+  }
+  heap[index] = entry;
+}
+
+function popDistance(heap: DistanceEntry[]) {
+  const first = heap[0];
+  const last = heap.pop();
+  if (!first || !last) { return first; }
+  if (heap.length === 0) { return first; }
+  let index = 0;
+  while (index < heap.length) {
+    const left = index * 2 + 1;
+    const right = left + 1;
+    if (left >= heap.length) { break; }
+    const child = right < heap.length &&
+      (heap[right]?.distance ?? Number.POSITIVE_INFINITY) <
+      (heap[left]?.distance ?? Number.POSITIVE_INFINITY)
+      ? right
+      : left;
+    if ((heap[child]?.distance ?? Number.POSITIVE_INFINITY) >= last.distance) { break; }
+    heap[index] = heap[child]!;
+    index = child;
+  }
+  heap[index] = last;
+  return first;
+}
+
+function passiveAdjacency(size: number, conductances: readonly Conductance[]) {
+  const adjacent = Array.from({ length: size }, () => [] as PassiveNeighbor[]);
+  for (const { a, b, g, batteryId } of conductances) {
+    if (batteryId !== undefined) { continue; }
+    const resistance = 1 / g;
+    adjacent[a]?.push({ node: b, resistance });
+    adjacent[b]?.push({ node: a, resistance });
+  }
+  return adjacent;
+}
+
+function shortestPassiveResistances(adjacent: readonly PassiveNeighbor[][], start: number) {
+  const distances = Array.from({ length: adjacent.length }, () => Number.POSITIVE_INFINITY);
+  const heap: DistanceEntry[] = [];
+  distances[start] = 0;
+  pushDistance(heap, { node: start, distance: 0 });
+  while (heap.length > 0) {
+    const current = popDistance(heap);
+    if (!current || current.distance !== distances[current.node]) { continue; }
+    for (const edge of adjacent[current.node] ?? []) {
+      const distance = current.distance + edge.resistance;
+      if (distance >= (distances[edge.node] ?? Number.POSITIVE_INFINITY)) { continue; }
+      distances[edge.node] = distance;
+      pushDistance(heap, { node: edge.node, distance });
+    }
+  }
+  return distances;
 }
 
 /** Whether a battery's terminals are joined by a conductive path outside that battery. */
@@ -373,6 +571,7 @@ function sumVoltagePath(path: readonly TreeCoordinate[], solution: Float64Array,
 function nodeVoltages(
   size: number,
   conductances: readonly Conductance[],
+  currentSource?: { from: number; to: number; amps: number },
 ) {
   if (conductances.some(({ g }) => !Number.isFinite(g))) {
     return null;
@@ -389,6 +588,12 @@ function nodeVoltages(
       for (const column of path) {
         matrix[row.unknown * count + column.unknown] += g * row.sign * column.sign;
       }
+    }
+  }
+  if (currentSource) {
+    const path = treeVoltagePath(tree, currentSource.from, currentSource.to);
+    for (const row of path) {
+      rhs[row.unknown] += row.sign * currentSource.amps;
     }
   }
   const solution = solveRealLinearSystem(count, matrix, rhs);
@@ -410,6 +615,34 @@ function nodeVoltages(
       return { value: baseline + correction.value, scale: Math.abs(baseline) + correction.scale };
     },
   };
+}
+
+/** Equivalent resistance of the passive network between two terminals. */
+function externalResistance(
+  nodes: readonly number[],
+  conductances: readonly Conductance[],
+  from: number,
+  to: number,
+) {
+  const localIndex = new Map(nodes.map((node, local) => [node, local]));
+  const localFrom = localIndex.get(from);
+  const localTo = localIndex.get(to);
+  if (localFrom === undefined || localTo === undefined) { return null; }
+  if (localFrom === localTo) { return 0; }
+  const localConductances: Conductance[] = [];
+  for (const edge of conductances) {
+    const a = localIndex.get(edge.a);
+    const b = localIndex.get(edge.b);
+    if (a !== undefined && b !== undefined) { localConductances.push({ ...edge, a, b }); }
+  }
+  const solved = nodeVoltages(nodes.length, localConductances, {
+    from: localFrom,
+    to: localTo,
+    amps: 1,
+  });
+  if (!solved) { return null; }
+  const resistance = solved.difference(localFrom, localTo).value;
+  return Number.isFinite(resistance) && resistance >= 0 ? resistance : null;
 }
 
 function readPart(
@@ -516,15 +749,565 @@ function hasOnlyFiniteReadings(
   return Object.values(wireCurrents).every(Number.isFinite);
 }
 
-function shortedBattery(
+function batteriesBySourceGroup(
+  batteries: readonly CircuitPart[],
+  sourceTree: SourceConstraintTree,
+  index: Map<string, number>,
+) {
+  const groups = new Map<number, CircuitPart[]>();
+  for (const battery of batteries) {
+    const terminal = index.get(`${battery.id}:a`);
+    const group = terminal === undefined ? undefined : sourceTree.component[terminal];
+    if (group === undefined) { continue; }
+    const groupBatteries = groups.get(group) ?? [];
+    groupBatteries.push(battery);
+    groups.set(group, groupBatteries);
+  }
+  return groups;
+}
+
+function shortedBatteryByTerminalRatio(
   batteries: readonly CircuitPart[],
   parts: Record<string, CircuitPartReading>,
+  sourceTree: SourceConstraintTree,
+  batteriesByGroup: Map<number, CircuitPart[]>,
+  index: Map<string, number>,
+  protectedBatteryIds: Set<string>,
 ) {
   return batteries.find((battery) => {
+    if (protectedBatteryIds.has(battery.id)) { return false; }
+    const terminal = index.get(`${battery.id}:a`);
+    const group = terminal === undefined ? undefined : sourceTree.component[terminal];
+    const groupBatteries = group === undefined ? undefined : batteriesByGroup.get(group);
+    if (group !== undefined && groupBatteries && groupBatteries.length > 1 &&
+      !sourceTree.inconsistent.has(group)) {
+      return false;
+    }
     const reading = parts[battery.id];
-    if (!reading || reading.currentAmps === 0) { return false; }
-    return Math.abs(reading.voltageVolts / reading.currentAmps) < SHORT_OHMS;
+    return Boolean(reading && reading.currentAmps !== 0 &&
+      Math.abs(reading.voltageVolts / reading.currentAmps) < SHORT_OHMS);
   });
+}
+
+function addBatteryTerminalToPassiveGroup(
+  battery: CircuitPart,
+  sourceGroup: number,
+  passiveComponents: number[],
+  index: Map<string, number>,
+  protectedBatteryIds: Set<string>,
+  groups: Map<string, { sourceGroup: number; passiveGroup: number; nodes: number[] }>,
+) {
+  if (protectedBatteryIds.has(battery.id)) { return; }
+  for (const terminal of ["a", "b"] as const) {
+    const node = index.get(`${battery.id}:${terminal}`);
+    const passiveGroup = node === undefined ? undefined : passiveComponents[node];
+    if (node === undefined || passiveGroup === undefined) { continue; }
+    const sourcePassiveKey = `${sourceGroup}:${passiveGroup}`;
+    const group = groups.get(sourcePassiveKey) ?? { sourceGroup, passiveGroup, nodes: [] };
+    group.nodes.push(node);
+    groups.set(sourcePassiveKey, group);
+  }
+}
+
+function sourcePassiveNodeGroups(
+  sourceTree: SourceConstraintTree,
+  batteriesByGroup: Map<number, CircuitPart[]>,
+  passiveComponents: number[],
+  index: Map<string, number>,
+  protectedBatteryIds: Set<string>,
+) {
+  const groups = new Map<string, { sourceGroup: number; passiveGroup: number; nodes: number[] }>();
+  for (const [sourceGroup, groupBatteries] of batteriesByGroup) {
+    if (groupBatteries.length < 2 || sourceTree.inconsistent.has(sourceGroup)) { continue; }
+    for (const battery of groupBatteries) {
+      addBatteryTerminalToPassiveGroup(
+        battery,
+        sourceGroup,
+        passiveComponents,
+        index,
+        protectedBatteryIds,
+        groups,
+      );
+    }
+  }
+  return groups;
+}
+
+function passiveComponentsByNode(size: number, passive: readonly Conductance[]) {
+  const components = conductiveComponents(size, passive);
+  const nodesByComponent = new Map<number, number[]>();
+  for (let node = 0; node < size; node += 1) {
+    const component = components[node];
+    if (component === undefined) { continue; }
+    const nodes = nodesByComponent.get(component) ?? [];
+    nodes.push(node);
+    nodesByComponent.set(component, nodes);
+  }
+  const conductancesByComponent = new Map<number, Conductance[]>();
+  for (const edge of passive) {
+    const component = components[edge.a];
+    if (component === undefined || component !== components[edge.b]) { continue; }
+    const edges = conductancesByComponent.get(component) ?? [];
+    edges.push(edge);
+    conductancesByComponent.set(component, edges);
+  }
+  return { components, nodesByComponent, conductancesByComponent };
+}
+
+interface PassiveBatteryEdge {
+  battery: CircuitPart;
+  fromComponent: number;
+  toComponent: number;
+  fromNode: number;
+  toNode: number;
+}
+
+function batteryEdgesByPassiveComponent(
+  batteries: readonly CircuitPart[],
+  index: Map<string, number>,
+  passiveComponents: number[],
+) {
+  const edges: PassiveBatteryEdge[] = [];
+  const incidentEdges = new Map<number, number[]>();
+  for (const battery of batteries) {
+    const fromNode = index.get(`${battery.id}:a`);
+    const toNode = index.get(`${battery.id}:b`);
+    const fromComponent = fromNode === undefined ? undefined : passiveComponents[fromNode];
+    const toComponent = toNode === undefined ? undefined : passiveComponents[toNode];
+    if (fromNode === undefined || toNode === undefined ||
+      fromComponent === undefined || toComponent === undefined) {
+      continue;
+    }
+    const edgeIndex = edges.length;
+    edges.push({ battery, fromComponent, toComponent, fromNode, toNode });
+    for (const component of [fromComponent, toComponent]) {
+      const incident = incidentEdges.get(component) ?? [];
+      incident.push(edgeIndex);
+      incidentEdges.set(component, incident);
+    }
+  }
+  return { edges, incidentEdges };
+}
+
+interface BatteryBlockSearch {
+  edges: readonly PassiveBatteryEdge[];
+  incidentEdges: Map<number, number[]>;
+  discovered: Map<number, number>;
+  low: Map<number, number>;
+  stack: number[];
+  cycles: PassiveBatteryEdge[][];
+}
+
+function recordBatteryCycle(search: BatteryBlockSearch, lastEdge: number) {
+  const loop: PassiveBatteryEdge[] = [];
+  const degrees = new Map<number, number>();
+  while (search.stack.length > 0) {
+    const edgeIndex = search.stack.pop();
+    const edge = edgeIndex === undefined ? undefined : search.edges[edgeIndex];
+    if (!edge) { break; }
+    loop.push(edge);
+    for (const component of [edge.fromComponent, edge.toComponent]) {
+      degrees.set(component, (degrees.get(component) ?? 0) + 1);
+    }
+    if (edgeIndex === lastEdge) { break; }
+  }
+  if (loop.length >= 2 && [...degrees.values()].every((degree) => degree === 2)) {
+    search.cycles.push(loop);
+  }
+}
+
+function visitBatteryBlocks(search: BatteryBlockSearch, component: number, parentEdge: number) {
+  const order = search.discovered.size;
+  search.discovered.set(component, order);
+  search.low.set(component, order);
+  for (const edgeIndex of search.incidentEdges.get(component) ?? []) {
+    if (edgeIndex === parentEdge) { continue; }
+    const edge = search.edges[edgeIndex];
+    if (!edge) { continue; }
+    const next = edge.fromComponent === component ? edge.toComponent : edge.fromComponent;
+    // A source wholly inside one passive component is handled by the ordinary
+    // load test, rather than being part of a multi-source series cycle.
+    if (next === component) { continue; }
+    const nextOrder = search.discovered.get(next);
+    if (nextOrder === undefined) {
+      search.stack.push(edgeIndex);
+      visitBatteryBlocks(search, next, edgeIndex);
+      const nextLow = search.low.get(next) ?? order;
+      search.low.set(component, Math.min(search.low.get(component) ?? order, nextLow));
+      if (nextLow >= order) { recordBatteryCycle(search, edgeIndex); }
+    } else if (nextOrder < order) {
+      search.stack.push(edgeIndex);
+      search.low.set(component, Math.min(search.low.get(component) ?? order, nextOrder));
+    }
+  }
+}
+
+function batteryCycleGroups(
+  edges: readonly PassiveBatteryEdge[],
+  incidentEdges: Map<number, number[]>,
+) {
+  // Biconnected blocks separate cycles at shared junctions and discard open
+  // branches. Removing only leaves would miss a figure-eight's two valid loops.
+  const search: BatteryBlockSearch = {
+    edges,
+    incidentEdges,
+    discovered: new Map(),
+    low: new Map(),
+    stack: [],
+    cycles: [],
+  };
+  for (const component of incidentEdges.keys()) {
+    if (!search.discovered.has(component)) { visitBatteryBlocks(search, component, -1); }
+  }
+  return search.cycles;
+}
+
+function seriesLoopExternalResistance(
+  loop: readonly PassiveBatteryEdge[],
+  nodesByComponent: Map<number, number[]>,
+  conductancesByComponent: Map<number, Conductance[]>,
+) {
+  const terminalsByComponent = new Map<number, number[]>();
+  for (const edge of loop) {
+    const fromTerminals = terminalsByComponent.get(edge.fromComponent) ?? [];
+    fromTerminals.push(edge.fromNode);
+    terminalsByComponent.set(edge.fromComponent, fromTerminals);
+    const toTerminals = terminalsByComponent.get(edge.toComponent) ?? [];
+    toTerminals.push(edge.toNode);
+    terminalsByComponent.set(edge.toComponent, toTerminals);
+  }
+  let totalResistance = 0;
+  for (const [component, terminals] of terminalsByComponent) {
+    if (terminals.length !== 2) { return null; }
+    const nodes = nodesByComponent.get(component);
+    const conductances = conductancesByComponent.get(component) ?? [];
+    const from = terminals[0];
+    const to = terminals[1];
+    if (!nodes || from === undefined || to === undefined) { return null; }
+    const resistance = externalResistance(nodes, conductances, from, to);
+    if (resistance === null) { return null; }
+    totalResistance += resistance;
+  }
+  return totalResistance;
+}
+
+function shortedSeriesLoopBattery(
+  batteries: readonly CircuitPart[],
+  parts: Record<string, CircuitPartReading>,
+  index: Map<string, number>,
+  passiveComponents: number[],
+  nodesByComponent: Map<number, number[]>,
+  conductancesByComponent: Map<number, Conductance[]>,
+) {
+  const graph = batteryEdgesByPassiveComponent(batteries, index, passiveComponents);
+  const protectedBatteryIds = new Set<string>();
+  for (const loop of batteryCycleGroups(graph.edges, graph.incidentEdges)) {
+    const resistance = seriesLoopExternalResistance(loop, nodesByComponent, conductancesByComponent);
+    if (resistance === null) { continue; }
+    for (const edge of loop) { protectedBatteryIds.add(edge.battery.id); }
+    if (resistance >= SHORT_OHMS) { continue; }
+    const flowingBattery = loop.find((edge) => parts[edge.battery.id]?.currentAmps !== 0);
+    if (flowingBattery) { return { protectedBatteryIds, shortedBattery: flowingBattery.battery }; }
+  }
+  return { protectedBatteryIds, shortedBattery: undefined };
+}
+
+function passiveEscapeConductances(
+  size: number,
+  rails: number[],
+  passive: readonly Conductance[],
+) {
+  const total = Array.from({ length: size }, () => 0);
+  for (const { a, b, g } of passive) {
+    const fromRail = rails[a];
+    const toRail = rails[b];
+    if (fromRail === toRail) { continue; }
+    if (fromRail !== undefined) { total[fromRail] = (total[fromRail] ?? 0) + g; }
+    if (toRail !== undefined) { total[toRail] = (total[toRail] ?? 0) + g; }
+  }
+  return total;
+}
+
+interface PassiveResistanceIndex {
+  anchors: Map<number, number>;
+  tails: Map<number, number>;
+  coreNodes: number[];
+  coreConductances: Conductance[];
+  coreResistance: Map<string, number | null>;
+}
+
+interface LocalPassiveConductance extends Conductance {
+  localA: number;
+  localB: number;
+}
+
+function localPassiveConductances(nodes: readonly number[], conductances: readonly Conductance[]) {
+  const localIndex = new Map(nodes.map((node, local) => [node, local]));
+  return conductances.flatMap((edge) => {
+    const a = localIndex.get(edge.a);
+    const b = localIndex.get(edge.b);
+    return a === undefined || b === undefined ? [] : [{ ...edge, localA: a, localB: b }];
+  });
+}
+
+function passiveComponentAdjacency(nodes: readonly number[], localEdges: readonly LocalPassiveConductance[]) {
+  const adjacent = nodes.map(() => [] as { edge: number; node: number; resistance: number }[]);
+  for (const [edgeIndex, edge] of localEdges.entries()) {
+    const resistance = 1 / edge.g;
+    adjacent[edge.localA]?.push({ edge: edgeIndex, node: edge.localB, resistance });
+    adjacent[edge.localB]?.push({ edge: edgeIndex, node: edge.localA, resistance });
+  }
+  return adjacent;
+}
+
+function peelPassiveComponentLeaves(
+  adjacent: readonly { edge: number; node: number; resistance: number }[][],
+) {
+  const degree = adjacent.map((edges) => edges.length);
+  const pending = degree.flatMap((value, node) => value <= 1 ? [node] : []);
+  const removedEdges = new Set<number>();
+  const peeled: { node: number; parent: number; resistance: number }[] = [];
+  for (const node of pending) {
+    if ((degree[node] ?? 0) > 1) { continue; }
+    let remaining: { edge: number; node: number; resistance: number } | undefined;
+    for (const edge of adjacent[node] ?? []) {
+      if (!removedEdges.has(edge.edge)) { remaining = edge; break; }
+    }
+    if (remaining) {
+      removedEdges.add(remaining.edge);
+      peeled.push({ node, parent: remaining.node, resistance: remaining.resistance });
+      degree[node] = 0;
+      degree[remaining.node] = (degree[remaining.node] ?? 0) - 1;
+      if ((degree[remaining.node] ?? 0) <= 1) { pending.push(remaining.node); }
+    } else {
+      degree[node] = 0;
+    }
+  }
+  return { degree, removedEdges, peeled };
+}
+
+function passiveCoreNetwork(
+  nodes: readonly number[],
+  localEdges: readonly LocalPassiveConductance[],
+  degree: readonly number[],
+  removedEdges: ReadonlySet<number>,
+) {
+  const coreLocalNodes = degree.flatMap((value, node) => value > 0 ? [node] : []);
+  const coreNodes = coreLocalNodes.map((node) => nodes[node]).filter(
+    (node): node is number => node !== undefined,
+  );
+  const coreConductances = localEdges.flatMap((edge, edgeIndex) => {
+    if (removedEdges.has(edgeIndex) || degree[edge.localA] === 0 || degree[edge.localB] === 0) { return []; }
+    const a = nodes[edge.localA];
+    const b = nodes[edge.localB];
+    return a === undefined || b === undefined ? [] : [{ a, b, g: edge.g }];
+  });
+  return { coreLocalNodes, coreNodes, coreConductances };
+}
+
+function passiveNodeAnchors(
+  nodes: readonly number[],
+  coreLocalNodes: readonly number[],
+  peeled: readonly { node: number; parent: number; resistance: number }[],
+) {
+  const anchors = new Map<number, number>();
+  const tails = new Map<number, number>();
+  for (const node of coreLocalNodes) {
+    const globalNode = nodes[node];
+    if (globalNode !== undefined) {
+      anchors.set(globalNode, globalNode);
+      tails.set(globalNode, 0);
+    }
+  }
+  for (let cursor = peeled.length - 1; cursor >= 0; cursor -= 1) {
+    const leaf = peeled[cursor];
+    if (!leaf) { continue; }
+    const globalNode = nodes[leaf.node];
+    const globalParent = nodes[leaf.parent];
+    const anchor = globalParent === undefined ? undefined : anchors.get(globalParent);
+    const parentTail = globalParent === undefined ? undefined : tails.get(globalParent);
+    if (globalNode !== undefined && anchor !== undefined && parentTail !== undefined) {
+      anchors.set(globalNode, anchor);
+      tails.set(globalNode, leaf.resistance + parentTail);
+    }
+  }
+  return { anchors, tails };
+}
+
+function passiveResistanceIndex(nodes: readonly number[], conductances: readonly Conductance[]) {
+  const localEdges = localPassiveConductances(nodes, conductances);
+  const adjacent = passiveComponentAdjacency(nodes, localEdges);
+  const { degree, removedEdges, peeled } = peelPassiveComponentLeaves(adjacent);
+  const { coreLocalNodes, coreNodes, coreConductances } = passiveCoreNetwork(
+    nodes,
+    localEdges,
+    degree,
+    removedEdges,
+  );
+  const { anchors, tails } = passiveNodeAnchors(nodes, coreLocalNodes, peeled);
+  return { anchors, tails, coreNodes, coreConductances, coreResistance: new Map<string, number | null>() };
+}
+
+function indexedExternalResistance(
+  index: PassiveResistanceIndex,
+  from: number,
+  to: number,
+  shortestPathResistance: number,
+) {
+  const fromAnchor = index.anchors.get(from);
+  const toAnchor = index.anchors.get(to);
+  const fromTail = index.tails.get(from);
+  const toTail = index.tails.get(to);
+  if (fromAnchor === undefined || toAnchor === undefined || fromTail === undefined || toTail === undefined) {
+    // A tree has no 2-core; its unique path is its exact equivalent resistance.
+    return shortestPathResistance;
+  }
+  if (fromAnchor === toAnchor) { return shortestPathResistance; }
+
+  const pair = fromAnchor < toAnchor ? `${fromAnchor}:${toAnchor}` : `${toAnchor}:${fromAnchor}`;
+  let coreResistance = index.coreResistance.get(pair);
+  if (coreResistance === undefined) {
+    coreResistance = externalResistance(index.coreNodes, index.coreConductances, fromAnchor, toAnchor);
+    index.coreResistance.set(pair, coreResistance);
+  }
+  if (coreResistance === null) { return null; }
+  const resistance = fromTail + coreResistance + toTail;
+  return Number.isFinite(resistance) && resistance >= 0 ? resistance : null;
+}
+
+function externalPairIsShort(
+  from: number,
+  to: number,
+  sourceTree: SourceConstraintTree,
+  rails: number[],
+  escapeConductance: number[],
+  adjacent: readonly PassiveNeighbor[][],
+  distancesByNode: Map<number, number[]>,
+  resistanceIndex: PassiveResistanceIndex,
+) {
+  const sourceDifference = sourceVoltageDifference(sourceTree, from, to);
+  // Keep compensated nonzero differences even beside much larger voltages.
+  if (sourceDifference.value === 0) { return false; }
+  const fromRail = rails[from];
+  const toRail = rails[to];
+  if (fromRail === undefined || toRail === undefined || fromRail === toRail) { return false; }
+  // Each route must leave both zero-voltage conductor rails. Their total
+  // outgoing conductance bounds the external conductance from above.
+  if ((escapeConductance[fromRail] ?? 0) <= 1 / SHORT_OHMS ||
+    (escapeConductance[toRail] ?? 0) <= 1 / SHORT_OHMS) {
+    return false;
+  }
+
+  let distances = distancesByNode.get(from);
+  if (!distances) {
+    distances = shortestPassiveResistances(adjacent, from);
+    distancesByNode.set(from, distances);
+  }
+  if ((distances[to] ?? Number.POSITIVE_INFINITY) < SHORT_OHMS) { return true; }
+
+  const resistance = indexedExternalResistance(resistanceIndex, from, to, distances[to] ?? Number.POSITIVE_INFINITY);
+  return resistance !== null && resistance < SHORT_OHMS;
+}
+
+function shortedBatteryByExternalResistance(
+  groups: Map<string, { sourceGroup: number; passiveGroup: number; nodes: number[] }>,
+  batteriesByGroup: Map<number, CircuitPart[]>,
+  indexSize: number,
+  sourceTree: SourceConstraintTree,
+  rails: number[],
+  escapeConductance: number[],
+  passive: readonly Conductance[],
+  nodesByComponent: Map<number, number[]>,
+  conductancesByComponent: Map<number, Conductance[]>,
+) {
+  const adjacent = passiveAdjacency(indexSize, passive);
+  const distancesByNode = new Map<number, number[]>();
+  const resistanceIndexes = new Map<number, PassiveResistanceIndex>();
+  for (const { sourceGroup, passiveGroup, nodes } of groups.values()) {
+    const battery = batteriesByGroup.get(sourceGroup)?.[0];
+    const componentNodes = nodesByComponent.get(passiveGroup);
+    const componentConductances = conductancesByComponent.get(passiveGroup) ?? [];
+    if (!battery || !componentNodes) { continue; }
+    let resistanceIndex = resistanceIndexes.get(passiveGroup);
+    if (!resistanceIndex) {
+      resistanceIndex = passiveResistanceIndex(componentNodes, componentConductances);
+      resistanceIndexes.set(passiveGroup, resistanceIndex);
+    }
+    for (let fromIndex = 0; fromIndex < nodes.length; fromIndex += 1) {
+      const from = nodes[fromIndex];
+      if (from === undefined) { continue; }
+      for (let toIndex = fromIndex + 1; toIndex < nodes.length; toIndex += 1) {
+        const to = nodes[toIndex];
+        if (to !== undefined && externalPairIsShort(
+          from,
+          to,
+          sourceTree,
+          rails,
+          escapeConductance,
+          adjacent,
+          distancesByNode,
+          resistanceIndex,
+        )) {
+          return battery;
+        }
+      }
+    }
+  }
+}
+
+function shortedBattery(
+  document: CircuitDocument,
+  batteries: readonly CircuitPart[],
+  parts: Record<string, CircuitPartReading>,
+  index: Map<string, number>,
+  conductances: readonly Conductance[],
+  switchStates: Record<string, boolean>,
+) {
+  const passive = conductances.filter(({ batteryId }) => batteryId === undefined);
+  const passiveNetwork = passiveComponentsByNode(index.size, passive);
+  const seriesLoop = shortedSeriesLoopBattery(
+    batteries,
+    parts,
+    index,
+    passiveNetwork.components,
+    passiveNetwork.nodesByComponent,
+    passiveNetwork.conductancesByComponent,
+  );
+  if (seriesLoop.shortedBattery) { return seriesLoop.shortedBattery; }
+
+  const sourceEdges = sourceConstraintEdges(document, index, switchStates);
+  const sourceTree = sourceConstraintTree(index.size, sourceEdges);
+  const batteriesByGroup = batteriesBySourceGroup(batteries, sourceTree, index);
+  const byTerminalRatio = shortedBatteryByTerminalRatio(
+    batteries,
+    parts,
+    sourceTree,
+    batteriesByGroup,
+    index,
+    seriesLoop.protectedBatteryIds,
+  );
+  if (byTerminalRatio) { return byTerminalRatio; }
+
+  const rails = zeroVoltageSourceRails(index.size, sourceEdges);
+  const escapeConductance = passiveEscapeConductances(index.size, rails, passive);
+  const groups = sourcePassiveNodeGroups(
+    sourceTree,
+    batteriesByGroup,
+    passiveNetwork.components,
+    index,
+    seriesLoop.protectedBatteryIds,
+  );
+  return shortedBatteryByExternalResistance(
+    groups,
+    batteriesByGroup,
+    index.size,
+    sourceTree,
+    rails,
+    escapeConductance,
+    passive,
+    passiveNetwork.nodesByComponent,
+    passiveNetwork.conductancesByComponent,
+  );
 }
 
 function connectedTerminals(document: CircuitDocument) {
@@ -618,7 +1401,7 @@ export function analyzeCircuit(
   const batteries = document.parts.filter((part) => part.kind === "battery");
   const readings = { parts, wireCurrents, issues };
   if (batteries.length === 0) { return result("idle", "電池を置くと電流を計算します。", readings); }
-  const shorted = shortedBattery(batteries, parts);
+  const shorted = shortedBattery(document, batteries, parts, index, conductances, switchStates);
   if (shorted) {
     const message = `${shorted.label}が短絡しています。抵抗か電球を直列に入れてください。`;
     return result("short", message, {

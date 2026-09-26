@@ -117,7 +117,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function validateOptions(options: unknown): string | null {
+function validateOptions(options: unknown, document: CircuitDocument): string | null {
   if (!isRecord(options)) { return "解析条件はオブジェクトで指定してください。"; }
   const duration = options.durationSeconds;
   const timeStep = options.timeStepSeconds;
@@ -129,11 +129,17 @@ function validateOptions(options: unknown): string | null {
     return "直流動作点から開始する設定は真偽値で指定してください。";
   }
   if (options.switchStates !== undefined) {
-    if (!isRecord(options.switchStates)) {
+    if (!isRecord(options.switchStates) || options.switchStates instanceof Map || options.switchStates instanceof Set) {
       return "スイッチ状態は部品 ID ごとの真偽値で指定してください。";
     }
-    if (Object.values(options.switchStates).some((state) => typeof state !== "boolean")) {
-      return "スイッチ状態は部品 ID ごとの真偽値で指定してください。";
+    const switchIds = new Set(document.parts.filter((part) => part.kind === "switch").map(({ id }) => id));
+    for (const [partId, state] of Object.entries(options.switchStates)) {
+      if (!switchIds.has(partId)) {
+        return `スイッチ状態の対象「${partId}」はスイッチ部品ではありません。`;
+      }
+      if (typeof state !== "boolean") {
+        return "スイッチ状態は部品 ID ごとの真偽値で指定してください。";
+      }
     }
   }
   return null;
@@ -445,7 +451,10 @@ function initialOverrides(
   return overrides;
 }
 
-function initialDocument(document: CircuitDocument, groups: readonly CapacitorGroup[]): CircuitDocument {
+function initialDocument(
+  document: CircuitDocument,
+  groups: readonly CapacitorGroup[],
+): CircuitDocument {
   const capacitorGroupById = new Map<string, CapacitorGroup>();
   for (const group of groups) {
     for (const member of group.members) { capacitorGroupById.set(member.partId, group); }
@@ -463,13 +472,6 @@ function initialDocument(document: CircuitDocument, groups: readonly CapacitorGr
           kind: "battery",
           voltageVolts: 1,
           internalResistanceOhms: 0,
-        };
-      }
-      if (part.kind === "inductor") {
-        return {
-          ...part,
-          kind: "current-source",
-          currentAmps: part.initialCurrentAmps ?? DEFAULT_INITIAL_CURRENT,
         };
       }
       return part;
@@ -620,11 +622,12 @@ function initializeTransient(
   const groups = capacitorGroups.groups ?? [];
   const overrides = useOperatingPoint ? {} : initialOverrides(document, groups);
   if (overrides === null) { return { reason: "交流電源の初期値を有限な数値で計算できません。" }; }
-  const solverDocument = useOperatingPoint ? document : initialDocument(document, groups);
-  const analysis = solveAnalogStep(solverDocument, {
+  const initialDocumentForSolve = useOperatingPoint ? document : initialDocument(document, groups);
+  const analysis = solveAnalogStep(initialDocumentForSolve, {
     mode: "dc",
     switchStates: options.switchStates,
     voltageOverrides: overrides,
+    initialInductorCurrents: !useOperatingPoint,
   });
   if (analysis.status !== "valid") {
     const context = useOperatingPoint ? "直流動作点" : "初期状態";
@@ -933,7 +936,7 @@ export function simulateTransient(
     if (shapeIssue) { return invalid(shapeIssue); }
     const reactiveIssue = validateReactiveValues(document);
     if (reactiveIssue) { return invalid(reactiveIssue); }
-    const optionsIssue = validateOptions(options);
+    const optionsIssue = validateOptions(options, document);
     if (optionsIssue) { return invalid(optionsIssue); }
     if (!document.parts.length) { return invalid("過渡解析には部品が必要です。"); }
     const steps = stepCount(options.durationSeconds, options.timeStepSeconds);

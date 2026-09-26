@@ -32,7 +32,7 @@ function currentImbalance(result: AnalogCircuitAnalysis, terminals: string[]) {
     const [id, terminal] = endpoint.split(":");
     return result.parts[id].terminalCurrents[terminal as "a" | "b"]!;
   });
-  const scale = Math.max(...currents.map((value) => Math.hypot(value.real, value.imaginary)), 1e-9);
+  const scale = Math.max(...currents.map((value) => Math.hypot(value.real, value.imaginary))) || 1;
   return phasorError({
     real: currents.reduce((sum, value) => sum + value.real, 0),
     imaginary: currents.reduce((sum, value) => sum + value.imaginary, 0),
@@ -41,7 +41,7 @@ function currentImbalance(result: AnalogCircuitAnalysis, terminals: string[]) {
 
 function powerImbalance(result: AnalogCircuitAnalysis) {
   const powers = Object.values(result.parts).map((reading) => reading.power);
-  const scale = Math.max(...powers.map((value) => Math.hypot(value.real, value.imaginary)), 1e-9);
+  const scale = Math.max(...powers.map((value) => Math.hypot(value.real, value.imaginary))) || 1;
   return phasorError({
     real: powers.reduce((sum, value) => sum + value.real, 0),
     imaginary: powers.reduce((sum, value) => sum + value.imaginary, 0),
@@ -78,13 +78,13 @@ describe("DC circuit conservation and invariance", () => {
     expect(powerImbalance(result)).toBeLessThan(1e-9);
   });
 
-  it("conserves current and power in 24 reproducible unbalanced bridges", () => {
+  it("conserves current and power in 100 bridges spanning 18 orders of resistance", () => {
     let seed = 20_260_926;
     const nextResistance = () => {
       seed = (seed * 1_664_525 + 1_013_904_223) % 2 ** 32;
-      return 10 ** (-1 + 6 * seed / 2 ** 32);
+      return 10 ** (-2 + 18 * seed / 2 ** 32);
     };
-    for (let index = 0; index < 24; index += 1) {
+    for (let index = 0; index < 100; index += 1) {
       const document = bridgeCircuit(Array.from({ length: 5 }, nextResistance));
       const result = analyzeAnalogCircuit(document);
 
@@ -105,8 +105,13 @@ describe("DC circuit conservation and invariance", () => {
       expect(reordered.status).toBe("valid");
       for (const component of document.parts) {
         expect(phasorError(reordered.parts[component.id].voltage, result.parts[component.id].voltage.real, 0, 12)).toBeLessThan(1e-9);
-        expect(phasorError(reordered.parts[component.id].current, result.parts[component.id].current.real, 0,
-          Math.max(Math.abs(result.parts[component.id].current.real), 1e-9))).toBeLessThan(1e-9);
+        const expectedCurrent = result.parts[component.id].current.real;
+        // Near a balanced bridge, its current can be set by a voltage smaller
+        // than the rounding error of the two 12 V node potentials. Bound that
+        // error in amperes using Ohm's law instead of a fixed current floor.
+        const roundingAmps = 64 * Number.EPSILON * 12 / (component.resistanceOhms ?? 1);
+        expect(Math.abs(reordered.parts[component.id].current.real - expectedCurrent))
+          .toBeLessThanOrEqual(1e-9 * Math.abs(expectedCurrent) + roundingAmps);
       }
     }
   });
@@ -122,6 +127,70 @@ describe("DC circuit conservation and invariance", () => {
     expect(currentImbalance(result, ["source:a", "r0:a", "r2:a"])).toBeLessThan(1e-9);
     expect(powerImbalance(result)).toBeLessThan(1e-9);
   });
+
+  it.each(["dc", "ac"] as const)(
+    "keeps a disconnected low-resistance part from making %s analysis singular",
+    (mode) => {
+      const document = network([
+        part("source", "ac-source", { voltageVolts: 5, offsetVolts: 5 }),
+        part("load", "resistor", { resistanceOhms: 100 }),
+        part("unused", "resistor", { resistanceOhms: 1e-6 }),
+        part("ground", "ground"),
+      ], [["source:a", "load:a"], ["source:b", "load:b"], ["ground:a", "source:b"]]);
+
+      const result = analyzeAnalogCircuit(document, { mode });
+
+      expect(result.status, result.message).toBe("valid");
+      expect(result.parts.load.voltage.real).toBeCloseTo(5, 12);
+      expect(result.parts.load.current.real).toBeCloseTo(0.05, 12);
+      expect(result.parts.unused.voltage.real).toBeCloseTo(0, 12);
+      expect(result.parts.unused.current.real).toBeCloseTo(0, 12);
+      expect(powerImbalance(result)).toBeLessThan(1e-9);
+    },
+  );
+
+  it.each([1e-6, 1, 1e12, 1e20])(
+    "preserves a floating source and load at resistance %s without artificial leakage",
+    (resistanceOhms) => {
+      const document = network([
+        part("ground", "ground"),
+        part("source", "battery", { voltageVolts: 3 }),
+        part("load", "resistor", { resistanceOhms }),
+      ], [["source:a", "load:a"], ["source:b", "load:b"]]);
+
+      const result = analyzeAnalogCircuit(document);
+
+      expect(result.status, result.message).toBe("valid");
+      expect(result.parts.load.voltage.real).toBeCloseTo(3, 12);
+      expect(result.parts.load.current.real / (3 / resistanceOhms)).toBeCloseTo(1, 10);
+      expect(result.parts.source.current.real / (-3 / resistanceOhms)).toBeCloseTo(1, 10);
+      expect(powerImbalance(result)).toBeLessThan(1e-9);
+    },
+  );
+
+  it.each(["resistor", "bulb", "potentiometer"] as const)(
+    "preserves a small %s's current, voltage and power with a large series resistance",
+    (kind) => {
+      const document = network([
+        part("source", "ac-source", { voltageVolts: 9, offsetVolts: 9 }),
+        part("small", kind, { resistanceOhms: 0.01 }),
+        part("large", "resistor", { resistanceOhms: 1e16 }),
+        part("ground", "ground"),
+      ], [["source:a", "small:a"], ["small:b", "large:a"], ["large:b", "source:b"], ["ground:a", "source:b"]]);
+      const expectedCurrent = 9 / (1e16 + 0.01);
+
+      for (const mode of ["dc", "ac"] as const) {
+        const result = analyzeAnalogCircuit(document, { mode });
+        expect(result.status, result.message).toBe("valid");
+        for (const id of ["small", "large"]) {
+          expect(result.parts[id].current.real / expectedCurrent).toBeCloseTo(1, 10);
+        }
+        expect(result.parts.source.current.real / -expectedCurrent).toBeCloseTo(1, 10);
+        expect(result.parts.small.voltage.real / (0.01 * expectedCurrent)).toBeCloseTo(1, 10);
+        expect(result.parts.small.power.real / (0.01 * expectedCurrent ** 2)).toBeCloseTo(1, 10);
+      }
+    },
+  );
 
   it("computes absorbed power from terminal differences even at a large common voltage", () => {
     const document = network([
@@ -144,6 +213,33 @@ describe("AC series RLC analytic response", () => {
   const inductance = 0.02;
   const capacitance = 2e-6;
   const resonance = 1 / (2 * Math.PI * Math.sqrt(inductance * capacitance));
+
+  it.each(["capacitor", "inductor"] as const)(
+    "preserves the small %s voltage drop and series current at a large impedance ratio",
+    (kind) => {
+      const frequencyHz = 1000;
+      const omega = 2 * Math.PI * frequencyHz;
+      const reactance = kind === "capacitor" ? -1 / omega : omega * 1e-8;
+      const document = network([
+        part("source", "ac-source", { voltageVolts: 9, phaseDegrees: 45, frequencyHz }),
+        part("reactive", kind, { capacitanceFarads: 1, inductanceHenries: 1e-8 }),
+        part("load", "resistor", { resistanceOhms: 1e16 }),
+        part("ground", "ground"),
+      ], [["source:a", "reactive:a"], ["reactive:b", "load:a"], ["load:b", "source:b"], ["ground:a", "source:b"]]);
+      const result = analyzeAnalogCircuit(document, { mode: "ac" });
+      const currentComponent = 9 / Math.sqrt(2) / 1e16;
+
+      expect(result.status, result.message).toBe("valid");
+      for (const id of ["reactive", "load"]) {
+        expect(result.parts[id].current.real / currentComponent).toBeCloseTo(1, 10);
+        expect(result.parts[id].current.imaginary / currentComponent).toBeCloseTo(1, 10);
+      }
+      expect(result.parts.reactive.voltage.real / (-reactance * currentComponent)).toBeCloseTo(1, 10);
+      expect(result.parts.reactive.voltage.imaginary / (reactance * currentComponent)).toBeCloseTo(1, 10);
+      expect(result.parts.reactive.power.real).toBe(0);
+      expect(result.parts.reactive.power.imaginary / (2 * reactance * currentComponent ** 2)).toBeCloseTo(1, 10);
+    },
+  );
 
   it.each([0.01, 0.1, 1, 10, 100])("matches impedance, phase and complex power at %s times resonance", (ratio) => {
     const frequencyHz = resonance * ratio;

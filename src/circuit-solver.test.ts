@@ -211,7 +211,121 @@ describe("analyzeCircuit", () => {
     // Two batteries: no single supply current, but the resistor carries 18 V / 9 Ω.
     expect(result.currentAmps).toBeNull();
     expect(Math.abs(result.parts.r.currentAmps)).toBeCloseTo(2);
+    expect(result.parts.b1.currentAmps).toBeLessThan(0);
+    expect(result.parts.b2.currentAmps).toBeLessThan(0);
+    expect(result.parts.r.powerWatts).toBeCloseTo(36, 3);
+    expect(result.parts.b1.powerWatts + result.parts.b2.powerWatts)
+      .toBeCloseTo(result.parts.r.powerWatts + Object.values(result.wireCurrents)
+        .reduce((loss, current) => loss + current ** 2 * 1e-6, 0), 7);
   });
+
+  it.each([
+    { resistance: 0.000_75, status: "short" },
+    { resistance: 0.000_997_5, status: "closed" },
+    { resistance: 0.0015, status: "closed" },
+  ])("classifies a $resistance-ohm load across series cells as $status", ({ resistance, status }) => {
+    const document: CircuitDocument = {
+      title: "直列電池と閾値以上の負荷",
+      parts: [
+        part("b1", "battery"),
+        part("b2", "battery"),
+        part("load", "resistor", { resistanceOhms: resistance }),
+      ],
+      wires: [
+        wire("w1", "b1", "b", "b2", "a"),
+        wire("w2", "b2", "b", "load", "a"),
+        wire("w3", "load", "b", "b1", "a"),
+      ],
+    };
+
+    expect(analyzeCircuit(document).status).toBe(status);
+  });
+
+  it.each([
+    { resistance: 0.0003, status: "short" },
+    { resistance: 0.000_75, status: "closed" },
+  ])("uses total external resistance for $resistance-ohm series segments", ({ resistance, status }) => {
+    const document: CircuitDocument = {
+      title: "直列電池と分割された負荷抵抗",
+      parts: [
+        part("b1", "battery"),
+        part("b2", "battery"),
+        part("r1", "resistor", { resistanceOhms: resistance }),
+        part("r2", "resistor", { resistanceOhms: resistance }),
+      ],
+      wires: [
+        wire("w1", "b1", "b", "r1", "a"),
+        wire("w2", "r1", "b", "b2", "a"),
+        wire("w3", "b2", "b", "r2", "a"),
+        wire("w4", "r2", "b", "b1", "a"),
+      ],
+    };
+
+    expect(analyzeCircuit(document).status).toBe(status);
+  });
+
+  it("keeps a resistor-separated battery loop closed when a dangling source is attached", () => {
+    const document: CircuitDocument = {
+      title: "直列電池の抵抗ループと開放分岐",
+      parts: [
+        part("b1", "battery", { voltageVolts: 9 }),
+        part("b2", "battery", { voltageVolts: 9 }),
+        part("b3", "battery", { voltageVolts: 9 }),
+        part("r1", "resistor", { resistanceOhms: 0.000_75 }),
+        part("r2", "resistor", { resistanceOhms: 0.000_75 }),
+      ],
+      wires: [
+        wire("w1", "b1", "b", "r1", "a"),
+        wire("w2", "r1", "b", "b2", "a"),
+        wire("w3", "b2", "b", "r2", "a"),
+        wire("w4", "r2", "b", "b1", "a"),
+        wire("w5", "b3", "a", "b1", "b"),
+      ],
+    };
+
+    const result = analyzeCircuit(document);
+
+    expect(result.status).toBe("closed");
+    expect(result.parts.b3.currentAmps).toBeCloseTo(0);
+  });
+
+  it.each([
+    { firstLoopResistance: 0.000_75, secondLoopResistance: 0.000_75, status: "closed" },
+    { firstLoopResistance: 0.0003, secondLoopResistance: 0.0003, status: "short" },
+    { firstLoopResistance: 0.0003, secondLoopResistance: 0.000_75, status: "short" },
+  ])(
+    "classifies figure-eight battery loops ($firstLoopResistance Ω, $secondLoopResistance Ω) as $status",
+    ({ firstLoopResistance, secondLoopResistance, status }) => {
+      const document: CircuitDocument = {
+        title: "単一接点を共有する電池ループ",
+        parts: [
+          part("b1", "battery", { voltageVolts: 9 }),
+          part("b2", "battery", { voltageVolts: 9 }),
+          part("b3", "battery", { voltageVolts: 9 }),
+          part("b4", "battery", { voltageVolts: 9 }),
+          part("r1", "resistor", { resistanceOhms: firstLoopResistance }),
+          part("r2", "resistor", { resistanceOhms: firstLoopResistance }),
+          part("r3", "resistor", { resistanceOhms: secondLoopResistance }),
+          part("r4", "resistor", { resistanceOhms: secondLoopResistance }),
+          part("shared", "junction"),
+        ],
+        wires: [
+          wire("w1", "b1", "b", "shared", "a"),
+          wire("w2", "shared", "a", "r1", "a"),
+          wire("w3", "r1", "b", "b2", "a"),
+          wire("w4", "b2", "b", "r2", "a"),
+          wire("w5", "r2", "b", "b1", "a"),
+          wire("w6", "b3", "b", "shared", "a"),
+          wire("w7", "shared", "a", "r3", "a"),
+          wire("w8", "r3", "b", "b4", "a"),
+          wire("w9", "b4", "b", "r4", "a"),
+          wire("w10", "r4", "b", "b3", "a"),
+        ],
+      };
+
+      expect(analyzeCircuit(document).status).toBe(status);
+    },
+  );
 
   it("keeps a closed loop with opposing equal batteries at zero current", () => {
     const document: CircuitDocument = {
@@ -362,6 +476,35 @@ describe("analyzeCircuit", () => {
     expect(overLimit.status).toBe("invalid");
     expect(overLimit.message).toContain(`${MAX_CIRCUIT_ANALYSIS_TERMINALS}端子`);
     expect(overLimit.issues).toEqual([{ severity: "error", message: overLimit.message }]);
+  });
+
+  it("analyzes a maximum-size parallel load without repeated dense resistance probes", () => {
+    const batteries = Array.from({ length: 253 }, (_, index) =>
+      part(`battery-${index}`, "battery", { voltageVolts: 9 }),
+    );
+    const parts = [
+      ...batteries,
+      part("load-a", "resistor", { resistanceOhms: 0.001_999 }),
+      part("load-b", "resistor", { resistanceOhms: 0.001_999 }),
+      part("positive", "junction"),
+      part("negative", "junction"),
+    ];
+    const wires = batteries.flatMap((battery, index) => [
+      wire(`positive-${index}`, battery.id, "a", "positive", "a"),
+      wire(`negative-${index}`, battery.id, "b", "negative", "a"),
+    ]);
+    for (const load of ["load-a", "load-b"]) {
+      wires.push(
+        wire(`${load}-positive`, load, "a", "positive", "a"),
+        wire(`${load}-negative`, load, "b", "negative", "a"),
+      );
+    }
+
+    const result = analyzeCircuit({ title: "最大端子数の並列回路", parts, wires });
+
+    expect(parts.reduce((count, item) => count + (item.kind === "junction" ? 1 : 2), 0))
+      .toBe(MAX_CIRCUIT_ANALYSIS_TERMINALS);
+    expect(result.status).toBe("closed");
   });
 
   it("stops an oversized dense resistor network before solving it", () => {
@@ -570,6 +713,63 @@ describe("analyzeCircuit", () => {
       .toBeCloseTo(result.parts.load.powerWatts + wireLoss, 7);
   });
 
+  it.each([
+    { resistance: 0.000_75, status: "short" },
+    { resistance: 0.000_999, status: "closed" },
+    { resistance: 0.0015, status: "closed" },
+    { resistance: 10, status: "closed" },
+  ])("classifies a $resistance-ohm parallel-battery load as $status", ({ resistance, status }) => {
+    const document: CircuitDocument = {
+      title: "並列電池の低抵抗負荷",
+      parts: [
+        part("battery-a", "battery", { voltageVolts: 9 }),
+        part("battery-b", "battery", { voltageVolts: 9 }),
+        part("load", "resistor", { resistanceOhms: resistance }),
+        part("positive", "junction"),
+        part("negative", "junction"),
+      ],
+      wires: [
+        wire("w1", "battery-a", "a", "positive", "a"),
+        wire("w2", "battery-b", "a", "positive", "a"),
+        wire("w3", "load", "a", "positive", "a"),
+        wire("w4", "battery-a", "b", "negative", "a"),
+        wire("w5", "battery-b", "b", "negative", "a"),
+        wire("w6", "load", "b", "negative", "a"),
+      ],
+    };
+
+    const result = analyzeCircuit(document);
+
+    expect(result.status).toBe(status);
+  });
+
+  it("detects a short across a series source group's parallel load branches", () => {
+    const document: CircuitDocument = {
+      title: "直列電池と並列低抵抗負荷",
+      parts: [
+        part("battery-a", "battery", { voltageVolts: 9 }),
+        part("battery-b", "battery", { voltageVolts: 9 }),
+        part("load-a", "resistor", { resistanceOhms: 0.0015 }),
+        part("load-b", "resistor", { resistanceOhms: 0.0015 }),
+        part("positive", "junction"),
+        part("middle", "junction"),
+        part("negative", "junction"),
+      ],
+      wires: [
+        wire("w1", "battery-a", "a", "positive", "a"),
+        wire("w2", "battery-a", "b", "middle", "a"),
+        wire("w3", "middle", "a", "battery-b", "a"),
+        wire("w4", "battery-b", "b", "negative", "a"),
+        wire("w5", "load-a", "a", "positive", "a"),
+        wire("w6", "load-a", "b", "negative", "a"),
+        wire("w7", "load-b", "a", "positive", "a"),
+        wire("w8", "load-b", "b", "negative", "a"),
+      ],
+    };
+
+    expect(analyzeCircuit(document).status).toBe("short");
+  });
+
   it("treats inherited switch-state keys as absent and stores special IDs safely", () => {
     const openSwitch: CircuitDocument = {
       title: "継承キーのスイッチ状態",
@@ -624,6 +824,8 @@ describe("analyzeCircuit", () => {
 
     expect(singleOpen.status).toBe("open");
     expect(singleOpen.currentAmps).toBe(0);
+    expect(singleOpen.parts.battery.voltageVolts).toBeCloseTo(9);
+    expect(singleOpen.parts.battery.currentAmps).toBe(0);
     expect(multipleOpen.status).toBe("open");
     expect(multipleOpen.currentAmps).toBeNull();
   });

@@ -157,6 +157,79 @@ describe("legacy DC solver physics", () => {
     expect(result.parts.bridge.currentAmps).toBeCloseTo(0, 12);
   });
 
+  it("resolves a small difference between large opposing battery voltages", () => {
+    const strongerVoltage = 1e16;
+    const weakerVoltage = strongerVoltage - 2;
+    const document: CircuitDocument = {
+      title: "大きな電圧の差分",
+      parts: [
+        part("strong", "battery", { voltageVolts: strongerVoltage }),
+        part("weak", "battery", { voltageVolts: weakerVoltage }),
+        part("load", "resistor", { resistanceOhms: 10 }),
+      ],
+      wires: [
+        wire("w1", "strong", "b", "weak", "b"),
+        wire("w2", "weak", "a", "load", "a"),
+        wire("w3", "load", "b", "strong", "a"),
+      ],
+    };
+
+    const result = analyzeCircuit(document);
+    const expectedCurrent = 2 / (10 + 5e-6);
+
+    expect(result.status, result.message).toBe("closed");
+    expect(Math.abs(result.parts.load.voltageVolts)).toBeCloseTo(expectedCurrent * 10, 8);
+    expect(Math.abs(result.parts.load.currentAmps / expectedCurrent)).toBeCloseTo(1, 8);
+    expect(Math.abs(result.parts.strong.currentAmps / expectedCurrent)).toBeCloseTo(1, 8);
+    expect(Math.abs(result.parts.weak.currentAmps / expectedCurrent)).toBeCloseTo(1, 8);
+    expect(result.parts.strong.currentAmps).toBeLessThan(0);
+    expect(result.parts.weak.currentAmps).toBeGreaterThan(0);
+    expect(Object.values(result.wireCurrents).every(Number.isFinite)).toBe(true);
+  });
+
+  it("does not erase a compensated nonzero source difference in short detection", () => {
+    const strongerVoltage = 1e16;
+    const weakerVoltage = strongerVoltage - 2;
+    const document: CircuitDocument = {
+      title: "大きな電圧の差分と短絡負荷",
+      parts: [
+        part("strong", "battery", { voltageVolts: strongerVoltage }),
+        part("weak", "battery", { voltageVolts: weakerVoltage }),
+        part("load", "resistor", { resistanceOhms: 0.000_75 }),
+      ],
+      wires: [
+        wire("w1", "strong", "b", "weak", "b"),
+        wire("w2", "weak", "a", "load", "a"),
+        wire("w3", "load", "b", "strong", "a"),
+      ],
+    };
+
+    expect(analyzeCircuit(document).status).toBe("short");
+  });
+
+  it("keeps finite readings for a large voltage and resistance with finite power", () => {
+    const document: CircuitDocument = {
+      title: "大きな有限値",
+      parts: [
+        part("source", "battery", { voltageVolts: 1e200 }),
+        part("load", "resistor", { resistanceOhms: 1e100 }),
+      ],
+      wires: [
+        wire("w1", "source", "a", "load", "a"),
+        wire("w2", "load", "b", "source", "b"),
+      ],
+    };
+
+    const result = analyzeCircuit(document);
+
+    expect(result.status, result.message).toBe("closed");
+    expect(result.parts.load.currentAmps / 1e100).toBeCloseTo(1, 12);
+    expect(result.parts.source.currentAmps / -1e100).toBeCloseTo(1, 12);
+    expect(result.parts.load.powerWatts / 1e300).toBeCloseTo(1, 12);
+    expect(result.parts.source.powerWatts / 1e300).toBeCloseTo(1, 12);
+    expect(Object.values(result.wireCurrents).every(Number.isFinite)).toBe(true);
+  });
+
   it("resolves tiny currents from equal parallel sources into a 1e20-ohm load", () => {
     const result = analyzeCircuit(parallelSourcesWithLargeLoad(1e20));
     const expectedLoadCurrent = 9 / 1e20;

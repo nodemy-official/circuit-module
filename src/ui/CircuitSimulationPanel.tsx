@@ -52,7 +52,7 @@ export function CircuitSimulationPanel({
     {showAnalysisSettings && <>
       <div className="circuit-panel__heading"><h2>解析の設定</h2></div>
       <label htmlFor={`${id}-mode`}>定常解析</label>
-      <NativeSelect id={`${id}-mode`} value={options.mode ?? "auto"} onChange={(event) => onChange({ mode: event.target.value as CircuitAnalysisOptions["mode"] })}>
+      <NativeSelect id={`${id}-mode`} value={options.mode ?? "auto"} onChange={(event) => onChange({ ...options, mode: event.target.value as CircuitAnalysisOptions["mode"] })}>
         <option value="auto">自動（電源に合わせる）</option>
         <option value="dc">直流・動作点</option>
         <option value="ac">交流・小信号</option>
@@ -61,7 +61,7 @@ export function CircuitSimulationPanel({
         <label htmlFor={`${id}-frequency`}>解析周波数 (Hz)</label>
         <Input id={`${id}-frequency`} type="number" min="0" step="any" value={frequency} onValueChange={(nextValue) => {
           const value = Number(nextValue);
-          if (Number.isFinite(value) && value > 0) { onChange({ mode: "ac", frequencyHz: value }); }
+          if (Number.isFinite(value) && value > 0) { onChange({ ...options, mode: "ac", frequencyHz: value }); }
         }} />
         <p>計測値は実効値と位相です。異なる周波数の電源は個別に解析します。半導体は直流動作点まわりの小信号として計算します。</p>
       </>}

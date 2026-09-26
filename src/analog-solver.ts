@@ -28,6 +28,8 @@ export interface AnalogCircuitIssue {
   severity: AnalogIssueSeverity;
   message: string;
   partId?: string;
+  /** Stable discriminator for a missing current return path. */
+  code?: "current-source-no-return-path";
 }
 
 export interface AnalogCircuitPartReading {
@@ -69,6 +71,8 @@ export interface AnalogStepOptions {
   switchStates?: Record<string, boolean>;
   /** DC source overrides for a moving source, keyed by part ID. Negative values are allowed. */
   voltageOverrides?: Record<string, number>;
+  /** Transient initialization: fix inductor currents and solve their initial voltage derivatives. */
+  initialInductorCurrents?: boolean;
 }
 
 /** Maximum terminal count accepted by this dense MNA solver. */
@@ -104,6 +108,7 @@ interface Branch {
   positiveNode: number;
   negativeNode: number;
   seriesResistanceOhms: number;
+  seriesReactanceOhms?: number;
   sourceVoltage: ComplexValue;
   unknownIndex: number;
   /** Outer terminal tied to the wiper by an ideal internal potentiometer segment. */
@@ -117,6 +122,7 @@ interface MnaLayout {
   internalBranches: Branch[];
   internalBranchesByPartId: Map<string, Branch[]>;
   size: number;
+  initialInductorCurrents: boolean;
 }
 
 interface NonlinearModel {
@@ -490,6 +496,7 @@ function unionPartConduction(
   topology: Topology,
   parent: number[],
   switchStates: Record<string, boolean>,
+  initialInductorCurrents = false,
 ) {
   const nodeFor = (terminal: CircuitTerminal) =>
     topology.terminalNodes.get(endpointKey(part.id, terminal)) ?? topology.referenceNode;
@@ -501,10 +508,12 @@ function unionPartConduction(
     case "resistor":
     case "bulb":
     case "ammeter":
-    case "inductor":
     case "diode":
     case "led":
       join("a", "b");
+      return;
+    case "inductor":
+      if (!initialInductorCurrents) { join("a", "b"); }
       return;
     case "switch":
       if (isSwitchClosed(part, switchStates)) { join("a", "b"); }
@@ -530,11 +539,11 @@ function unionPartConduction(
   }
 }
 
-function currentSourcePathIssue(
+function currentSourcePathIssues(
   document: CircuitDocument,
   topology: Topology,
   switchStates: Record<string, boolean>,
-): AnalogCircuitIssue | undefined {
+): AnalogCircuitIssue[] {
   const parent = Array.from({ length: topology.nodeCount }, (_, index) => index);
   for (const part of document.parts) {
     unionPartConduction(part, topology, parent, switchStates);
@@ -542,18 +551,85 @@ function currentSourcePathIssue(
   const nodeFor = (part: CircuitPart, terminal: CircuitTerminal) =>
     topology.terminalNodes.get(endpointKey(part.id, terminal)) ?? topology.referenceNode;
 
+  const issues: AnalogCircuitIssue[] = [];
   for (const source of document.parts) {
     if (source.kind !== "current-source" || Math.abs(source.currentAmps ?? 0) === 0) { continue; }
     const positiveRoot = findRoot(parent, nodeFor(source, "a"));
     const negativeRoot = findRoot(parent, nodeFor(source, "b"));
     if (positiveRoot !== negativeRoot) {
-      return {
+      issues.push({
         severity: "error" as const,
         partId: source.id,
+        code: "current-source-no-return-path",
         message: `${source.label}に直流の戻り道がありません。抵抗などをつないで電流経路を作ってください。`,
-      };
+      });
     }
   }
+  return issues;
+}
+
+function initialCurrentsAreBalanced(currents: readonly number[]) {
+  let maxAbs = 0;
+  for (const current of currents) { maxAbs = Math.max(maxAbs, Math.abs(current)); }
+  if (maxAbs === 0) { return true; }
+
+  let sum = 0;
+  let correction = 0;
+  let scale = 0;
+  for (const current of currents) {
+    const normalized = current / maxAbs;
+    const next = sum + normalized;
+    correction += Math.abs(sum) >= Math.abs(normalized)
+      ? (sum - next) + normalized
+      : (normalized - next) + sum;
+    sum = next;
+    scale += Math.abs(normalized);
+  }
+
+  const normalizedBalance = sum + correction;
+  const tolerance = 64 * Number.EPSILON * scale + Number.MIN_VALUE / maxAbs;
+  return Number.isFinite(normalizedBalance) && Math.abs(normalizedBalance) <= tolerance;
+}
+
+function initialInductorIssues(
+  document: CircuitDocument,
+  topology: Topology,
+  switchStates: Record<string, boolean>,
+): AnalogCircuitIssue[] {
+  const parent = Array.from({ length: topology.nodeCount }, (_, index) => index);
+  for (const part of document.parts) {
+    unionPartConduction(part, topology, parent, switchStates, true);
+  }
+  const balances = new Map<number, { currents: number[]; partId: string }>();
+  const add = (node: number, current: number, partId: string) => {
+    const root = findRoot(parent, node);
+    const balance = balances.get(root) ?? { currents: [], partId };
+    balance.currents.push(current);
+    balances.set(root, balance);
+  };
+  for (const part of document.parts) {
+    if (part.kind !== "inductor" && part.kind !== "current-source") { continue; }
+    const current = part.kind === "inductor" ? (part.initialCurrentAmps ?? 0) : (part.currentAmps ?? 0);
+    if (!Number.isFinite(current)) {
+      return [{ severity: "error", partId: part.id, message: `${part.label}の初期電流は有限の数値にしてください。` }];
+    }
+    const nodeA = nodeForTerminal(topology, part, "a");
+    const nodeB = nodeForTerminal(topology, part, "b");
+    if (findRoot(parent, nodeA) === findRoot(parent, nodeB)) { continue; }
+    add(nodeA, current, part.id);
+    add(nodeB, -current, part.id);
+  }
+  const issues: AnalogCircuitIssue[] = [];
+  for (const balance of balances.values()) {
+    if (!initialCurrentsAreBalanced(balance.currents)) {
+      issues.push({
+        severity: "error",
+        partId: balance.partId,
+        message: "コイルの初期電流と電流源の指定値が接続点の電流のつり合いを満たしません。初期電流と極性を確認してください。",
+      });
+    }
+  }
+  return issues;
 }
 
 function sourceVoltageForDc(part: CircuitPart, overrides: Record<string, number>) {
@@ -570,11 +646,18 @@ interface BranchSpec {
   positiveNode: number;
   negativeNode: number;
   seriesResistanceOhms: number;
+  seriesReactanceOhms?: number;
   sourceVoltage: ComplexValue;
 }
 
 function nodeForTerminal(topology: Topology, part: CircuitPart, terminal: CircuitTerminal) {
   return topology.terminalNodes.get(endpointKey(part.id, terminal)) ?? topology.referenceNode;
+}
+
+function partReactance(part: CircuitPart, frequencyHz: number) {
+  return part.kind === "capacitor"
+    ? -1 / (2 * Math.PI * (frequencyHz * (part.capacitanceFarads ?? 0)))
+    : 2 * Math.PI * (frequencyHz * (part.inductanceHenries ?? 0));
 }
 
 function branchSpecForPart(
@@ -584,9 +667,29 @@ function branchSpecForPart(
   frequencyHz: number | undefined,
   voltageOverrides: Record<string, number>,
   switchStates: Record<string, boolean>,
+  initialInductorCurrents: boolean,
 ): BranchSpec | null {
   const positiveNode = nodeForTerminal(topology, part, "a");
   const negativeNode = nodeForTerminal(topology, part, "b");
+  if (part.kind === "resistor" || part.kind === "bulb") {
+    return {
+      part,
+      positiveNode,
+      negativeNode,
+      seriesResistanceOhms: resistorValue(part),
+      sourceVoltage: complex(),
+    };
+  }
+  if (mode === "ac" && (part.kind === "capacitor" || part.kind === "inductor")) {
+    return {
+      part,
+      positiveNode,
+      negativeNode,
+      seriesResistanceOhms: 0,
+      seriesReactanceOhms: partReactance(part, frequencyHz ?? 0),
+      sourceVoltage: complex(),
+    };
+  }
   if (part.kind === "battery") {
     return {
       part,
@@ -605,7 +708,7 @@ function branchSpecForPart(
   if (part.kind === "ammeter" || (part.kind === "switch" && isSwitchClosed(part, switchStates))) {
     return { part, positiveNode, negativeNode, seriesResistanceOhms: 0, sourceVoltage: complex() };
   }
-  if (part.kind === "inductor" && mode === "dc") {
+  if (part.kind === "inductor" && mode === "dc" && !initialInductorCurrents) {
     return { part, positiveNode, negativeNode, seriesResistanceOhms: 0, sourceVoltage: complex() };
   }
   return null;
@@ -627,7 +730,8 @@ function addMnaBranch(
   branchByPartId: Map<string, Branch>,
 ): AnalogCircuitIssue | undefined {
   const { part, positiveNode, negativeNode, seriesResistanceOhms, sourceVoltage } = spec;
-  if (positiveNode === negativeNode && seriesResistanceOhms === 0) {
+  const seriesReactanceOhms = spec.seriesReactanceOhms ?? 0;
+  if (positiveNode === negativeNode && seriesResistanceOhms === 0 && seriesReactanceOhms === 0) {
     if (sourceVoltage.real === 0 && sourceVoltage.imaginary === 0) { return undefined; }
     return {
       severity: "error",
@@ -641,6 +745,7 @@ function addMnaBranch(
     positiveNode,
     negativeNode,
     seriesResistanceOhms,
+    seriesReactanceOhms,
     sourceVoltage,
     unknownIndex: topology.nodeUnknownCount + branches.length,
   };
@@ -694,13 +799,14 @@ function buildLayout(
   frequencyHz: number | undefined,
   voltageOverrides: Record<string, number>,
   switchStates: Record<string, boolean>,
+  initialInductorCurrents = false,
 ): { layout?: MnaLayout; issue?: AnalogCircuitIssue } {
   const branches: Branch[] = [];
   const branchByPartId = new Map<string, Branch>();
   const internalBranches: Branch[] = [];
   const internalBranchesByPartId = new Map<string, Branch[]>();
   for (const part of document.parts) {
-    const spec = branchSpecForPart(part, topology, mode, frequencyHz, voltageOverrides, switchStates);
+    const spec = branchSpecForPart(part, topology, mode, frequencyHz, voltageOverrides, switchStates, initialInductorCurrents);
     if (spec) {
       const issue = addMnaBranch(spec, topology, branches, branchByPartId);
       if (issue) { return { issue }; }
@@ -731,6 +837,7 @@ function buildLayout(
       internalBranches,
       internalBranchesByPartId,
       size,
+      initialInductorCurrents,
     },
   };
 }
@@ -1049,20 +1156,16 @@ function isSwitchClosed(part: CircuitPart, switchStates: Record<string, boolean>
 }
 
 function stampDcPassivePart(
-  matrix: Float64Array,
   residual: Float64Array,
   layout: MnaLayout,
-  state: Float64Array,
   part: CircuitPart,
 ) {
   const nodeA = layout.topology.terminalNodes.get(endpointKey(part.id, "a")) ?? layout.topology.referenceNode;
   const nodeB = layout.topology.terminalNodes.get(endpointKey(part.id, "b")) ?? layout.topology.referenceNode;
-  if (part.kind === "resistor" || part.kind === "bulb") {
-    stampConductance(matrix, residual, layout, state, nodeA, nodeB, 1 / resistorValue(part));
-  } else if (part.kind === "potentiometer") {
-    // Each potentiometer section is stamped as a current-carrying MNA branch below.
-  } else if (part.kind === "current-source") {
+  if (part.kind === "current-source") {
     stampCurrentSource(residual, layout, nodeA, nodeB, part.currentAmps ?? 0);
+  } else if (part.kind === "inductor" && layout.initialInductorCurrents) {
+    stampCurrentSource(residual, layout, nodeA, nodeB, part.initialCurrentAmps ?? 0);
   }
 }
 
@@ -1077,14 +1180,38 @@ function stampDcNonlinearPart(
   if (model) { stampNonlinear(matrix, residual, layout, part, model); }
 }
 
-function gminAnchorNodes(document: CircuitDocument, layout: MnaLayout, mode: AnalogAnalysisMode) {
-  // One anchor per conductive network avoids adding a parallel leakage at each nonlinear terminal.
+interface ReferenceConstraint {
+  node: number;
+  derivatives: { inside: number; outside: number; inductance: number }[];
+}
+
+function inductorCutset(
+  inductors: { a: number; b: number; inductance: number }[],
+  parent: number[],
+  root: number,
+): ReferenceConstraint["derivatives"] {
+  const derivatives: ReferenceConstraint["derivatives"] = [];
+  for (const branch of inductors) {
+    const aInside = findRoot(parent, branch.a) === root;
+    const bInside = findRoot(parent, branch.b) === root;
+    if (aInside === bInside) { continue; }
+    derivatives.push({
+      inside: aInside ? branch.a : branch.b,
+      outside: aInside ? branch.b : branch.a,
+      inductance: branch.inductance,
+    });
+  }
+  return derivatives;
+}
+
+function referenceConstraints(document: CircuitDocument, layout: MnaLayout, mode: AnalogAnalysisMode): ReferenceConstraint[] {
+  // Each disconnected conductive network has an arbitrary common-mode voltage.
   const parent = Array.from({ length: layout.topology.nodeCount }, (_, index) => index);
   const switchStates = Object.fromEntries(document.parts
     .filter((part) => part.kind === "switch")
     .map((part) => [part.id, layout.branchByPartId.has(part.id)]));
   for (const part of document.parts) {
-    unionPartConduction(part, layout.topology, parent, switchStates);
+    unionPartConduction(part, layout.topology, parent, switchStates, layout.initialInductorCurrents);
     if (mode === "ac" && part.kind === "capacitor") {
       joinConductiveNodes(
         parent,
@@ -1100,33 +1227,94 @@ function gminAnchorNodes(document: CircuitDocument, layout: MnaLayout, mode: Ana
     const root = findRoot(parent, node);
     if (!anchorByRoot.has(root)) { anchorByRoot.set(root, node); }
   }
-  return [...anchorByRoot]
-    .filter(([root]) => root !== referenceRoot)
-    .map(([, node]) => node);
+  if (!layout.initialInductorCurrents) {
+    return [...anchorByRoot]
+      .filter(([root]) => root !== referenceRoot)
+      .map(([, node]) => ({ node, derivatives: [] }));
+  }
+
+  return initialInductorReferences(document, layout, parent, anchorByRoot, referenceRoot);
+}
+
+function initialInductorReferences(
+  document: CircuitDocument,
+  layout: MnaLayout,
+  parent: number[],
+  anchorByRoot: Map<number, number>,
+  referenceRoot: number,
+): ReferenceConstraint[] {
+  const inductors = document.parts.filter((part) => part.kind === "inductor").map((part) => ({
+    a: nodeForTerminal(layout.topology, part, "a"),
+    b: nodeForTerminal(layout.topology, part, "b"),
+    inductance: part.inductanceHenries ?? 0,
+  }));
+  const inductiveParent = [...parent];
+  for (const branch of inductors) { joinConductiveNodes(inductiveParent, branch.a, branch.b); }
+  const referenceByGroup = new Map<number, number>([[findRoot(inductiveParent, referenceRoot), referenceRoot]]);
+  const constraints: ReferenceConstraint[] = [];
+  for (const [root, node] of anchorByRoot) {
+    const group = findRoot(inductiveParent, root);
+    if (!referenceByGroup.has(group)) { referenceByGroup.set(group, root); }
+    if (root === referenceRoot) { continue; }
+    const derivatives = referenceByGroup.get(group) === root ? [] : inductorCutset(inductors, parent, root);
+    constraints.push({ node, derivatives });
+  }
+  return constraints;
+}
+
+function stampDcReferences(
+  document: CircuitDocument,
+  layout: MnaLayout,
+  state: Float64Array,
+  matrix: Float64Array,
+  residual: Float64Array,
+) {
+  for (const { node, derivatives } of referenceConstraints(document, layout, "dc")) {
+    const unknown = layout.topology.nodeUnknowns[node] ?? -1;
+    if (unknown < 0) { continue; }
+    // Replace a redundant KCL row with an exact reference. Adding a tiny
+    // conductance here loses that reference next to low-resistance branches.
+    matrix.fill(0, unknown * layout.size, (unknown + 1) * layout.size);
+    residual[unknown] = 0;
+    if (derivatives.length === 0) {
+      matrix[unknown * layout.size + unknown] = 1;
+      residual[unknown] = state[unknown] ?? 0;
+      continue;
+    }
+    // Across an inductor cutset, the prescribed currents already satisfy KCL.
+    // Its time derivative fixes the otherwise arbitrary relative potential:
+    // sum of outward V_L / L = 0, since independent current sources are constant.
+    for (const branch of derivatives) {
+      const conductance = 1 / branch.inductance;
+      const inside = layout.topology.nodeUnknowns[branch.inside] ?? -1;
+      const outside = layout.topology.nodeUnknowns[branch.outside] ?? -1;
+      addMatrix(matrix, layout.size, unknown, inside, conductance);
+      addMatrix(matrix, layout.size, unknown, outside, -conductance);
+      residual[unknown] += conductance * (nodeRealValue(layout, branch.inside, state) - nodeRealValue(layout, branch.outside, state));
+    }
+  }
 }
 
 function assembleDc(
   document: CircuitDocument,
   layout: MnaLayout,
   state: Float64Array,
-  includeGmin = true,
+  includeReferences = true,
 ): DcAssembly {
   const matrix = new Float64Array(layout.size * layout.size);
   const residual = new Float64Array(layout.size);
-  if (includeGmin) {
-    for (const node of gminAnchorNodes(document, layout, "dc")) {
-      stampConductance(matrix, residual, layout, state, node, layout.topology.referenceNode, GMIN_SIEMENS);
-    }
-  }
 
   for (const part of document.parts) {
-    stampDcPassivePart(matrix, residual, layout, state, part);
+    stampDcPassivePart(residual, layout, part);
     const branch = layout.branchByPartId.get(part.id);
     if (branch) { addVoltageBranch(matrix, residual, layout, state, branch); }
     stampDcNonlinearPart(matrix, residual, layout, state, part);
   }
   for (const branch of layout.internalBranches) {
     addVoltageBranch(matrix, residual, layout, state, branch);
+  }
+  if (includeReferences) {
+    stampDcReferences(document, layout, state, matrix, residual);
   }
   return { matrix, residual };
 }
@@ -1184,13 +1372,13 @@ function linearDcSeed(document: CircuitDocument, layout: MnaLayout) {
     }
   }
   for (const part of document.parts) {
-    if (part.kind !== "current-source") { stampDcPassivePart(matrix, residual, layout, state, part); }
     const branch = layout.branchByPartId.get(part.id);
     if (branch) { addVoltageBranch(matrix, residual, layout, state, branch); }
   }
   for (const branch of layout.internalBranches) {
     addVoltageBranch(matrix, residual, layout, state, branch);
   }
+  stampDcReferences(document, layout, state, matrix, residual);
   const rhs = Float64Array.from(residual, (value) => -value);
   return solveRealLinearSystem(layout.size, matrix, rhs);
 }
@@ -1230,7 +1418,7 @@ function solveDcNewtonStep(
 function solveDc(
   document: CircuitDocument,
   layout: MnaLayout,
-): { state?: Float64Array; converged: boolean; singular: boolean; gminDominates?: boolean } {
+): { state?: Float64Array; converged: boolean; singular: boolean; invalidPhysicalSolution?: boolean } {
   let state = new Float64Array(layout.size);
   let usedLinearSeed = false;
   if (layout.size === 0) { return { state, converged: true, singular: false }; }
@@ -1269,7 +1457,7 @@ function validatePhysicalDcSolution(
   document: CircuitDocument,
   layout: MnaLayout,
   state: Float64Array,
-): { state?: Float64Array; converged: boolean; singular: boolean; gminDominates?: boolean } {
+): { state?: Float64Array; converged: boolean; singular: boolean; invalidPhysicalSolution?: boolean } {
   const physicalAssembly = assembleDc(document, layout, state, false);
   const physicalScore = residualScore(
     layout,
@@ -1284,7 +1472,7 @@ function validatePhysicalDcSolution(
     ),
   );
   if (physicalScore > 1) {
-    return { converged: false, singular: false, gminDominates: true };
+    return { converged: false, singular: false, invalidPhysicalSolution: true };
   }
   return { state, converged: true, singular: false };
 }
@@ -1293,8 +1481,8 @@ function dcSolutionFailureMessage(solution: ReturnType<typeof solveDc>) {
   if (solution.singular) {
     return "直流回路を計算できません。理想電圧源のループや接続を確認してください。";
   }
-  if (solution.gminDominates) {
-    return "実部品の電流経路がなく、数値安定化用の微小コンダクタンスが電流を肩代わりしています。導通する戻り道を追加してください。";
+  if (solution.invalidPhysicalSolution) {
+    return "実部品の電流・電圧のつり合いを満たす直流動作点を計算できません。導通する戻り道と部品の値を確認してください。";
   }
   return "非線形部品の直流動作点が収束しませんでした。値や接続を確認してください。";
 }
@@ -1319,103 +1507,18 @@ function addComplexMatrix(
   matrixImaginary[index] = (matrixImaginary[index] ?? 0) + valueImaginary;
 }
 
-function stampComplexAdmittance(
-  matrixReal: Float64Array,
-  matrixImaginary: Float64Array,
-  layout: MnaLayout,
-  positiveNode: number,
-  negativeNode: number,
-  admittance: ComplexValue,
-) {
-  const positiveUnknown = layout.topology.nodeUnknowns[positiveNode] ?? -1;
-  const negativeUnknown = layout.topology.nodeUnknowns[negativeNode] ?? -1;
-  addComplexMatrix(
-    matrixReal,
-    matrixImaginary,
-    layout.size,
-    positiveUnknown,
-    positiveUnknown,
-    admittance.real,
-    admittance.imaginary,
-  );
-  addComplexMatrix(
-    matrixReal,
-    matrixImaginary,
-    layout.size,
-    positiveUnknown,
-    negativeUnknown,
-    -admittance.real,
-    -admittance.imaginary,
-  );
-  addComplexMatrix(
-    matrixReal,
-    matrixImaginary,
-    layout.size,
-    negativeUnknown,
-    positiveUnknown,
-    -admittance.real,
-    -admittance.imaginary,
-  );
-  addComplexMatrix(
-    matrixReal,
-    matrixImaginary,
-    layout.size,
-    negativeUnknown,
-    negativeUnknown,
-    admittance.real,
-    admittance.imaginary,
-  );
-}
-
-function stampAcReferenceGmin(
+function stampAcReferences(
   document: CircuitDocument,
   matrixReal: Float64Array,
   matrixImaginary: Float64Array,
   layout: MnaLayout,
 ) {
-  for (const node of gminAnchorNodes(document, layout, "ac")) {
-    stampComplexAdmittance(
-      matrixReal,
-      matrixImaginary,
-      layout,
-      node,
-      layout.topology.referenceNode,
-      complex(GMIN_SIEMENS),
-    );
-  }
-}
-
-function stampAcPassivePart(
-  matrixReal: Float64Array,
-  matrixImaginary: Float64Array,
-  layout: MnaLayout,
-  part: CircuitPart,
-  omega: number,
-) {
-  const nodeA = nodeForTerminal(layout.topology, part, "a");
-  const nodeB = nodeForTerminal(layout.topology, part, "b");
-  if (part.kind === "resistor" || part.kind === "bulb") {
-    stampComplexAdmittance(matrixReal, matrixImaginary, layout, nodeA, nodeB, complex(1 / resistorValue(part)));
-  } else if (part.kind === "potentiometer") {
-    // Each potentiometer section is stamped as a current-carrying MNA branch below.
-  } else if (part.kind === "capacitor") {
-    stampComplexAdmittance(
-      matrixReal,
-      matrixImaginary,
-      layout,
-      nodeA,
-      nodeB,
-      complex(0, omega * (part.capacitanceFarads ?? 0)),
-    );
-  } else if (part.kind === "inductor") {
-    stampComplexAdmittance(
-      matrixReal,
-      matrixImaginary,
-      layout,
-      nodeA,
-      nodeB,
-      complex(0, -1 / (omega * (part.inductanceHenries ?? 1))),
-    );
+  for (const { node } of referenceConstraints(document, layout, "ac")) {
+    const unknown = layout.topology.nodeUnknowns[node] ?? -1;
+    if (unknown < 0) { continue; }
+    matrixReal.fill(0, unknown * layout.size, (unknown + 1) * layout.size);
+    matrixImaginary.fill(0, unknown * layout.size, (unknown + 1) * layout.size);
+    matrixReal[unknown * layout.size + unknown] = 1;
   }
 }
 
@@ -1440,7 +1543,7 @@ function stampAcVoltageBranch(
     branch.unknownIndex,
     branch.unknownIndex,
     -branch.seriesResistanceOhms,
-    0,
+    -(branch.seriesReactanceOhms ?? 0),
   );
   rhsReal[branch.unknownIndex] = branch.sourceVoltage.real;
   rhsImaginary[branch.unknownIndex] = branch.sourceVoltage.imaginary;
@@ -1477,18 +1580,14 @@ function stampAcSmallSignalPart(
 function solveAc(
   document: CircuitDocument,
   layout: MnaLayout,
-  frequencyHz: number,
   dcState: Float64Array,
 ): ComplexValue[] | null {
   const matrixReal = new Float64Array(layout.size * layout.size);
   const matrixImaginary = new Float64Array(layout.size * layout.size);
   const rhsReal = new Float64Array(layout.size);
   const rhsImaginary = new Float64Array(layout.size);
-  const omega = 2 * Math.PI * frequencyHz;
-  stampAcReferenceGmin(document, matrixReal, matrixImaginary, layout);
 
   for (const part of document.parts) {
-    stampAcPassivePart(matrixReal, matrixImaginary, layout, part, omega);
     const branch = layout.branchByPartId.get(part.id);
     if (branch) {
       stampAcVoltageBranch(matrixReal, matrixImaginary, rhsReal, rhsImaginary, layout, branch);
@@ -1498,6 +1597,7 @@ function solveAc(
   for (const branch of layout.internalBranches) {
     stampAcVoltageBranch(matrixReal, matrixImaginary, rhsReal, rhsImaginary, layout, branch);
   }
+  stampAcReferences(document, matrixReal, matrixImaginary, layout);
 
   return solveComplexLinearSystem(
     layout.size,
@@ -1531,6 +1631,7 @@ function currentsFromVoltageBranch(
   const branch = layout.branchByPartId.get(part.id);
   if (!branch) { return null; }
   const value = solution[branch.unknownIndex] ?? complex();
+  if (value.real === 0 && value.imaginary === 0) { return [complex(), complex()]; }
   return [value, complex(-value.real, -value.imaginary)];
 }
 
@@ -1626,6 +1727,10 @@ function terminalCurrentsForPart(
   frequencyHz: number | undefined,
   dcState: Float64Array,
 ): ComplexValue[] {
+  if (part.kind === "inductor" && layout.initialInductorCurrents) {
+    const current = part.initialCurrentAmps ?? 0;
+    return [complex(current), complex(-current)];
+  }
   const branchCurrents = currentsFromVoltageBranch(part, layout, solution);
   if (branchCurrents) { return branchCurrents; }
   if (
@@ -1681,6 +1786,29 @@ function componentPower(
   return power;
 }
 
+function impedanceMeasurements(resistance: number, reactance: number, current: ComplexValue) {
+  const voltage = complexMultiply(complex(resistance, reactance), current);
+  const power = complexMultiply(voltage, complexConjugate(current));
+  return {
+    voltage,
+    power: complex(resistance === 0 ? 0 : power.real, reactance === 0 ? 0 : power.imaginary),
+  };
+}
+
+function resistiveMeasurements(part: CircuitPart, currents: ComplexValue[]) {
+  if (part.kind === "resistor" || part.kind === "bulb") {
+    return impedanceMeasurements(resistorValue(part), 0, currents[0] ?? complex());
+  }
+  if (part.kind !== "potentiometer") { return null; }
+  const segments = potentiometerSegments(part);
+  const ac = impedanceMeasurements(segments.ac, 0, currents[0] ?? complex());
+  const bc = impedanceMeasurements(segments.cb, 0, currents[1] ?? complex());
+  return {
+    voltage: voltageDifference(ac.voltage, bc.voltage),
+    power: complex(ac.power.real + bc.power.real),
+  };
+}
+
 function makeNodeVoltages(layout: MnaLayout, solution: ComplexValue[]) {
   const nodes: Record<string, ComplexValue> = {};
   for (let node = 0; node < layout.topology.nodeCount; node += 1) {
@@ -1711,9 +1839,15 @@ function makeReadings(
       frequencyHz,
       dcState,
     );
-    const voltage = primaryVoltage(part, terminalVoltages);
     const current = primaryCurrent(part, terminalCurrents);
-    const power = componentPower(part, terminalVoltages, terminalCurrents);
+    // I is an independent MNA unknown, so Z I retains a tiny voltage drop that
+    // subtraction of two nearly equal node potentials would erase.
+    const resistive = resistiveMeasurements(part, terminalCurrents);
+    const reactive = mode === "ac" && (part.kind === "capacitor" || part.kind === "inductor")
+      ? impedanceMeasurements(0, layout.branchByPartId.get(part.id)?.seriesReactanceOhms ?? 0, current)
+      : null;
+    const voltage = resistive?.voltage ?? reactive?.voltage ?? primaryVoltage(part, terminalVoltages);
+    const power = resistive?.power ?? reactive?.power ?? componentPower(part, terminalVoltages, terminalCurrents);
     const terminalVoltageMap: Partial<Record<CircuitTerminal, ComplexValue>> = {};
     const terminalCurrentMap: Partial<Record<CircuitTerminal, ComplexValue>> = {};
     const terminals = terminalsOf(part.kind);
@@ -1808,28 +1942,36 @@ function dcResult(
   initialIssues: AnalogCircuitIssue[] = [],
 ): AnalogCircuitAnalysis {
   const mode = options.mode;
+  const switchStates = options.switchStates === undefined ? {} : options.switchStates;
+  const voltageOverrides = options.voltageOverrides ?? {};
   if (document.parts.length === 0) { return result("empty", mode, "部品を配置して回路を作成してください。"); }
   const issue = documentIssue(
     document,
-    options.voltageOverrides ?? {},
-    options.switchStates === undefined ? {} : options.switchStates,
+    voltageOverrides,
+    switchStates,
   );
   if (issue) {
     return result("invalid", mode, issue, { issues: [{ severity: "error", message: issue }] });
   }
 
   const topology = buildTopology(document);
-  const returnPathIssue = currentSourcePathIssue(document, topology, options.switchStates ?? {});
+  if (options.initialInductorCurrents) {
+    const issues = initialInductorIssues(document, topology, switchStates);
+    if (issues[0]) { return result("invalid", mode, issues[0].message, { issues }); }
+  }
+  const returnPathIssues = currentSourcePathIssues(document, topology, switchStates);
+  const returnPathIssue = returnPathIssues[0];
   if (returnPathIssue) {
-    return result("invalid", mode, returnPathIssue.message, { issues: [returnPathIssue] });
+    return result("invalid", mode, returnPathIssue.message, { issues: returnPathIssues });
   }
   const prepared = buildLayout(
     document,
     topology,
     "dc",
     undefined,
-    options.voltageOverrides ?? {},
-    options.switchStates ?? {},
+    voltageOverrides,
+    switchStates,
+    options.initialInductorCurrents ?? false,
   );
   if (!prepared.layout) {
     const message = prepared.issue?.message ?? "回路を計算できませんでした。接続を確認してください。";
@@ -1889,11 +2031,12 @@ function prepareAcBias(
     // valid AC networks because their unrelated DC model has redundant ideal branches.
     return { topology, state: new Float64Array(0) };
   }
-  const returnPathIssue = currentSourcePathIssue(document, topology, options.switchStates ?? {});
+  const returnPathIssues = currentSourcePathIssues(document, topology, options.switchStates ?? {});
+  const returnPathIssue = returnPathIssues[0];
   if (returnPathIssue) {
     return result("invalid", "ac", returnPathIssue.message, {
       frequencyHz,
-      issues: [returnPathIssue],
+      issues: returnPathIssues,
     });
   }
   const dcLayoutResult = buildLayout(
@@ -1915,8 +2058,8 @@ function prepareAcBias(
   if (!dcSolution.converged || !dcSolution.state) {
     const message = dcSolution.singular
       ? "交流解析の直流動作点を計算できません。理想電圧源のループや接続を確認してください。"
-      : dcSolution.gminDominates
-        ? "交流解析の直流動作点に実部品の電流経路がなく、数値安定化用の微小コンダクタンスが電流を肩代わりしています。導通する戻り道を追加してください。"
+      : dcSolution.invalidPhysicalSolution
+        ? "交流解析の直流動作点で実部品の電流・電圧のつり合いを満たせません。導通する戻り道と部品の値を確認してください。"
       : "交流解析に使う直流動作点が収束しませんでした。";
     return result("invalid", "ac", message, {
       frequencyHz,
@@ -1952,7 +2095,7 @@ function prepareAcSolution(
       issues: prepared.issue ? [prepared.issue] : [],
     });
   }
-  const values = solveAc(document, prepared.layout, frequencyHz, bias.state);
+  const values = solveAc(document, prepared.layout, bias.state);
   if (!values) {
     const message = "交流回路を計算できません。理想電圧源のループや接続を確認してください。";
     return result("invalid", "ac", message, {
@@ -2020,6 +2163,12 @@ export function solveAnalogStep(
   options: AnalogStepOptions,
 ): AnalogCircuitAnalysis {
   const document = documentWithCatalogDefaults(inputDocument);
+  if (options.initialInductorCurrents !== undefined &&
+      (typeof options.initialInductorCurrents !== "boolean" ||
+       (options.initialInductorCurrents && options.mode !== "dc"))) {
+    const message = "コイルの初期電流を使う設定は直流の初期状態解析でのみ真偽値として指定してください。";
+    return result("invalid", options.mode, message, { issues: [{ severity: "error", message }] });
+  }
   return options.mode === "dc" ? dcResult(document, options) : acResult(document, options);
 }
 

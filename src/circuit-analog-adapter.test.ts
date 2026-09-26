@@ -6,6 +6,7 @@ import {
   type CircuitPart,
   type CircuitPartKind,
 } from "./circuit-model.js";
+import { createCircuitExample } from "./circuit-examples.js";
 import { analyzeCircuit } from "./circuit-solver.js";
 
 const part = (
@@ -79,5 +80,120 @@ describe("analyzeExtendedCircuit", () => {
 
     expect(result.status).toBe("invalid");
     expect(result.message).toContain("スイッチ状態");
+  });
+
+  it("reports an open DC return through an open switch and honors the solved switch state", () => {
+    const document: CircuitDocument = {
+      title: "スイッチで開いた拡張回路",
+      parts: [
+        part("source", "battery", { voltageVolts: 5 }),
+        part("switch", "switch", { initiallyClosed: false }),
+        part("load", "resistor", { resistanceOhms: 100 }),
+        part("capacitor", "capacitor"),
+      ],
+      wires: [
+        { id: "w1", from: { partId: "source", terminal: "a" }, to: { partId: "switch", terminal: "a" } },
+        { id: "w2", from: { partId: "switch", terminal: "b" }, to: { partId: "load", terminal: "a" } },
+        { id: "w3", from: { partId: "load", terminal: "b" }, to: { partId: "source", terminal: "b" } },
+      ],
+    };
+
+    const open = analyzeCircuit(document);
+    const closed = analyzeCircuit(document, { switch: true });
+
+    expect(open.status).toBe("open");
+    expect(open.currentAmps).toBe(0);
+    expect(open.message).toContain("開いている");
+    expect(closed.status).toBe("closed");
+    expect(closed.parts.load.currentAmps).toBeCloseTo(0.05, 8);
+  });
+
+  it("treats a capacitor as open in DC and as a return path in AC", () => {
+    const document: CircuitDocument = {
+      title: "コンデンサーの直流・交流経路",
+      parts: [part("source", "ac-source", { voltageVolts: 5, frequencyHz: 100 }), part("capacitor", "capacitor")],
+      wires: [
+        { id: "w1", from: { partId: "source", terminal: "a" }, to: { partId: "capacitor", terminal: "a" } },
+        { id: "w2", from: { partId: "source", terminal: "b" }, to: { partId: "capacitor", terminal: "b" } },
+      ],
+    };
+
+    expect(analyzeCircuit(document, {}, { mode: "dc" }).status).toBe("open");
+    const ac = analyzeCircuit(document, {}, { mode: "ac" });
+    expect(ac.status).toBe("closed");
+    expect(ac.parts.capacitor.currentAmps).toBeGreaterThan(0);
+  });
+
+  it("keeps a balanced multi-source loop closed even when its current is zero", () => {
+    const document: CircuitDocument = {
+      title: "逆向きの拡張回路電池",
+      parts: [
+        part("first", "battery", { voltageVolts: 9 }),
+        part("second", "battery", { voltageVolts: 9 }),
+        part("load", "resistor", { resistanceOhms: 10 }),
+        part("capacitor", "capacitor"),
+      ],
+      wires: [
+        { id: "w1", from: { partId: "first", terminal: "b" }, to: { partId: "second", terminal: "b" } },
+        { id: "w2", from: { partId: "second", terminal: "a" }, to: { partId: "load", terminal: "a" } },
+        { id: "w3", from: { partId: "load", terminal: "b" }, to: { partId: "first", terminal: "a" } },
+      ],
+    };
+
+    const result = analyzeCircuit(document);
+
+    expect(result.status).toBe("closed");
+    expect(result.currentAmps).toBeNull();
+    expect(result.parts.load.currentAmps).toBeCloseTo(0, 12);
+  });
+
+  it("does not use an unexcited current source as a return path", () => {
+    const dcCircuit: CircuitDocument = {
+      title: "0 A電流源と電池",
+      parts: [part("battery", "battery", { voltageVolts: 5 }), part("current", "current-source", { currentAmps: 0 })],
+      wires: [
+        { id: "w1", from: { partId: "battery", terminal: "a" }, to: { partId: "current", terminal: "a" } },
+        { id: "w2", from: { partId: "battery", terminal: "b" }, to: { partId: "current", terminal: "b" } },
+      ],
+    };
+    const acCircuit: CircuitDocument = {
+      title: "交流解析中の電流源",
+      parts: [part("source", "ac-source", { voltageVolts: 5, frequencyHz: 100 }), part("current", "current-source", { currentAmps: 0.01 })],
+      wires: [
+        { id: "w1", from: { partId: "source", terminal: "a" }, to: { partId: "current", terminal: "a" } },
+        { id: "w2", from: { partId: "source", terminal: "b" }, to: { partId: "current", terminal: "b" } },
+      ],
+    };
+
+    const dc = analyzeCircuit(dcCircuit, {}, { mode: "dc" });
+    const ac = analyzeCircuit(acCircuit, {}, { mode: "ac" });
+
+    expect(dc.status).toBe("open");
+    expect(dc.currentAmps).toBeNull();
+    expect(dc.parts.battery.currentAmps).toBeCloseTo(0, 12);
+    expect(ac.status).toBe("open");
+    expect(ac.currentAmps).toBeNull();
+    expect(ac.parts.source.currentAmps).toBeCloseTo(0, 12);
+  });
+
+  it("requires an external op-amp output return path and ignores an isolated part", () => {
+    const unloaded: CircuitDocument = {
+      title: "無負荷オペアンプ",
+      parts: [part("amp", "op-amp"), part("isolated", "resistor", { resistanceOhms: 100 })],
+      wires: [],
+    };
+    const capacitiveLoad: CircuitDocument = {
+      title: "コンデンサー負荷のオペアンプ",
+      parts: [part("amp", "op-amp"), part("load", "capacitor"), part("ground", "ground")],
+      wires: [
+        { id: "w1", from: { partId: "amp", terminal: "c" }, to: { partId: "load", terminal: "a" } },
+        { id: "w2", from: { partId: "load", terminal: "b" }, to: { partId: "ground", terminal: "a" } },
+      ],
+    };
+
+    expect(analyzeCircuit(unloaded, {}, { mode: "dc" }).status).toBe("idle");
+    expect(analyzeCircuit(createCircuitExample("opamp"), {}, { mode: "dc" }).status).toBe("closed");
+    expect(analyzeCircuit(capacitiveLoad, {}, { mode: "dc" }).status).toBe("idle");
+    expect(analyzeCircuit(capacitiveLoad, {}, { mode: "ac" }).status).toBe("closed");
   });
 });

@@ -294,6 +294,31 @@ describe("simulateTransient", () => {
     );
   });
 
+  it("uses the actual shorter final time step for the inductor state update", () => {
+    const resistance = 8;
+    const inductance = 2;
+    const initialCurrent = 0.5;
+    const document: CircuitDocument = {
+      title: "RL final short step",
+      parts: [
+        part("inductor", "inductor", { inductanceHenries: inductance, initialCurrentAmps: initialCurrent }),
+        part("resistor", "resistor", { resistanceOhms: resistance }),
+      ],
+      wires: [
+        wire("wire-a", "inductor", "a", "resistor", "a"),
+        wire("wire-b", "inductor", "b", "resistor", "b"),
+      ],
+    };
+    const result = simulateTransient(document, { durationSeconds: 0.25, timeStepSeconds: 0.1 });
+    const first = initialCurrent / (1 + resistance * 0.1 / inductance);
+    const second = first / (1 + resistance * 0.1 / inductance);
+    const final = second / (1 + resistance * 0.05 / inductance);
+
+    expect(result.status, result.message).toBe("valid");
+    expect(result.samples.map(({ timeSeconds }) => timeSeconds)).toEqual([0, 0.1, 0.2, 0.25]);
+    expect(result.samples.at(-1)?.parts.inductor?.currentAmps).toBeCloseTo(final, 12);
+  });
+
   it("lets a switch stop and resume RC charging according to the supplied state", () => {
     const document: CircuitDocument = {
       title: "Switched RC",
@@ -324,8 +349,11 @@ describe("simulateTransient", () => {
     });
 
     expect(closed.status, closed.message).toBe("valid");
+    expect(closed.samples[0]?.parts.switch?.switchClosed).toBe(true);
     expect(closed.samples[1]?.parts.capacitor?.voltageVolts).toBeCloseTo(1 / 11, 10);
     expect(open.status, open.message).toBe("valid");
+    expect(open.samples[0]?.parts.switch?.switchClosed).toBe(false);
+    expect(open.samples[1]?.parts.switch?.switchClosed).toBe(false);
     expect(open.samples[1]?.parts.capacitor?.voltageVolts).toBeCloseTo(0, 12);
     expect(open.samples[1]?.parts.resistor?.currentAmps).toBeCloseTo(0, 12);
   });
@@ -351,6 +379,33 @@ describe("simulateTransient", () => {
 
     expect(result.status).toBe("invalid");
     expect(result.message).toContain("スイッチ状態");
+    expect(result.samples).toHaveLength(0);
+  });
+
+  it("rejects a Map used as the switch state map", () => {
+    const result = simulateTransient(parallelCapacitorsCircuit("switch"), {
+      durationSeconds: 0.01,
+      timeStepSeconds: 0.01,
+      switchStates: new Map([["link", false]]) as unknown as Record<string, boolean>,
+    });
+
+    expect(result.status).toBe("invalid");
+    expect(result.message).toContain("スイッチ状態");
+    expect(result.samples).toHaveLength(0);
+  });
+
+  it.each([
+    ["missing", "スイッチ部品ではありません"],
+    ["source", "スイッチ部品ではありません"],
+  ])("rejects switch overrides for %s", (partId, expectedMessage) => {
+    const result = simulateTransient(parallelCapacitorsCircuit("switch"), {
+      durationSeconds: 0.01,
+      timeStepSeconds: 0.01,
+      switchStates: { [partId]: true },
+    });
+
+    expect(result.status).toBe("invalid");
+    expect(result.message).toContain(expectedMessage);
     expect(result.samples).toHaveLength(0);
   });
 

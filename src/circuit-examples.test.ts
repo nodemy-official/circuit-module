@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { circuitExampleCatalog, createCircuitExample, type CircuitExampleKind } from "./circuit-examples.js";
 import { analyzeCircuit } from "./circuit-solver.js";
 import { parseCircuitDocument, serializeCircuitDocument } from "./circuit-serialization.js";
+import { simulateTransient } from "./transient-solver.js";
 
 describe("working circuit examples", () => {
   it.each(Object.keys(circuitExampleCatalog) as CircuitExampleKind[])("can save, reopen, and solve %s", (kind) => {
@@ -9,8 +10,13 @@ describe("working circuit examples", () => {
     const parsed = parseCircuitDocument(serializeCircuitDocument(document));
     expect(parsed).toEqual({ ok: true, document });
     const analysis = analyzeCircuit(document);
-    expect(analysis.status, analysis.message).toBe("closed");
+    expect(analysis.status, analysis.message).toBe(kind === "charging" ? "open" : "closed");
     expect(analysis.issues.filter((issue) => issue.severity === "error")).toEqual([]);
+    if (kind === "charging") {
+      const transient = simulateTransient(document, { durationSeconds: 0.005, timeStepSeconds: 0.000_05 });
+      expect(transient.status, transient.message).toBe("valid");
+      expect(transient.samples.at(-1)?.parts.load.voltageVolts).toBeGreaterThan(3);
+    }
   });
 
   it("reports the RC filter's RMS magnitude, phase, and real power", () => {
