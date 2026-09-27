@@ -1,8 +1,9 @@
-import { useId } from "react";
-import { GRID, pathData, type Point } from "../circuit-geometry.js";
+import { useEffect, useId, useMemo, useRef } from "react";
+import { GRID, type Point } from "../circuit-geometry.js";
 import type { CircuitAnalysis } from "../circuit-solver.js";
 import type { CircuitBoardSlotProps } from "./CircuitBoard.js";
 import { circuitSlot } from "./style-props.js";
+import { createFlowPath, flowArrowPath } from "./flow-geometry.js";
 
 type FlowKind = "current" | "electron";
 export type FlowDisplay = FlowKind | "both";
@@ -28,9 +29,9 @@ export function wireFlowLabel(current: number, from: string, to: string, display
   return `。電流は${source}から${destination}へ、電子はその逆向きに流れます`;
 }
 
-function FlowGlyph({ kind }: { kind: FlowKind }) {
+function FlowGlyph({ kind, arrowPath }: { kind: FlowKind; arrowPath?: string }) {
   return kind === "current" ? (
-    <path className="circuit-board__current-arrow" d="M -8 -8 H -1 V -11 L 6 -6 L -1 -1 V -4 H -8 Z" />
+    <path className="circuit-board__current-arrow" d={arrowPath ?? "M -8 -8 H -1 V -11 L 6 -6 L -1 -1 V -4 H -8 Z"} />
   ) : (
     <>
       <circle className="circuit-board__electron" cx="-3" cy="-6" r="4" />
@@ -38,6 +39,44 @@ function FlowGlyph({ kind }: { kind: FlowKind }) {
       <path className="circuit-board__electron-arrow" d="M 4 -9 L 7 -6 L 4 -3" />
     </>
   );
+}
+
+/** Use the CSS motion clock so bending also respects pause and reduced-motion styles. */
+function useFlowArrowShape(kind: FlowKind, path: ReturnType<typeof createFlowPath>) {
+  const trackRef = useRef<SVGGElement>(null);
+  useEffect(() => {
+    const track = trackRef.current;
+    if (kind !== "current" || !track || typeof requestAnimationFrame === "undefined") { return; }
+    const particles = Array.from(track.querySelectorAll<SVGGElement>(".circuit-board__flow-particle")).map((particle) => ({
+      particle,
+      arrow: particle.querySelector<SVGPathElement>(".circuit-board__current-arrow"),
+      previousDistance: Number.NaN,
+      previousScale: Number.NaN,
+    }));
+    let frame = 0;
+    const update = () => {
+      const scaleValue = Number.parseFloat(getComputedStyle(track).getPropertyValue("--circuit-board-flow-scale"));
+      const scale = Number.isFinite(scaleValue) && scaleValue > 0 ? scaleValue : 1;
+      // Read all motion positions before writing SVG geometry to avoid layout thrashing.
+      const distances = particles.map(({ particle }) => {
+        const offset = getComputedStyle(particle).offsetDistance;
+        const value = Number.parseFloat(offset);
+        return offset.endsWith("%") ? path.length * value / 100 : value;
+      });
+      for (const [index, state] of particles.entries()) {
+        const distance = distances[index];
+        if (!state.arrow || !Number.isFinite(distance)) { continue; }
+        if (distance === state.previousDistance && scale === state.previousScale) { continue; }
+        state.arrow.setAttribute("d", flowArrowPath(path, distance, scale));
+        state.previousDistance = distance;
+        state.previousScale = scale;
+      }
+      frame = requestAnimationFrame(update);
+    };
+    update();
+    return () => cancelAnimationFrame(frame);
+  }, [kind, path]);
+  return trackRef;
 }
 
 function FlowTrack({
@@ -53,24 +92,25 @@ function FlowTrack({
   length: number;
   slotProps?: CircuitBoardSlotProps;
 }) {
-  const path = pathData(forward ? route : [...route].reverse());
+  const path = useMemo(() => createFlowPath(forward ? route : [...route].reverse()), [route, forward]);
+  const trackRef = useFlowArrowShape(kind, path);
   const count = Math.min(48, Math.max(1, Math.ceil(length / 64)));
   // A fixed illustrative speed keeps direction legible; it is not electron drift velocity.
   const duration = length / 40;
   const offsets = Array.from({ length: count }, (_, index) => (index + 0.5) / count);
   return (
-    <g {...circuitSlot("circuit-board__flow", slotProps?.flow)} data-flow={kind} data-direction={forward ? "forward" : "reverse"}>
+    <g ref={trackRef} {...circuitSlot("circuit-board__flow", slotProps?.flow)} data-flow={kind} data-direction={forward ? "forward" : "reverse"}>
       {offsets.map((offset) => (
         <g
           key={offset}
           {...circuitSlot("circuit-board__flow-particle", slotProps?.flowParticle, {
-            offsetPath: `path('${path}')`,
+            offsetPath: `path('${path.data}')`,
             offsetDistance: `${offset * 100}%`,
             animationDuration: `${duration}s`,
             animationDelay: `${-offset * duration}s`,
           })}
         >
-          <g className="circuit-board__flow-glyph"><FlowGlyph kind={kind} /></g>
+          <g className="circuit-board__flow-glyph"><FlowGlyph kind={kind} arrowPath={kind === "current" ? flowArrowPath(path, offset * path.length) : undefined} /></g>
         </g>
       ))}
     </g>

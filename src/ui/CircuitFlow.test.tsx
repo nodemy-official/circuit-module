@@ -2,13 +2,14 @@
 import { act, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { GRID, routeDocumentWires, type Point } from "../circuit-geometry.js";
 import { createExampleCircuit, endpointName, type CircuitDocument } from "../circuit-model.js";
 import { analyzeCircuit, type CircuitAnalysis } from "../circuit-solver.js";
 import { CircuitBoard } from "./CircuitBoard.js";
 import { CircuitEditor } from "./CircuitEditor.js";
 import { CircuitEditorLayout } from "./CircuitEditorLayout.js";
+import { CircuitWireFlow } from "./CircuitFlow.js";
 
 const circuit = createExampleCircuit();
 const closedAnalysis = analyzeCircuit(circuit);
@@ -55,6 +56,7 @@ afterEach(() => {
   else { Reflect.deleteProperty(window, "matchMedia"); }
   if (actEnvironmentDescriptor) { Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", actEnvironmentDescriptor); }
   else { Reflect.deleteProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT"); }
+  vi.unstubAllGlobals();
 });
 
 function staticBoard(document: CircuitDocument, analysis?: CircuitAnalysis, showFlow?: boolean) {
@@ -87,14 +89,47 @@ function requiredFlow(container: ParentNode, wireId: string, kind: "current" | "
 }
 
 function motionPathStart(flowTrack: Element): Point {
+  const path = motionPathData(flowTrack);
+  const startMatch = /^\s*M\s*(-?(?:\d+(?:\.\d*)?|\.\d+))\s+(-?(?:\d+(?:\.\d*)?|\.\d+))/i.exec(path);
+  if (!startMatch[1] || !startMatch[2]) { throw new Error(`Flow motion path has no start point: ${path}`); }
+  return { x: Number(startMatch[1]), y: Number(startMatch[2]) };
+}
+
+function motionPathData(flowTrack: Element) {
   const particle = flowTrack.querySelector(".circuit-board__flow-particle");
   if (!particle) { throw new Error("Flow track has no animated particle"); }
   const style = particle.getAttribute("style") ?? "";
   const pathMatch = /offset-path:\s*path\(\s*(['"])(.*?)\1\s*\)/i.exec(style);
   if (!pathMatch[2]) { throw new Error(`Flow particle is missing its CSS motion path: ${style}`); }
-  const startMatch = /^\s*M\s*(-?(?:\d+(?:\.\d*)?|\.\d+))\s+(-?(?:\d+(?:\.\d*)?|\.\d+))/i.exec(pathMatch[2]);
-  if (!startMatch[1] || !startMatch[2]) { throw new Error(`Flow motion path has no start point: ${pathMatch[2]}`); }
-  return { x: Number(startMatch[1]), y: Number(startMatch[2]) };
+  return pathMatch[2];
+}
+
+function renderFlowPath(route: readonly Point[], current: number) {
+  const markup = renderToStaticMarkup(
+    <svg aria-hidden="true"><CircuitWireFlow route={route} current={current} display="current" /></svg>,
+  );
+  const container = parseMarkup(markup);
+  const track = container.querySelector('.circuit-board__flow[data-flow="current"]');
+  if (!track) { throw new Error("Missing current flow track"); }
+  return motionPathData(track);
+}
+
+function quadraticJoinVectors(path: string): [Point, Point][] {
+  const values = path.match(/-?(?:\d+(?:\.\d*)?|\.\d+)/g)?.map(Number) ?? [];
+  if (values.length !== 10) { throw new Error(`Expected one quadratic corner in flow path: ${path}`); }
+  const [startX, startY, entryX, entryY, controlX, controlY, exitX, exitY, endX, endY] = values as [
+    number, number, number, number, number, number, number, number, number, number,
+  ];
+  return [
+    [
+      { x: entryX - startX, y: entryY - startY },
+      { x: controlX - entryX, y: controlY - entryY },
+    ],
+    [
+      { x: exitX - controlX, y: exitY - controlY },
+      { x: endX - exitX, y: endY - exitY },
+    ],
+  ];
 }
 
 function flowDirections(container: ParentNode, wireId: string) {
@@ -129,6 +164,48 @@ function mount(element: ReactNode) {
   return container;
 }
 
+function mockFlowMotion() {
+  let offsetDistance = "10%";
+  let nextFrameId = 1;
+  const frames = new Map<number, FrameRequestCallback>();
+  const requestAnimationFrame = vi.fn((callback: FrameRequestCallback) => {
+    const id = nextFrameId++;
+    frames.set(id, callback);
+    return id;
+  });
+  const cancelAnimationFrame = vi.fn((id: number) => { frames.delete(id); });
+  const getComputedStyle = vi.fn((element: Element) => ({
+    offsetDistance: element.classList.contains("circuit-board__flow-particle") ? offsetDistance : "",
+    getPropertyValue: (property: string) => property === "--circuit-board-flow-scale" ? "1" : "",
+  }) as CSSStyleDeclaration);
+
+  vi.stubGlobal("requestAnimationFrame", requestAnimationFrame);
+  vi.stubGlobal("cancelAnimationFrame", cancelAnimationFrame);
+  vi.stubGlobal("getComputedStyle", getComputedStyle);
+
+  return {
+    requestAnimationFrame,
+    cancelAnimationFrame,
+    setOffsetDistance(value: string) { offsetDistance = value; },
+    advanceFrame() {
+      const next = frames.entries().next().value as [number, FrameRequestCallback] | undefined;
+      if (!next) { throw new Error("No animation frame is queued"); }
+      const [id, callback] = next;
+      frames.delete(id);
+      act(() => callback(0));
+    },
+    pendingFrameCount() { return frames.size; },
+  };
+}
+
+function unmount(container: HTMLElement) {
+  const index = mounted.findIndex((entry) => entry.container === container);
+  if (index < 0) { throw new Error("Mounted container was lost"); }
+  const [{ root }] = mounted.splice(index, 1);
+  act(() => root.unmount());
+  container.remove();
+}
+
 function required(container: ParentNode, selector: string): HTMLElement {
   const target = container.querySelector<HTMLElement>(selector);
   if (!target) { throw new Error(`Missing element: ${selector}`); }
@@ -151,6 +228,73 @@ function flowDisplayKey(container: ParentNode, kind: "current" | "electron") {
 }
 
 describe("Circuit flow preview", () => {
+  it("deforms the current arrow with its CSS path position and preserves its shape when position is unchanged", () => {
+    const motion = mockFlowMotion();
+    const route = [{ x: 0, y: 0 }, { x: 2, y: 0 }, { x: 2, y: 2 }];
+    const container = mount(<svg aria-hidden="true"><CircuitWireFlow route={route} current={1} display="current" /></svg>);
+    const arrow = required(container, ".circuit-board__current-arrow");
+
+    const beforeBend = arrow.getAttribute("d");
+    motion.setOffsetDistance("50%");
+    motion.advanceFrame();
+    const onBend = arrow.getAttribute("d");
+    expect(onBend).not.toBe(beforeBend);
+
+    motion.advanceFrame();
+    expect(arrow.getAttribute("d")).toBe(onBend);
+
+    motion.setOffsetDistance("90%");
+    motion.advanceFrame();
+    expect(arrow.getAttribute("d")).not.toBe(onBend);
+  });
+
+  it("cancels the queued shape update when the flow unmounts", () => {
+    const motion = mockFlowMotion();
+    const route = [{ x: 0, y: 0 }, { x: 2, y: 0 }, { x: 2, y: 2 }];
+    const container = mount(<svg aria-hidden="true"><CircuitWireFlow route={route} current={1} display="current" /></svg>);
+    const pendingFrame = motion.requestAnimationFrame.mock.results.at(-1)?.value;
+    expect(motion.pendingFrameCount()).toBe(1);
+    expect(pendingFrame).toBeDefined();
+
+    unmount(container);
+
+    expect(motion.cancelAnimationFrame).toHaveBeenCalledWith(pendingFrame);
+    expect(motion.pendingFrameCount()).toBe(0);
+  });
+
+  it("rounds flow turns with aligned tangents in both directions", () => {
+    const route = [{ x: 0, y: 0 }, { x: 3, y: 0 }, { x: 3, y: 2 }];
+    const forward = renderFlowPath(route, 1);
+    const reverse = renderFlowPath(route, -1);
+
+    expect(forward).toBe("M 0 0 L 48 0 Q 60 0 60 12 L 60 40");
+    expect(reverse).toBe("M 60 40 L 60 12 Q 60 0 48 0 L 0 0");
+    for (const [first, second] of [...quadraticJoinVectors(forward), ...quadraticJoinVectors(reverse)]) {
+      expect(first.x * second.y - first.y * second.x).toBeCloseTo(0);
+      expect(first.x * second.x + first.y * second.y).toBeGreaterThan(0);
+    }
+  });
+
+  it("keeps adjacent short-corner trims within their shared segment", () => {
+    const route = [
+      { x: 0, y: 0 },
+      { x: 2, y: 0 },
+      { x: 2, y: 0 },
+      { x: 2, y: 0.25 },
+      { x: 3, y: 0.25 },
+      { x: 4, y: 0.25 },
+    ];
+
+    expect(renderFlowPath(route, 1)).toBe(
+      "M 0 0 L 37.5 0 Q 40 0 40 2.5 L 40 2.5 Q 40 5 42.5 5 L 60 5 L 80 5",
+    );
+  });
+
+  it("retains a collinear reversal in the particle path", () => {
+    expect(renderFlowPath([{ x: 0, y: 0 }, { x: 2, y: 0 }, { x: 0, y: 0 }], 1))
+      .toBe("M 0 0 L 40 0 L 0 0");
+  });
+
   it("maps signed wire current to opposing electron flow along each route", () => {
     expect(directionalAnalysis.status).toBe("closed");
     const markup = mount(<CircuitBoard document={directionalCircuit} analysis={directionalAnalysis} showFlow renderControls={null} />);
