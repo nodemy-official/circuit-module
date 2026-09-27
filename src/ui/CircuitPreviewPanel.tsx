@@ -285,7 +285,7 @@ export function CircuitPreviewPanel({
         <div className="circuit-preview__part-layout">
           <section className="circuit-preview__controls" aria-label="部品の操作">{renderControls()}</section>
           <section className="circuit-preview__live" aria-label="部品の計測値">
-            <h3>計測値<span>値の変更を反映</span></h3>
+            <h3>計測値</h3>
             {renderReadings()}
           </section>
         </div>

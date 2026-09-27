@@ -101,41 +101,45 @@
   .circuit-ui-dialog-title { margin: 0; font-size: 20px; font-weight: 650; line-height: 1.4; overflow-wrap: anywhere; }
   .circuit-ui-dialog-description { margin: var(--circuit-space-3) 0 0; color: var(--circuit-muted); font-size: 13px; }
   .circuit-preview-dialog > .circuit-ui-dialog-description { margin-top: var(--circuit-space-2); }
+  .circuit-ui-dialog-content.circuit-preview-dialog { box-shadow: 0 16px 40px rgb(0 0 0 / 16%); }
   .circuit-preview-dialog__header { display: flex; align-items: center; gap: var(--circuit-space-3); padding-right: calc(var(--circuit-space-8) + var(--circuit-space-4)); }
-  .circuit-preview-dialog__identity { display: flex; align-items: center; gap: var(--circuit-space-4); min-width: 0; }
-  .circuit-preview-dialog__identity > svg { width: 32px; height: 32px; color: var(--circuit-muted); }
+  .circuit-preview-dialog__identity { display: flex; align-items: center; gap: var(--circuit-space-3); min-width: 0; }
+  .circuit-preview-dialog__identity > svg { box-sizing: content-box; width: 24px; height: 24px; padding: 0; border-radius: 0; color: var(--circuit-muted); background: transparent; }
   .circuit-preview-dialog__kind { margin: var(--circuit-space-1) 0 0; color: var(--circuit-muted); font-size: 12px; }
   .circuit-preview-dialog__identity > svg,
   .circuit-preview-dialog__part > svg { fill: none; stroke: currentColor; stroke-width: 1.65; stroke-linecap: round; stroke-linejoin: round; }
   .circuit-preview-dialog :is(.circuit-preview-dialog__identity, .circuit-preview-dialog__part) svg text { fill: currentColor; stroke: none; }
-  .circuit-preview-dialog__body { display: grid; gap: var(--circuit-space-6); margin-top: var(--circuit-space-6); }
-  .circuit-preview-dialog__footer { display: flex; align-items: center; justify-content: space-between; gap: var(--circuit-space-4); margin: var(--circuit-space-6) calc(0px - var(--circuit-space-6)) calc(0px - var(--circuit-space-6)); padding: var(--circuit-space-4) var(--circuit-space-6); border-top: 1px solid var(--circuit-line); background: var(--circuit-soft); }
+  .circuit-preview-dialog__body { display: grid; gap: var(--circuit-space-5); margin-top: var(--circuit-space-5); }
+  .circuit-preview-dialog__footer { display: flex; align-items: center; justify-content: flex-end; gap: var(--circuit-space-2); margin: var(--circuit-space-5) calc(0px - var(--circuit-space-6)) calc(0px - var(--circuit-space-6)); padding: var(--circuit-space-4) var(--circuit-space-6); border-top: 1px solid var(--circuit-line); background: transparent; }
   .circuit-preview-dialog__footer p { margin: 0; color: var(--circuit-muted); font-size: 12px; }
   .circuit-preview-dialog__footer > button:last-child { flex-shrink: 0; }
   .circuit-preview-dialog__hint { margin: 0; color: var(--circuit-muted); font-size: 12px; }
   .circuit-preview-dialog__count { font-variant-numeric: tabular-nums; font-weight: 400; color: var(--circuit-muted); }
   .circuit-preview-dialog__parts { list-style: none; padding: 0; margin: 0; }
   .circuit-preview-dialog__parts > li + li { border-top: 1px solid var(--circuit-line); }
-  .circuit-preview-dialog__part[data-slot] { width: 100%; justify-content: flex-start; gap: var(--circuit-space-3); padding: var(--circuit-space-3) var(--circuit-space-2); text-align: left; font-weight: 400; }
+  .circuit-preview-dialog__part[data-slot] { width: 100%; min-height: 48px; justify-content: flex-start; gap: var(--circuit-space-3); padding: var(--circuit-space-3) var(--circuit-space-2); text-align: left; font-weight: 400; }
   .circuit-preview-dialog__part > span { flex: 1; display: grid; min-width: 0; gap: var(--circuit-space-1); }
-  .circuit-preview-dialog__part strong { font-weight: 600; overflow-wrap: anywhere; }
+  .circuit-preview-dialog__part strong { font-weight: 500; overflow-wrap: anywhere; }
   .circuit-preview-dialog__part small { color: var(--circuit-muted); font-size: 12px; }
   .circuit-preview-dialog__part > svg { width: 24px; height: 24px; color: var(--circuit-muted); }
   .circuit-preview-dialog__part > svg:last-child { width: 16px; height: 16px; }
-  .circuit-preview-dialog .circuit-ui-tabs-content { min-width: 0; padding-top: var(--circuit-space-4); gap: var(--circuit-space-4); }
+  .circuit-preview-dialog .circuit-ui-tabs-list { gap: var(--circuit-space-4); padding: 0; border-bottom: 1px solid var(--circuit-line); border-radius: 0; background: transparent; }
+  .circuit-preview-dialog .circuit-ui-tabs-trigger { flex: 0 0 auto; min-height: var(--circuit-control-height); padding: 0 var(--circuit-space-2); border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: transparent; }
+  .circuit-preview-dialog .circuit-ui-tabs-trigger[data-active] { border-color: transparent; border-bottom-color: var(--circuit-accent); background: transparent; color: var(--circuit-ink); }
+  .circuit-preview-dialog .circuit-ui-tabs-content { min-width: 0; padding-top: var(--circuit-space-3); gap: var(--circuit-space-3); }
   .circuit-preview-dialog .circuit-ui-tabs-content:not([hidden]) { display: grid; }
   .circuit-preview-dialog .circuit-ui-tabs-content > p { margin: 0; color: var(--circuit-muted); font-size: 12px; line-height: 1.6; }
   /* The per-part dialog reuses preview classes; let this layout own its spacing. */
-  .circuit-preview-dialog .circuit-preview { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--circuit-space-6); height: auto; overflow: visible; }
+  .circuit-preview-dialog .circuit-preview { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--circuit-space-5); height: auto; overflow: visible; }
   .circuit-preview-dialog .circuit-preview__heading { align-items: center; gap: var(--circuit-space-3); padding: 0; border: 0; }
   .circuit-preview-dialog .circuit-preview__heading-copy { display: grid; gap: var(--circuit-space-1); }
   .circuit-preview-dialog .circuit-preview__heading h2 { color: var(--circuit-ink); font-size: 14px; }
   .circuit-preview-dialog .circuit-preview__heading button { color: var(--circuit-ink); font-size: 12px; }
   .circuit-preview-dialog .circuit-preview__change-status { margin: 0; color: var(--circuit-muted); font-size: 12px; }
-  .circuit-preview__part-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: var(--circuit-space-6); padding-top: var(--circuit-space-6); }
+  .circuit-preview__part-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: var(--circuit-space-5); padding-top: var(--circuit-space-6); }
   .circuit-preview-dialog .circuit-preview__part-layout { padding-top: 0; }
   .circuit-preview__controls, .circuit-preview__live { min-width: 0; }
-  .circuit-preview__live { padding-left: var(--circuit-space-6); border-left: 1px solid var(--circuit-line); }
+  .circuit-preview__live { padding: 0 0 0 var(--circuit-space-5); border-left: 1px solid var(--circuit-line); background: transparent; }
   .circuit-preview__live > h3 { display: flex; align-items: center; flex-wrap: wrap; gap: var(--circuit-space-2); margin: 0 0 var(--circuit-space-3); font-size: 14px; }
   .circuit-preview__live > h3 > span { color: var(--circuit-muted); font-size: 11px; font-weight: 400; }
   .circuit-preview-dialog .circuit-preview__parts { gap: var(--circuit-space-4); }
@@ -168,11 +172,16 @@
   .circuit-preview-dialog .circuit-simulation { padding: 0; border: 0; }
   .circuit-preview-dialog .circuit-simulation :is(input, select, button) { min-height: var(--circuit-control-height); color: var(--circuit-ink); background: var(--circuit-surface); border-color: var(--circuit-control-line); }
   .circuit-preview-dialog .circuit-simulation p { color: var(--circuit-muted); }
-  .circuit-preview-dialog__analysis { display: grid; gap: var(--circuit-space-3); padding: 0; }
+  .circuit-preview-dialog__analysis { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: var(--circuit-space-2) var(--circuit-space-4); padding: 0; }
+  .circuit-preview-dialog__analysis :is(.circuit-panel__heading, .circuit-analysis__state-label) { display: none; }
+  .circuit-preview-dialog__analysis .circuit-analysis__state { grid-column: 1; grid-row: 1; justify-content: flex-start; gap: var(--circuit-space-2); margin: 0; padding: 0; border: 0; background: transparent; }
+  .circuit-preview-dialog__analysis :is(.circuit-analysis__mode, .circuit-analysis__reason, .circuit-analysis__counts, .circuit-analysis__issues) { grid-column: 1 / -1; }
   .circuit-preview-dialog .circuit-preview-dialog__analysis :is(.circuit-panel__heading, .circuit-analysis__mode, .circuit-analysis__reason, .circuit-analysis__counts, .circuit-analysis__issues) { margin: 0; }
   .circuit-preview-dialog__analysis :is(h2, .circuit-analysis__metric-label, .circuit-analysis__metric > strong, .circuit-analysis__metric > span) { color: var(--circuit-ink); }
   .circuit-preview-dialog__analysis .circuit-analysis__reason { min-height: 0; color: var(--circuit-muted); }
-  .circuit-preview-dialog__analysis .circuit-analysis__metric { background: transparent; }
+  .circuit-preview-dialog__analysis .circuit-analysis__metric { grid-column: 2; grid-row: 1; display: flex; align-items: baseline; flex-wrap: wrap; gap: var(--circuit-space-2); margin: 0; padding: 0; border: 0; background: transparent; }
+  .circuit-preview-dialog__analysis .circuit-analysis__metric > span { font-size: 11px; color: var(--circuit-muted); }
+  .circuit-preview-dialog__analysis .circuit-analysis__metric > strong { margin: 0; font-size: 20px; }
   .circuit-preview-dialog ::selection { color: var(--circuit-ink); background: var(--circuit-accent-soft); }
 
   :where(.circuit-theme, .circuit-editor) {
@@ -201,7 +210,7 @@
     .circuit-ui-dialog-content { max-height: calc(100dvh - var(--circuit-space-6)); width: calc(100vw - var(--circuit-space-6)); padding: var(--circuit-space-4); }
     .circuit-preview-dialog__header { padding-right: calc(var(--circuit-space-8) + var(--circuit-space-6)); }
     .circuit-preview__part-layout { grid-template-columns: 1fr; gap: var(--circuit-space-6); }
-    .circuit-preview__live { padding: var(--circuit-space-6) 0 0; border-left: 0; border-top: 1px solid var(--circuit-line); }
+    .circuit-preview__live { padding: var(--circuit-space-4) 0 0; border-left: 0; border-top: 1px solid var(--circuit-line); }
     .circuit-preview-dialog .circuit-preview__readings { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .circuit-preview-dialog .circuit-preview__number input { font-size: 16px; }
     .circuit-preview-dialog__footer { margin: var(--circuit-space-5) calc(0px - var(--circuit-space-4)) calc(0px - var(--circuit-space-4)); padding: var(--circuit-space-4) var(--circuit-space-4) max(var(--circuit-space-4), env(safe-area-inset-bottom)); }

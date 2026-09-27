@@ -15,6 +15,7 @@ import type { CircuitInspectorProps } from "./CircuitInspector.js";
 import { CircuitPalette } from "./CircuitPalette.js";
 import type { CircuitPaletteProps } from "./CircuitPalette.js";
 import { CircuitPreviewDialog } from "./circuit-preview-dialog.js";
+import { CircuitPreviewParts } from "./CircuitPreviewParts.js";
 import { Button } from "./primitives.js";
 import { EditorAnalysisStatus, EditorSidebar, type EditorSidebarTab } from "./EditorSidebar.js";
 import { useCircuitEditorContext } from "./CircuitEditor.js";
@@ -195,10 +196,10 @@ function EditorHeader({
       </div>}
       {!preview && <span className="circuit-editor__header-divider" aria-hidden="true" />}
       <div className="circuit-editor__document-name">
-        {preview ? <span>{title || "名称未設定の回路"}</span> : <input aria-label="回路名" title="クリックして回路名を変更" value={title} onChange={(event) => onTitleChange(event.target.value)} placeholder="名称未設定の回路" />}
+        {preview ? <h2>{title || "名称未設定の回路"}</h2> : <input aria-label="回路名" title="クリックして回路名を変更" value={title} onChange={(event) => onTitleChange(event.target.value)} placeholder="名称未設定の回路" />}
       </div>
       <div className="circuit-editor__header-actions">
-        {preview && <Button variant="outline" className="circuit-editor__preview-panel-toggle" aria-haspopup="dialog" aria-expanded={previewPanelOpen} onClick={onOpenPreviewPanel}><CircuitIcon name="sliders" size={16} />解析・部品</Button>}
+        {preview && <Button variant="ghost" className="circuit-editor__preview-panel-toggle" aria-haspopup="dialog" aria-expanded={previewPanelOpen} onClick={onOpenPreviewPanel}><CircuitIcon name="sliders" size={16} />解析・部品</Button>}
         {!preview && <details ref={fileMenuRef} className="circuit-editor__file-menu">
           <summary className="circuit-button">ファイル</summary>
           <div className="circuit-editor__file-actions">
@@ -356,6 +357,7 @@ function EditorCenter({
   onAddBattery,
   onSwitchToggle,
   onInspectPart,
+  onResetPreview,
   sampledAnalysis,
   onFrameChange,
   onEditSelection,
@@ -377,11 +379,13 @@ function EditorCenter({
   onAddBattery: () => void;
   onSwitchToggle: (partId: string) => void;
   onInspectPart: (partId: string) => void;
+  onResetPreview: () => void;
   sampledAnalysis: ReturnType<typeof analyzeCircuit> | null;
   onFrameChange: (frame: CircuitTransientFrame | null) => void;
   onEditSelection: () => void;
   onOpenAnalysis: () => void;
 }) {
+  const boardAnalysis = sampledAnalysis ?? previewAnalysis ?? editor.analysis;
   return (
     <section className="circuit-editor__center" aria-label={preview ? "プレビュー領域" : "編集領域"}>
       {!preview && <EditorToolbar
@@ -392,6 +396,10 @@ function EditorCenter({
         selectTool={selectTool}
         helpDialogRef={helpDialogRef}
       />}
+      {preview && previewAnalysis && <div className="circuit-editor__preview-footer">
+        <CircuitAnalysisPanel analysis={boardAnalysis} showReason={false} className="circuit-editor__preview-summary" />
+        <span className="circuit-editor__preview-hint">ドラッグで移動・ピンチで拡大</span>
+      </div>}
       <div className="circuit-editor__canvas">
         <CircuitBoard
           key={boardVersion}
@@ -416,7 +424,7 @@ function EditorCenter({
           onViewportCenterChange={onViewportCenterChange}
           {...boardProps}
           document={previewDocument ?? editor.document}
-          analysis={sampledAnalysis ?? previewAnalysis ?? editor.analysis}
+          analysis={boardAnalysis}
           showFlow={preview || boardProps?.showFlow === true}
           showPotentials={boardProps?.showPotentials ?? true}
           onSwitchToggle={preview ? onSwitchToggle : boardProps?.onSwitchToggle}
@@ -427,17 +435,16 @@ function EditorCenter({
           panOnScroll={boardProps?.panOnScroll ?? !preview}
         />
         <EditorCanvasNotices preview={preview} editor={editor} onAddBattery={onAddBattery} />
+        {preview && previewDocument?.parts.length === 0 && <div className="circuit-editor__empty-canvas"><CircuitIcon name="circuit" size={32} /><h2>表示する部品がありません</h2><p>部品のある回路を読み込むと、ここで動作を確かめられます。</p></div>}
       </div>
-      {preview && previewAnalysis ? (
-        <div className="circuit-editor__preview-footer">
-          <CircuitAnalysisPanel analysis={sampledAnalysis ?? previewAnalysis} showReason={false} className="circuit-editor__preview-summary" />
-          <span className="circuit-editor__preview-hint">部品をダブルクリックして値を調整</span>
-        </div>
-      ) : <EditorCanvasFooter editor={editor} preview={preview} part={part} wire={wire} tool={tool} analysis={sampledAnalysis ?? editor.analysis} onOpenAnalysis={onOpenAnalysis} />}
-      {preview && previewDocument && previewAnalysis && <details className="circuit-editor__learning">
-        <summary>学習ビュー<span>時間波形・エネルギー・比較</span></summary>
-        <CircuitSimulationPanel document={previewDocument} baselineDocument={editor.document} analysis={previewAnalysis} options={editor.analysisOptions} onChange={editor.setAnalysisOptions} onFrameChange={onFrameChange} />
-      </details>}
+      {!preview && <EditorCanvasFooter editor={editor} preview={preview} part={part} wire={wire} tool={tool} analysis={sampledAnalysis ?? editor.analysis} onOpenAnalysis={onOpenAnalysis} />}
+      {preview && previewDocument && previewAnalysis && <>
+        <CircuitPreviewParts document={previewDocument} initialDocument={editor.document} analysis={boardAnalysis} onInspectPart={onInspectPart} onSwitchToggle={onSwitchToggle} onReset={onResetPreview} />
+        <details className="circuit-editor__learning">
+          <summary>学習ビュー<span>時間波形・エネルギー・比較</span></summary>
+          <CircuitSimulationPanel document={previewDocument} baselineDocument={editor.document} analysis={previewAnalysis} options={editor.analysisOptions} onChange={editor.setAnalysisOptions} onFrameChange={onFrameChange} />
+        </details>
+      </>}
     </section>
   );
 }
@@ -719,6 +726,7 @@ export function CircuitEditorLayout({
           onAddBattery={() => addPart("battery")}
           onSwitchToggle={togglePreviewSwitch}
           onInspectPart={openPreviewDialog}
+          onResetPreview={resetPreview}
           sampledAnalysis={sampledAnalysis}
           onFrameChange={onFrameChange}
           onEditSelection={() => setSidebarTab("properties")}

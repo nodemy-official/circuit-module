@@ -55,7 +55,7 @@ export function CircuitPreviewDialog({
             </div>
           </div>
         </header>
-        <DialogDescription>値を変えて回路を試せます。編集データには反映されません。</DialogDescription>
+        <DialogDescription>値を試しても編集データは変わりません。</DialogDescription>
         <div className="circuit-preview-dialog__body">
           {part ? (
             <CircuitPreviewPanel
@@ -76,14 +76,13 @@ export function CircuitPreviewDialog({
                   <TabsTrigger value="analysis">解析設定</TabsTrigger>
                 </TabsList>
                 <TabsContent value="parts">
-                  <p className="circuit-preview-dialog__hint">部品を選んで値を調整・計測します。回路図のダブルクリックでも開けます。</p>
                   {document.parts.length > 0 ? <ul className="circuit-preview-dialog__parts">
                     {document.parts.map((item) => (
                       <li key={item.id}>
                         <Button variant="ghost" className="circuit-preview-dialog__part" onClick={() => onSelectPart(item.id)}>
                           <CircuitPartIcon kind={item.kind} aria-hidden="true" />
-                          <span><strong>{item.label}</strong><small>{circuitPartCatalog[item.kind].name}</small></span>
-                          <CircuitIcon name="chevron" aria-hidden="true" />
+                          <span><strong>{item.label}</strong>{item.label !== circuitPartCatalog[item.kind].name && <small>{circuitPartCatalog[item.kind].name}</small>}</span>
+                          <CircuitIcon name="arrowRight" aria-hidden="true" />
                         </Button>
                       </li>
                     ))}
@@ -91,14 +90,14 @@ export function CircuitPreviewDialog({
                 </TabsContent>
                 <TabsContent value="analysis">
                   <CircuitSimulationPanel document={document} analysis={analysis} options={options} onChange={onOptionsChange} showLearningPanels={false} />
-                  <p>時間波形と変更前後の比較は、回路図の下にある「学習ビュー」で確認できます。</p>
+                  <p>波形と比較は、回路図下の「学習ビュー」で確認できます。</p>
                 </TabsContent>
               </Tabs>
             </>
           )}
         </div>
         <footer className="circuit-preview-dialog__footer">
-          {part ? <p>閉じたあとも、試した値を保持します。</p> : <Button variant="outline" disabled={changed === 0} onClick={() => onReset()}><CircuitIcon name="undo" />すべてリセット{changed > 0 && `（${changed}部品）`}</Button>}
+          {!part && <Button variant="outline" disabled={changed === 0} onClick={() => onReset()}><CircuitIcon name="undo" />すべてリセット{changed > 0 && `（${changed}部品）`}</Button>}
           <DialogClose render={<Button />}>回路に戻る</DialogClose>
         </footer>
       </DialogContent>
