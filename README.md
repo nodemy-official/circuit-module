@@ -169,7 +169,7 @@ export function App() {
 
 ### ブロックのレンダリング結果に埋め込む
 
-`CircuitPreview` は preset の標準 CSS を使う、編集ナビゲーションのないインラインプレビューです。親の幅に合わせて表示し、`style` の `--circuit-preview-height` で基板の高さを任意に指定できます。埋め込みプレビュー自身が内側に16pxの余白を持つため、親に余白を追加する必要はありません。余白を親で管理する場合は、root の `style={{ padding: 0 }}` で内側余白をなくせます。以下ではブロックの版が変わったときに `key` を更新し、`initialDocument` から試行値を作り直します。プレビュー内での値の変更は親の文書へ反映されません。
+`CircuitPreview` は preset の標準 CSS を使う、編集ナビゲーションのないインラインプレビューです。親の幅に合わせて表示し、`style` の `--circuit-preview-height` で基板の高さを任意に指定できます。埋め込みプレビュー自身が内側に20pxの余白を持つため、親に余白を追加する必要はありません。余白を親で管理する場合は、root の `style={{ padding: 0 }}` で内側余白をなくせます。以下ではブロックの版が変わったときに `key` を更新し、`initialDocument` から試行値を作り直します。プレビュー内での値の変更は親の文書へ反映されません。
 
 ```tsx
 import { CircuitPreview } from "@nodemy-official/circuit-module/ui/preset";
@@ -198,13 +198,67 @@ function CircuitBlockResult({
 }
 ```
 
-高さを指定しない場合は、親の幅に応じた高さ（260〜380px）が使われます。グリッドや flex の子に置く場合は、親の項目にも `min-width: 0` を設定すると内容が親の幅に収まります。`data-theme="dark"`、または祖先の `.dark` / `[data-theme="dark"]` でダークテーマを指定できます。テーマ指定がない場合の既定はライトです。基板の「表示設定」と時間波形・変更前後比較を含む「学習ビュー」は折りたたまれた状態で表示されます。試行値はマウント中に保持されるため、表示するブロックやその内容を差し替える際は、例のように変化する ID や版を `key` に含めてください。
+高さを指定しない場合は、親の幅に応じた高さ（280〜400px）が使われます。グリッドや flex の子に置く場合は、親の項目にも `min-width: 0` を設定すると内容が親の幅に収まります。`data-theme="dark"`、または祖先の `.dark` / `[data-theme="dark"]` でダークテーマを指定できます。テーマ指定がない場合の既定はライトです。試行値はマウント中に保持されるため、表示するブロックやその内容を差し替える際は、例のように変化する ID や版を `key` に含めてください。
+
+プレビューに表示する要素は `previewFeatures` で選べます。`CircuitPreview` と `CircuitEditorLayout` の両方で使え、各項目は省略すると有効になります。`ac` だけは既定で自動判定され、交流電源を含む回路、または交流解析を選んだときに交流向けの機能を表示します。
+
+| 項目 | 表示内容 |
+| --- | --- |
+| `title` | 回路名 |
+| `summary` | 基板上とダイアログ内の解析概要 |
+| `parts` | 部品一覧、部品の調整、基板上の部品確認・スイッチ操作 |
+| `analysisSettings` | ダイアログ内の「解析設定」タブ |
+| `learning` | 学習ビュー全体。`false` にすると以下の学習機能もすべて隠す |
+| `transient` | 過渡波形 |
+| `energy` | 電力・エネルギー |
+| `comparison` | 元の回路との比較 |
+| `ac` | 交流向け機能。`true` / `false` で固定、`"auto"` で回路と解析設定から判定 |
+
+`learning` を有効にしても、`transient`、`energy`、`comparison`、`ac` がすべて無効なら空の学習ビューは表示されません。`parts: false` は部品一覧だけでなく、基板上の部品確認・スイッチ操作も隠します。`ac: false` は交流向けツールの表示だけを切り替え、解析モードや計測値は変更しません。型は `@nodemy-official/circuit-module/ui/preset` の `CircuitPreviewFeatures` から import できます。
+
+回路図だけを表示する場合は、他の表示項目をすべて無効にします。基板の流れ・電位表示やコントロールも隠すには `boardProps` を使います。
+
+```tsx
+import { CircuitPreview, type CircuitPreviewFeatures } from "@nodemy-official/circuit-module/ui/preset";
+
+const boardOnly = {
+  title: false,
+  summary: false,
+  parts: false,
+  analysisSettings: false,
+  learning: false,
+} satisfies CircuitPreviewFeatures;
+
+<CircuitPreview
+  initialDocument={document}
+  previewFeatures={boardOnly}
+  boardProps={{ showFlow: false, showPotentials: false, renderControls: null }}
+/>
+```
+
+個別に選ぶ例では、タイトルと部品操作を隠し、解析概要と過渡波形を表示します。交流向けの機能は自動判定に任せます。
+
+```tsx
+const lessonFeatures = {
+  title: false,
+  summary: true,
+  parts: false,
+  analysisSettings: false,
+  learning: true,
+  transient: true,
+  energy: false,
+  comparison: false,
+  ac: "auto",
+} satisfies CircuitPreviewFeatures;
+
+<CircuitPreview initialDocument={document} previewFeatures={lessonFeatures} />
+```
 
 標準スタイルは任意です。`/ui/styles.css` は全スタイル、`/ui/board.css` は基板、`/ui/editor.css` はエディターと各パネル用です。どれも必要なものだけを import できます。モジュールの root には `className`、`style`、HTML 属性を渡せます。内部要素は `slotProps` の `className` と `style` で調整します。root と slot の `style` では CSS カスタムプロパティも型キャストなしで指定できます（例: `style={{ "--circuit-accent": "#7c3aed" }}`）。全 slot 名は公開型 `CircuitBoardSlot`、`CircuitPaletteSlot`、`CircuitInspectorSlot`、`CircuitAnalysisPanelSlot` に定義されています。部品・導線・端子の `data-selected` / `data-pending` や、パネルの `data-state` / `data-status` を使い、状態に応じた CSS も書けます。`CircuitBoard` の `showFlow` を `true` にすると解析に基づく電流・電子の流れを表示できます（既定は `false`）。標準レイアウトではプレビュー中に自動で有効になります。
 
 余白には `--circuit-space-1`〜`--circuit-space-6` と `--circuit-space-8`（順に 4/8/12/16/20/24/32px）、コントロールの高さには標準 `--circuit-control-height`（36px）、コンパクト `--circuit-control-height-compact`（32px）、タッチ `--circuit-control-height-touch`（44px）を使います。これらは各 CSS entry から自動で読み込まれるため追加の import は不要です。親要素に同名の CSS 変数を指定すると子 UI に継承され、アプリに合わせて調整できます。
 
-`showPotentials` を `true` にすると、電位色を切り替えるチェックボックスと、2点間の電圧差・端子電流を確認する操作UIを表示します（既定は `false`）。電位色はチェックボックスで切り替え、初期状態ではOFFです。
+`showPotentials` を `true` にすると、電位色を切り替えるチェックボックスと、2点間の電圧差・端子電流を確認する操作UIを表示します（既定は `false`）。電位色はチェックボックスで切り替え、初期状態ではOFFです。プレビューでも `boardProps` の `showFlow`、`showPotentials`、`renderControls` を尊重します。これらに `false`、`false`、`null` を渡すと、それぞれ流れ表示、電位表示、基板コントロールを隠せます。
 
 流れ表示の凡例には、表示する向きを選ぶラジオボタンがあり、「電流のみ」（初期値）、「電子のみ」、「両方」を選べます。選択は粒子・凡例・導線の読み上げ説明に反映されます。`flow`、`flowParticle`、`flowLegend`、`flowKey`、`flowNote`、`flowPauseButton`、`flowDisplayControl`、`flowDisplayOption` slot と、`--circuit-board-current` / `--circuit-board-electron` CSS 変数で見た目を調整できます。
 
@@ -216,7 +270,7 @@ function CircuitBlockResult({
 
 標準 preset は部品の追加・ドラッグ移動・回転・削除、端子接続、導線の経路調整とつなぎ替え、部品値の編集、解析結果の確認に対応します。キーボードでは `1`〜`7` で部品を追加し、`V` で選択ツール、`H` で移動ツールに切り替えます。選択中の部品は `R` で回転、`Delete` で削除できます。`⌘ / Ctrl + Z` で元に戻し、`⌘ / Ctrl + Shift + Z` でやり直します。`Esc` は選択や接続を解除します。UI を使わないアプリは `./model`、`./edit`、`./geometry`、`./solver` のみを利用できます。
 
-標準エディターのヘッダーで「プレビュー」を押すと、回路の配置と配線を保ったまま試算できます。プレビューでは左右の編集サイドバーを隠し、回路図を全幅で表示します。部品をダブルクリックすると調整値と計測値をダイアログで開けます。キーボードでは部品の `Enter`、スイッチの詳細は `Shift+Enter` で開き、プレビュー中のスイッチはクリック、`Enter`、`Space` で切り替えます。「解析・部品」ダイアログには部品一覧と解析設定があり、狭い画面でもタブを切り替えて確認できます。部品ごと、または全体の試行値をリセットでき、ダイアログを閉じても値を保持します。編集に戻ると試行値は編集データへ反映されません。独自の画面で部品詳細を開く場合は `CircuitBoard` の `onInspectPart(partId)` callback を使えます。回路図の流れ表示は解析に基づき、オレンジの矢印が電流、青いマイナス粒と小さな矢印が電子の流れを表します。凡例の「表示する向き」では電流のみ、電子のみ、両方を選べ、選択に合わせてアニメーション・凡例・導線の読み上げ説明が切り替わります。ゼロ電流、開回路、短絡、解析不能時は粒が動きません。凡例で一時停止・再生を切り替えられ、`prefers-reduced-motion` が有効な環境では粒子を動かさず方向だけを表示します。速度と粒数は模式的な表現です。`Esc` または「編集に戻る」でプレビューを終了できます。
+標準エディターのヘッダーで「プレビュー」を押すと、回路の配置と配線を保ったまま試算できます。プレビューでは左右の編集サイドバーを隠し、回路図を全幅で表示します。部品をダブルクリックすると調整値と計測値をダイアログで開けます。キーボードでは部品の `Enter`、スイッチの詳細は `Shift+Enter` で開き、プレビュー中のスイッチはクリック、`Enter`、`Space` で切り替えます。「解析・部品」ダイアログには部品一覧と「解析設定」タブがあり、狭い画面でも切り替えて確認できます。`previewFeatures` で「部品」や「解析設定」を個別に隠せます。部品ごと、または全体の試行値をリセットでき、ダイアログを閉じても値を保持します。編集に戻ると試行値は編集データへ反映されません。独自の画面で部品詳細を開く場合は `CircuitBoard` の `onInspectPart(partId)` callback を使えます。回路図の流れ表示は解析に基づき、オレンジの矢印が電流、青いマイナス粒と小さな矢印が電子の流れを表します。凡例の「表示する向き」では電流のみ、電子のみ、両方を選べ、選択に合わせてアニメーション・凡例・導線の読み上げ説明が切り替わります。ゼロ電流、開回路、短絡、解析不能時は粒が動きません。凡例で一時停止・再生を切り替えられ、`prefers-reduced-motion` が有効な環境では粒子を動かさず方向だけを表示します。速度と粒数は模式的な表現です。`Esc` または「編集に戻る」でプレビューを終了できます。
 
 電位の色、時間カーソルに同期する複数波形、エネルギーや交流応答、プレビューでの変更前後比較の試し方は[回路の学習可視化](docs/learning-visualizations.md)を参照してください。
 

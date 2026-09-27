@@ -8,6 +8,7 @@ import { CircuitPartIcon } from "./CircuitPalette.js";
 import { CircuitPreviewPanel } from "./CircuitPreviewPanel.js";
 import { CircuitSimulationPanel } from "./CircuitSimulationPanel.js";
 import { Button, Dialog, DialogClose, DialogContent, DialogDescription, DialogTitle, Tabs, TabsContent, TabsList, TabsTrigger } from "./primitives.js";
+import type { ResolvedPreviewFeatures } from "./preview-features.js";
 
 interface CircuitPreviewDialogProps {
   open: boolean;
@@ -17,6 +18,7 @@ interface CircuitPreviewDialogProps {
   analysis: CircuitAnalysis;
   analysisProps?: Partial<CircuitAnalysisPanelProps>;
   options: CircuitAnalysisOptions;
+  features: ResolvedPreviewFeatures;
   container: RefObject<HTMLElement | null>;
   returnFocus: RefObject<HTMLElement | SVGElement | null>;
   onOpenChange: (open: boolean) => void;
@@ -28,10 +30,10 @@ interface CircuitPreviewDialogProps {
 
 /** The preview keeps experiments local; closing a dialog preserves its current values. */
 export function CircuitPreviewDialog({
-  open, partId, document, initialDocument, analysis, analysisProps, options, container, returnFocus,
+  open, partId, document, initialDocument, analysis, analysisProps, options, features, container, returnFocus,
   onOpenChange, onSelectPart, onChange, onOptionsChange, onReset,
 }: CircuitPreviewDialogProps) {
-  const part = document.parts.find((item) => item.id === partId);
+  const part = features.parts ? document.parts.find((item) => item.id === partId) : undefined;
   const changed = document.parts.filter((item) => {
     const initial = initialDocument.parts.find((candidate) => candidate.id === item.id);
     return JSON.stringify(item) !== JSON.stringify(initial);
@@ -43,8 +45,12 @@ export function CircuitPreviewDialog({
   }, [open, partId, container]);
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent container={container} finalFocus={() => { returnFocus.current?.focus({ preventScroll: true }); return false; }} className="circuit-preview-dialog">
+    <Dialog open={open && features.dialog} onOpenChange={onOpenChange}>
+      <DialogContent container={container} finalFocus={() => {
+        const target = returnFocus.current?.isConnected ? returnFocus.current : container.current?.querySelector<HTMLElement>(".circuit-board__viewport");
+        target?.focus({ preventScroll: true });
+        return false;
+      }} className="circuit-preview-dialog">
         <header className="circuit-preview-dialog__header">
           {part && <Button variant="ghost" size="icon" aria-label="部品一覧に戻る" onClick={() => onSelectPart(null)}><CircuitIcon name="arrowLeft" /></Button>}
           <div className="circuit-preview-dialog__identity">
@@ -69,13 +75,13 @@ export function CircuitPreviewDialog({
             />
           ) : (
             <>
-              <CircuitAnalysisPanel {...analysisProps} analysis={analysis} className={`circuit-preview-dialog__analysis ${analysisProps?.className ?? ""}`} />
-              <Tabs defaultValue="parts">
+              {features.summary && <CircuitAnalysisPanel {...analysisProps} analysis={analysis} className={`circuit-preview-dialog__analysis ${analysisProps?.className ?? ""}`} />}
+              <Tabs key={`${features.parts}-${features.analysisSettings}`} defaultValue={features.parts ? "parts" : "analysis"}>
                 <TabsList aria-label="回路プレビューの設定">
-                  <TabsTrigger value="parts">部品<span className="circuit-preview-dialog__count">{document.parts.length}</span></TabsTrigger>
-                  <TabsTrigger value="analysis">解析設定</TabsTrigger>
+                  {features.parts && <TabsTrigger value="parts">部品<span className="circuit-preview-dialog__count">{document.parts.length}</span></TabsTrigger>}
+                  {features.analysisSettings && <TabsTrigger value="analysis">解析設定</TabsTrigger>}
                 </TabsList>
-                <TabsContent value="parts">
+                {features.parts && <TabsContent value="parts">
                   {document.parts.length > 0 ? <ul className="circuit-preview-dialog__parts">
                     {document.parts.map((item) => (
                       <li key={item.id}>
@@ -87,17 +93,17 @@ export function CircuitPreviewDialog({
                       </li>
                     ))}
                   </ul> : <p className="circuit-preview__empty">この回路にはまだ部品がありません。</p>}
-                </TabsContent>
-                <TabsContent value="analysis">
-                  <CircuitSimulationPanel document={document} analysis={analysis} options={options} onChange={onOptionsChange} showLearningPanels={false} />
-                  <p>波形と比較は、回路図下の「学習ビュー」で確認できます。</p>
-                </TabsContent>
+                </TabsContent>}
+                {features.analysisSettings && <TabsContent value="analysis">
+                  <CircuitSimulationPanel document={document} analysis={analysis} options={options} onChange={onOptionsChange} showLearningPanels={false} learningFeatures={features} />
+                  {features.learning && <p>追加の解析は、回路図下の「学習ビュー」で確認できます。</p>}
+                </TabsContent>}
               </Tabs>
             </>
           )}
         </div>
         <footer className="circuit-preview-dialog__footer">
-          {!part && <Button variant="outline" disabled={changed === 0} onClick={() => onReset()}><CircuitIcon name="undo" />すべてリセット{changed > 0 && `（${changed}部品）`}</Button>}
+          {!part && features.parts && <Button variant="outline" disabled={changed === 0} onClick={() => onReset()}><CircuitIcon name="undo" />すべてリセット{changed > 0 && `（${changed}部品）`}</Button>}
           <DialogClose render={<Button />}>回路に戻る</DialogClose>
         </footer>
       </DialogContent>

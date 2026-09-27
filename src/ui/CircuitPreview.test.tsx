@@ -3,6 +3,7 @@ import { act, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createEmptyCircuit, createExampleCircuit } from "../circuit-model.js";
+import { createCircuitExample } from "../circuit-examples.js";
 import { CircuitPreview } from "./preset.js";
 
 const mounted: Array<{ root: Root; container: HTMLElement }> = [];
@@ -30,10 +31,20 @@ function mount(children: ReactNode) {
   return container;
 }
 
+function rerender(container: HTMLElement, children: ReactNode) {
+  const preview = mounted.find((entry) => entry.container === container);
+  if (!preview) { throw new Error("Preview root is not mounted"); }
+  act(() => preview.root.render(children));
+}
+
 function required(container: ParentNode, selector: string) {
   const element = container.querySelector(selector);
   if (!element) { throw new Error(`Missing ${selector}`); }
   return element;
+}
+
+function hasSummaryText(container: ParentNode, text: string) {
+  return [...container.querySelectorAll("summary")].some((summary) => summary.textContent?.includes(text));
 }
 
 describe("embedded circuit preview", () => {
@@ -151,5 +162,129 @@ describe("embedded circuit preview", () => {
     });
     expect(zoom.defaultPrevented).toBe(true);
     expect(surface.getAttribute("viewBox")).not.toBe(initialView);
+  });
+
+  it("shows AC features automatically only for an AC circuit and honors explicit overrides", () => {
+    const dc = mount(<CircuitPreview initialDocument={createExampleCircuit()} />);
+    const dcPreview = required(dc, ".circuit-editor");
+    expect(hasSummaryText(required(dcPreview, ".circuit-editor__learning"), "交流の位相・周波数応答")).toBe(false);
+    act(() => required(dcPreview, ".circuit-editor__preview-panel-toggle").dispatchEvent(new MouseEvent("click", { bubbles: true })));
+    expect(required(dcPreview, '[role="dialog"] select').querySelector('option[value="ac"]')).toBeNull();
+
+    const acDocument = createCircuitExample("ac");
+    const ac = mount(<CircuitPreview initialDocument={acDocument} />);
+    const acPreview = required(ac, ".circuit-editor");
+    expect(hasSummaryText(required(acPreview, ".circuit-editor__learning"), "交流の位相・周波数応答")).toBe(true);
+    act(() => required(acPreview, ".circuit-editor__preview-panel-toggle").dispatchEvent(new MouseEvent("click", { bubbles: true })));
+    expect(required(acPreview, '[role="dialog"] select').querySelector('option[value="ac"]')).not.toBeNull();
+
+    const forcedOn = mount(<CircuitPreview initialDocument={createExampleCircuit()} previewFeatures={{ ac: true }} />);
+    const forcedOnPreview = required(forcedOn, ".circuit-editor");
+    expect(hasSummaryText(required(forcedOnPreview, ".circuit-editor__learning"), "交流の位相・周波数応答")).toBe(true);
+    act(() => required(forcedOnPreview, ".circuit-editor__preview-panel-toggle").dispatchEvent(new MouseEvent("click", { bubbles: true })));
+    expect(required(forcedOnPreview, '[role="dialog"] select').querySelector('option[value="ac"]')).not.toBeNull();
+
+    const forcedOff = mount(<CircuitPreview initialDocument={acDocument} previewFeatures={{ ac: false }} />);
+    const forcedOffPreview = required(forcedOff, ".circuit-editor");
+    expect(hasSummaryText(required(forcedOffPreview, ".circuit-editor__learning"), "交流の位相・周波数応答")).toBe(false);
+    act(() => required(forcedOffPreview, ".circuit-editor__preview-panel-toggle").dispatchEvent(new MouseEvent("click", { bubbles: true })));
+    expect(forcedOffPreview.querySelector('[role="dialog"] option[value="ac"]')).toBeNull();
+  });
+
+  it("hides each optional preview section independently", () => {
+    const document = createCircuitExample("ac");
+
+    const noTitle = mount(<CircuitPreview initialDocument={document} previewFeatures={{ title: false }} />);
+    expect(required(noTitle, ".circuit-editor__header").querySelector(".circuit-editor__document-name")).toBeNull();
+    expect(required(noTitle, ".circuit-editor__preview-panel-toggle")).not.toBeNull();
+
+    const noSummary = mount(<CircuitPreview initialDocument={document} previewFeatures={{ summary: false }} />);
+    expect(noSummary.querySelector(".circuit-editor__preview-footer")).toBeNull();
+    act(() => required(noSummary, ".circuit-editor__preview-panel-toggle").dispatchEvent(new MouseEvent("click", { bubbles: true })));
+    expect(noSummary.querySelector('[role="dialog"] .circuit-preview-dialog__analysis')).toBeNull();
+
+    const noParts = mount(<CircuitPreview initialDocument={createExampleCircuit()} previewFeatures={{ parts: false }} />);
+    const noPartsPreview = required(noParts, ".circuit-editor");
+    expect(noPartsPreview.querySelector(".circuit-preview-parts")).toBeNull();
+    const switchPart = required(noPartsPreview, '.circuit-board__part[data-kind="switch"]');
+    expect(required(noPartsPreview, ".circuit-board").getAttribute("data-switch-interactive")).toBe("false");
+    expect(switchPart.getAttribute("aria-pressed")).toBeNull();
+    expect(switchPart.getAttribute("aria-haspopup")).toBeNull();
+    act(() => required(noPartsPreview, ".circuit-editor__preview-panel-toggle").dispatchEvent(new MouseEvent("click", { bubbles: true })));
+    expect([...required(noPartsPreview, '[role="dialog"]').querySelectorAll('[role="tab"]')].some((tab) => tab.textContent?.includes("部品"))).toBe(false);
+    expect(required(noPartsPreview, '[role="dialog"] select').querySelector('option[value="dc"]')).not.toBeNull();
+
+    const noAnalysisSettings = mount(<CircuitPreview initialDocument={document} previewFeatures={{ analysisSettings: false }} />);
+    act(() => required(noAnalysisSettings, ".circuit-editor__preview-panel-toggle").dispatchEvent(new MouseEvent("click", { bubbles: true })));
+    expect(required(noAnalysisSettings, '[role="dialog"]').textContent).not.toContain("解析設定");
+    expect(required(noAnalysisSettings, '[role="dialog"]').textContent).toContain("部品");
+    expect(noAnalysisSettings.querySelector('[role="dialog"] select')).toBeNull();
+
+    const noLearning = mount(<CircuitPreview initialDocument={document} previewFeatures={{ learning: false }} />);
+    expect(noLearning.querySelector(".circuit-editor__learning")).toBeNull();
+  });
+
+  it("hides individual learning tools and removes the learning section when none remain", () => {
+    const document = createCircuitExample("ac");
+    const onlyTransient = mount(<CircuitPreview initialDocument={document} previewFeatures={{ energy: false, ac: false, comparison: false }} />);
+    expect(onlyTransient.querySelector(".circuit-editor__learning")).not.toBeNull();
+    expect(onlyTransient.querySelector(".circuit-transient")).not.toBeNull();
+    expect(onlyTransient.querySelector('[aria-label="電力とエネルギー"]')).toBeNull();
+    expect(hasSummaryText(onlyTransient, "交流の位相・周波数応答")).toBe(false);
+    expect(onlyTransient.querySelector(".circuit-comparison")).toBeNull();
+
+    const onlyEnergy = mount(<CircuitPreview initialDocument={document} previewFeatures={{ transient: false, ac: false, comparison: false }} />);
+    expect(onlyEnergy.querySelector(".circuit-transient")).toBeNull();
+    expect(onlyEnergy.querySelector('[aria-label="電力とエネルギー"]')).not.toBeNull();
+    expect(hasSummaryText(onlyEnergy, "交流の位相・周波数応答")).toBe(false);
+    expect(onlyEnergy.querySelector(".circuit-comparison")).toBeNull();
+
+    const onlyComparison = mount(<CircuitPreview initialDocument={document} previewFeatures={{ transient: false, energy: false, ac: false }} />);
+    expect(onlyComparison.querySelector(".circuit-transient")).toBeNull();
+    expect(onlyComparison.querySelector('[aria-label="電力とエネルギー"]')).toBeNull();
+    expect(hasSummaryText(onlyComparison, "交流の位相・周波数応答")).toBe(false);
+    expect(onlyComparison.querySelector(".circuit-comparison")).not.toBeNull();
+
+    const noLearningTools = mount(<CircuitPreview initialDocument={document} previewFeatures={{ transient: false, energy: false, ac: false, comparison: false }} />);
+    expect(noLearningTools.querySelector(".circuit-editor__learning")).toBeNull();
+  });
+
+  it("updates feature visibility on rerender and closes a dialog when its sections disappear", () => {
+    const document = createExampleCircuit();
+    const container = mount(<CircuitPreview initialDocument={document} previewFeatures={{ parts: false, analysisSettings: true }} />);
+    const preview = required(container, ".circuit-editor");
+    expect(preview.querySelector(".circuit-preview-parts")).toBeNull();
+    act(() => required(preview, ".circuit-editor__preview-panel-toggle").dispatchEvent(new MouseEvent("click", { bubbles: true })));
+    expect(preview.querySelector('[role="dialog"]')).not.toBeNull();
+
+    rerender(container, <CircuitPreview initialDocument={document} previewFeatures={{ title: false, summary: false, parts: false, analysisSettings: false, learning: false }} />);
+    expect(container.querySelector(".circuit-editor__header")).toBeNull();
+    expect(container.querySelector(".circuit-editor__preview-footer")).toBeNull();
+    expect(container.querySelector(".circuit-editor__learning")).toBeNull();
+    expect(container.querySelector('[role="dialog"]')).toBeNull();
+
+    rerender(container, <CircuitPreview initialDocument={document} previewFeatures={{ parts: true, analysisSettings: false }} />);
+    expect(container.querySelector(".circuit-preview-parts")).not.toBeNull();
+    expect(required(container, ".circuit-editor__preview-panel-toggle")).not.toBeNull();
+  });
+
+  it("honors board display props in preview without mutating the supplied document", () => {
+    const document = createExampleCircuit();
+    const original = structuredClone(document);
+    const container = mount(
+      <CircuitPreview
+        initialDocument={document}
+        previewFeatures={{ title: false, summary: false, parts: false, analysisSettings: false, learning: false, transient: false, energy: false, ac: false, comparison: false }}
+        boardProps={{ showFlow: false, showPotentials: false, renderControls: null }}
+      />,
+    );
+    const preview = required(container, ".circuit-editor");
+    const board = required(preview, ".circuit-board");
+    expect(board.getAttribute("data-show-flow")).toBe("false");
+    expect(board.querySelector(".circuit-board__flow-legend")).toBeNull();
+    expect(board.querySelector(".circuit-potential")).toBeNull();
+    expect(board.querySelector(".circuit-board__controls")).toBeNull();
+    act(() => required(board, '.circuit-board__part[data-kind="switch"]').dispatchEvent(new MouseEvent("click", { bubbles: true })));
+    expect(document).toEqual(original);
   });
 });

@@ -20,11 +20,16 @@ import { Button } from "./primitives.js";
 import { EditorAnalysisStatus, EditorSidebar, type EditorSidebarTab } from "./EditorSidebar.js";
 import { useCircuitEditorContext } from "./CircuitEditor.js";
 import type { CircuitStyleProps } from "./style-props.js";
+import { resolvePreviewFeatures, type CircuitPreviewFeatures, type ResolvedPreviewFeatures } from "./preview-features.js";
+
+export type { CircuitPreviewFeatures } from "./preview-features.js";
 
 export interface CircuitEditorLayoutProps extends Omit<HTMLAttributes<HTMLElement>, "children" | "style"> {
   style?: CircuitStyleProps["style"];
   /** Render an inline preview for a document block, without editor navigation. */
   previewOnly?: boolean;
+  /** Choose preview sections; AC features follow the circuit by default. */
+  previewFeatures?: CircuitPreviewFeatures;
   /** Reserved for the preset's mobile panel state. Build a custom root with the headless provider to control this attribute. */
   "data-panel"?: never;
   "data-preview-panel"?: never;
@@ -155,6 +160,7 @@ function EditorHeader({
   title,
   preview,
   previewOnly,
+  previewFeatures,
   previewPanelOpen,
   previewToggleRef,
   onTitleChange,
@@ -166,6 +172,7 @@ function EditorHeader({
   title: string;
   preview: boolean;
   previewOnly: boolean;
+  previewFeatures: ResolvedPreviewFeatures;
   previewPanelOpen: boolean;
   previewToggleRef: RefObject<HTMLButtonElement | null>;
   onTitleChange: (title: string) => void;
@@ -195,11 +202,11 @@ function EditorHeader({
         <span className="circuit-editor__brand">回路エディター</span>
       </div>}
       {!preview && <span className="circuit-editor__header-divider" aria-hidden="true" />}
-      <div className="circuit-editor__document-name">
+      {(!preview || previewFeatures.title) && <div className="circuit-editor__document-name">
         {preview ? <h2>{title || "名称未設定の回路"}</h2> : <input aria-label="回路名" title="クリックして回路名を変更" value={title} onChange={(event) => onTitleChange(event.target.value)} placeholder="名称未設定の回路" />}
-      </div>
+      </div>}
       <div className="circuit-editor__header-actions">
-        {preview && <Button variant="ghost" className="circuit-editor__preview-panel-toggle" aria-haspopup="dialog" aria-expanded={previewPanelOpen} onClick={onOpenPreviewPanel}><CircuitIcon name="sliders" size={16} />解析・部品</Button>}
+        {preview && previewFeatures.dialog && <Button variant="ghost" className="circuit-editor__preview-panel-toggle" aria-haspopup="dialog" aria-expanded={previewPanelOpen} onClick={onOpenPreviewPanel}><CircuitIcon name="sliders" size={16} />解析・部品</Button>}
         {!preview && <details ref={fileMenuRef} className="circuit-editor__file-menu">
           <summary className="circuit-button">ファイル</summary>
           <div className="circuit-editor__file-actions">
@@ -340,10 +347,27 @@ function EditorCanvasFooter({
   );
 }
 
+function PreviewLearningSection({ document, initialDocument, analysis, editor, features, onFrameChange }: {
+  document: CircuitDocument;
+  initialDocument: CircuitDocument;
+  analysis: ReturnType<typeof analyzeCircuit>;
+  editor: EditorContext;
+  features: ResolvedPreviewFeatures;
+  onFrameChange: (frame: CircuitTransientFrame | null) => void;
+}) {
+  if (!features.learning) { return null; }
+  const labels = [features.transient && "時間波形", features.energy && "エネルギー", features.ac && "交流応答", features.comparison && "比較"].filter(Boolean).join("・");
+  return <details className="circuit-editor__learning">
+    <summary>学習ビュー<span>{labels}</span></summary>
+    <CircuitSimulationPanel document={document} baselineDocument={initialDocument} analysis={analysis} options={editor.analysisOptions} onChange={editor.setAnalysisOptions} onFrameChange={onFrameChange} showAnalysisSettings={false} learningFeatures={features} />
+  </details>;
+}
+
 function EditorCenter({
   editor,
   boardVersion,
   preview,
+  previewFeatures,
   previewDocument,
   previewAnalysis,
   tool,
@@ -366,6 +390,7 @@ function EditorCenter({
   editor: EditorContext;
   boardVersion: number;
   preview: boolean;
+  previewFeatures: ResolvedPreviewFeatures;
   previewDocument: CircuitDocument | null;
   previewAnalysis: ReturnType<typeof analyzeCircuit> | null;
   tool: EditorTool;
@@ -386,6 +411,7 @@ function EditorCenter({
   onOpenAnalysis: () => void;
 }) {
   const boardAnalysis = sampledAnalysis ?? previewAnalysis ?? editor.analysis;
+  const previewHandlers = previewFeatures.parts ? { onSwitchToggle, onInspectPart } : {};
   return (
     <section className="circuit-editor__center" aria-label={preview ? "プレビュー領域" : "編集領域"}>
       {!preview && <EditorToolbar
@@ -396,7 +422,7 @@ function EditorCenter({
         selectTool={selectTool}
         helpDialogRef={helpDialogRef}
       />}
-      {preview && previewAnalysis && <div className="circuit-editor__preview-footer">
+      {preview && previewFeatures.summary && <div className="circuit-editor__preview-footer">
         <CircuitAnalysisPanel analysis={boardAnalysis} showReason={false} className="circuit-editor__preview-summary" />
         <span className="circuit-editor__preview-hint">ドラッグで移動・ピンチで拡大</span>
       </div>}
@@ -425,10 +451,10 @@ function EditorCenter({
           {...boardProps}
           document={previewDocument ?? editor.document}
           analysis={boardAnalysis}
-          showFlow={preview || boardProps?.showFlow === true}
+          showFlow={boardProps?.showFlow ?? preview}
           showPotentials={boardProps?.showPotentials ?? true}
-          onSwitchToggle={preview ? onSwitchToggle : boardProps?.onSwitchToggle}
-          onInspectPart={preview ? onInspectPart : boardProps?.onInspectPart}
+          onSwitchToggle={preview ? previewHandlers.onSwitchToggle : boardProps?.onSwitchToggle}
+          onInspectPart={preview ? previewHandlers.onInspectPart : boardProps?.onInspectPart}
           readOnly={preview || boardProps?.readOnly === true}
           fitOnResize={preview || boardProps?.fitOnResize === true}
           compactControls={preview || (boardProps?.compactControls ?? true)}
@@ -437,13 +463,10 @@ function EditorCenter({
         <EditorCanvasNotices preview={preview} editor={editor} onAddBattery={onAddBattery} />
         {preview && previewDocument?.parts.length === 0 && <div className="circuit-editor__empty-canvas"><CircuitIcon name="circuit" size={32} /><h2>表示する部品がありません</h2><p>部品のある回路を読み込むと、ここで動作を確かめられます。</p></div>}
       </div>
-      {!preview && <EditorCanvasFooter editor={editor} preview={preview} part={part} wire={wire} tool={tool} analysis={sampledAnalysis ?? editor.analysis} onOpenAnalysis={onOpenAnalysis} />}
+      {!preview && <EditorCanvasFooter editor={editor} preview={preview} part={part} wire={wire} tool={tool} analysis={boardAnalysis} onOpenAnalysis={onOpenAnalysis} />}
       {preview && previewDocument && previewAnalysis && <>
-        <CircuitPreviewParts document={previewDocument} initialDocument={editor.document} analysis={boardAnalysis} onInspectPart={onInspectPart} onSwitchToggle={onSwitchToggle} onReset={onResetPreview} />
-        <details className="circuit-editor__learning">
-          <summary>学習ビュー<span>時間波形・エネルギー・比較</span></summary>
-          <CircuitSimulationPanel document={previewDocument} baselineDocument={editor.document} analysis={previewAnalysis} options={editor.analysisOptions} onChange={editor.setAnalysisOptions} onFrameChange={onFrameChange} />
-        </details>
+        {previewFeatures.parts && <CircuitPreviewParts document={previewDocument} initialDocument={editor.document} analysis={boardAnalysis} onInspectPart={onInspectPart} onSwitchToggle={onSwitchToggle} onReset={onResetPreview} />}
+        <PreviewLearningSection document={previewDocument} initialDocument={editor.document} analysis={previewAnalysis} editor={editor} features={previewFeatures} onFrameChange={onFrameChange} />
       </>}
     </section>
   );
@@ -528,6 +551,7 @@ function EditorDialogs({
 export function CircuitEditorLayout({
   className = "",
   previewOnly = false,
+  previewFeatures,
   boardProps,
   paletteProps,
   inspectorProps,
@@ -550,10 +574,14 @@ export function CircuitEditorLayout({
   const preview = previewDocument !== null;
   const previewAnalysis = useMemo(() => previewDocument ? analyzeCircuit(previewDocument, {}, editor.analysisOptions) : null, [previewDocument, editor.analysisOptions]);
   const activeDocument = previewDocument ?? editor.document;
+  const features = resolvePreviewFeatures(previewFeatures, activeDocument, previewAnalysis ?? editor.analysis, editor.analysisOptions);
   const [transientState, setTransientState] = useState<{ document: CircuitDocument; frame: CircuitTransientFrame | null } | null>(null);
   const onFrameChange = useCallback((frame: CircuitTransientFrame | null) => setTransientState({ document: activeDocument, frame }), [activeDocument]);
   const activeFrame = transientState?.document === activeDocument ? transientState.frame : null;
-  const sampledAnalysis = useMemo(() => activeFrame ? analysisAtTransientFrame(activeDocument, activeFrame) : null, [activeDocument, activeFrame]);
+  const sampledAnalysis = useMemo(() => {
+    if (preview && (!features.learning || !features.transient)) { return null; }
+    return activeFrame ? analysisAtTransientFrame(activeDocument, activeFrame) : null;
+  }, [activeDocument, activeFrame, preview, features.learning, features.transient]);
   const [panel, setPanel] = useState<"parts" | "properties" | null>(null);
   const previousPanel = useRef(panel);
   const rootRef = useRef<HTMLElement>(null);
@@ -572,6 +600,11 @@ export function CircuitEditorLayout({
     setPanel(null);
     focusBoard();
   });
+
+  useEffect(() => {
+    if (!features.dialog) { setPreviewPanelOpen(false); }
+    if (!features.parts) { setPreviewPartId(null); }
+  }, [features.dialog, features.parts]);
 
   function resetPreview(partId?: string) {
     setPreviewDocument((current) => !partId || !current
@@ -692,10 +725,11 @@ export function CircuitEditorLayout({
 
   return (
     <Root aria-label={previewOnly ? "回路プレビュー" : undefined} {...rootProps} ref={rootRef} className={`circuit-editor ${className}`} data-panel={panel ?? "none"} data-preview={preview} data-embedded={previewOnly} data-preview-panel={previewPanelOpen ? "open" : "closed"} onKeyDown={onKeyDown} onBlur={onBlur}>
-      <EditorHeader
+      {(!previewOnly || features.header) && <EditorHeader
         title={editor.document.title}
         preview={preview}
         previewOnly={previewOnly}
+        previewFeatures={features}
         previewPanelOpen={previewPanelOpen}
         previewToggleRef={previewToggleRef}
         onTitleChange={editor.setTitle}
@@ -703,7 +737,7 @@ export function CircuitEditorLayout({
         onOpenPreviewPanel={() => openPreviewDialog(null)}
         onOpenSample={() => resetDialogRef.current?.showModal()}
         files={files}
-      />
+      />}
       {files.error && <p className="circuit-editor__file-error" role="alert">{files.error}</p>}
       {files.loading && <p className="circuit-editor__file-status" role="status">回路ファイルを読み込んでいます…</p>}
       <div className="circuit-editor__workspace">
@@ -713,6 +747,7 @@ export function CircuitEditorLayout({
           editor={editor}
           boardVersion={boardVersion}
           preview={preview}
+          previewFeatures={features}
           previewDocument={previewDocument}
           previewAnalysis={previewAnalysis}
           tool={tool}
@@ -753,6 +788,7 @@ export function CircuitEditorLayout({
         analysis={previewAnalysis}
         analysisProps={analysisProps}
         options={editor.analysisOptions}
+        features={features}
         container={rootRef}
         returnFocus={previewReturnFocus}
         onOpenChange={setPreviewPanelOpen}
