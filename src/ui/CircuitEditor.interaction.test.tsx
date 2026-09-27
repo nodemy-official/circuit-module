@@ -615,11 +615,16 @@ describe("CircuitEditor interactions", () => {
     expect(required(ui.container, ".circuit-board").getAttribute("data-read-only")).toBe("true");
     expect(required(ui.container, '[data-part-id="battery"][data-kind="battery"]').getAttribute("role")).toBe("button");
 
-    click(required(ui.container, '[data-part-id="junction"][data-kind="junction"]'));
     clickTerminal(ui.container, junction.id);
     keyDown(required(ui.container, ".circuit-editor"), "1");
     expect(ui.editor.pendingEndpoint).toBeNull();
     expect(ui.editor.document.parts).toHaveLength(2);
+
+    click(required(ui.container, '[data-part-id="junction"][data-kind="junction"]'));
+    expect(previewDialog(ui.container).querySelector('[data-slot="dialog-title"]')?.textContent).toBe("接続点");
+    keyDown(required(ui.container, ".circuit-editor"), "Escape");
+    expect(required(ui.container, ".circuit-editor").getAttribute("data-preview")).toBe("true");
+    expect(required(ui.container, ".circuit-board").getAttribute("data-read-only")).toBe("true");
 
     keyDown(required(ui.container, ".circuit-editor"), "Escape");
     expect(required(ui.container, ".circuit-editor").getAttribute("data-preview")).toBe("false");

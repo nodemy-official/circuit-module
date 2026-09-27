@@ -343,6 +343,83 @@ describe("CircuitBoard fitOnResize", () => {
 });
 
 describe("CircuitBoard selection and board gestures", () => {
+  it("opens read-only part details with a click, Enter, or Space while preserving edit selection", () => {
+    const onInspectPart = vi.fn();
+    const onSelectPart = vi.fn();
+    const ui = mountBoard(selectionDocument, { readOnly: true, onInspectPart });
+    const part = requiredElement(ui.container, '[data-part-id="part-a"]');
+
+    expect(part.getAttribute("role")).toBe("button");
+    expect(part.getAttribute("aria-keyshortcuts")).toBe("Enter Space");
+    expect(part.querySelector("title")?.textContent).toContain("クリック、Enter、Space");
+
+    dispatchClick(part);
+    expect(onInspectPart).toHaveBeenNthCalledWith(1, "part-a");
+    for (const key of ["Enter", " "]) {
+      act(() => part.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true })));
+    }
+    expect(onInspectPart).toHaveBeenCalledTimes(3);
+
+    ui.update({ readOnly: false, onSelectPart });
+    const editablePart = requiredElement(ui.container, '[data-part-id="part-a"]');
+    const point = clientAtGrid(ui.container, { x: 0, y: 0 });
+    dispatchPointer(editablePart, "pointerdown", { ...point, button: 0 });
+    dispatchPointer(requiredElement(ui.container, ".circuit-board__surface"), "pointerup", { ...point, button: 0 });
+    dispatchClick(editablePart);
+    act(() => editablePart.dispatchEvent(new KeyboardEvent("keydown", { key: " ", bubbles: true, cancelable: true })));
+
+    expect(onInspectPart).toHaveBeenCalledTimes(3);
+    expect(onSelectPart.mock.calls).toEqual([["part-a", false], ["part-a", false]]);
+  });
+
+  it("uses ordinary detail controls for a read-only switch without a toggle handler", () => {
+    const switchDocument: CircuitDocument = {
+      title: "詳細を開くスイッチ",
+      parts: [{ id: "switch", kind: "switch", x: 0, y: 0, label: "スイッチ" }],
+      wires: [],
+    };
+    const onInspectPart = vi.fn();
+    const ui = mountBoard(switchDocument, { readOnly: true, onInspectPart });
+    const part = requiredElement(ui.container, '[data-part-id="switch"]');
+
+    expect(part.getAttribute("aria-keyshortcuts")).toBe("Enter Space");
+    dispatchClick(part);
+    expect(onInspectPart).toHaveBeenCalledWith("switch");
+  });
+
+  it("suppresses detail clicks after dragging on a read-only part", () => {
+    const onInspectPart = vi.fn();
+    const ui = mountBoard(selectionDocument, { readOnly: true, onInspectPart });
+    const part = requiredElement(ui.container, '[data-part-id="part-a"]');
+    const surface = requiredElement(ui.container, ".circuit-board__surface");
+    const point = clientAtGrid(ui.container, { x: 0, y: 0 });
+
+    dispatchPointer(part, "pointerdown", { ...point, button: 0 });
+    dispatchPointer(surface, "pointermove", { ...point, clientX: point.clientX + 8, button: 0 });
+    dispatchPointer(surface, "pointerup", { ...point, clientX: point.clientX + 8, button: 0 });
+    dispatchClick(part);
+
+    expect(onInspectPart).not.toHaveBeenCalled();
+    dispatchClick(part);
+    expect(onInspectPart).toHaveBeenCalledOnce();
+  });
+
+  it("suppresses a part click retargeted after read-only panning", () => {
+    const onInspectPart = vi.fn();
+    const ui = mountBoard(selectionDocument, { readOnly: true, onInspectPart });
+    const background = requiredElement(ui.container, "[data-circuit-board-background]");
+    const surface = requiredElement(ui.container, ".circuit-board__surface");
+    const part = requiredElement(ui.container, '[data-part-id="part-a"]');
+    const point = clientAtGrid(ui.container, { x: 5, y: 5 });
+
+    dispatchPointer(background, "pointerdown", { ...point, button: 0 });
+    dispatchPointer(surface, "pointermove", { ...point, clientX: point.clientX + 20, button: 0 });
+    dispatchPointer(surface, "pointerup", { ...point, clientX: point.clientX + 20, button: 0 });
+    dispatchClick(part);
+
+    expect(onInspectPart).not.toHaveBeenCalled();
+  });
+
   it("passes additive modifiers once for part clicks and preserves an existing selection during drag", () => {
     const onSelectPart = vi.fn();
     const onMovePart = vi.fn();
@@ -477,24 +554,30 @@ describe("CircuitBoard selection and board gestures", () => {
     expect(onSelectRange).not.toHaveBeenCalled();
   });
 
-  it("cancels an in-progress board gesture when a second touch starts a pinch", () => {
+  it("cancels an in-progress board gesture when a second touch starts a pinch", async () => {
     const onSelectRange = vi.fn();
-    const ui = mountBoard(selectionDocument, { onSelectRange });
+    const onInspectPart = vi.fn();
+    const ui = mountBoard(selectionDocument, { readOnly: true, onInspectPart, onSelectRange });
     const background = requiredElement(ui.container, "[data-circuit-board-background]");
     const surface = requiredElement(ui.container, ".circuit-board__surface");
+    const part = requiredElement(ui.container, '[data-part-id="part-a"]');
     const before = cameraViewBox(ui.container);
-    const first = clientAtGrid(ui.container, { x: 5, y: 5 });
-    const second = clientAtGrid(ui.container, { x: 7, y: 5 });
+    const first = clientAtGrid(ui.container, { x: 0, y: 0 });
+    const second = clientAtGrid(ui.container, { x: 2, y: 0 });
 
-    dispatchPointer(background, "pointerdown", { ...first, pointerId: 1, pointerType: "touch", button: 0 });
+    dispatchPointer(part, "pointerdown", { ...first, pointerId: 1, pointerType: "touch", button: 0 });
     dispatchPointer(background, "pointerdown", { ...second, pointerId: 2, pointerType: "touch", button: 0, shiftKey: true });
+    dispatchPointer(surface, "pointermove", { ...first, clientX: first.clientX + 8, pointerId: 1, pointerType: "touch", button: 0 });
     dispatchPointer(surface, "pointermove", { ...second, clientX: second.clientX + 30, pointerId: 2, pointerType: "touch", button: 0 });
     flushFrame();
     dispatchPointer(surface, "pointerup", { ...first, pointerId: 1, pointerType: "touch", button: 0 });
+    await new Promise((resolve) => setTimeout(resolve, 10));
     dispatchPointer(surface, "pointerup", { ...second, clientX: second.clientX + 30, pointerId: 2, pointerType: "touch", button: 0 });
+    dispatchClick(part);
 
     expect(cameraViewBox(ui.container).width).toBeLessThan(before.width);
     expect(onSelectRange).not.toHaveBeenCalled();
+    expect(onInspectPart).not.toHaveBeenCalled();
   });
 
   it("keeps all selected parts selected when an arrow key moves one of them", () => {

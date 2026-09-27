@@ -73,6 +73,7 @@
     "format": "biome format --write .",
     "storybook": "storybook dev -p 6006",
     "build-storybook": "storybook build",
+    "build-storybook:test": "storybook build --test --output-dir storybook-static/test",
     "test": "vitest run",
     "prepack": "npm run build"
   },

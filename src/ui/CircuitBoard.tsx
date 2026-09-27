@@ -76,7 +76,7 @@ export interface CircuitBoardProps extends Omit<ComponentPropsWithoutRef<"div">,
   pendingEndpoint?: CircuitEndpoint | null;
   /** Wire endpoint being replaced; the original wire stays intact until a target is chosen. */
   pendingWire?: { wireId: string; end: CircuitWireEnd } | null;
-  /** Open part details on double click or Enter (Shift+Enter for switches). */
+  /** Open details on double click or Enter (Shift+Enter for switches); read-only parts without a switch toggle also open on click or Space. */
   onInspectPart?: (id: string) => void;
   onSelectPart?: (id: string, additive?: boolean) => void;
   onSelectWire?: (id: string, additive?: boolean) => void;
@@ -414,6 +414,33 @@ function isPreviewPartGesture(event: PointerEvent<SVGSVGElement>, readOnly: bool
   return Boolean(onInspectPart) && event.button === 0 && !spacePressed && Boolean(event.target.closest('.circuit-board__part'));
 }
 
+function readOnlyPartGestureStart(event: PointerEvent<SVGSVGElement>, spacePressed: boolean) {
+  if (event.button !== 0 || spacePressed || !(event.target instanceof Element)) { return null; }
+  if (!event.target.closest(".circuit-board__part")) { return null; }
+  return { pointerId: event.pointerId, x: event.clientX, y: event.clientY, moved: false };
+}
+
+function canToggleReadOnlySwitch(part: CircuitPart, readOnly: boolean, onSwitchToggle?: (id: string) => void) {
+  return readOnly && part.kind === "switch" && onSwitchToggle !== undefined;
+}
+
+function partInspectionAccessibility(part: CircuitPart, readOnly: boolean, canInspect: boolean, canToggleSwitch: boolean) {
+  if (!canInspect) { return { keyShortcuts: undefined, titleHint: "" }; }
+  if (!readOnly) {
+    return { keyShortcuts: part.kind === "switch" ? "Shift+Enter" : "Enter", titleHint: "：ダブルクリックで値を調整・計測" };
+  }
+  if (part.kind === "switch" && canToggleSwitch) {
+    return { keyShortcuts: "Shift+Enter", titleHint: "：ダブルクリックまたはShift+Enterで値を調整・計測" };
+  }
+  return { keyShortcuts: "Enter Space", titleHint: "：クリック、Enter、Spaceで値を調整・計測" };
+}
+
+function shouldInspectPartOnKey(event: KeyboardEvent<SVGGElement>, part: CircuitPart, readOnly: boolean, onSwitchToggle?: (id: string) => void) {
+  const switchRequiresShift = part.kind === "switch" && (!readOnly || onSwitchToggle !== undefined);
+  if (event.key === "Enter") { return !switchRequiresShift || event.shiftKey; }
+  return readOnly && event.key === " " && !canToggleReadOnlySwitch(part, readOnly, onSwitchToggle);
+}
+
 function clickCircuitPart(
   event: MouseEvent<SVGGElement>,
   part: CircuitPart,
@@ -429,6 +456,53 @@ function clickCircuitPart(
     if (onPointerClick) { onPointerClick(event, part); }
     else { onSelectPart?.(part.id, event.shiftKey || event.ctrlKey || event.metaKey); }
   }
+}
+
+function handleCircuitPartClick(
+  event: MouseEvent<SVGGElement>,
+  part: CircuitPart,
+  readOnly: boolean,
+  onInspectPart: CircuitBoardProps["onInspectPart"],
+  onSelectPart: CircuitBoardProps["onSelectPart"],
+  onSwitchToggle: CircuitBoardProps["onSwitchToggle"],
+  onPointerClick: ((event: MouseEvent<SVGGElement>, part: CircuitPart) => void) | undefined,
+  pendingClick: { current: ReturnType<typeof setTimeout> | null },
+  inspect: (element: SVGGElement) => void,
+) {
+  const switchCanToggle = canToggleReadOnlySwitch(part, readOnly, onSwitchToggle);
+  if (readOnly && onInspectPart && switchCanToggle && event.detail > 0) {
+    event.stopPropagation();
+    if (pendingClick.current !== null) { clearTimeout(pendingClick.current); }
+    if (event.detail === 1 && onSwitchToggle) {
+      const toggleSwitch = onSwitchToggle;
+      pendingClick.current = setTimeout(() => { pendingClick.current = null; toggleSwitch(part.id); }, 350);
+    }
+    return;
+  }
+  if (readOnly && onInspectPart && !switchCanToggle) {
+    event.stopPropagation();
+    inspect(event.currentTarget);
+    return;
+  }
+  clickCircuitPart(event, part, readOnly, onSelectPart, onSwitchToggle, onPointerClick);
+}
+
+function handleCircuitPartKeyDown(
+  event: KeyboardEvent<SVGGElement>,
+  part: CircuitPart,
+  readOnly: boolean,
+  onInspectPart: CircuitBoardProps["onInspectPart"],
+  onSwitchToggle: CircuitBoardProps["onSwitchToggle"],
+  inspect: (element: SVGGElement) => void,
+  onKeyDown: (event: KeyboardEvent<SVGGElement>, part: CircuitPart) => void,
+) {
+  if (onInspectPart && shouldInspectPartOnKey(event, part, readOnly, onSwitchToggle)) {
+    event.preventDefault();
+    event.stopPropagation();
+    inspect(event.currentTarget);
+    return;
+  }
+  onKeyDown(event, part);
 }
 
 function keyDownOnCircuitPart(
@@ -607,6 +681,12 @@ function CircuitPartArtwork({
   };
   const meter = getMeterDisplay(part.kind, analysis?.parts[part.id], analysis?.status);
   const accessibility = circuitPartAccessibility(part, isSelected, readOnly, onSwitchToggle, analysis?.parts[part.id]?.switchClosed);
+  const inspectionAccessibility = partInspectionAccessibility(
+    part,
+    readOnly,
+    onInspectPart !== undefined,
+    canToggleReadOnlySwitch(part, readOnly, onSwitchToggle),
+  );
   const labelLayout = circuitPartLabelLayout(part);
 
   return (
@@ -622,26 +702,13 @@ function CircuitPartArtwork({
       aria-label={meter ? `${accessibility.ariaLabel}、${meter.text}` : accessibility.ariaLabel}
       aria-pressed={accessibility.ariaPressed}
       aria-haspopup={onInspectPart ? "dialog" : undefined}
-      aria-keyshortcuts={onInspectPart ? part.kind === "switch" ? "Shift+Enter" : "Enter" : undefined}
+      aria-keyshortcuts={inspectionAccessibility.keyShortcuts}
       onPointerDown={(event) => onPointerDown(event, part)}
-      onClick={(event) => {
-        if (readOnly && onInspectPart && part.kind === "switch" && onSwitchToggle && event.detail > 0) {
-          event.stopPropagation();
-          if (pendingClick.current !== null) { clearTimeout(pendingClick.current); }
-          if (event.detail === 1) { pendingClick.current = setTimeout(() => { pendingClick.current = null; onSwitchToggle(part.id); }, 350); }
-          return;
-        }
-        clickCircuitPart(event, part, readOnly, onSelectPart, onSwitchToggle, onPointerClick);
-      }}
+      onClick={(event) => handleCircuitPartClick(event, part, readOnly, onInspectPart, onSelectPart, onSwitchToggle, onPointerClick, pendingClick, inspect)}
       onDoubleClick={onInspectPart ? (event) => { event.preventDefault(); event.stopPropagation(); inspect(event.currentTarget); } : undefined}
-      onKeyDown={(event) => {
-        if (onInspectPart && event.key === "Enter" && (part.kind !== "switch" || event.shiftKey)) {
-          event.preventDefault(); event.stopPropagation(); inspect(event.currentTarget); return;
-        }
-        onKeyDown(event, part);
-      }}
+      onKeyDown={(event) => handleCircuitPartKeyDown(event, part, readOnly, onInspectPart, onSwitchToggle, inspect, onKeyDown)}
     >
-      <title>{`${part.label}（${partDescriptions[part.kind]}）${meter ? `：${meter.text}${meter.phaseText ? ` · ${meter.phaseText}` : ""}\n${meter.note}` : ""}${onInspectPart ? "：ダブルクリックで値を調整・計測" : ""}`}</title>
+      <title>{`${part.label}（${partDescriptions[part.kind]}）${meter ? `：${meter.text}${meter.phaseText ? ` · ${meter.phaseText}` : ""}\n${meter.note}` : ""}${inspectionAccessibility.titleHint}`}</title>
       <circle {...circuitSlot("circuit-board__part-hit", slotProps?.partHit)} r="23" />
       <rect {...circuitSlot("circuit-board__selection-halo", slotProps?.selectionHalo)} x="-25" y="-24" width="50" height="48" rx="5" />
       <CircuitPartSymbol part={part} selected={isSelected} renderPart={renderPart} analysis={analysis} slotProps={slotProps} />
@@ -888,6 +955,7 @@ export function CircuitBoard({
   const rangeRef = useRef<RangeState | null>(null);
   const modifierPartClickRef = useRef<{ id: string; additive: boolean } | null>(null);
   const suppressPointerClickRef = useRef(false);
+  const readOnlyPartGestureRef = useRef<{ pointerId: number; x: number; y: number; moved: boolean } | null>(null);
   const keyboardPartClickRef = useRef<string | null>(null);
   const keyboardWireClickRef = useRef<string | null>(null);
   const draggedRef = useRef(false);
@@ -1349,10 +1417,24 @@ export function CircuitBoard({
     return true;
   }
 
+  function finishReadOnlyPartGesture(event: PointerEvent<SVGSVGElement>) {
+    const gesture = readOnlyPartGestureRef.current;
+    if (!gesture || gesture.pointerId !== event.pointerId) { return; }
+    readOnlyPartGestureRef.current = null;
+    if (!gesture.moved) { return; }
+    draggedRef.current = true;
+    if (clearDragClickTimer.current !== null) { clearTimeout(clearDragClickTimer.current); }
+    clearDragClickTimer.current = setTimeout(() => {
+      draggedRef.current = false;
+      clearDragClickTimer.current = null;
+    }, 0);
+  }
+
   function trackTouchStart(event: PointerEvent<SVGSVGElement>) {
     if (event.pointerType !== "touch") { return false; }
     touchesRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
     if (touchesRef.current.size !== 2) { return false; }
+    readOnlyPartGestureRef.current = null;
     if (clearDragClickTimer.current !== null) { clearTimeout(clearDragClickTimer.current); }
     clearDragClickTimer.current = null;
     const [first, second] = [...touchesRef.current.entries()];
@@ -1705,6 +1787,7 @@ export function CircuitBoard({
         onPointerLeave={() => { pointerInsideRef.current = false; setPointer(null); setConnectionTarget(null); }}
         onPointerDownCapture={(event) => {
           if (!connectionDragRef.current && gesturePointersRef.current.size === 0) {
+            readOnlyPartGestureRef.current = null;
             draggedRef.current = false;
             if (clearDragClickTimer.current !== null) { clearTimeout(clearDragClickTimer.current); }
             clearDragClickTimer.current = null;
@@ -1722,13 +1805,21 @@ export function CircuitBoard({
             startRange(event);
             return;
           }
-          if (isPreviewPartGesture(event, readOnly, onInspectPart, onSwitchToggle, spacePressedRef.current)) { return; }
+          if (isPreviewPartGesture(event, readOnly, onInspectPart, onSwitchToggle, spacePressedRef.current)) {
+            readOnlyPartGestureRef.current = readOnlyPartGestureStart(event, spacePressedRef.current);
+            return;
+          }
           if (event.button !== 1 && !spacePressedRef.current && !panMode && !readOnly) { return; }
           event.preventDefault();
           event.stopPropagation();
           startPan(event);
         }}
         onPointerMove={(event) => {
+          const partGesture = readOnlyPartGestureRef.current;
+          if (partGesture?.pointerId === event.pointerId
+            && (Math.abs(event.clientX - partGesture.x) > 4 || Math.abs(event.clientY - partGesture.y) > 4)) {
+            partGesture.moved = true;
+          }
           moveDrag(event);
           if (pendingEndpoint && !panMode && !readOnly && !panRef.current && !pinchRef.current) {
             const target = targetAtPointer(event);
@@ -1736,8 +1827,12 @@ export function CircuitBoard({
             setConnectionTarget(target);
           }
         }}
-        onPointerUp={finishDrag}
+        onPointerUp={(event) => {
+          finishReadOnlyPartGesture(event);
+          finishDrag(event);
+        }}
         onPointerCancel={(event) => {
+          if (readOnlyPartGestureRef.current?.pointerId === event.pointerId) { readOnlyPartGestureRef.current = null; }
           cancelConnectionDrag();
           finishDrag(event);
         }}

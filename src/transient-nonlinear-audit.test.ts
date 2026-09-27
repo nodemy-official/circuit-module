@@ -4,6 +4,11 @@ import type { CircuitDocument, CircuitPart, CircuitPartKind, CircuitWire } from 
 import { solveAnalogStep } from "./analog-solver.js";
 import { simulateTransient } from "./transient-solver.js";
 
+const auditFrequencyHz = 50;
+const auditTimeStepSeconds = 0.0002;
+const auditPeriodSeconds = 1 / auditFrequencyHz;
+const auditSamplesPerCycle = Math.round(auditPeriodSeconds / auditTimeStepSeconds);
+
 function part(id: string, kind: CircuitPartKind, properties: Partial<CircuitPart> = {}): CircuitPart {
   return { id, kind, x: 0, y: 0, label: id, ...properties };
 }
@@ -13,7 +18,7 @@ function wire(id: string, fromPart: string, fromTerminal: "a" | "b" | "c", toPar
 }
 
 const source = (voltageVolts: number, offsetVolts: number) =>
-  part("signal", "ac-source", { voltageVolts, frequencyHz: 50, offsetVolts });
+  part("signal", "ac-source", { voltageVolts, frequencyHz: auditFrequencyHz, offsetVolts });
 const ground = part("ground", "ground");
 
 function circuitFor(kind: CircuitPartKind): CircuitDocument {
@@ -106,7 +111,7 @@ function circuitFor(kind: CircuitPartKind): CircuitDocument {
 }
 
 function instantSourceVoltage(sampleTime: number, rms: number, offset: number) {
-  return offset + Math.SQRT2 * rms * Math.cos(2 * Math.PI * 50 * sampleTime);
+  return offset + Math.SQRT2 * rms * Math.cos(2 * Math.PI * auditFrequencyHz * sampleTime);
 }
 
 function estimatedRmsPhasor(samples: ReturnType<typeof simulateTransient>["samples"], partId: string, field: "voltageVolts" | "currentAmps") {
@@ -114,7 +119,7 @@ function estimatedRmsPhasor(samples: ReturnType<typeof simulateTransient>["sampl
   let sineSum = 0;
   for (const sample of samples) {
     const value = sample.parts[partId]?.[field] ?? Number.NaN;
-    const angle = 2 * Math.PI * 50 * sample.timeSeconds;
+    const angle = 2 * Math.PI * auditFrequencyHz * sample.timeSeconds;
     cosineSum += value * Math.cos(angle);
     sineSum += value * Math.sin(angle);
   }
@@ -164,13 +169,22 @@ describe("nonlinear transient/DC consistency audit", () => {
     "matches nonlinear small-signal AC phasors for a small transient around the DC bias for %s",
     (kind) => {
       const document = circuitFor(kind);
-      const analysis = solveAnalogStep(document, { mode: "ac", frequencyHz: 50 });
-      const waveform = simulateTransient(document, { durationSeconds: 0.2, timeStepSeconds: 0.0002 });
+      // These fixtures have no C/L storage and the nonlinear models are memoryless, so no settling cycles are needed.
+      // Exclude the t=0 initialization sample from the phasor estimate.
+      expect(
+        document.parts.some(({ kind: partKind }) => partKind === "capacitor" || partKind === "inductor"),
+        `${kind} one-cycle comparison assumes there are no energy-storage parts`,
+      ).toBe(false);
+      const analysis = solveAnalogStep(document, { mode: "ac", frequencyHz: auditFrequencyHz });
+      const waveform = simulateTransient(document, {
+        durationSeconds: auditPeriodSeconds,
+        timeStepSeconds: auditTimeStepSeconds,
+      });
 
       expect(analysis.status, analysis.message).toBe("valid");
       expect(waveform.status, waveform.message).toBe("valid");
-      const periodicSamples = waveform.samples.slice(500, 1000);
-      expect(periodicSamples).toHaveLength(500);
+      const periodicSamples = waveform.samples.slice(1, auditSamplesPerCycle + 1);
+      expect(periodicSamples).toHaveLength(auditSamplesPerCycle);
       for (const [field, quantity] of [["voltageVolts", "voltage"], ["currentAmps", "current"]] as const) {
         const observed = estimatedRmsPhasor(periodicSamples, "device", field);
         const expected = analysis.parts.device[quantity];

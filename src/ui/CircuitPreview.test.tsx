@@ -47,6 +47,14 @@ function hasSummaryText(container: ParentNode, text: string) {
   return [...container.querySelectorAll("summary")].some((summary) => summary.textContent?.includes(text));
 }
 
+function openParts(preview: ParentNode) {
+  const toggle = required(preview, ".circuit-preview-parts__toggle") as HTMLButtonElement;
+  if (toggle.getAttribute("aria-expanded") !== "true") {
+    act(() => toggle.click());
+  }
+  return toggle;
+}
+
 describe("embedded circuit preview", () => {
   it("renders directly in a lesson and stays read-only after Escape and editor shortcuts", () => {
     const container = mount(<CircuitPreview initialDocument={createExampleCircuit()} />);
@@ -60,26 +68,67 @@ describe("embedded circuit preview", () => {
     expect(container.querySelectorAll(".circuit-board__part")).toHaveLength(4);
   });
 
-  it("keeps experiments independent when multiple blocks share the same source document", () => {
+  it("keeps experiments and parts-list disclosure independent when blocks share a source document", () => {
     const initialDocument = createExampleCircuit();
     const original = structuredClone(initialDocument);
     const container = mount(<><CircuitPreview initialDocument={initialDocument} /><CircuitPreview initialDocument={initialDocument} /></>);
     const [first, second] = container.querySelectorAll(".circuit-editor");
+    const firstToggle = required(first, ".circuit-preview-parts__toggle");
+    const secondToggle = required(second, ".circuit-preview-parts__toggle");
+    expect(firstToggle.getAttribute("aria-expanded")).toBe("false");
+    expect(secondToggle.getAttribute("aria-expanded")).toBe("false");
+    openParts(first);
     const firstSwitch = required(first, '.circuit-preview-parts__card[data-kind="switch"] .circuit-preview-parts__switch');
-    const secondSwitch = required(second, '.circuit-preview-parts__card[data-kind="switch"] .circuit-preview-parts__switch');
     expect(firstSwitch.getAttribute("aria-pressed")).toBe("true");
     act(() => firstSwitch.dispatchEvent(new MouseEvent("click", { bubbles: true })));
     expect(firstSwitch.getAttribute("aria-pressed")).toBe("false");
-    expect(secondSwitch.getAttribute("aria-pressed")).toBe("true");
+    expect(secondToggle.getAttribute("aria-expanded")).toBe("false");
+    expect(second.querySelector(".circuit-preview-parts__grid")).toBeNull();
     expect(required(first, '.circuit-board__part[data-kind="switch"]').getAttribute("aria-pressed")).toBe("false");
     expect(required(first, ".circuit-analysis").getAttribute("data-status")).toBe("open");
     expect(required(second, ".circuit-analysis").getAttribute("data-status")).toBe("closed");
+    openParts(second);
+    expect(required(second, '.circuit-preview-parts__card[data-kind="switch"] .circuit-preview-parts__switch').getAttribute("aria-pressed")).toBe("true");
+    act(() => firstToggle.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+    expect(firstToggle.getAttribute("aria-expanded")).toBe("false");
+    expect(secondToggle.getAttribute("aria-expanded")).toBe("true");
     expect(initialDocument).toEqual(original);
+  });
+
+  it("starts with a collapsed parts list and preserves experiment values when it closes and reopens", () => {
+    const container = mount(<CircuitPreview initialDocument={createExampleCircuit()} />);
+    const preview = required(container, ".circuit-editor");
+    const toggle = required(preview, ".circuit-preview-parts__toggle") as HTMLButtonElement;
+    const list = required(preview, ".circuit-preview-parts__list") as HTMLDivElement;
+
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(toggle.getAttribute("aria-controls")).toBe(list.id);
+    expect(list.hidden).toBe(true);
+    expect(preview.querySelector(".circuit-preview-parts__grid")).toBeNull();
+    expect(preview.querySelector(".circuit-preview-parts__card")).toBeNull();
+
+    act(() => toggle.click());
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    expect(list.hidden).toBe(false);
+    expect(preview.querySelectorAll(".circuit-preview-parts__card")).toHaveLength(4);
+    const switchControl = required(preview, '.circuit-preview-parts__card[data-kind="switch"] .circuit-preview-parts__switch');
+    act(() => switchControl.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+    expect(required(preview, ".circuit-analysis").getAttribute("data-status")).toBe("open");
+
+    act(() => toggle.click());
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(list.hidden).toBe(true);
+    expect(preview.querySelector(".circuit-preview-parts__grid")).toBeNull();
+    act(() => toggle.click());
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    expect(required(preview, '.circuit-preview-parts__card[data-kind="switch"] .circuit-preview-parts__switch').getAttribute("aria-pressed")).toBe("false");
+    expect(required(preview, ".circuit-analysis").getAttribute("data-status")).toBe("open");
   });
 
   it("updates live readings when a part card toggles a switch", () => {
     const container = mount(<CircuitPreview initialDocument={createExampleCircuit()} />);
     const preview = required(container, ".circuit-editor");
+    openParts(preview);
     const switchControl = required(preview, '.circuit-preview-parts__card[data-kind="switch"] .circuit-preview-parts__switch');
     const resistorReadings = required(preview, '.circuit-preview-parts__card[data-part-id="part-2"] .circuit-preview-parts__readings');
     const initialReadings = resistorReadings.textContent;
@@ -93,32 +142,51 @@ describe("embedded circuit preview", () => {
     expect(required(preview, '.circuit-preview-parts__card[data-part-id="part-2"] .circuit-preview-parts__readings').textContent).not.toBe(initialReadings);
   });
 
-  it("restores the initial values from the always-visible parts section", () => {
+  it("toggles a board switch and resets values while the parts list stays collapsed", () => {
     const container = mount(<CircuitPreview initialDocument={createExampleCircuit()} />);
     const preview = required(container, ".circuit-editor");
-    const switchControl = required(preview, '.circuit-preview-parts__card[data-kind="switch"] .circuit-preview-parts__switch');
-    act(() => switchControl.dispatchEvent(new MouseEvent("click", { bubbles: true })));
-    expect(required(preview, ".circuit-analysis").getAttribute("data-status")).toBe("open");
+    const toggle = required(preview, ".circuit-preview-parts__toggle");
+    const boardSwitch = required(preview, '.circuit-board__part[data-kind="switch"]');
+    const resetButton = required(preview, ".circuit-preview-parts__reset") as HTMLButtonElement;
 
-    const resetButton = required(preview, ".circuit-preview-parts__heading button") as HTMLButtonElement;
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(resetButton.disabled).toBe(true);
+    act(() => boardSwitch.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+    expect(required(preview, ".circuit-analysis").getAttribute("data-status")).toBe("open");
+    expect(required(preview, ".circuit-preview-parts__toggle").getAttribute("aria-expanded")).toBe("false");
     expect(resetButton.disabled).toBe(false);
+
     act(() => resetButton.click());
 
-    expect(required(preview, '.circuit-preview-parts__card[data-kind="switch"]').getAttribute("data-changed")).toBe("false");
-    expect(required(preview, '.circuit-preview-parts__card[data-kind="switch"] .circuit-preview-parts__switch').getAttribute("aria-pressed")).toBe("true");
+    expect(required(preview, '.circuit-board__part[data-kind="switch"]').getAttribute("aria-pressed")).toBe("true");
     expect(required(preview, ".circuit-analysis").getAttribute("data-status")).toBe("closed");
-    expect((required(preview, ".circuit-preview-parts__heading button") as HTMLButtonElement).disabled).toBe(true);
+    expect(required(preview, ".circuit-preview-parts__toggle").getAttribute("aria-expanded")).toBe("false");
+    expect(preview.querySelector(".circuit-preview-parts__grid")).toBeNull();
+    expect(resetButton.disabled).toBe(true);
   });
 
   it("opens the detail dialog for the selected part card", () => {
     const container = mount(<CircuitPreview initialDocument={createExampleCircuit()} />);
     const preview = required(container, ".circuit-editor");
+    openParts(preview);
     const detailButton = required(preview, '.circuit-preview-parts__card[data-part-id="part-2"] .circuit-preview-parts__inspect');
 
     act(() => detailButton.dispatchEvent(new MouseEvent("click", { bubbles: true })));
 
     expect((required(preview, ".circuit-editor__preview-panel-toggle") as HTMLButtonElement).getAttribute("aria-expanded")).toBe("true");
     expect(required(preview, '[role="dialog"] .circuit-ui-dialog-title').textContent).toBe("抵抗");
+  });
+
+  it("opens a selected part's detail dialog with one click on the board", () => {
+    const container = mount(<CircuitPreview initialDocument={createExampleCircuit()} />);
+    const preview = required(container, ".circuit-editor");
+    const resistor = required(preview, '.circuit-board__part[data-part-id="part-2"]');
+
+    act(() => resistor.dispatchEvent(new MouseEvent("click", { bubbles: true, detail: 1 })));
+
+    expect(required(preview, '[role="dialog"] .circuit-ui-dialog-title').textContent).toBe("抵抗");
+    expect(required(preview, ".circuit-preview-parts__toggle").getAttribute("aria-expanded")).toBe("false");
+    expect(preview.querySelector(".circuit-preview-parts__grid")).toBeNull();
   });
 
   it("shows the empty-circuit message without rendering part cards", () => {
@@ -138,6 +206,7 @@ describe("embedded circuit preview", () => {
     };
     const container = mount(<CircuitPreview initialDocument={invalidDocument} />);
     const preview = required(container, ".circuit-editor");
+    openParts(preview);
     const bulbStatus = required(preview, '.circuit-preview-parts__card[data-kind="bulb"] .circuit-preview-parts__light');
 
     expect(required(preview, ".circuit-analysis").getAttribute("data-status")).toBe("invalid");

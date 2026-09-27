@@ -1,3 +1,4 @@
+import { useId, useState } from "react";
 import { circuitPartCatalog, circuitPartNumericFields, type CircuitDocument, type CircuitPart } from "../circuit-model.js";
 import type { CircuitAnalysis } from "../circuit-solver.js";
 import { formatCircuitQuantity } from "../circuit-visualization.js";
@@ -66,36 +67,45 @@ function LightStatus({ part, analysis }: { part: CircuitPart; analysis: CircuitA
 
 /** Visible controls and live readings keep experiments next to the circuit. */
 export function CircuitPreviewParts({ document, initialDocument, analysis, onInspectPart, onSwitchToggle, onReset }: CircuitPreviewPartsProps) {
+  const [expanded, setExpanded] = useState(false);
+  const listId = useId();
   const initialParts = new Map(initialDocument.parts.map((part) => [part.id, part]));
   const changedIds = new Set(document.parts.filter((part) => partChanged(part, initialParts.get(part.id))).map((part) => part.id));
   if (document.parts.length === 0) { return null; }
   return <section className="circuit-preview-parts" aria-label="部品の操作と計測">
     <header className="circuit-preview-parts__heading">
-      <h2>部品 <span>{document.parts.length}</span></h2>
-      <Button variant="ghost" disabled={changedIds.size === 0} onClick={() => onReset()}><CircuitIcon name="undo" size={15} />元の値に戻す</Button>
+      <h2><button type="button" className="circuit-preview-parts__toggle" aria-expanded={expanded} aria-controls={listId} onClick={() => setExpanded((open) => !open)}>
+        <span>部品の一覧・比較</span><span className="circuit-preview-parts__count">{document.parts.length}</span><CircuitIcon name="chevron" size={16} />
+      </button></h2>
+      <Button className="circuit-preview-parts__reset" variant="ghost" disabled={changedIds.size === 0} onClick={() => onReset()}><CircuitIcon name="undo" size={15} />元の値に戻す</Button>
     </header>
-    <ul className="circuit-preview-parts__grid">
-      {document.parts.map((part) => {
-        const value = setting(part);
-        const reading = analysis.parts[part.id];
-        const closed = reading?.switchClosed ?? part.initiallyClosed ?? circuitPartCatalog.switch.defaults.initiallyClosed ?? false;
-        return <li className="circuit-preview-parts__card" key={part.id} data-part-id={part.id} data-kind={part.kind} data-changed={changedIds.has(part.id)}>
-          <div className="circuit-preview-parts__identity">
-            <span className="circuit-preview-parts__icon"><CircuitPartIcon kind={part.kind} aria-hidden="true" /></span>
-            <div><h3>{part.label}</h3>{part.label !== circuitPartCatalog[part.kind].name && <span>{circuitPartCatalog[part.kind].name}</span>}</div>
-            {changedIds.has(part.id) && <span className="circuit-preview-parts__changed">変更済み</span>}
-          </div>
-          <div className="circuit-preview-parts__configuration">
-            {part.kind === "switch" ? <button type="button" className="circuit-preview-parts__switch" aria-label={`${part.label}のON / OFF`} aria-pressed={closed} onClick={() => onSwitchToggle(part.id)}>
-              <span className="circuit-preview-parts__switch-track" aria-hidden="true"><span /></span><strong>{closed ? "ON" : "OFF"}</strong>
-            </button> : value && <div className="circuit-preview-parts__setting"><span>{value.label}</span><strong>{value.value}</strong></div>}
-            <LightStatus part={part} analysis={analysis} />
-          </div>
-          <PartReadings part={part} analysis={analysis} />
-          <button type="button" className="circuit-preview-parts__inspect" aria-label={`${part.label}の調整・詳細`} aria-haspopup="dialog" onClick={() => onInspectPart(part.id)}>詳細<CircuitIcon name="arrowRight" size={14} /></button>
-        </li>;
-      })}
-    </ul>
-    <p className="circuit-preview-parts__footnote">{analysis.timeSeconds !== undefined ? "計測値は選択した時刻の瞬時値です。" : analysis.mode === "ac" ? "交流の電圧・電流は実効値です。" : "電圧・電流の符号は端子の向きを表します。"} 変更はこのプレビュー内にだけ反映されます。</p>
+    <p className="circuit-preview-parts__hint">部品をクリックして調整・計測。スイッチはクリックで切替、ダブルクリックで詳細を開きます。</p>
+    <div className="circuit-preview-parts__list" id={listId} hidden={!expanded}>
+      {expanded && <>
+        <ul className="circuit-preview-parts__grid">
+          {document.parts.map((part) => {
+            const value = setting(part);
+            const reading = analysis.parts[part.id];
+            const closed = reading?.switchClosed ?? part.initiallyClosed ?? circuitPartCatalog.switch.defaults.initiallyClosed ?? false;
+            return <li className="circuit-preview-parts__card" key={part.id} data-part-id={part.id} data-kind={part.kind} data-changed={changedIds.has(part.id)}>
+              <div className="circuit-preview-parts__identity">
+                <span className="circuit-preview-parts__icon"><CircuitPartIcon kind={part.kind} aria-hidden="true" /></span>
+                <div><h3>{part.label}</h3>{part.label !== circuitPartCatalog[part.kind].name && <span>{circuitPartCatalog[part.kind].name}</span>}</div>
+                {changedIds.has(part.id) && <span className="circuit-preview-parts__changed">変更済み</span>}
+              </div>
+              <div className="circuit-preview-parts__configuration">
+                {part.kind === "switch" ? <button type="button" className="circuit-preview-parts__switch" aria-label={`${part.label}のON / OFF`} aria-pressed={closed} onClick={() => onSwitchToggle(part.id)}>
+                  <span className="circuit-preview-parts__switch-track" aria-hidden="true"><span /></span><strong>{closed ? "ON" : "OFF"}</strong>
+                </button> : value && <div className="circuit-preview-parts__setting"><span>{value.label}</span><strong>{value.value}</strong></div>}
+                <LightStatus part={part} analysis={analysis} />
+              </div>
+              <PartReadings part={part} analysis={analysis} />
+              <button type="button" className="circuit-preview-parts__inspect" aria-label={`${part.label}の調整・詳細`} aria-haspopup="dialog" onClick={() => onInspectPart(part.id)}>詳細<CircuitIcon name="arrowRight" size={14} /></button>
+            </li>;
+          })}
+        </ul>
+        <p className="circuit-preview-parts__footnote">{analysis.timeSeconds !== undefined ? "計測値は選択した時刻の瞬時値です。" : analysis.mode === "ac" ? "交流の電圧・電流は実効値です。" : "電圧・電流の符号は端子の向きを表します。"} 変更はこのプレビュー内にだけ反映されます。</p>
+      </>}
+    </div>
   </section>;
 }
