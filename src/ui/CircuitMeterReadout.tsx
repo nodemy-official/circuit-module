@@ -110,7 +110,7 @@ export function getMeterDisplay(
   const text = status === "connected" && measurement !== undefined
     ? `${formatEngineering(measurement, unit, !isAc)}${isAc ? "（実効値）" : ""}`
     : `— ${unit} · ${statusLabel(status)}`;
-  const phaseText = status === "connected" && isAc && phase !== undefined
+  const phaseText = status === "connected" && isAc && phase !== undefined && measurement !== 0
     ? phaseLabel(meterKind, phase)
     : undefined;
 

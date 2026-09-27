@@ -269,8 +269,8 @@ function InspectorFields({
             type="checkbox"
             role="switch"
             aria-label="スイッチを閉じる"
-            aria-checked={part.initiallyClosed ?? false}
-            checked={part.initiallyClosed ?? false}
+            aria-checked={part.initiallyClosed ?? circuitPartCatalog.switch.defaults.initiallyClosed ?? false}
+            checked={part.initiallyClosed ?? circuitPartCatalog.switch.defaults.initiallyClosed ?? false}
             onChange={(event) => change({ initiallyClosed: event.target.checked })}
             disabled={!onChange}
             data-field="initiallyClosed"
@@ -307,7 +307,7 @@ function InspectorReadings({
   }
   if (!reading) { return null; }
   const labels = measurementLabels(kind);
-  const isAc = reading.voltagePhaseDegrees !== undefined || reading.currentPhaseDegrees !== undefined;
+  const isAc = reading.voltagePhaseDegrees !== undefined || reading.currentPhaseDegrees !== undefined || reading.reactivePowerVars !== undefined;
   return (
     <div {...circuitSlot("circuit-inspector__readings", slotProps?.readings)}>
       <h3 {...circuitSlot(undefined, slotProps?.readingsTitle)}>計測値</h3>
@@ -327,15 +327,15 @@ function InspectorReadings({
           <dt {...circuitSlot(undefined, slotProps?.readingLabel)}>電力</dt>
           <dd {...circuitSlot(undefined, slotProps?.readingValue)}><span>{format(reading.powerWatts)}</span><small {...circuitSlot(undefined, slotProps?.readingUnit)}>W</small></dd>
         </div>
-        {(reading.voltagePhaseDegrees !== undefined || reading.currentPhaseDegrees !== undefined) && <>
-          <div {...circuitSlot(undefined, slotProps?.readingRow)} data-measurement="voltage-phase">
+        {isAc && <>
+          {Math.abs(reading.voltageVolts) > 0 && <div {...circuitSlot(undefined, slotProps?.readingRow)} data-measurement="voltage-phase">
             <dt {...circuitSlot(undefined, slotProps?.readingLabel)}>電圧位相</dt>
             <dd {...circuitSlot(undefined, slotProps?.readingValue)}><span>{format(reading.voltagePhaseDegrees)}</span><small {...circuitSlot(undefined, slotProps?.readingUnit)}>°</small></dd>
-          </div>
-          <div {...circuitSlot(undefined, slotProps?.readingRow)} data-measurement="current-phase">
+          </div>}
+          {Math.abs(reading.currentAmps) > 0 && <div {...circuitSlot(undefined, slotProps?.readingRow)} data-measurement="current-phase">
             <dt {...circuitSlot(undefined, slotProps?.readingLabel)}>電流位相</dt>
             <dd {...circuitSlot(undefined, slotProps?.readingValue)}><span>{format(reading.currentPhaseDegrees)}</span><small {...circuitSlot(undefined, slotProps?.readingUnit)}>°</small></dd>
-          </div>
+          </div>}
           {reading.reactivePowerVars !== undefined && <div {...circuitSlot(undefined, slotProps?.readingRow)} data-measurement="reactive-power">
             <dt {...circuitSlot(undefined, slotProps?.readingLabel)}>無効電力</dt>
             <dd {...circuitSlot(undefined, slotProps?.readingValue)}><span>{format(reading.reactivePowerVars)}</span><small {...circuitSlot(undefined, slotProps?.readingUnit)}>var</small></dd>

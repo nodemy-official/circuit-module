@@ -136,6 +136,10 @@ function readingText(container: ParentNode, partId: string, measurement: "curren
   return meterReading(container, partId, measurement).textContent?.trim() ?? "";
 }
 
+function meterTitle(container: ParentNode, partId: string) {
+  return required<SVGTitleElement>(container, `.circuit-board__part[data-part-id="${partId}"] > title`).textContent ?? "";
+}
+
 function previewInput(container: ParentNode, label: string) {
   return required<HTMLInputElement>(previewDialog(container), `[aria-label="${label}"]`);
 }
@@ -203,6 +207,18 @@ describe("CircuitEditorLayout meter readouts", () => {
     expect(readingText(ui.container, "ammeter", "current")).toContain("300 mA");
     expect(readingText(ui.container, "voltmeter", "voltage")).toContain("実効値");
     expect(readingText(ui.container, "voltmeter", "voltage")).toContain("9 V");
+  });
+
+  it("keeps AC voltmeter RMS magnitude and shifts its displayed phase by 180 degrees when A/B are swapped", () => {
+    const forward = mount(meterCircuit({ sourceKind: "ac-source" }));
+    const reversed = mount(meterCircuit({ sourceKind: "ac-source", reverseMeters: true }));
+    const forwardValue = readingText(forward.container, "voltmeter", "voltage");
+    const reversedValue = readingText(reversed.container, "voltmeter", "voltage");
+
+    expect(forwardValue).toBe("9 V（実効値）");
+    expect(reversedValue).toBe(forwardValue);
+    expect(meterTitle(forward.container, "voltmeter")).toContain("電圧位相 0°");
+    expect(meterTitle(reversed.container, "voltmeter")).toMatch(/電圧位相 [−-]?180°/);
   });
 
   it("explains unconnected meters and short-circuit analysis failures", () => {

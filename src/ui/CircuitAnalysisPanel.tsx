@@ -46,9 +46,8 @@ const statusReason: Record<CircuitAnalysis["status"], string> = {
   invalid: "部品の値や端子の接続を確認してください。",
 };
 
-function transientCurrentDisplay(value: number | null, timeSeconds: number | undefined) {
+function currentDisplay(value: number | null) {
   if (value === null) { return { value: "—", unit: "A" }; }
-  if (timeSeconds === undefined) { return { value: value.toFixed(3), unit: "A" }; }
   const formatted = formatCircuitQuantity(value, "A");
   const separator = formatted.lastIndexOf(" ");
   return separator < 0
@@ -68,7 +67,7 @@ export function CircuitAnalysisPanel({
   "aria-label": ariaLabel,
   ...sectionProps
 }: CircuitAnalysisPanelProps) {
-  const currentDisplay = transientCurrentDisplay(analysis.currentAmps, analysis.timeSeconds);
+  const displayedCurrent = currentDisplay(analysis.currentAmps);
   const rootProps = circuitSlot("circuit-panel circuit-analysis", {
     className: [className, slotProps?.root?.className].filter(Boolean).join(" "),
     style: style || slotProps?.root?.style ? { ...style, ...slotProps?.root?.style } : undefined,
@@ -89,7 +88,7 @@ export function CircuitAnalysisPanel({
       {showReason && <p {...circuitSlot("circuit-analysis__reason", slotProps?.reason)}>{analysis.mode ? analysis.message : statusReason[analysis.status]}</p>}
       <div {...circuitSlot("circuit-analysis__metric", slotProps?.metric)}>
         <span {...circuitSlot(undefined, slotProps?.metricLabel)}>{analysis.mode === "ac" ? "電源電流（実効値）" : analysis.mode ? "電源電流" : "電流"}</span>
-        <strong {...circuitSlot(undefined, slotProps?.metricValue)}><span {...circuitSlot(undefined, slotProps?.metricNumber)}>{currentDisplay.value}</span><small {...circuitSlot(undefined, slotProps?.metricUnit)}>{currentDisplay.unit}</small></strong>
+        <strong {...circuitSlot(undefined, slotProps?.metricValue)}><span {...circuitSlot(undefined, slotProps?.metricNumber)}>{displayedCurrent.value}</span><small {...circuitSlot(undefined, slotProps?.metricUnit)}>{displayedCurrent.unit}</small></strong>
       </div>
       {(partCount !== undefined || wireCount !== undefined) && (
         <div {...circuitSlot("circuit-analysis__counts", slotProps?.counts)} role="group" aria-label="回路の構成">

@@ -17,12 +17,12 @@ afterEach(() => {
   vi.restoreAllMocks(); vi.unstubAllGlobals();
 });
 
-function mount() {
+function mount(initialDocument = createCircuitExample("charging")) {
   const container = document.createElement("div");
   document.body.append(container);
   const root = createRoot(container);
   let controller: CircuitEditorController | undefined;
-  act(() => root.render(<CircuitEditor initialDocument={createCircuitExample("charging")}>{(editor) => {
+  act(() => root.render(<CircuitEditor initialDocument={initialDocument}>{(editor) => {
     controller = editor; return <CircuitEditorLayout />;
   }}</CircuitEditor>));
   mounted.push({ root, container });
@@ -90,5 +90,18 @@ describe("learning visualization integration", () => {
     act(() => { reference.value = selected.value; reference.dispatchEvent(new Event("change", { bubbles: true })); });
     expect(required(ui.container, '.circuit-potential__difference').textContent).toContain("0 V");
     expect(before).not.toContain("：0 V");
+  });
+
+  it("omits phase labels for zero AC potential and terminal current", () => {
+    const document = createCircuitExample("ac");
+    const source = document.parts.find((part) => part.id === "source");
+    if (!source) { throw new Error("Expected the AC example to contain a source"); }
+    source.voltageVolts = 0;
+    const ui = mount(document);
+    const details = required(ui.container, ".circuit-potential__difference").closest("details");
+
+    expect(details?.textContent).toContain("0 V");
+    expect(details?.textContent).toContain("0 A");
+    expect(details?.textContent).not.toContain("∠0°");
   });
 });

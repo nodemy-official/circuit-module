@@ -1,4 +1,5 @@
 import {
+  circuitPartCatalog,
   terminalsOf,
   type CircuitDocument,
   type CircuitEndpoint,
@@ -8,6 +9,7 @@ import {
 import { analyzeExtendedCircuit } from "./circuit-analog-adapter.js";
 import { solveRealLinearSystem } from "./analog-math.js";
 import { meterStatuses, type MeterStatus } from "./meter-status.js";
+import { circuitDocumentShapeIssue, isSimulationRecord, simulationRecordField } from "./simulation-input.js";
 
 export type CircuitStatus = "empty" | "idle" | "open" | "closed" | "short" | "invalid";
 export type CircuitIssueSeverity = "error" | "warning" | "info";
@@ -26,7 +28,10 @@ export interface CircuitPartReading {
   voltageVolts: number;
   /** Current entering terminal A (op-amp: output C). Signed in DC; RMS magnitude in AC. */
   currentAmps: number;
-  /** Real power absorbed; independent voltage/current sources report delivered power. */
+  /**
+   * Real power absorbed; sources active in the selected analysis mode report delivered power.
+   * In AC analysis, a battery contributes only its passive internal resistance.
+   */
   powerWatts: number;
   /** 0–1 brightness for bulbs (rated power) and DC LEDs (rated current). */
   brightness?: number;
@@ -111,6 +116,22 @@ function result(
 const positive = (value: number | undefined) =>
   value !== undefined && Number.isFinite(value) && value > 0;
 
+function documentWithCatalogDefaults(document: CircuitDocument): CircuitDocument {
+  return {
+    ...document,
+    parts: document.parts.map((part) => {
+      const values: Record<string, unknown> = {
+        ...circuitPartCatalog[part.kind].defaults,
+        ...part,
+      };
+      for (const [field, value] of Object.entries(circuitPartCatalog[part.kind].defaults)) {
+        if (values[field] === undefined) { values[field] = value; }
+      }
+      return values as unknown as CircuitPart;
+    }),
+  };
+}
+
 function partValueIssue(part: CircuitPart): string | null {
   if (part.kind === "switch" && part.initiallyClosed !== undefined && typeof part.initiallyClosed !== "boolean") {
     return `${part.label}のスイッチ状態は真偽値にしてください。`;
@@ -182,7 +203,7 @@ function isClosed(part: CircuitPart, switchStates: Record<string, boolean>) {
   const override = Object.hasOwn(switchStates, part.id)
     ? switchStates[part.id]
     : undefined;
-  return override ?? part.initiallyClosed ?? false;
+  return override ?? part.initiallyClosed ?? circuitPartCatalog.switch.defaults.initiallyClosed ?? false;
 }
 
 /** Ohms between the part's terminals, or null when no current can pass. */
@@ -1366,16 +1387,28 @@ export function analyzeCircuit(
   switchStates: Record<string, boolean> = {},
   options: CircuitAnalysisOptions = {},
 ): CircuitAnalysis {
-  const legacyKinds = new Set(["battery", "resistor", "bulb", "switch", "ammeter", "voltmeter", "junction"]);
-  if (options.mode === "ac" || document.parts.some((part) => !legacyKinds.has(part.kind))) {
-    return analyzeExtendedCircuit(document, switchStates, options);
+  const inputIssue = circuitAnalysisInputIssue(document, switchStates, options);
+  if (inputIssue) { return invalidInputResult(inputIssue); }
+  const normalizedDocument = documentWithCatalogDefaults(document);
+  let normalizedOptions: CircuitAnalysisOptions;
+  try {
+    normalizedOptions = {
+      mode: simulationRecordField(options, "mode") as CircuitAnalysisOptions["mode"],
+      frequencyHz: simulationRecordField(options, "frequencyHz") as number | undefined,
+    };
+  } catch {
+    return invalidInputResult("解析条件を読み取れません。");
   }
-  if (document.parts.length === 0) { return result("empty", "部品を配置して回路を作成してください。"); }
-  const invalid = documentIssue(document, switchStates);
+  const legacyKinds = new Set(["battery", "resistor", "bulb", "switch", "ammeter", "voltmeter", "junction"]);
+  if (normalizedOptions.mode === "ac" || normalizedDocument.parts.some((part) => !legacyKinds.has(part.kind))) {
+    return analyzeExtendedCircuit(normalizedDocument, switchStates, normalizedOptions);
+  }
+  if (normalizedDocument.parts.length === 0) { return result("empty", "部品を配置して回路を作成してください。"); }
+  const invalid = documentIssue(normalizedDocument, switchStates);
   if (invalid) {
     return result("invalid", invalid, { issues: [{ severity: "error", message: invalid }] });
   }
-  const terminalCount = document.parts.reduce(
+  const terminalCount = normalizedDocument.parts.reduce(
     (count, part) => count + terminalsOf(part.kind).length,
     0,
   );
@@ -1385,23 +1418,23 @@ export function analyzeCircuit(
       "部品を減らすか、回路を分けて解析してください。";
     return result("invalid", message, { issues: [{ severity: "error", message }] });
   }
-  const index = indexTerminals(document.parts);
-  const conductances = buildNetwork(document, index, switchStates);
+  const index = indexTerminals(normalizedDocument.parts);
+  const conductances = buildNetwork(normalizedDocument, index, switchStates);
   const solved = nodeVoltages(index.size, conductances);
   if (!solved) {
     const message = "回路を計算できませんでした。接続と部品の数値を確認してください。";
     return result("invalid", message, { issues: [{ severity: "error", message }] });
   }
-  const { parts, wireCurrents } = readAll(document, index, solved, switchStates);
+  const { parts, wireCurrents } = readAll(normalizedDocument, index, solved, switchStates);
   if (!hasOnlyFiniteReadings(parts, wireCurrents)) {
     const message = "回路の計算結果が数値の範囲を超えました。電圧・電流・抵抗値を確認してください。";
     return result("invalid", message, { issues: [{ severity: "error", message }] });
   }
-  const issues = collectIssues(document, parts);
-  const batteries = document.parts.filter((part) => part.kind === "battery");
+  const issues = collectIssues(normalizedDocument, parts);
+  const batteries = normalizedDocument.parts.filter((part) => part.kind === "battery");
   const readings = { parts, wireCurrents, issues };
   if (batteries.length === 0) { return result("idle", "電池を置くと電流を計算します。", readings); }
-  const shorted = shortedBattery(document, batteries, parts, index, conductances, switchStates);
+  const shorted = shortedBattery(normalizedDocument, batteries, parts, index, conductances, switchStates);
   if (shorted) {
     const message = `${shorted.label}が短絡しています。抵抗か電球を直列に入れてください。`;
     return result("short", message, {
@@ -1425,7 +1458,7 @@ export function analyzeCircuit(
     });
   }
   const bulbPowerWatts = Object.fromEntries(
-    document.parts
+    normalizedDocument.parts
       .filter((part) => part.kind === "bulb")
       .map((part) => [part.id, parts[part.id]?.powerWatts ?? 0]),
   );
@@ -1435,4 +1468,32 @@ export function analyzeCircuit(
     bulbPowerWatts,
     currentAmps: only ? Math.abs(parts[only.id]?.currentAmps ?? 0) : null,
   });
+}
+
+function invalidInputResult(message: string): CircuitAnalysis {
+  return result("invalid", message, { issues: [{ severity: "error", message }] });
+}
+
+function circuitAnalysisInputIssue(document: unknown, switchStates: unknown, options: unknown) {
+  try {
+    const shapeIssue = circuitDocumentShapeIssue(document);
+    if (shapeIssue) { return shapeIssue; }
+    if (!isSimulationRecord(switchStates)) {
+      return "スイッチ状態は部品 ID ごとの真偽値で指定してください。";
+    }
+    if (!isSimulationRecord(options)) { return "解析条件はオブジェクトで指定してください。"; }
+    const mode = simulationRecordField(options, "mode");
+    const frequencyHz = simulationRecordField(options, "frequencyHz");
+    if (mode !== undefined && mode !== "auto" && mode !== "dc" && mode !== "ac") {
+      return "解析方式は auto、dc、または ac で指定してください。";
+    }
+    if (frequencyHz !== undefined &&
+        (typeof frequencyHz !== "number" || !Number.isFinite(frequencyHz) || frequencyHz <= 0)) {
+      return "解析周波数は有限な0より大きい数値にしてください。";
+    }
+    const kinds = new Map((document as CircuitDocument).parts.map((part) => [part.id, part.kind]));
+    return switchStateIssue(switchStates, kinds);
+  } catch {
+    return "解析条件またはスイッチ状態を読み取れません。";
+  }
 }

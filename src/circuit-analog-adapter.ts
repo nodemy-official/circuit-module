@@ -1,16 +1,17 @@
 import { analyzeAnalogCircuit, type ComplexValue, type AnalogCircuitPartReading } from "./analog-solver.js";
+import { complexPhaseDegrees } from "./analog-math.js";
+import { acAnalysisFrequency, frequencyMatches, isAcReactiveConductive } from "./ac-reactive.js";
 import { circuitPartCatalog, terminalsOf, type CircuitDocument, type CircuitPart, type CircuitTerminal } from "./circuit-model.js";
+import { circuitDocumentShapeIssue, isSimulationRecord, simulationRecordField } from "./simulation-input.js";
 import type { CircuitAnalysis, CircuitAnalysisOptions, CircuitPartReading } from "./circuit-solver.js";
 
 const sourceKinds = new Set(["battery", "ac-source", "current-source"]);
 const directlyConductiveKinds = new Set<CircuitPart["kind"]>([
-  "battery", "ac-source", "resistor", "bulb", "ammeter", "diode", "led", "inductor",
+  "battery", "ac-source", "resistor", "bulb", "ammeter", "diode", "led",
 ]);
 const magnitude = (value: ComplexValue) => Math.hypot(value.real, value.imaginary);
 const phase = (value: ComplexValue) =>
-  value.real === 0 && value.imaginary === 0
-    ? 0
-    : Math.atan2(value.imaginary, value.real) * 180 / Math.PI;
+  value.real === 0 && value.imaginary === 0 ? 0 : complexPhaseDegrees(value);
 
 function setRecordValue<T>(record: Record<string, T>, property: string, value: T) {
   Object.defineProperty(record, property, {
@@ -52,6 +53,14 @@ function joinGraphPart(graph: ConductivityGraph, part: CircuitPart, terminals: C
   }
 }
 
+function partEstablishesPotentialPath(part: CircuitPart, mode: "dc" | "ac", frequencyHz: number) {
+  if (directlyConductiveKinds.has(part.kind)) { return true; }
+  if (part.kind === "inductor") {
+    return mode === "dc" || isAcReactiveConductive(part, frequencyHz);
+  }
+  return part.kind === "capacitor" && mode === "ac" && isAcReactiveConductive(part, frequencyHz);
+}
+
 function referenceEndpointKey(document: CircuitDocument, graph: ConductivityGraph) {
   const firstGround = graph.firstGround;
   if (firstGround) { return graph.endpointKey(firstGround.id, "a"); }
@@ -65,18 +74,19 @@ function connectPartInGraph(
   part: CircuitPart,
   document: CircuitDocument,
   mode: "dc" | "ac",
+  frequencyHz: number,
   switchStates: Record<string, boolean>,
   reference: string | undefined,
 ) {
-  if (directlyConductiveKinds.has(part.kind)) { joinGraphPart(graph, part, ["a", "b"]); return; }
+  if (partEstablishesPotentialPath(part, mode, frequencyHz)) {
+    joinGraphPart(graph, part, ["a", "b"]);
+    return;
+  }
   if (part.kind === "switch") {
     if (switchClosedState(part, switchStates)) { joinGraphPart(graph, part, ["a", "b"]); }
     return;
   }
-  if (part.kind === "capacitor") {
-    if (mode === "ac") { joinGraphPart(graph, part, ["a", "b"]); }
-    return;
-  }
+  if (part.kind === "capacitor" || part.kind === "inductor") { return; }
   if (part.kind === "current-source") {
     const currentAmps = part.currentAmps ?? circuitPartCatalog["current-source"].defaults.currentAmps ?? 0;
     if (mode === "dc" && currentAmps !== 0) { joinGraphPart(graph, part, ["a", "b"]); }
@@ -99,6 +109,7 @@ function connectPartInGraph(
 function connectivityGraph(
   document: CircuitDocument,
   mode: "dc" | "ac",
+  frequencyHz: number,
   switchStates: Record<string, boolean>,
   excludedPartId: string,
 ) {
@@ -119,7 +130,7 @@ function connectivityGraph(
   const reference = referenceEndpointKey(document, graph);
   for (const part of document.parts) {
     if (part.id === excludedPartId) { continue; }
-    connectPartInGraph(graph, part, document, mode, switchStates, reference);
+    connectPartInGraph(graph, part, document, mode, frequencyHz, switchStates, reference);
   }
   return graph;
 }
@@ -143,9 +154,10 @@ function hasSourceReturnPath(
   document: CircuitDocument,
   source: CircuitPart,
   mode: "dc" | "ac",
+  frequencyHz: number,
   switchStates: Record<string, boolean>,
 ) {
-  const graph = connectivityGraph(document, mode, switchStates, source.id);
+  const graph = connectivityGraph(document, mode, frequencyHz, switchStates, source.id);
   return connectedInGraph(
     graph.adjacent,
     graph.endpointKey(source.id, "a"),
@@ -157,9 +169,10 @@ function hasOpAmpOutputReturnPath(
   document: CircuitDocument,
   opAmp: CircuitPart,
   mode: "dc" | "ac",
+  frequencyHz: number,
   switchStates: Record<string, boolean>,
 ) {
-  const graph = connectivityGraph(document, mode, switchStates, opAmp.id);
+  const graph = connectivityGraph(document, mode, frequencyHz, switchStates, opAmp.id);
   const reference = referenceEndpointKey(document, graph);
   return reference !== undefined && connectedInGraph(
     graph.adjacent,
@@ -168,7 +181,16 @@ function hasOpAmpOutputReturnPath(
   );
 }
 
-function isActiveSourceForMode(source: CircuitPart, mode: "dc" | "ac") {
+function isActiveSourceForMode(source: CircuitPart, mode: "dc" | "ac", frequencyHz: number) {
+  if (source.kind === "battery") { return mode === "dc"; }
+  if (source.kind === "ac-source") {
+    if (mode === "dc") {
+      return (source.offsetVolts ?? circuitPartCatalog["ac-source"].defaults.offsetVolts ?? 0) !== 0;
+    }
+    const sourceFrequency = source.frequencyHz ?? circuitPartCatalog["ac-source"].defaults.frequencyHz ?? 0;
+    const amplitude = source.voltageVolts ?? circuitPartCatalog["ac-source"].defaults.voltageVolts ?? 0;
+    return amplitude !== 0 && frequencyMatches(sourceFrequency, frequencyHz);
+  }
   if (source.kind !== "current-source") { return true; }
   const currentAmps = source.currentAmps ?? circuitPartCatalog["current-source"].defaults.currentAmps ?? 0;
   return mode === "dc" && currentAmps !== 0;
@@ -179,15 +201,18 @@ function analysisStatus(
   analogStatus: "valid" | "empty" | "invalid",
   sources: CircuitPart[],
   mode: "dc" | "ac",
+  frequencyHz: number,
   switchStates: Record<string, boolean>,
 ): CircuitAnalysis["status"] {
   if (analogStatus !== "valid") { return analogStatus; }
   const hasOpAmpOutputLoop = document.parts.some((part) =>
-    part.kind === "op-amp" && hasOpAmpOutputReturnPath(document, part, mode, switchStates),
+    part.kind === "op-amp" && hasOpAmpOutputReturnPath(document, part, mode, frequencyHz, switchStates),
   );
-  const activeSources = sources.filter((source) => isActiveSourceForMode(source, mode));
+  const activeSources = sources.filter((source) => isActiveSourceForMode(source, mode, frequencyHz));
   if (activeSources.length === 0) { return hasOpAmpOutputLoop ? "closed" : "idle"; }
-  const hasClosedSourceLoop = activeSources.some((source) => hasSourceReturnPath(document, source, mode, switchStates));
+  const hasClosedSourceLoop = activeSources.some((source) =>
+    hasSourceReturnPath(document, source, mode, frequencyHz, switchStates),
+  );
   return hasClosedSourceLoop || hasOpAmpOutputLoop ? "closed" : "open";
 }
 
@@ -197,8 +222,9 @@ function adaptReading(
   ac: boolean,
   switchStates: Record<string, boolean>,
 ): CircuitPartReading {
+  const deliversPower = ac ? part.kind === "ac-source" : sourceKinds.has(part.kind);
   const powerWatts = part.kind === "capacitor" || part.kind === "inductor" ? 0
-    : reading.power.real * (sourceKinds.has(part.kind) ? -1 : 1);
+    : reading.power.real * (deliversPower ? -1 : 1);
   const result: CircuitPartReading = {
     voltageVolts: ac ? magnitude(reading.voltage) : reading.voltage.real,
     currentAmps: ac ? magnitude(reading.current) : reading.current.real,
@@ -226,9 +252,20 @@ export function analyzeExtendedCircuit(
   switchStates: Record<string, boolean>,
   options: CircuitAnalysisOptions,
 ): CircuitAnalysis {
+  const inputIssue = adapterInputIssue(document, switchStates, options);
+  if (inputIssue) { return invalidAdapterResult(inputIssue); }
+  let validatedOptions: CircuitAnalysisOptions;
+  try {
+    validatedOptions = {
+      mode: simulationRecordField(options, "mode") as CircuitAnalysisOptions["mode"],
+      frequencyHz: simulationRecordField(options, "frequencyHz") as number | undefined,
+    };
+  } catch {
+    return invalidAdapterResult("解析条件を読み取れません。");
+  }
   const firstAc = document.parts.find((part) => part.kind === "ac-source");
-  const mode = options.mode === "ac" || (options.mode !== "dc" && firstAc) ? "ac" : "dc";
-  const frequencyHz = options.frequencyHz ?? firstAc?.frequencyHz ?? 1000;
+  const mode = validatedOptions.mode === "ac" || (validatedOptions.mode !== "dc" && firstAc) ? "ac" : "dc";
+  const frequencyHz = acAnalysisFrequency(document, validatedOptions.frequencyHz);
   const analog = analyzeAnalogCircuit(document, { mode, frequencyHz, switchStates });
   const parts: Record<string, CircuitPartReading> = {};
   for (const part of document.parts) {
@@ -264,7 +301,7 @@ export function analyzeExtendedCircuit(
     };
   }
   const sources = document.parts.filter((part) => sourceKinds.has(part.kind));
-  const status = analysisStatus(document, analog.status, sources, mode, switchStates);
+  const status = analysisStatus(document, analog.status, sources, mode, frequencyHz, switchStates);
   const message = status === "open"
     ? "回路が開いているため電流は流れていません。導線とスイッチを確認してください。"
     : analog.message;
@@ -282,4 +319,38 @@ export function analyzeExtendedCircuit(
     wireCurrents: {},
     issues: analog.issues,
   };
+}
+
+function invalidAdapterResult(message: string): CircuitAnalysis {
+  return {
+    status: "invalid",
+    message,
+    currentAmps: null,
+    parts: {},
+    bulbPowerWatts: {},
+    wireCurrents: {},
+    issues: [{ severity: "error", message }],
+  };
+}
+
+function adapterInputIssue(document: unknown, switchStates: unknown, options: unknown) {
+  try {
+    const shapeIssue = circuitDocumentShapeIssue(document);
+    if (shapeIssue) { return shapeIssue; }
+    if (!isSimulationRecord(switchStates)) {
+      return "スイッチ状態は部品 ID ごとの真偽値で指定してください。";
+    }
+    if (!isSimulationRecord(options)) { return "解析条件はオブジェクトで指定してください。"; }
+    const mode = simulationRecordField(options, "mode");
+    const frequencyHz = simulationRecordField(options, "frequencyHz");
+    if (mode !== undefined && mode !== "auto" && mode !== "dc" && mode !== "ac") {
+      return "解析方式は auto、dc、または ac で指定してください。";
+    }
+    return frequencyHz !== undefined &&
+      (typeof frequencyHz !== "number" || !Number.isFinite(frequencyHz) || frequencyHz <= 0)
+      ? "解析周波数は有限な0より大きい数値にしてください。"
+      : null;
+  } catch {
+    return "解析条件またはスイッチ状態を読み取れません。";
+  }
 }

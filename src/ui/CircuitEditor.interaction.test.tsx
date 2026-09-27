@@ -378,8 +378,8 @@ describe("CircuitEditor interactions", () => {
       .map((part) => part.getAttribute("data-part-id"))).toEqual(["battery"]);
     expect([...previewDialog(ui.container).querySelectorAll(".circuit-preview__live [data-part-id]")]
       .map((part) => part.getAttribute("data-part-id"))).toEqual(["battery"]);
-    expect(previewReading(ui.container, "battery", "voltage")).toBe("—");
-    expect(previewReading(ui.container, "battery", "current")).toBe("—");
+    expect(previewReading(ui.container, "battery", "voltage")).toBe("9 V");
+    expect(previewReading(ui.container, "battery", "current")).toBe("0 A");
   });
 
   it("uses one instrument-specific readout for each meter part dialog", () => {

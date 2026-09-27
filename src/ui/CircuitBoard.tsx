@@ -30,6 +30,7 @@ import {
 } from "../circuit-geometry.js";
 import type { CircuitSelection, CircuitWireEnd } from "../circuit-edit.js";
 import {
+  circuitPartCatalog,
   circuitPartNumericFields,
   endpointName,
   terminalName,
@@ -230,20 +231,24 @@ const partDetailKeys: Partial<Record<CircuitPartKind, readonly CircuitPartNumeri
   "op-amp": ["openLoopGain"],
 };
 
+function formatPartDetail(part: CircuitPart, key: CircuitPartNumericKey, unit: string) {
+  const value = part[key] ?? circuitPartCatalog[part.kind].defaults[key];
+  if (value === undefined) { return ""; }
+  if (key === "wiperPosition") { return `${Math.round(value * 100)}%`; }
+  const prefix = key === "currentGain" ? "β " : key === "thresholdVolts" ? "Vth " : key === "openLoopGain" ? "A₀ " : "";
+  const suffix = key === "voltageVolts" && part.kind === "ac-source" ? " RMS" : key === "ratedCurrentAmps" ? " 定格" : "";
+  return `${prefix}${engineeringValue(value, unit)}${suffix}`;
+}
+
 function partDetail(part: CircuitPart) {
   const fields = circuitPartNumericFields(part.kind);
   return (partDetailKeys[part.kind] ?? []).map((key) => {
     const field = fields.find((candidate) => candidate.key === key);
-    const value = part[key];
-    if (value === undefined || !field) { return ""; }
-    if (key === "wiperPosition") { return `${Math.round(value * 100)}%`; }
-    const prefix = key === "currentGain" ? "β " : key === "thresholdVolts" ? "Vth " : key === "openLoopGain" ? "A₀ " : "";
-    const suffix = key === "voltageVolts" && part.kind === "ac-source" ? " RMS" : key === "ratedCurrentAmps" ? " 定格" : "";
-    return `${prefix}${engineeringValue(value, field.unit)}${suffix}`;
+    return field ? formatPartDetail(part, key, field.unit) : "";
   }).filter(Boolean).join(" · ");
 }
 
-function StandardPartArt({ part, brightness = 0, slotProps }: { part: CircuitPart; brightness?: number; slotProps?: CircuitBoardSlotProps }) {
+function StandardPartArt({ part, brightness = 0, switchClosed, slotProps }: { part: CircuitPart; brightness?: number; switchClosed?: boolean; slotProps?: CircuitBoardSlotProps }) {
   const symbol = circuitSlot("circuit-board__symbol", slotProps?.symbol);
 
   switch (part.kind) {
@@ -289,7 +294,7 @@ function StandardPartArt({ part, brightness = 0, slotProps }: { part: CircuitPar
         </g>
       );
     case "switch": {
-      const closed = part.initiallyClosed ?? false;
+      const closed = switchClosed ?? part.initiallyClosed ?? circuitPartCatalog.switch.defaults.initiallyClosed ?? false;
       return (
         <g {...symbol}>
           <path d="M -20 0 H -9 M 9 0 H 20" />
@@ -456,16 +461,17 @@ function cancelDragForPinch(
   onMoveEnd?.();
 }
 
-function circuitPartAccessibility(part: CircuitPart, isSelected: boolean, readOnly: boolean, onSwitchToggle?: (id: string) => void) {
+function circuitPartAccessibility(part: CircuitPart, isSelected: boolean, readOnly: boolean, onSwitchToggle?: (id: string) => void, switchClosed?: boolean) {
   const canToggleSwitch = readOnly && part.kind === "switch" && onSwitchToggle !== undefined;
+  const closed = switchClosed ?? part.initiallyClosed ?? circuitPartCatalog.switch.defaults.initiallyClosed ?? false;
   return {
     canToggleSwitch,
     role: readOnly ? canToggleSwitch ? "button" : undefined : "button",
     tabIndex: readOnly ? canToggleSwitch ? 0 : undefined : 0,
     ariaLabel: canToggleSwitch
-      ? `${part.label}を${part.initiallyClosed ? "開く" : "閉じる"}`
+      ? `${part.label}を${closed ? "開く" : "閉じる"}`
       : `${part.label}、${partDescriptions[part.kind]}`,
-    ariaPressed: readOnly ? canToggleSwitch ? part.initiallyClosed ?? false : undefined : isSelected,
+    ariaPressed: readOnly ? canToggleSwitch ? closed : undefined : isSelected,
   };
 }
 
@@ -503,7 +509,12 @@ function CircuitPartSymbol({
           })}
         </g>
       )}
-      {renderPart ? renderPart(part, selected) : <StandardPartArt part={part} brightness={analysis?.parts[part.id]?.brightness} slotProps={slotProps} />}
+      {renderPart ? renderPart(part, selected) : <StandardPartArt
+        part={part}
+        brightness={analysis?.parts[part.id]?.brightness}
+        switchClosed={analysis?.parts[part.id]?.switchClosed}
+        slotProps={slotProps}
+      />}
     </g>
   );
 }
@@ -595,7 +606,7 @@ function CircuitPartArtwork({
     onInspectPart(part.id);
   };
   const meter = getMeterDisplay(part.kind, analysis?.parts[part.id], analysis?.status);
-  const accessibility = circuitPartAccessibility(part, isSelected, readOnly, onSwitchToggle);
+  const accessibility = circuitPartAccessibility(part, isSelected, readOnly, onSwitchToggle, analysis?.parts[part.id]?.switchClosed);
   const labelLayout = circuitPartLabelLayout(part);
 
   return (

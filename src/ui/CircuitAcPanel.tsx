@@ -1,12 +1,17 @@
 import { useId, useState, type ChangeEvent } from "react";
-import type { CircuitDocument, CircuitPart } from "../circuit-model.js";
+import { frequencyMatches } from "../ac-reactive.js";
+import { circuitPartCatalog, type CircuitDocument, type CircuitPart } from "../circuit-model.js";
 import { analyzeCircuit, type CircuitAnalysis, type CircuitAnalysisOptions, type CircuitPartReading } from "../circuit-solver.js";
 
-const MIN_SWEEP_FREQUENCY_HZ = 1e-9;
-const MAX_SWEEP_FREQUENCY_HZ = 1e12;
 const MIN_SWEEP_POINTS = 3;
 const MAX_SWEEP_POINTS = 81;
 const WAVEFORM_SAMPLES = 96;
+
+function acSourceFrequencyHz(part: CircuitPart): number {
+  return part.kind === "ac-source"
+    ? part.frequencyHz ?? circuitPartCatalog["ac-source"].defaults.frequencyHz ?? 1000
+    : 0;
+}
 
 function finite(value: number | undefined): value is number {
   return value !== undefined && Number.isFinite(value);
@@ -24,6 +29,14 @@ function formatFrequency(value: number): string {
   if (magnitude >= 1e3) { return `${formatNumber(value / 1e3)} kHz`; }
   if (magnitude < 1) { return `${formatNumber(value * 1e3)} mHz`; }
   return `${formatNumber(value)} Hz`;
+}
+
+function formatPeriod(frequencyHz: number): string {
+  const periodSeconds = 1 / frequencyHz;
+  if (Number.isFinite(periodSeconds)) { return formatNumber(periodSeconds); }
+  const logarithm = -Math.log10(frequencyHz);
+  const exponent = Math.floor(logarithm);
+  return `${formatNumber(10 ** (logarithm - exponent))}e+${exponent}`;
 }
 
 function wrapDegrees(value: number): number {
@@ -49,11 +62,14 @@ function usableAcAnalysis(
   analysis: CircuitAnalysis,
   options: CircuitAnalysisOptions,
   frequencyHz: number,
+  requestedFrequencyHz: number,
   selectedPart: CircuitPart | undefined,
   reading: CircuitPartReading | undefined,
 ): boolean {
-  return options.mode !== "dc" && analysis.mode === "ac" && analysis.status === "closed" &&
+  return options.mode !== "dc" && analysis.mode === "ac" &&
+    (analysis.status === "closed" || analysis.status === "idle") &&
     document.parts.some((part) => part.kind === "ac-source") && finite(frequencyHz) && frequencyHz > 0 &&
+    analysis.frequencyHz === requestedFrequencyHz &&
     Boolean(selectedPart && reading);
 }
 
@@ -65,21 +81,41 @@ function createFrequencySweep(
   pointCount: number,
 ): StoredSweep {
   const span = 10 ** (decades / 2);
-  const minFrequency = Math.max(MIN_SWEEP_FREQUENCY_HZ, centerFrequencyHz / span);
-  const maxFrequency = Math.min(MAX_SWEEP_FREQUENCY_HZ, centerFrequencyHz * span);
+  const minFrequency = Math.max(Number.MIN_VALUE, centerFrequencyHz / span);
+  const maxFrequency = Math.min(Number.MAX_VALUE, centerFrequencyHz * span);
   if (!Number.isFinite(minFrequency) || !Number.isFinite(maxFrequency) || minFrequency <= 0 || maxFrequency <= minFrequency) {
     return { document, selectedPartId: partId, centerFrequencyHz, decades, pointCount, points: [] };
   }
-  const logRatio = Math.log(maxFrequency / minFrequency);
-  const points: SweepPoint[] = Array.from({ length: pointCount }, (_, index) => {
-    const frequencyHz = minFrequency * Math.exp(logRatio * index / (pointCount - 1));
-    // All AC sources are swept together; amplitudes and phases stay the same.
+  const lowerSteps = Math.floor((pointCount - 1) / 2);
+  const upperSteps = pointCount - 1 - lowerSteps;
+  const logFrequency = (start: number, end: number, index: number, steps: number) => {
+    if (index === 0) { return start; }
+    if (index === steps) { return end; }
+    return Math.exp(Math.log(start) + (Math.log(end) - Math.log(start)) * index / steps);
+  };
+  const frequencies = new Set<number>();
+  for (let index = 0; index <= lowerSteps; index += 1) {
+    frequencies.add(logFrequency(minFrequency, centerFrequencyHz, index, lowerSteps));
+  }
+  for (let index = 1; index <= upperSteps; index += 1) {
+    frequencies.add(logFrequency(centerFrequencyHz, maxFrequency, index, upperSteps));
+  }
+  const points: SweepPoint[] = [...frequencies].sort((first, second) => first - second).map((frequencyHz) => {
+    // Keep the same excitation set as the displayed analysis. Sources at other
+    // frequencies are out of band there, so they must stay out of the whole sweep.
     const sweptDocument: CircuitDocument = {
       ...document,
-      parts: document.parts.map((part) => part.kind === "ac-source" ? { ...part, frequencyHz } : part),
+      parts: document.parts.map((part) => {
+        if (part.kind !== "ac-source") { return part; }
+        return frequencyMatches(acSourceFrequencyHz(part), centerFrequencyHz)
+          ? { ...part, frequencyHz }
+          : { ...part, voltageVolts: 0 };
+      }),
     };
     const pointAnalysis = analyzeCircuit(sweptDocument, {}, { mode: "ac", frequencyHz });
-    const voltage = pointAnalysis.status === "closed" ? pointAnalysis.parts[partId]?.voltageVolts : undefined;
+    const voltage = pointAnalysis.status === "closed" || pointAnalysis.status === "idle"
+      ? pointAnalysis.parts[partId]?.voltageVolts
+      : undefined;
     return { frequencyHz, voltageVolts: finite(voltage) ? voltage : null };
   });
   return { document, selectedPartId: partId, centerFrequencyHz, decades, pointCount, points };
@@ -98,8 +134,9 @@ function matchingSweep(
   return sweep;
 }
 
-function emptyMessage(options: CircuitAnalysisOptions, analysis: CircuitAnalysis, hasAcSource: boolean): string {
+function emptyMessage(options: CircuitAnalysisOptions, analysis: CircuitAnalysis, hasAcSource: boolean, requestedFrequencyHz: number): string {
   if (options.mode === "dc" || analysis.mode !== "ac") { return "交流解析を選ぶと、正弦波の位相と周波数応答を表示します。"; }
+  if (analysis.frequencyHz !== requestedFrequencyHz) { return "解析周波数が変更されました。新しい解析結果を待っています。"; }
   if (!hasAcSource) { return "交流電源を含む回路で利用できます。"; }
   return analysis.status !== "closed"
     ? analysis.message || "有効な交流解析結果を待っています。"
@@ -117,7 +154,7 @@ export interface CircuitAcPanelProps {
 }
 
 function waveformPath(rms: number | null, phaseRadians: number | null, centerY: number): string | null {
-  if (rms === null || (rms > 1e-15 && phaseRadians === null)) { return null; }
+  if (rms === null || (rms > 0 && phaseRadians === null)) { return null; }
   const xStart = 72;
   const xEnd = 408;
   return Array.from({ length: WAVEFORM_SAMPLES + 1 }, (_, index) => {
@@ -130,7 +167,7 @@ function waveformPath(rms: number | null, phaseRadians: number | null, centerY: 
 }
 
 function phaseDifference(reading: CircuitPartReading, voltageRms: number | null, currentRms: number | null): number | null {
-  if ((voltageRms ?? 0) <= 1e-15 || (currentRms ?? 0) <= 1e-15 ||
+  if ((voltageRms ?? 0) === 0 || (currentRms ?? 0) === 0 ||
     !finite(reading.voltagePhaseDegrees) || !finite(reading.currentPhaseDegrees)) { return null; }
   return wrapDegrees(reading.currentPhaseDegrees - reading.voltagePhaseDegrees);
 }
@@ -143,14 +180,15 @@ function describePhaseDifference(difference: number | null): string {
     : `電流は電圧より${formatNumber(Math.abs(difference))}°遅れます。`;
 }
 
-function axisPeakLabel(peak: number | null, unit: "V" | "A", sign: 1 | -1): string {
-  if (peak === null) { return `— ${unit}`; }
-  return `${sign < 0 ? "−" : "+"}${formatNumber(peak)} ${unit}`;
+function axisPeakLabel(peak: number | null, rms: number | null, unit: "V" | "A", sign: 1 | -1): string {
+  if (peak === null || rms === null) { return `— ${unit}`; }
+  const value = Number.isFinite(peak) ? formatNumber(peak) : `${formatNumber(rms)} × √2`;
+  return `${sign < 0 ? "−" : "+"}${value} ${unit}`;
 }
 
 function missingPhase(voltageRms: number | null, voltagePhase: number | null, currentRms: number | null, currentPhase: number | null): boolean {
-  return ((voltageRms ?? 0) > 1e-15 && voltagePhase === null) ||
-    ((currentRms ?? 0) > 1e-15 && currentPhase === null);
+  return ((voltageRms ?? 0) > 0 && voltagePhase === null) ||
+    ((currentRms ?? 0) > 0 && currentPhase === null);
 }
 
 function PhaseSummary({ difference, hasUnknownPhase }: { difference: number | null; hasUnknownPhase: boolean }) {
@@ -177,17 +215,17 @@ function Waveform({ reading, frequencyHz, partLabel }: { reading: CircuitPartRea
   const hasUnknownPhase = missingPhase(voltageRms, voltagePhase, currentRms, currentPhase);
   return <div className="circuit-ac__waveform" data-voltage-rms={voltageRms ?? "undefined"} data-current-rms={currentRms ?? "undefined"}>
     <svg viewBox="0 0 480 190" role="img" aria-labelledby={`${id}-title`} aria-describedby={`${id}-description`}>
-      <title id={`${id}-title`}>{partLabel}の電圧と電流の交流波形</title>
+      <title id={`${id}-title`}>{`${partLabel}の電圧と電流の交流波形`}</title>
       <desc id={`${id}-description`}>1周期を表示しています。電圧と電流は実効値から作った正弦波で、縦軸は独立した尺度です。</desc>
       <path d="M72 42V166H408" className="circuit-ac__axis" />
       <path d="M408 42V166" className="circuit-ac__axis" />
       <path d="M72 104H408" className="circuit-ac__grid" />
-      <text x="66" y="48" textAnchor="end">{axisPeakLabel(voltagePeak, "V", 1)}</text>
-      <text x="66" y="168" textAnchor="end">{axisPeakLabel(voltagePeak, "V", -1)}</text>
-      <text x="414" y="48">{axisPeakLabel(currentPeak, "A", 1)}</text>
-      <text x="414" y="168">{axisPeakLabel(currentPeak, "A", -1)}</text>
+      <text x="66" y="48" textAnchor="end">{axisPeakLabel(voltagePeak, voltageRms, "V", 1)}</text>
+      <text x="66" y="168" textAnchor="end">{axisPeakLabel(voltagePeak, voltageRms, "V", -1)}</text>
+      <text x="414" y="48">{axisPeakLabel(currentPeak, currentRms, "A", 1)}</text>
+      <text x="414" y="168">{axisPeakLabel(currentPeak, currentRms, "A", -1)}</text>
       <text x="72" y="183">0 s</text>
-      <text x="408" y="183" textAnchor="end">T = {formatNumber(1 / frequencyHz)} s</text>
+      <text x="408" y="183" textAnchor="end">T = {formatPeriod(frequencyHz)} s</text>
       {voltagePoints !== null && <polyline points={voltagePoints} className="circuit-ac__trace circuit-ac__trace--voltage" />}
       {currentPoints !== null && <polyline points={currentPoints} className="circuit-ac__trace circuit-ac__trace--current" />}
     </svg>
@@ -228,7 +266,7 @@ function FrequencyResponse({ points, partLabel }: { points: SweepPoint[]; partLa
     <h3>{partLabel}の周波数応答</h3>
     <p>選んだ部品の電圧実効値を周波数ごとに示します。横軸は対数目盛です。</p>
     <svg viewBox="0 0 390 190" role="img" aria-labelledby={`${id}-title`}>
-      <title id={`${id}-title`}>{partLabel}の電圧実効値の周波数応答</title>
+      <title id={`${id}-title`}>{`${partLabel}の電圧実効値の周波数応答`}</title>
       <path d="M54 22V146H368" className="circuit-ac__axis" />
       <path d="M54 146H368" className="circuit-ac__grid" />
       <text x="48" y="28" textAnchor="end">{formatNumber(maxVoltage)} V</text>
@@ -250,14 +288,14 @@ function FrequencyResponse({ points, partLabel }: { points: SweepPoint[]; partLa
         data-frequency-hz={point.frequencyHz}
         data-voltage-rms={point.voltageVolts}
       >
-        <title>{formatFrequency(point.frequencyHz)}：{formatNumber(point.voltageVolts)} V 実効値</title>
+        <title>{`${formatFrequency(point.frequencyHz)}：${formatNumber(point.voltageVolts)} V 実効値`}</title>
       </circle>)}
       {points.filter(({ voltageVolts }) => voltageVolts === null).map((point) => <g
         key={`invalid-${point.frequencyHz}`}
         data-valid="false"
         data-frequency-hz={point.frequencyHz}
       >
-        <title>{formatFrequency(point.frequencyHz)}：解析できませんでした</title>
+        <title>{`${formatFrequency(point.frequencyHz)}：解析できませんでした`}</title>
         <text x={x(point.frequencyHz)} y="141" textAnchor="middle" className="circuit-ac__invalid-point">×</text>
       </g>)}
     </svg>
@@ -269,7 +307,8 @@ function FrequencyResponse({ points, partLabel }: { points: SweepPoint[]; partLa
 export function CircuitAcPanel({ document, analysis, options }: CircuitAcPanelProps) {
   const id = useId();
   const sourceFrequency = document.parts.find((part) => part.kind === "ac-source")?.frequencyHz;
-  const centerFrequencyHz = analysis.frequencyHz ?? options.frequencyHz ?? sourceFrequency ?? 1000;
+  const requestedFrequencyHz = options.frequencyHz ?? sourceFrequency ?? circuitPartCatalog["ac-source"].defaults.frequencyHz ?? 1000;
+  const centerFrequencyHz = analysis.frequencyHz ?? requestedFrequencyHz;
   const [selectedPartId, setSelectedPartId] = useState("");
   const [decades, setDecades] = useState(2);
   const [pointCount, setPointCount] = useState(41);
@@ -280,7 +319,7 @@ export function CircuitAcPanel({ document, analysis, options }: CircuitAcPanelPr
     choices[0];
   const reading = selectedPart ? analysis.parts[selectedPart.id] : undefined;
   const hasAcSource = document.parts.some((part) => part.kind === "ac-source");
-  const active = usableAcAnalysis(document, analysis, options, centerFrequencyHz, selectedPart, reading);
+  const active = usableAcAnalysis(document, analysis, options, centerFrequencyHz, requestedFrequencyHz, selectedPart, reading);
   const visibleSweep = matchingSweep(sweep, document, selectedPart?.id, centerFrequencyHz, decades, pointCount);
 
   const runSweep = () => {
@@ -301,7 +340,7 @@ export function CircuitAcPanel({ document, analysis, options }: CircuitAcPanelPr
   if (!active || !selectedPart || !reading) {
     return <section className="circuit-panel circuit-ac" aria-label="交流の波形と周波数応答" data-state="empty">
       <div className="circuit-panel__heading"><h2>交流の波形と周波数応答</h2></div>
-      <p className="circuit-ac__empty" role={analysis.status === "invalid" ? "alert" : "status"}>{emptyMessage(options, analysis, hasAcSource)}</p>
+      <p className="circuit-ac__empty" role={analysis.status === "invalid" ? "alert" : "status"}>{emptyMessage(options, analysis, hasAcSource, requestedFrequencyHz)}</p>
     </section>;
   }
 
@@ -322,7 +361,7 @@ export function CircuitAcPanel({ document, analysis, options }: CircuitAcPanelPr
       <label htmlFor={`${id}-points`}>解析点数（最大 {MAX_SWEEP_POINTS}）</label>
       <input id={`${id}-points`} type="number" min={MIN_SWEEP_POINTS} max={MAX_SWEEP_POINTS} step="1" value={pointCount} onChange={changePointCount} />
       <button type="button" className="circuit-button" onClick={runSweep} disabled={!active}>対数スイープを計算</button>
-      <p className="circuit-ac__sweep-note">すべての交流電源の周波数を同時に変えた応答です。実効値と位相は保ちます。</p>
+      <p className="circuit-ac__sweep-note">解析周波数に一致する交流電源を同時にスイープします。実効値と位相は保ち、異なる周波数の電源は解析対象外にします。</p>
     </div>
     {showSweepMessage && <p className="circuit-ac__empty" role="status">周波数範囲を解析できませんでした。解析周波数を確認してください。</p>}
     {visibleSweep && visibleSweep.points.length > 0 && <FrequencyResponse points={visibleSweep.points} partLabel={selectedPart.label} />}

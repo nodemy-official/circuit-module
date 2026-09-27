@@ -83,6 +83,68 @@ export const complexMagnitude = (value: ComplexValue) => Math.hypot(value.real, 
 
 export const complexPhaseRadians = (value: ComplexValue) => Math.atan2(value.imaginary, value.real);
 
+export function complexPhaseDegrees(value: ComplexValue) {
+  const { real, imaginary } = value;
+  // atan2 returns zero when a tiny, representable angle in degrees is below
+  // the smallest binary64 radian. Divide by the scaled real part first.
+  if (real > 0 && Math.abs(imaginary) <= real * 1e-8) {
+    const scaledReal = real / 180;
+    if (scaledReal !== 0) { return (imaginary / scaledReal) / Math.PI; }
+  }
+  return (complexPhaseRadians(value) * 180) / Math.PI;
+}
+
+function exactFloatUnits(value: number) {
+  if (!Number.isFinite(value)) { return; }
+  const bitsView = new DataView(new ArrayBuffer(8));
+  bitsView.setFloat64(0, value, false);
+  const highWord = bitsView.getUint32(0, false);
+  const lowWord = bitsView.getUint32(4, false);
+  const negative = highWord >= 2 ** 31;
+  const unsignedHighWord = highWord % (2 ** 31);
+  const exponent = Math.floor(unsignedHighWord / (2 ** 20));
+  const fractionHigh = unsignedHighWord % (2 ** 20);
+  const fraction = BigInt(fractionHigh) * (2n ** 32n) + BigInt(lowWord);
+  if (exponent === 0) { return negative ? -fraction : fraction; }
+  const significand = (2n ** 52n) + fraction;
+  const units = significand * (2n ** BigInt(exponent - 1));
+  return negative ? -units : units;
+}
+
+function floatFromExactUnits(value: bigint) {
+  if (value === 0n) { return 0; }
+  const negative = value < 0n;
+  const magnitude = negative ? -value : value;
+  const bitLength = magnitude.toString(2).length;
+  if (bitLength <= 52) {
+    return (negative ? -1 : 1) * Number(magnitude) * Number.MIN_VALUE;
+  }
+
+  const shift = bitLength - 53;
+  const discardedUnits = 2n ** BigInt(shift);
+  let significand = magnitude / discardedUnits;
+  if (shift > 0) {
+    const remainder = magnitude % discardedUnits;
+    const halfway = discardedUnits / 2n;
+    if (remainder > halfway || (remainder === halfway && significand % 2n === 1n)) {
+      significand += 1n;
+    }
+  }
+  const rounded = Number(significand) * 2 ** (shift - 1074);
+  return negative ? -rounded : rounded;
+}
+
+/** Sums finite binary64 values exactly before rounding the final result once. */
+export function exactComponentSum(values: readonly number[]) {
+  let sum = 0n;
+  for (const value of values) {
+    const units = exactFloatUnits(value);
+    if (units === undefined) { return Number.NaN; }
+    sum += units;
+  }
+  return floatFromExactUnits(sum);
+}
+
 function complexPivotRow(
   size: number,
   matrixReal: Float64Array,
@@ -202,6 +264,92 @@ function validSystem(size: number, matrix: Float64Array, rhs: Float64Array) {
     matrix.every(Number.isFinite) && rhs.every(Number.isFinite);
 }
 
+function powerOfTwoAtMost(value: number) {
+  if (value <= 0) { return 0; }
+  // 2**1024 overflows and 2**-1075 underflows, so keep the exponent in range.
+  const exponent = Math.max(-1074, Math.min(1023, Math.floor(Math.log2(value))));
+  return 2 ** exponent;
+}
+
+function rowScalingFactor(coefficientScale: number, rhsScale: number) {
+  const rowScale = powerOfTwoAtMost(coefficientScale);
+  // Leave the row untouched when normalizing its coefficients would overflow
+  // the right-hand side; that preserves small coefficients in extreme systems.
+  return rowScale > 0 && rhsScale / rowScale <= Number.MAX_VALUE / 4 ? rowScale : 0;
+}
+
+function preservesBinary64ValueWhenScaled(value: number, rowScale: number) {
+  if (value === 0) { return true; }
+  const scaled = value / rowScale;
+  // Subnormal rounding can change a small coefficient or RHS during equilibration.
+  return Number.isFinite(scaled) && scaled * rowScale === value;
+}
+
+function canScaleComplexRow(
+  size: number,
+  start: number,
+  row: number,
+  rowScale: number,
+  matrixReal: Float64Array,
+  matrixImaginary: Float64Array,
+  rhsReal: Float64Array,
+  rhsImaginary: Float64Array,
+) {
+  if (!preservesBinary64ValueWhenScaled(rhsReal[row] ?? 0, rowScale) ||
+    !preservesBinary64ValueWhenScaled(rhsImaginary[row] ?? 0, rowScale)) {
+    return false;
+  }
+  for (let column = 0; column < size; column += 1) {
+    const index = start + column;
+    if (!preservesBinary64ValueWhenScaled(matrixReal[index] ?? 0, rowScale) ||
+      !preservesBinary64ValueWhenScaled(matrixImaginary[index] ?? 0, rowScale)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function scaleComplexRows(
+  size: number,
+  matrixReal: Float64Array,
+  matrixImaginary: Float64Array,
+  rhsReal: Float64Array,
+  rhsImaginary: Float64Array,
+) {
+  for (let row = 0; row < size; row += 1) {
+    let coefficientScale = 0;
+    const start = row * size;
+    for (let column = 0; column < size; column += 1) {
+      const index = start + column;
+      coefficientScale = Math.max(
+        coefficientScale,
+        Math.abs(matrixReal[index] ?? 0),
+        Math.abs(matrixImaginary[index] ?? 0),
+      );
+    }
+    const rhsScale = Math.max(Math.abs(rhsReal[row] ?? 0), Math.abs(rhsImaginary[row] ?? 0));
+    const rowScale = rowScalingFactor(coefficientScale, rhsScale);
+    if (rowScale === 0) { continue; }
+    if (!canScaleComplexRow(
+      size,
+      start,
+      row,
+      rowScale,
+      matrixReal,
+      matrixImaginary,
+      rhsReal,
+      rhsImaginary,
+    )) { continue; }
+    for (let column = 0; column < size; column += 1) {
+      const index = start + column;
+      matrixReal[index] = (matrixReal[index] ?? 0) / rowScale;
+      matrixImaginary[index] = (matrixImaginary[index] ?? 0) / rowScale;
+    }
+    rhsReal[row] = (rhsReal[row] ?? 0) / rowScale;
+    rhsImaginary[row] = (rhsImaginary[row] ?? 0) / rowScale;
+  }
+}
+
 /** Solves a dense complex matrix in place; returns null for singular or nonfinite systems. */
 export function solveComplexLinearSystem(
   size: number,
@@ -213,6 +361,7 @@ export function solveComplexLinearSystem(
   if (!validSystem(size, matrixReal, rhsReal) || !validSystem(size, matrixImaginary, rhsImaginary)) {
     return null;
   }
+  scaleComplexRows(size, matrixReal, matrixImaginary, rhsReal, rhsImaginary);
   for (let column = 0; column < size; column += 1) {
     const { pivot, magnitude } = complexPivotRow(size, matrixReal, matrixImaginary, column);
     if (magnitude === 0 || !Number.isFinite(magnitude)) { return null; }
@@ -249,6 +398,27 @@ function realPivotRow(size: number, matrix: Float64Array, column: number) {
     }
   }
   return { pivot, magnitude };
+}
+
+function scaleRealRows(size: number, matrix: Float64Array, rhs: Float64Array) {
+  for (let row = 0; row < size; row += 1) {
+    let coefficientScale = 0;
+    const start = row * size;
+    for (let column = 0; column < size; column += 1) {
+      coefficientScale = Math.max(coefficientScale, Math.abs(matrix[start + column] ?? 0));
+    }
+    const rowScale = rowScalingFactor(coefficientScale, Math.abs(rhs[row] ?? 0));
+    if (rowScale === 0) { continue; }
+    let preservesValues = preservesBinary64ValueWhenScaled(rhs[row] ?? 0, rowScale);
+    for (let column = 0; preservesValues && column < size; column += 1) {
+      preservesValues = preservesBinary64ValueWhenScaled(matrix[start + column] ?? 0, rowScale);
+    }
+    if (!preservesValues) { continue; }
+    for (let column = 0; column < size; column += 1) {
+      matrix[start + column] = (matrix[start + column] ?? 0) / rowScale;
+    }
+    rhs[row] = (rhs[row] ?? 0) / rowScale;
+  }
 }
 
 function swapRealRows(size: number, matrix: Float64Array, rhs: Float64Array, firstRow: number, secondRow: number) {
@@ -290,6 +460,7 @@ export function solveRealLinearSystem(
   rhs: Float64Array,
 ): Float64Array | null {
   if (!validSystem(size, matrix, rhs)) { return null; }
+  scaleRealRows(size, matrix, rhs);
   for (let column = 0; column < size; column += 1) {
     const { pivot, magnitude } = realPivotRow(size, matrix, column);
     if (magnitude === 0 || !Number.isFinite(magnitude)) { return null; }

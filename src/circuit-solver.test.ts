@@ -55,6 +55,139 @@ function parallel(first: number, second: number): CircuitDocument {
 }
 
 describe("analyzeCircuit", () => {
+  it("uses the closed catalog default for a switch omitted from a legacy DC circuit", () => {
+    const document: CircuitDocument = {
+      title: "省略されたスイッチ状態",
+      parts: [
+        { id: "battery", kind: "battery", x: 0, y: 0, label: "電池", voltageVolts: 12 },
+        { id: "load", kind: "resistor", x: 0, y: 0, label: "抵抗", resistanceOhms: 10 },
+        { id: "switch", kind: "switch", x: 0, y: 0, label: "スイッチ" },
+      ],
+      wires: [
+        wire("w1", "battery", "a", "load", "a"),
+        wire("w2", "load", "b", "switch", "a"),
+        wire("w3", "switch", "b", "battery", "b"),
+      ],
+    };
+
+    const result = analyzeCircuit(document);
+
+    expect(result.status).toBe("closed");
+    expect(result.parts.switch.switchClosed).toBe(true);
+    expect(result.currentAmps).toBeCloseTo(1.2, 5);
+  });
+
+  it("uses the same omitted closed-switch default in extended DC circuits", () => {
+    const legacy: CircuitDocument = {
+      title: "省略されたスイッチ状態",
+      parts: [
+        { id: "battery", kind: "battery", x: 0, y: 0, label: "電池", voltageVolts: 12 },
+        { id: "ammeter", kind: "ammeter", x: 0, y: 0, label: "電流計" },
+        { id: "load", kind: "resistor", x: 0, y: 0, label: "抵抗", resistanceOhms: 10 },
+        { id: "switch", kind: "switch", x: 0, y: 0, label: "スイッチ" },
+        { id: "voltmeter", kind: "voltmeter", x: 0, y: 0, label: "電圧計" },
+      ],
+      wires: [
+        wire("w1", "battery", "a", "ammeter", "a"),
+        wire("w2", "ammeter", "b", "load", "a"),
+        wire("w3", "load", "b", "switch", "a"),
+        wire("w4", "switch", "b", "battery", "b"),
+        wire("w5", "voltmeter", "a", "load", "a"),
+        wire("w6", "voltmeter", "b", "load", "b"),
+      ],
+    };
+    const extended: CircuitDocument = {
+      ...legacy,
+      parts: [...legacy.parts, part("ground", "ground")],
+      wires: [...legacy.wires, wire("w7", "ground", "a", "battery", "b")],
+    };
+
+    const legacyResult = analyzeCircuit(legacy);
+    const extendedResult = analyzeCircuit(extended, {}, { mode: "dc" });
+
+    expect(legacyResult.status).toBe("closed");
+    expect(extendedResult.status).toBe("closed");
+    expect(extendedResult.parts.switch.switchClosed).toBe(true);
+    expect(extendedResult.currentAmps).toBeCloseTo(legacyResult.currentAmps ?? Number.NaN, 4);
+    expect(extendedResult.parts.ammeter.currentAmps).toBeCloseTo(legacyResult.parts.ammeter.currentAmps, 4);
+    expect(extendedResult.parts.load.voltageVolts).toBeCloseTo(legacyResult.parts.load.voltageVolts, 4);
+    expect(extendedResult.parts.voltmeter.voltageVolts).toBeCloseTo(legacyResult.parts.voltmeter.voltageVolts, 4);
+    expect(extendedResult.parts.ammeter.meterStatus).toBe("connected");
+    expect(extendedResult.parts.voltmeter.meterStatus).toBe("connected");
+  });
+
+  it("uses catalog defaults for omitted values on the legacy DC path", () => {
+    const document: CircuitDocument = {
+      title: "既定値の直流回路",
+      parts: [
+        { id: "battery", kind: "battery", x: 0, y: 0, label: "電池" },
+        { id: "load", kind: "resistor", x: 0, y: 0, label: "抵抗" },
+      ],
+      wires: [
+        wire("w1", "battery", "a", "load", "a"),
+        wire("w2", "load", "b", "battery", "b"),
+      ],
+    };
+
+    const result = analyzeCircuit(document);
+
+    expect(result.status).toBe("closed");
+    expect(result.currentAmps).toBeCloseTo(0.9, 5);
+    expect(result.parts.load.voltageVolts).toBeCloseTo(9, 5);
+  });
+
+  it("matches extended DC voltage and meter polarity for series and parallel branches", () => {
+    const legacy = parallel(6, 12);
+    const extended: CircuitDocument = {
+      ...legacy,
+      parts: [...legacy.parts, part("ground", "ground")],
+      wires: [...legacy.wires, wire("w10", "ground", "a", "battery", "b")],
+    };
+    const legacyResult = analyzeCircuit(legacy);
+    const extendedResult = analyzeCircuit(extended, {}, { mode: "dc" });
+
+    expect(legacyResult.status).toBe("closed");
+    expect(extendedResult.status).toBe("closed");
+    expect(extendedResult.currentAmps).toBeCloseTo(legacyResult.currentAmps ?? Number.NaN, 4);
+    expect(extendedResult.parts.r1.currentAmps).toBeCloseTo(legacyResult.parts.r1.currentAmps, 4);
+    expect(extendedResult.parts.r2.currentAmps).toBeCloseTo(legacyResult.parts.r2.currentAmps, 4);
+    expect(extendedResult.parts.voltmeter.voltageVolts).toBeCloseTo(legacyResult.parts.voltmeter.voltageVolts, 4);
+    expect(extendedResult.parts.ammeter.meterStatus).toBe(legacyResult.parts.ammeter.meterStatus);
+    expect(extendedResult.parts.voltmeter.meterStatus).toBe(legacyResult.parts.voltmeter.meterStatus);
+
+    const reversedMeterCircuit: CircuitDocument = {
+      title: "逆極性電圧計",
+      parts: [
+        part("battery", "battery", { voltageVolts: 9 }),
+        part("ammeter", "ammeter"),
+        part("load", "resistor", { resistanceOhms: 9 }),
+        part("voltmeter", "voltmeter"),
+      ],
+      wires: [
+        wire("w1", "battery", "a", "ammeter", "b"),
+        wire("w2", "ammeter", "a", "load", "a"),
+        wire("w3", "load", "b", "battery", "b"),
+        wire("w4", "voltmeter", "a", "load", "b"),
+        wire("w5", "voltmeter", "b", "load", "a"),
+      ],
+    };
+    const reversedExtended: CircuitDocument = {
+      ...reversedMeterCircuit,
+      parts: [...reversedMeterCircuit.parts, part("ground", "ground")],
+      wires: [...reversedMeterCircuit.wires, wire("w6", "ground", "a", "battery", "b")],
+    };
+    const reversedLegacyResult = analyzeCircuit(reversedMeterCircuit);
+    const reversedExtendedResult = analyzeCircuit(reversedExtended, {}, { mode: "dc" });
+
+    expect(reversedLegacyResult.parts.ammeter.currentAmps).toBeCloseTo(-1, 4);
+    expect(reversedExtendedResult.parts.ammeter.currentAmps).toBeCloseTo(-1, 4);
+    expect(reversedExtendedResult.parts.voltmeter.voltageVolts).toBeCloseTo(-9, 4);
+    expect(reversedExtendedResult.parts.voltmeter.voltageVolts)
+      .toBeCloseTo(reversedLegacyResult.parts.voltmeter.voltageVolts, 4);
+    expect(reversedExtendedResult.parts.ammeter.meterStatus).toBe("connected");
+    expect(reversedExtendedResult.parts.voltmeter.meterStatus).toBe("connected");
+  });
+
   it("splits current between parallel branches by conductance", () => {
     const result = analyzeCircuit(parallel(6, 12));
     // 6 Ω ∥ 12 Ω = 4 Ω, so 12 V drives 3 A: 2 A through 6 Ω and 1 A through 12 Ω.
@@ -106,6 +239,22 @@ describe("analyzeCircuit", () => {
     expect(result.parts.switchMeter.voltageVolts).toBeCloseTo(9);
     expect(result.parts.switchMeter.meterStatus).toBe("connected");
     expect(Math.abs(result.parts.battery.voltageVolts)).toBeCloseTo(9);
+
+    const extended: CircuitDocument = {
+      ...document,
+      parts: [...document.parts, part("ground", "ground")],
+      wires: [...document.wires, wire("w9", "ground", "a", "battery", "b")],
+    };
+    const extendedResult = analyzeCircuit(extended, {}, { mode: "dc" });
+
+    expect(extendedResult.status).toBe("open");
+    expect(extendedResult.currentAmps).toBe(0);
+    expect(extendedResult.parts.switch.switchClosed).toBe(false);
+    expect(extendedResult.parts.ammeter.currentAmps).toBe(0);
+    expect(extendedResult.parts.loadMeter.voltageVolts).toBeCloseTo(0, 4);
+    expect(extendedResult.parts.switchMeter.voltageVolts).toBeCloseTo(9, 4);
+    expect(extendedResult.parts.loadMeter.meterStatus).toBe("connected");
+    expect(extendedResult.parts.switchMeter.meterStatus).toBe("connected");
   });
 
   it("keeps meter polarity signed and marks missing or floating probes", () => {

@@ -3,7 +3,7 @@ import { act, type ComponentProps } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { circuitPartCatalog, type CircuitDocument, type CircuitPart } from "../circuit-model.js";
-import type { CircuitAnalysis, CircuitPartReading } from "../circuit-solver.js";
+import { analyzeCircuit, type CircuitAnalysis, type CircuitPartReading } from "../circuit-solver.js";
 import { CircuitComparisonPanel } from "./CircuitComparisonPanel.js";
 
 const mounted: Array<{ root: Root; container: HTMLElement }> = [];
@@ -123,6 +123,38 @@ describe("CircuitComparisonPanel", () => {
     expect(ui.container.textContent).toContain("平均電力");
     expect(required<HTMLTableRowElement>(ui.container, 'tr[data-part-id="source"] td:last-child').textContent).toBe("供給（＋）");
     expect(required<HTMLTableRowElement>(ui.container, 'tr[data-part-id="r1"] td:last-child').textContent).toBe("吸収（＋）");
+  });
+
+  it("labels an AC battery's internal resistance as absorbing power", () => {
+    const acBaselineDocument: CircuitDocument = {
+      title: "交流基準",
+      parts: [
+        { ...part("source", "ac-source", "交流電源"), voltageVolts: 10, frequencyHz: 50 },
+        { ...part("load", "resistor", "負荷"), resistanceOhms: 10 },
+        { ...part("battery", "battery", "電池"), internalResistanceOhms: 10 },
+      ],
+      wires: [
+        { id: "w1", from: { partId: "source", terminal: "a" }, to: { partId: "load", terminal: "a" } },
+        { id: "w2", from: { partId: "load", terminal: "b" }, to: { partId: "battery", terminal: "a" } },
+        { id: "w3", from: { partId: "battery", terminal: "b" }, to: { partId: "source", terminal: "b" } },
+      ],
+    };
+    const currentDocument = { ...acBaselineDocument, title: "交流現在" };
+    const acBaselineAnalysis = analyzeCircuit(acBaselineDocument, {}, { mode: "ac", frequencyHz: 50 });
+    const currentAnalysis = analyzeCircuit(currentDocument, {}, { mode: "ac", frequencyHz: 50 });
+    expect(currentAnalysis.parts.battery.powerWatts).toBeCloseTo(2.5, 10);
+    const ui = mount({
+      document: currentDocument,
+      analysis: currentAnalysis,
+      baselineDocument: acBaselineDocument,
+      baselineAnalysis: acBaselineAnalysis,
+    });
+
+    chooseMetric(ui.container, "powerWatts");
+
+    expect(required<HTMLTableRowElement>(ui.container, 'tr[data-part-id="source"] td:last-child').textContent).toBe("供給（＋）");
+    expect(required<HTMLTableRowElement>(ui.container, 'tr[data-part-id="battery"] td:last-child').textContent).toBe("吸収（＋）");
+    expect(ui.container.textContent).toContain("電池の内部抵抗など受動部品は吸収（＋）");
   });
 
   it("does not subtract AC readings when their frequencies differ", () => {

@@ -1,14 +1,17 @@
 import {
+  circuitPartCatalog,
   terminalsOf,
   type CircuitDocument,
   type CircuitPart,
   type CircuitTerminal,
 } from "./circuit-model.js";
+import { acAnalysisFrequency, isAcReactiveConductive } from "./ac-reactive.js";
 
 export type MeterStatus = "connected" | "unconnected" | "floating";
 
 interface MeterStatusOptions {
   mode?: "dc" | "ac";
+  frequencyHz?: number;
   switchStates?: Record<string, boolean>;
 }
 
@@ -68,7 +71,7 @@ function joinWiresAndGrounds(
 
 function isSwitchClosed(part: CircuitPart, switchStates: Record<string, boolean>) {
   const override = Object.hasOwn(switchStates, part.id) ? switchStates[part.id] : undefined;
-  return override ?? part.initiallyClosed ?? false;
+  return override ?? part.initiallyClosed ?? circuitPartCatalog.switch.defaults.initiallyClosed ?? false;
 }
 
 function joinAcross(nodes: DisjointSet, index: Map<string, number>, part: CircuitPart, terminals: CircuitTerminal[]) {
@@ -132,6 +135,7 @@ function joinElectricalParts(
   options: MeterStatusOptions,
 ) {
   const switchStates = options.switchStates ?? {};
+  const frequencyHz = acAnalysisFrequency(document, options.frequencyHz);
   for (const part of document.parts) {
     switch (part.kind) {
       case "battery":
@@ -141,14 +145,20 @@ function joinElectricalParts(
       case "ammeter":
       case "diode":
       case "led":
-      case "inductor":
         joinAcross(nodes, index, part, ["a", "b"]);
+        break;
+      case "inductor":
+        if (options.mode !== "ac" || isAcReactiveConductive(part, frequencyHz)) {
+          joinAcross(nodes, index, part, ["a", "b"]);
+        }
         break;
       case "switch":
         if (isSwitchClosed(part, switchStates)) { joinAcross(nodes, index, part, ["a", "b"]); }
         break;
       case "capacitor":
-        if (options.mode === "ac") { joinAcross(nodes, index, part, ["a", "b"]); }
+        if (options.mode === "ac" && isAcReactiveConductive(part, frequencyHz)) {
+          joinAcross(nodes, index, part, ["a", "b"]);
+        }
         break;
       case "potentiometer":
       case "npn-transistor":

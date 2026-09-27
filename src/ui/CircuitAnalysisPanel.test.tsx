@@ -14,7 +14,7 @@ const baseAnalysis: CircuitAnalysis = {
 };
 
 describe("CircuitAnalysisPanel current formatting", () => {
-  it("keeps small transient current visible and preserves number and unit slots", () => {
+  it("keeps small steady and transient currents visible and preserves number and unit slots", () => {
     const transientMarkup = renderToStaticMarkup(<CircuitAnalysisPanel
       analysis={{ ...baseAnalysis, timeSeconds: 0.004 }}
       slotProps={{ metricNumber: { className: "host-number" }, metricUnit: { className: "host-unit" } }}
@@ -23,9 +23,13 @@ describe("CircuitAnalysisPanel current formatting", () => {
       analysis={{ ...baseAnalysis, currentAmps: null, timeSeconds: 0.004 }}
     />);
     const steadyMarkup = renderToStaticMarkup(<CircuitAnalysisPanel analysis={baseAnalysis} />);
+    const acMarkup = renderToStaticMarkup(<CircuitAnalysisPanel
+      analysis={{ ...baseAnalysis, mode: "ac", frequencyHz: 1000 }}
+    />);
 
     expect(transientMarkup).toMatch(/class="host-number">21\.86<\/span><small class="host-unit">μA<\/small>/);
     expect(nullMarkup).toMatch(/<span[^>]*>—<\/span><small[^>]*>A<\/small>/);
-    expect(steadyMarkup).toContain("0.000</span><small>A</small>");
+    expect(steadyMarkup).toContain("21.86</span><small>μA</small>");
+    expect(acMarkup).toContain("21.86</span><small>μA</small>");
   });
 });

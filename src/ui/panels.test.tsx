@@ -1,7 +1,7 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import { circuitPartCatalog, circuitPartKinds, circuitPartNumericFields, type CircuitPart, type CircuitWire } from "../circuit-model.js";
-import type { CircuitAnalysis, CircuitPartReading } from "../circuit-solver.js";
+import { analyzeCircuit, type CircuitAnalysis, type CircuitPartReading } from "../circuit-solver.js";
 import { CircuitAnalysisPanel } from "./CircuitAnalysisPanel.js";
 import { CircuitIcon } from "./CircuitIcon.js";
 import { CircuitInspector, type CircuitInspectorProps } from "./CircuitInspector.js";
@@ -37,6 +37,21 @@ function defaultPart(kind: CircuitPart["kind"], id = `part-${kind}`): CircuitPar
 }
 
 describe("headless panel styling contract", () => {
+  it("shows an omitted switch state as closed in the Inspector and preview", () => {
+    const switchPart: CircuitPart = { id: "switch", kind: "switch", x: 0, y: 0, label: "スイッチ" };
+    const document = { title: "既定値のスイッチ", parts: [switchPart], wires: [] };
+    const analysis = analyzeCircuit(document);
+    const inspector = renderToStaticMarkup(<CircuitInspector part={switchPart} onChange={() => {}} />);
+    const preview = renderToStaticMarkup(
+      <CircuitPreviewPanel document={document} initialDocument={document} analysis={analysis} onChange={() => {}} onReset={() => {}} />,
+    );
+
+    expect(analysis.parts.switch.switchClosed).toBe(true);
+    expect(inspector).toContain('aria-checked="true"');
+    expect(preview).toContain('aria-checked="true"');
+    expect(preview).toContain(">ON</strong>");
+  });
+
   it("uses terminal-aware reading labels and keeps potentiometer current referenced to A", () => {
     expect(measurementLabels("potentiometer")).toEqual({ voltage: "電圧（A−B）", current: "電流（Aへ流入）" });
     expect(measurementLabels("op-amp")).toEqual({ voltage: "出力電圧（対GND）", current: "電流（出力へ流入）" });
@@ -313,6 +328,24 @@ describe("meter display", () => {
       phaseText: "電流位相 −30°",
     });
     expect(current?.note).toContain("交流は実効値");
+  });
+
+  it("does not report a phase for a zero AC meter reading", () => {
+    const current = getMeterDisplay("ammeter", {
+      ...reading,
+      currentAmps: 0,
+      currentPhaseDegrees: 0,
+    }, "closed");
+    const voltage = getMeterDisplay("voltmeter", {
+      ...reading,
+      voltageVolts: 0,
+      voltagePhaseDegrees: 0,
+    }, "closed");
+
+    expect(current).toMatchObject({ status: "connected", text: "0 A（実効値）" });
+    expect(current?.phaseText).toBeUndefined();
+    expect(voltage).toMatchObject({ status: "connected", text: "0 V（実効値）" });
+    expect(voltage?.phaseText).toBeUndefined();
   });
 
   it("distinguishes unconnected, floating, unmeasured, invalid, and short meters", () => {

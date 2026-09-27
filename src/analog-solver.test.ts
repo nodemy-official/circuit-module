@@ -36,6 +36,133 @@ const wire = (
 });
 
 describe("analyzeAnalogCircuit", () => {
+  it("preserves branch voltage and complex power above a large common-mode voltage", () => {
+    const document: CircuitDocument = {
+      title: "大きい共通電位上の微小交流電圧",
+      parts: [
+        part("big", "ac-source", { voltageVolts: 1e12, frequencyHz: 1000 }),
+        part("small", "ac-source", { voltageVolts: 1e-3, frequencyHz: 1000 }),
+        part("load", "resistor", { resistanceOhms: 1e12 }),
+        part("meter", "voltmeter"),
+        part("ground", "ground"),
+      ],
+      wires: [
+        wire("w1", "big", "a", "small", "b"),
+        wire("w2", "small", "a", "load", "a"),
+        wire("w3", "load", "b", "big", "b"),
+        wire("w4", "meter", "a", "small", "a"),
+        wire("w5", "meter", "b", "small", "b"),
+        wire("w6", "ground", "a", "big", "b"),
+      ],
+    };
+
+    const result = analyzeAnalogCircuit(document, { mode: "ac" });
+
+    expect(result.status, result.message).toBe("valid");
+    const expectedCurrent = (1e12 + 1e-3) / 1e12;
+    expect(result.parts.small.voltage.real).toBeCloseTo(1e-3, 12);
+    expect(result.parts.meter.voltage.real).toBeCloseTo(1e-3, 12);
+    expect(result.parts.big.current.real / -expectedCurrent).toBeCloseTo(1, 12);
+    expect(result.parts.small.current.real / -expectedCurrent).toBeCloseTo(1, 12);
+    expect(result.parts.load.current.real / expectedCurrent).toBeCloseTo(1, 12);
+    expect(result.parts.big.power.real / (-1e12 * expectedCurrent)).toBeCloseTo(1, 12);
+    expect(result.parts.small.power.real / (-1e-3 * expectedCurrent)).toBeCloseTo(1, 12);
+    expect(result.parts.load.power.real / (1e12 * expectedCurrent ** 2)).toBeCloseTo(1, 12);
+    expect(result.parts.meter.power.real).toBe(0);
+    expect(result.parts.meter.power.imaginary).toBe(0);
+  });
+
+  it.each([2, 3])(
+    "rebases AC node voltages to preserve equal millivolt drops across %s series resistors",
+    (resistorCount) => {
+      const resistorIds = Array.from({ length: resistorCount }, (_, index) => `r${index + 1}`);
+      const parts = [
+        part("big", "ac-source", { voltageVolts: 1e12, frequencyHz: 1000 }),
+        part("small", "ac-source", { voltageVolts: resistorCount * 1e-3, frequencyHz: 1000 }),
+        ...resistorIds.map((id) => part(id, "resistor", { resistanceOhms: 1e-3 })),
+        part("meter", "voltmeter"),
+        part("meter-middle", "voltmeter"),
+        part("ground", "ground"),
+      ];
+      const wires = [
+        wire("source-x", "big", "a", "small", "a"),
+        wire("ground", "big", "b", "ground", "a"),
+        wire("meter-x", "meter", "a", "big", "a"),
+        wire("meter-c", "meter", "b", "small", "b"),
+        wire("meter-middle", "meter-middle", "a", resistorIds[0] ?? "", "b"),
+        wire("meter-middle-end", "meter-middle", "b", "small", "b"),
+        wire("chain-start", "big", "a", resistorIds[0] ?? "", "a"),
+      ];
+      for (let index = 0; index < resistorIds.length - 1; index += 1) {
+        const resistorId = resistorIds[index];
+        const nextResistorId = resistorIds[index + 1];
+        if (resistorId && nextResistorId) {
+          wires.push(wire(`chain-${index}`, resistorId, "b", nextResistorId, "a"));
+        }
+      }
+      wires.push(wire("chain-end", resistorIds.at(-1) ?? "", "b", "small", "b"));
+      const document: CircuitDocument = { title: "大共通電位上の微小交流電圧", parts, wires };
+
+      const result = analyzeAnalogCircuit(document, { mode: "ac" });
+
+      expect(result.status, result.message).toBe("valid");
+      for (const resistorId of resistorIds) {
+        expect(result.parts[resistorId]?.voltage.real).toBeCloseTo(1e-3, 11);
+        expect(result.parts[resistorId]?.current.real).toBeCloseTo(1, 11);
+      }
+      expect(result.parts.small.voltage.real).toBeCloseTo(resistorCount * 1e-3, 11);
+      expect(result.parts.meter.voltage.real).toBeCloseTo(resistorCount * 1e-3, 11);
+      expect(result.parts["meter-middle"].voltage.real).toBeCloseTo((resistorCount - 1) * 1e-3, 11);
+      expect(result.parts.ground.terminalVoltages.a).toEqual({ real: 0, imaginary: 0 });
+      expect(result.nodeVoltages["big:b"]).toEqual({ real: 0, imaginary: 0 });
+      expect(result.nodeVoltages["big:a"].real).toBe(1e12);
+    },
+  );
+
+  it.each([0, 90])(
+    "sums stable branch drops for a meter spanning several parts at high common mode (%s°)",
+    (phaseDegrees) => {
+      const document: CircuitDocument = {
+        title: "高電位上の直列微小電圧降下",
+        parts: [
+          part("source", "ac-source", { voltageVolts: 1e12, frequencyHz: 1000, phaseDegrees }),
+          part("r1", "resistor", { resistanceOhms: 1e-3 }),
+          part("r2", "resistor", { resistanceOhms: 1e-3 }),
+          part("load", "resistor", { resistanceOhms: 1e12 }),
+          part("meter", "voltmeter"),
+          part("ground", "ground"),
+        ],
+        wires: [
+          wire("w1", "source", "a", "r1", "a"),
+          wire("w2", "r1", "b", "r2", "a"),
+          wire("w3", "r2", "b", "load", "a"),
+          wire("w4", "load", "b", "source", "b"),
+          wire("w5", "meter", "a", "r1", "a"),
+          wire("w6", "meter", "b", "r2", "b"),
+          wire("w7", "ground", "a", "source", "b"),
+        ],
+      };
+
+      const result = analyzeAnalogCircuit(document, { mode: "ac" });
+
+      expect(result.status, result.message).toBe("valid");
+      const r1 = result.parts.r1;
+      const r2 = result.parts.r2;
+      const meter = result.parts.meter;
+      expect(Math.hypot(r1.voltage.real, r1.voltage.imaginary)).toBeCloseTo(1e-3, 10);
+      expect(Math.hypot(r2.voltage.real, r2.voltage.imaginary)).toBeCloseTo(1e-3, 10);
+      const expectedPhase = (phaseDegrees * Math.PI) / 180;
+      expect(meter.voltage.real).toBeCloseTo(2e-3 * Math.cos(expectedPhase), 10);
+      expect(meter.voltage.imaginary).toBeCloseTo(2e-3 * Math.sin(expectedPhase), 10);
+      expect(meter.voltage.real).toBeCloseTo(r1.voltage.real + r2.voltage.real, 10);
+      expect(meter.voltage.imaginary).toBeCloseTo(r1.voltage.imaginary + r2.voltage.imaginary, 10);
+      expect(result.parts.source.terminalCurrents.a!.real + r1.terminalCurrents.a!.real).toBeCloseTo(0, 10);
+      expect(result.parts.source.terminalCurrents.a!.imaginary + r1.terminalCurrents.a!.imaginary).toBeCloseTo(0, 10);
+      expect(r1.terminalCurrents.b!.real + r2.terminalCurrents.a!.real).toBeCloseTo(0, 10);
+      expect(r1.terminalCurrents.b!.imaginary + r2.terminalCurrents.a!.imaginary).toBeCloseTo(0, 10);
+    },
+  );
+
   it("solves an ideal DC voltage source exactly with its series resistance", () => {
     const document: CircuitDocument = {
       title: "電池と抵抗",
@@ -84,6 +211,42 @@ describe("analyzeAnalogCircuit", () => {
     expect(result.parts.voltmeter.voltage.real).toBeCloseTo(9, 8);
     expect(result.parts.voltmeter.current.real).toBe(0);
     expect(result.parts.voltmeter.meterStatus).toBe("connected");
+  });
+
+  it("reuses multi-branch voltage paths for meters with the same or reversed probes", () => {
+    const document: CircuitDocument = {
+      title: "複数の電圧計で共有する枝経路",
+      parts: [
+        part("source", "ac-source", { voltageVolts: 12, frequencyHz: 1000 }),
+        part("r0", "resistor", { resistanceOhms: 10 }),
+        part("r1", "resistor", { resistanceOhms: 10 }),
+        part("r2", "resistor", { resistanceOhms: 10 }),
+        part("forward", "voltmeter"),
+        part("reverse", "voltmeter"),
+        part("repeat", "voltmeter"),
+      ],
+      wires: [
+        wire("source-a", "source", "a", "r0", "a"),
+        wire("series-0", "r0", "b", "r1", "a"),
+        wire("series-1", "r1", "b", "r2", "a"),
+        wire("source-b", "r2", "b", "source", "b"),
+        wire("forward-a", "forward", "a", "r0", "b"),
+        wire("forward-b", "forward", "b", "r2", "b"),
+        wire("reverse-a", "reverse", "a", "r2", "b"),
+        wire("reverse-b", "reverse", "b", "r0", "b"),
+        wire("repeat-a", "repeat", "a", "r0", "b"),
+        wire("repeat-b", "repeat", "b", "r2", "b"),
+      ],
+    };
+
+    const result = analyzeAnalogCircuit(document, { mode: "ac" });
+
+    expect(result.status, result.message).toBe("valid");
+    expect(result.parts.forward.voltage.real).toBeCloseTo(8, 8);
+    expect(result.parts.forward.voltage.imaginary).toBeCloseTo(0, 10);
+    expect(result.parts.reverse.voltage.real).toBeCloseTo(-8, 8);
+    expect(result.parts.reverse.voltage.imaginary).toBeCloseTo(0, 10);
+    expect(result.parts.repeat.voltage).toEqual(result.parts.forward.voltage);
   });
 
   it("marks a wire-bypassed ammeter as floating instead of claiming its current is zero", () => {
@@ -414,6 +577,33 @@ describe("analyzeAnalogCircuit", () => {
     expect(result.parts.inductor.current.imaginary).toBeCloseTo(0, 8);
     expect(result.parts.inductor.power.imaginary).toBeGreaterThan(0);
   });
+
+  it.each([1e308, Number.MAX_VALUE])(
+    "keeps finite AC source phase %s finite before converting degrees to radians",
+    (phaseDegrees) => {
+      const document: CircuitDocument = {
+        title: "極端に大きい交流電源位相",
+        parts: [
+          part("source", "ac-source", {
+            voltageVolts: 2,
+            frequencyHz: 50,
+            phaseDegrees,
+          }),
+          part("load", "resistor", { resistanceOhms: 10 }),
+        ],
+        wires: [
+          wire("w1", "source", "a", "load", "a"),
+          wire("w2", "load", "b", "source", "b"),
+        ],
+      };
+
+      const result = analyzeAnalogCircuit(document, { mode: "ac", frequencyHz: 50 });
+
+      expect(result.status, result.message).toBe("valid");
+      expect(Math.hypot(result.parts.source.voltage.real, result.parts.source.voltage.imaginary)).toBeCloseTo(2, 8);
+      expect(Math.hypot(result.parts.load.voltage.real, result.parts.load.voltage.imaginary)).toBeCloseTo(2, 8);
+    },
+  );
 
   it("does not require a DC-only current source to have a return path in linear AC analysis", () => {
     const document: CircuitDocument = {

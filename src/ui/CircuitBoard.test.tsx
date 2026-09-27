@@ -5,6 +5,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { GRID } from "../circuit-geometry.js";
 import { createExampleCircuit, type CircuitDocument, type CircuitPart } from "../circuit-model.js";
+import { analyzeCircuit } from "../circuit-solver.js";
 import { CircuitBoard, type CircuitBoardControls, type CircuitBoardProps } from "./CircuitBoard.js";
 
 class MockResizeObserver implements ResizeObserver {
@@ -212,6 +213,24 @@ function panRight(container: ParentNode) {
 const document = createExampleCircuit();
 
 describe("CircuitBoard appearance and composition", () => {
+  it("renders an omitted switch state as the solver's closed catalog default", () => {
+    const switchDocument: CircuitDocument = {
+      title: "既定値のスイッチ",
+      parts: [{ id: "switch", kind: "switch", x: 0, y: 0, label: "スイッチ" }],
+      wires: [],
+    };
+    const analysis = analyzeCircuit(switchDocument);
+    const markup = renderToStaticMarkup(
+      <CircuitBoard document={switchDocument} analysis={analysis} readOnly onSwitchToggle={() => {}} />,
+    );
+
+    expect(analysis.parts.switch.switchClosed).toBe(true);
+    expect(markup).toContain('aria-label="スイッチを開く"');
+    expect(markup).toContain('aria-pressed="true"');
+    expect(markup).toContain('d="M -9 0 L 9 0"');
+    expect(markup).not.toContain('d="M -9 0 L 7 -10"');
+  });
+
   it("forwards host attributes and styles to the root and internal SVG/HTML elements", () => {
     const markup = renderToStaticMarkup(
       <CircuitBoard

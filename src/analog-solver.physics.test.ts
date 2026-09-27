@@ -71,6 +71,40 @@ function bjtAt(collector: number, base: number, emitter: number, currentGain = 1
 }
 
 describe("analog solver physical model regressions", () => {
+  it("keeps millivolt drops accurate after two large series AC common-mode sources", () => {
+    const document: CircuitDocument = {
+      title: "直列高電位源上の微小交流降下",
+      parts: [
+        part("high1", "ac-source", { voltageVolts: 1e12, frequencyHz: 1000 }),
+        part("high2", "ac-source", { voltageVolts: 1e12, frequencyHz: 1000 }),
+        part("small", "ac-source", { voltageVolts: 3e-3, frequencyHz: 1000 }),
+        part("r1", "resistor", { resistanceOhms: 1e-3 }),
+        part("r2", "resistor", { resistanceOhms: 1e-3 }),
+        part("r3", "resistor", { resistanceOhms: 1e-3 }),
+        part("ground", "ground"),
+      ],
+      wires: [
+        wire("ground", "ground", "a", "high1", "b"),
+        wire("high-sources", "high1", "a", "high2", "b"),
+        wire("high-small", "high2", "a", "small", "a"),
+        wire("chain-start", "high2", "a", "r1", "a"),
+        wire("chain-1", "r1", "b", "r2", "a"),
+        wire("chain-2", "r2", "b", "r3", "a"),
+        wire("chain-end", "r3", "b", "small", "b"),
+      ],
+    };
+
+    const result = analyzeAnalogCircuit(document, { mode: "ac" });
+
+    expect(result.status, result.message).toBe("valid");
+    for (const id of ["r1", "r2", "r3"]) {
+      expect(result.parts[id]?.current.real).toBeCloseTo(1, 10);
+      expect(result.parts[id]?.voltage.real).toBeCloseTo(1e-3, 10);
+    }
+    expect(result.parts.small.voltage.real).toBeCloseTo(3e-3, 10);
+    expect(result.parts.ground.terminalVoltages.a).toEqual({ real: 0, imaginary: 0 });
+  });
+
   it.each([
     { mode: "cutoff", drain: 5, gate: 1, source: 0, current: 0 },
     { mode: "triode", drain: 1, gate: 4, source: 0, current: 0.03 },
@@ -122,6 +156,286 @@ describe("analog solver physical model regressions", () => {
     const currents = result.parts.transistor.terminalCurrents;
     expect(currents.a!.real / currents.b!.real).toBeCloseTo(beta, 6);
     expect(currents.a!.real + currents.b!.real + currents.c!.real).toBeCloseTo(0, 12);
+  });
+
+  it("linearizes an AC diode around the operating point set by the source DC offset", () => {
+    const resistance = 1000;
+    const sourceAmplitude = 0.01;
+    const saturationCurrent = 1e-12;
+    const thermalVoltage = 0.025_85;
+    const document: CircuitDocument = {
+      title: "オフセットでバイアスしたダイオードの交流応答",
+      parts: [
+        part("source", "ac-source", {
+          voltageVolts: sourceAmplitude,
+          offsetVolts: 5,
+          frequencyHz: 1000,
+        }),
+        part("resistor", "resistor", { resistanceOhms: resistance }),
+        part("diode", "diode", { saturationCurrentAmps: saturationCurrent }),
+      ],
+      wires: [
+        wire("w1", "source", "a", "resistor", "a"),
+        wire("w2", "resistor", "b", "diode", "a"),
+        wire("w3", "diode", "b", "source", "b"),
+      ],
+    };
+
+    const dc = analyzeAnalogCircuit(document, { mode: "dc" });
+    const ac = analyzeAnalogCircuit(document, { mode: "ac" });
+
+    expect(dc.status, dc.message).toBe("valid");
+    expect(dc.parts.source.voltage.real).toBeCloseTo(5, 10);
+    expect(dc.parts.diode.current.real).toBeGreaterThan(0.004);
+    expect(dc.parts.diode.current.real).toBeLessThan(0.005);
+
+    const diodeConductance = (dc.parts.diode.current.real + saturationCurrent) / thermalVoltage;
+    const expectedCurrent = sourceAmplitude / (resistance + 1 / diodeConductance);
+    const expectedDiodeVoltage = expectedCurrent / diodeConductance;
+
+    expect(ac.status, ac.message).toBe("valid");
+    expect(ac.parts.diode.current.real).toBeCloseTo(expectedCurrent, 10);
+    expect(ac.parts.diode.current.imaginary).toBeCloseTo(0, 12);
+    expect(ac.parts.diode.voltage.real).toBeCloseTo(expectedDiodeVoltage, 10);
+    expect(ac.parts.diode.voltage.imaginary).toBeCloseTo(0, 12);
+  });
+
+  it("preserves a small-signal diode voltage above a large AC common mode", () => {
+    const resistance = 1000;
+    const sourceAmplitude = 1e-3;
+    const saturationCurrent = 1e-12;
+    const thermalVoltage = 0.025_85;
+    const document: CircuitDocument = {
+      title: "大きい交流共通電位上のダイオード微小信号",
+      parts: [
+        part("high", "ac-source", { voltageVolts: 1e12, frequencyHz: 1000 }),
+        part("small", "ac-source", { voltageVolts: sourceAmplitude, frequencyHz: 1000 }),
+        part("bias", "battery", { voltageVolts: 5 }),
+        part("resistor", "resistor", { resistanceOhms: resistance }),
+        part("diode", "diode", { saturationCurrentAmps: saturationCurrent }),
+        part("meter", "voltmeter"),
+        part("ground", "ground"),
+      ],
+      wires: [
+        wire("ground", "high", "b", "ground", "a"),
+        wire("small-source-high", "high", "a", "small", "a"),
+        wire("small-source-resistor", "small", "b", "resistor", "a"),
+        wire("resistor-diode", "resistor", "b", "diode", "b"),
+        wire("diode-bias", "diode", "a", "bias", "a"),
+        wire("bias-return", "bias", "b", "high", "a"),
+        wire("meter-diode-a", "meter", "a", "diode", "a"),
+        wire("meter-diode-b", "meter", "b", "diode", "b"),
+      ],
+    };
+
+    const dc = analyzeAnalogCircuit(document, { mode: "dc" });
+    const ac = analyzeAnalogCircuit(document, { mode: "ac" });
+    const diodeConductance = (dc.parts.diode.current.real + saturationCurrent) / thermalVoltage;
+    const expectedCurrent = sourceAmplitude / (resistance + 1 / diodeConductance);
+    const expectedDiodeVoltage = expectedCurrent / diodeConductance;
+
+    expect(dc.status, dc.message).toBe("valid");
+    expect(ac.status, ac.message).toBe("valid");
+    expect(ac.parts.diode.current.real).toBeCloseTo(expectedCurrent, 9);
+    expect(ac.parts.diode.voltage.real).toBeCloseTo(expectedDiodeVoltage, 9);
+    expect(ac.parts.meter.meterStatus).toBe("connected");
+    expect(ac.parts.meter.voltage.real).toBeCloseTo(expectedDiodeVoltage, 9);
+  });
+
+  it("keeps a representable inductor reactance when angular frequency would overflow first", () => {
+    const frequencyHz = 1e308;
+    const inductanceHenries = 1e-308;
+    const document: CircuitDocument = {
+      title: "中間値がオーバーフローするコイル回路",
+      parts: [
+        part("source", "ac-source", { voltageVolts: 1, frequencyHz }),
+        part("inductor", "inductor", { inductanceHenries }),
+      ],
+      wires: [
+        wire("w1", "source", "a", "inductor", "a"),
+        wire("w2", "inductor", "b", "source", "b"),
+      ],
+    };
+
+    const result = analyzeAnalogCircuit(document, { mode: "ac" });
+
+    expect(result.status, result.message).toBe("valid");
+    expect(result.parts.inductor.voltage.real).toBeCloseTo(1, 10);
+    expect(result.parts.inductor.voltage.imaginary).toBeCloseTo(0, 10);
+    expect(result.parts.inductor.current.real).toBeCloseTo(0, 10);
+    expect(result.parts.inductor.current.imaginary).toBeCloseTo(-1 / (2 * Math.PI), 10);
+  });
+
+  it("avoids losing precision when angular frequency times inductance is subnormal", () => {
+    const frequencyHz = 1e-308;
+    const inductanceHenries = 7.4e-16;
+    const sourceVoltage = 1e-308;
+    const reactance = (2 * Math.PI * frequencyHz) * inductanceHenries;
+    const document: CircuitDocument = {
+      title: "サブノーマル領域のコイルリアクタンス",
+      parts: [
+        part("source", "ac-source", { voltageVolts: sourceVoltage, frequencyHz }),
+        part("inductor", "inductor", { inductanceHenries }),
+      ],
+      wires: [
+        wire("w1", "source", "a", "inductor", "a"),
+        wire("w2", "inductor", "b", "source", "b"),
+      ],
+    };
+
+    const result = analyzeAnalogCircuit(document, { mode: "ac" });
+
+    expect(result.status, result.message).toBe("valid");
+    expect(reactance).toBeGreaterThan(0);
+    expect(result.parts.inductor.current.imaginary / (-sourceVoltage / reactance)).toBeCloseTo(1, 10);
+  });
+
+  it.each([
+    { kind: "capacitor" as const, frequencyHz: 1e-308, capacitanceFarads: 1e-308 },
+    { kind: "inductor" as const, frequencyHz: 1e308, inductanceHenries: 1e308 },
+  ])("treats an unrepresentably small $kind admittance as an open AC branch", (reactive) => {
+    const document: CircuitDocument = {
+      title: "極大リアクタンスの開放回路",
+      parts: [
+        part("source", "ac-source", { voltageVolts: 5, frequencyHz: reactive.frequencyHz }),
+        part("resistor", "resistor", { resistanceOhms: 100 }),
+        part("reactive", reactive.kind, reactive),
+      ],
+      wires: [
+        wire("w1", "source", "a", "resistor", "a"),
+        wire("w2", "resistor", "b", "reactive", "a"),
+        wire("w3", "reactive", "b", "source", "b"),
+      ],
+    };
+
+    const result = analyzeAnalogCircuit(document, { mode: "ac" });
+
+    expect(result.status, result.message).toBe("valid");
+    expect(result.parts.reactive.voltage.real).toBeCloseTo(5, 10);
+    expect(result.parts.reactive.current.real).toBe(0);
+    expect(result.parts.reactive.current.imaginary).toBe(0);
+    expect(result.parts.resistor.voltage.real).toBe(0);
+  });
+
+  it.each([
+    { kind: "capacitor" as const, frequencyHz: 1e-308, capacitanceFarads: 1e-308 },
+    { kind: "inductor" as const, frequencyHz: 1e308, inductanceHenries: 1e308 },
+  ])("does not make a dangling open $kind branch singular", (reactive) => {
+    const document: CircuitDocument = {
+      title: "片端が未接続の開放リアクタンス",
+      parts: [
+        part("source", "ac-source", { voltageVolts: 5, frequencyHz: reactive.frequencyHz }),
+        part("reactive", reactive.kind, reactive),
+      ],
+      wires: [wire("w1", "source", "a", "reactive", "a")],
+    };
+
+    const result = analyzeAnalogCircuit(document, { mode: "ac" });
+
+    expect(result.status, result.message).toBe("valid");
+    expect(result.parts.reactive.current.real).toBe(0);
+    expect(result.parts.reactive.current.imaginary).toBe(0);
+  });
+
+  it("solves an out-of-range capacitor reactance through its representable admittance", () => {
+    const document: CircuitDocument = {
+      title: "表現範囲を超えたリアクタンスの電流整合",
+      parts: [
+        part("source", "ac-source", { voltageVolts: 1e308, frequencyHz: 0.5 }),
+        part("resistor", "resistor", { resistanceOhms: 1 }),
+        part("capacitor", "capacitor", { capacitanceFarads: 1e-309 }),
+        part("ground", "ground"),
+      ],
+      wires: [
+        wire("w1", "source", "a", "resistor", "a"),
+        wire("w2", "resistor", "b", "capacitor", "a"),
+        wire("w3", "capacitor", "b", "source", "b"),
+        wire("w4", "ground", "a", "source", "b"),
+      ],
+    };
+
+    const result = analyzeAnalogCircuit(document, { mode: "ac" });
+
+    expect(result.status, result.message).toBe("valid");
+    expect(result.parts.capacitor.voltage.real).toBe(1e308);
+    const expectedCurrent = ((2 * Math.PI * 0.5) * 1e-309) * 1e308;
+    expect(result.parts.capacitor.current.imaginary / expectedCurrent).toBeCloseTo(1, 8);
+    expect(result.parts.resistor.current.imaginary / expectedCurrent).toBeCloseTo(1, 8);
+    expect(result.parts.source.current.imaginary / -expectedCurrent).toBeCloseTo(1, 8);
+    expect(result.parts.resistor.voltage.imaginary / expectedCurrent).toBeCloseTo(1, 8);
+    expect(result.parts.resistor.terminalCurrents.b!.imaginary +
+      result.parts.capacitor.terminalCurrents.a!.imaginary).toBeCloseTo(0, 8);
+    expect(result.parts.source.terminalCurrents.a!.imaginary +
+      result.parts.resistor.terminalCurrents.a!.imaginary).toBeCloseTo(0, 8);
+    expect(result.parts.resistor.power.real).toBeCloseTo(expectedCurrent ** 2, 8);
+    expect(result.parts.capacitor.power.real).toBe(0);
+    expect(result.parts.capacitor.voltage.real / 1e308).toBeCloseTo(1, 8);
+    expect(result.parts.capacitor.voltage.imaginary / 1e308).toBeCloseTo(0, 8);
+    expect(result.parts.capacitor.power.imaginary / (-1e308 * expectedCurrent)).toBeCloseTo(1, 8);
+    expect(result.parts.source.power.imaginary / -result.parts.capacitor.power.imaginary).toBeCloseTo(1, 8);
+    expect(result.parts.source.voltage.real - result.parts.resistor.voltage.real -
+      result.parts.capacitor.voltage.real).toBeCloseTo(0, 8);
+    expect(result.parts.source.voltage.imaginary - result.parts.resistor.voltage.imaginary -
+      result.parts.capacitor.voltage.imaginary).toBeCloseTo(0, 8);
+    expect((result.parts.source.power.real + result.parts.resistor.power.real) /
+      result.parts.resistor.power.real).toBeCloseTo(0, 8);
+  });
+
+  it("solves an out-of-range inductor reactance through its representable admittance", () => {
+    const frequencyHz = 0.5;
+    const inductanceHenries = 1e308;
+    const sourceVoltage = 1e308;
+    const expectedCurrent = sourceVoltage * (1 / (2 * Math.PI * frequencyHz)) / inductanceHenries;
+    const document: CircuitDocument = {
+      title: "有限アドミタンスで解く範囲外コイルリアクタンス",
+      parts: [
+        part("source", "ac-source", { voltageVolts: sourceVoltage, frequencyHz }),
+        part("resistor", "resistor", { resistanceOhms: 1 }),
+        part("inductor", "inductor", { inductanceHenries }),
+        part("ground", "ground"),
+      ],
+      wires: [
+        wire("w1", "source", "a", "resistor", "a"),
+        wire("w2", "resistor", "b", "inductor", "a"),
+        wire("w3", "inductor", "b", "source", "b"),
+        wire("w4", "ground", "a", "source", "b"),
+      ],
+    };
+
+    const result = analyzeAnalogCircuit(document, { mode: "ac" });
+
+    expect(result.status, result.message).toBe("valid");
+    expect(expectedCurrent).toBeGreaterThan(0.3);
+    expect(result.parts.inductor.current.imaginary / -expectedCurrent).toBeCloseTo(1, 8);
+    expect(result.parts.resistor.current.imaginary / -expectedCurrent).toBeCloseTo(1, 8);
+    expect(result.parts.source.current.imaginary / expectedCurrent).toBeCloseTo(1, 8);
+    expect(result.parts.resistor.terminalCurrents.b!.imaginary +
+      result.parts.inductor.terminalCurrents.a!.imaginary).toBeCloseTo(0, 8);
+    expect(result.parts.source.terminalCurrents.a!.imaginary +
+      result.parts.resistor.terminalCurrents.a!.imaginary).toBeCloseTo(0, 8);
+    expect(result.parts.inductor.voltage.real / 1e308).toBeCloseTo(1, 8);
+    expect(result.parts.inductor.power.imaginary / (1e308 * expectedCurrent)).toBeCloseTo(1, 8);
+    expect(result.parts.source.power.imaginary / -result.parts.inductor.power.imaginary).toBeCloseTo(1, 8);
+    expect((result.parts.source.power.real + result.parts.resistor.power.real) /
+      result.parts.resistor.power.real).toBeCloseTo(0, 8);
+    expect((result.parts.source.voltage.real - result.parts.resistor.voltage.real -
+      result.parts.inductor.voltage.real) / 1e308).toBeCloseTo(0, 8);
+    expect(result.parts.source.voltage.imaginary - result.parts.resistor.voltage.imaginary -
+      result.parts.inductor.voltage.imaginary).toBeCloseTo(0, 8);
+  });
+
+  it("keeps a shorted capacitor finite when its admittance exceeds the numeric range", () => {
+    const document: CircuitDocument = {
+      title: "アドミタンスが表現範囲を超える短絡コンデンサー",
+      parts: [part("capacitor", "capacitor", { capacitanceFarads: 1e10 })],
+      wires: [wire("short", "capacitor", "a", "capacitor", "b")],
+    };
+
+    const result = analyzeAnalogCircuit(document, { mode: "ac", frequencyHz: 1e308 });
+
+    expect(result.status, result.message).toBe("valid");
+    expect(result.parts.capacitor.voltage).toEqual({ real: 0, imaginary: 0 });
+    expect(result.parts.capacitor.current).toEqual({ real: 0, imaginary: 0 });
   });
 
   it("matches the finite-gain closed-loop op-amp output under load", () => {
@@ -213,7 +527,7 @@ describe("analog solver physical model regressions", () => {
     expect(result.message).toContain("有限でない");
   });
 
-  it("uses relative frequency matching below one nanohertz", () => {
+  it("matches sub-nanohertz frequencies only within floating-point rounding", () => {
     const document: CircuitDocument = {
       title: "極低周波の電源",
       parts: [
@@ -226,13 +540,16 @@ describe("analog solver physical model regressions", () => {
       ],
     };
 
-    const mismatched = analyzeAnalogCircuit(document, { mode: "ac", frequencyHz: 2e-10 });
-    const matched = analyzeAnalogCircuit(document, { mode: "ac", frequencyHz: 1.000_000_000_5e-10 });
+    const rounded = analyzeAnalogCircuit(document, {
+      mode: "ac",
+      frequencyHz: 1e-10 + 2 * Number.EPSILON * 1e-10,
+    });
+    const distinct = analyzeAnalogCircuit(document, { mode: "ac", frequencyHz: 1.000_000_000_5e-10 });
 
-    expect(mismatched.status).toBe("valid");
-    expect(mismatched.parts.load.voltage.real).toBeCloseTo(0, 12);
-    expect(mismatched.issues.some((issue) => issue.message.includes("異なる"))).toBe(true);
-    expect(matched.status).toBe("valid");
-    expect(matched.parts.load.voltage.real).toBeCloseTo(3, 8);
+    expect(rounded.status).toBe("valid");
+    expect(rounded.parts.load.voltage.real).toBeCloseTo(3, 8);
+    expect(distinct.status).toBe("valid");
+    expect(distinct.parts.load.voltage.real).toBeCloseTo(0, 12);
+    expect(distinct.issues.some((issue) => issue.message.includes("異なる"))).toBe(true);
   });
 });

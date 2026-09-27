@@ -14,9 +14,10 @@ export function useCircuitPotentialView(document: CircuitDocument, analysis?: Ci
   const reference = nodes.find((node) => node.id === referenceId) ?? defaultReference;
   const selected = nodes.find((node) => node.id === selectedId) ?? nodes.find((node) => node.currents.length > 2 && node.id !== defaultReference?.id) ?? nodes.find((node) => node.id !== defaultReference?.id) ?? defaultReference;
   const ac = analysis?.mode === "ac";
-  const potential = circuitPotential(selected, reference, ac);
+  const potentialContext = useMemo(() => analysis ? { document, analysis, nodes } : undefined, [document, analysis, nodes]);
+  const potential = circuitPotential(selected, reference, ac, potentialContext);
   const byEndpoint = new Map(nodes.flatMap((node) => node.endpoints.map((endpoint) => [circuitEndpointKey(endpoint), node] as const)));
-  return { enabled, setEnabled, scale, setScale, nodes, reference, selected, setReferenceId, setSelectedId, ac, potential, byEndpoint };
+  return { enabled, setEnabled, scale, setScale, nodes, reference, selected, setReferenceId, setSelectedId, ac, potential, potentialContext, byEndpoint };
 }
 
 type PotentialView = ReturnType<typeof useCircuitPotentialView>;
@@ -27,8 +28,8 @@ function CurrentRow({ entry, ac, scale }: { entry: CircuitNodeCurrent; ac: boole
   const direction = ac || entry.amps === 0 ? "" : entry.amps < 0 ? "← " : "→ ";
   return <li>
     <span>{entry.label}</span>
-    <svg viewBox="0 0 64 20" aria-hidden="true"><path d={path} fill="none" stroke="currentColor" strokeWidth={Math.abs(entry.amps) < 1e-14 ? 0 : 1 + 4 * Math.abs(entry.amps) / scale} /></svg>
-    <strong>{direction}{formatCircuitQuantity(Math.abs(entry.amps), "A")}{ac ? ` ∠${Number((entry.phaseDegrees ?? 0).toFixed(1))}°` : ""}</strong>
+    <svg viewBox="0 0 64 20" aria-hidden="true"><path d={path} fill="none" stroke="currentColor" strokeWidth={entry.amps === 0 ? 0 : 1 + 4 * Math.abs(entry.amps) / scale} /></svg>
+    <strong>{direction}{formatCircuitQuantity(Math.abs(entry.amps), "A")}{ac && entry.amps !== 0 ? ` ∠${Number((entry.phaseDegrees ?? 0).toFixed(1))}°` : ""}</strong>
   </li>;
 }
 
@@ -47,7 +48,7 @@ function PotentialDetails({ view }: { view: PotentialView }) {
       <label htmlFor={`${id}-scale`}>色の上限 (V)</label>
       <input id={`${id}-scale`} type="number" min="0.000001" step="any" value={view.scale} onChange={(event) => { if (event.target.valueAsNumber > 0 && Number.isFinite(event.target.valueAsNumber)) { view.setScale(event.target.valueAsNumber); } }} />
     </div>
-    <output className="circuit-potential__difference" aria-live="polite">測定点 − 基準点：{potential ? `${formatCircuitQuantity(potential.volts, "V")}${ac ? ` ∠${Number(potential.phaseDegrees.toFixed(1))}°` : ""}` : "基準を共有しないため測定できません"}</output>
+    <output className="circuit-potential__difference" aria-live="polite">測定点 − 基準点：{potential ? `${formatCircuitQuantity(potential.volts, "V")}${ac && potential.volts !== 0 ? ` ∠${Number(potential.phaseDegrees.toFixed(1))}°` : ""}` : "基準を共有しないため測定できません"}</output>
     <section className="circuit-potential__legend" aria-label="電位の色の凡例">
       {(ac ? [0, view.scale / 2, view.scale] : [-view.scale, 0, view.scale]).map((value) => <span key={value}><i style={{ backgroundColor: circuitPotentialColor(value, view.scale) }} />{formatCircuitQuantity(value, "V")}</span>)}
     </section>
@@ -75,13 +76,13 @@ export function CircuitPotentialOverlay({ document, routes, view, visible = true
   return <g className="circuit-potential-overlay" pointerEvents="none">
     {document.wires.map((wire) => {
       const node = view.byEndpoint.get(circuitEndpointKey(wire.from));
-      const value = circuitPotential(node, view.reference, view.ac);
+      const value = circuitPotential(node, view.reference, view.ac, view.potentialContext);
       const route = routes.get(wire.id);
       return value && route ? <path key={wire.id} data-potential-wire={wire.id} data-voltage={value.volts} d={pathData(route)} fill="none" stroke={circuitPotentialColor(value.volts, view.scale)} strokeWidth="5" opacity="0.8" /> : null;
     })}
     {view.nodes.flatMap((node) => node.endpoints.map((endpoint) => {
       const part = document.parts.find((item) => item.id === endpoint.partId);
-      const value = circuitPotential(node, view.reference, view.ac);
+      const value = circuitPotential(node, view.reference, view.ac, view.potentialContext);
       if (!part || !value) { return null; }
       const point = terminalPoint(part, endpoint.terminal);
       const selected = node.id === view.selected?.id;

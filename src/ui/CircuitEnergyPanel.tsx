@@ -78,7 +78,12 @@ function powerForPart(
 ): number | null {
   if (!reading || part.kind === "ground" || part.kind === "junction" || !finite(reading.powerWatts)) { return null; }
   const watts = transient && sourceKinds.has(part.kind) ? -reading.powerWatts : reading.powerWatts;
-  return Math.abs(watts) > 1e-15 ? watts : 0;
+  return watts;
+}
+
+function isPowerSource(part: CircuitPart, ac: boolean, transient: boolean): boolean {
+  if (transient) { return sourceKinds.has(part.kind); }
+  return ac ? part.kind === "ac-source" : sourceKinds.has(part.kind);
 }
 
 function powerEntries(
@@ -250,15 +255,15 @@ export function CircuitEnergyPanel({ document, analysis, frame }: CircuitEnergyP
     </section>;
   }
 
+  const ac = analysis.mode === "ac" && !usingTransient;
   const powers = powerEntries(document, analysis, sample, usingTransient);
-  const sources = powers.filter(({ part }) => sourceKinds.has(part.kind));
-  const components = powers.filter(({ part }) => !sourceKinds.has(part.kind));
+  const sources = powers.filter(({ part }) => isPowerSource(part, ac, usingTransient));
+  const components = powers.filter(({ part }) => !isPowerSource(part, ac, usingTransient));
   const maximumPower = powerGroupMaximum(powers);
   const energies = energyEntries(document, analysis, sample, usingTransient);
   const dissipation = usingTransient
     ? resistiveParts.map((part) => ({ part, joules: dissipatedByPart.get(part.id)?.[sampleIndex] ?? null }))
     : [];
-  const ac = analysis.mode === "ac" && !usingTransient;
   return <section className="circuit-panel circuit-energy" aria-label="電力とエネルギー" data-state={usingTransient ? "transient" : analysis.mode ?? "steady"}>
     <div className="circuit-panel__heading"><h2>電力とエネルギー</h2></div>
     {usingTransient && sample && <p className="circuit-energy__time" data-time-seconds={sample.timeSeconds}>

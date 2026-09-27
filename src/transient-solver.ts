@@ -415,16 +415,108 @@ function uniqueId(base: string, used: Set<string>) {
   return candidate;
 }
 
+function binaryFactor(value: number) {
+  const bits = new DataView(new ArrayBuffer(8));
+  bits.setFloat64(0, Math.abs(value));
+  const high = bits.getUint32(0);
+  const fraction = BigInt(high % 2 ** 20) * 2n ** 32n + BigInt(bits.getUint32(4));
+  const exponentBits = Math.floor(high / 2 ** 20) % 2 ** 11;
+  return exponentBits === 0
+    ? { mantissa: fraction, exponent: -1074 }
+    : { mantissa: fraction + 2n ** 52n, exponent: exponentBits - 1075 };
+}
+
+function exactCycleFraction(frequencyHz: number, timeSeconds: number) {
+  // Multiplying large cycle counts as doubles can erase a whole half-cycle.
+  // Reduce the exact product of the two supplied binary64 values modulo one.
+  const frequency = binaryFactor(frequencyHz);
+  const time = binaryFactor(timeSeconds);
+  const exponent = frequency.exponent + time.exponent;
+  if (exponent >= 0) { return 0; }
+  const denominator = 2n ** BigInt(-exponent);
+  let remainder = (frequency.mantissa * time.mantissa) % denominator;
+  // Keep fractions near a full turn as small negative offsets, so converting
+  // to Number does not round them to an exact zero crossing.
+  if (remainder * 2n > denominator) { remainder -= denominator; }
+  return Math.sign(timeSeconds) * Number(remainder) / Number(denominator);
+}
+
+function quadrantalTimeVoltage(rms: number, phaseDegrees: number, turns: number) {
+  // Reduce time and source phase separately before converting to radians.
+  // This preserves exact zero crossings at quadrantal phases and the small
+  // voltage component beside a large, nearly axis-aligned AC source.
+  const timeQuarters = (turns % 1) * 4;
+  const timeQuadrant = Math.round(timeQuarters);
+  const timeOffsetQuarters = timeQuarters - timeQuadrant;
+  const phaseQuadrant = Math.round(phaseDegrees / 90);
+  const phaseOffsetDegrees = phaseDegrees - phaseQuadrant * 90;
+  // The two offsets can add to another exact quadrantal angle (for example
+  // 45° of elapsed time plus a 45° source phase). Keep the rounding residue
+  // from converting turns to degrees before reducing their sum once more.
+  const split = (2 ** 27 + 1) * timeOffsetQuarters;
+  const timeHigh = split - (split - timeOffsetQuarters);
+  const timeLow = timeOffsetQuarters - timeHigh;
+  const timeOffsetDegrees = timeOffsetQuarters * 90;
+  const timeDegreeError = (timeHigh * 90 - timeOffsetDegrees) + timeLow * 90;
+  const combinedOffsetDegrees = timeOffsetDegrees + phaseOffsetDegrees;
+  const phaseContribution = combinedOffsetDegrees - timeOffsetDegrees;
+  const additionError = (timeOffsetDegrees - (combinedOffsetDegrees - phaseContribution)) +
+    (phaseOffsetDegrees - phaseContribution);
+  const extraQuadrant = Math.round(combinedOffsetDegrees / 90);
+  const offsetDegrees = (combinedOffsetDegrees - extraQuadrant * 90) + timeDegreeError + additionError;
+  const quadrant = ((timeQuadrant + phaseQuadrant + extraQuadrant) % 4 + 4) % 4;
+  const nearAxis = Math.abs(offsetDegrees) < 1e-7;
+  const offsetRadians = offsetDegrees * (Math.PI / 180);
+  const alongAxis = nearAxis ? rms : rms * Math.cos(offsetRadians);
+  const acrossAxis = nearAxis
+    ? (rms * (Math.PI / 180)) * offsetDegrees
+    : rms * Math.sin(offsetRadians);
+  return quadrant === 0 ? alongAxis : quadrant === 1 ? -acrossAxis
+    : quadrant === 2 ? -alongAxis : acrossAxis;
+}
+
+function subnormalTurnVoltage(rms: number, phaseDegrees: number, frequency: number, timeSeconds: number) {
+  const quadrant = Math.round(phaseDegrees / 90);
+  const offsetDegrees = phaseDegrees - quadrant * 90;
+  if (Math.abs(offsetDegrees) >= 1e-7) {
+    return quadrantalTimeVoltage(rms, phaseDegrees, 0);
+  }
+  // frequency × time can round to zero or lose most of its significant bits
+  // before multiplying by the voltage, although the contribution to a
+  // near-quadrantal zero crossing remains representable.
+  const phaseAcross = (rms * (Math.PI / 180)) * offsetDegrees;
+  const timeAcross = ((rms * frequency) * timeSeconds) * TWO_PI;
+  const acrossAxis = phaseAcross + timeAcross;
+  switch (((quadrant % 4) + 4) % 4) {
+    case 0: return rms;
+    case 1: return -acrossAxis;
+    case 2: return -rms;
+    default: return acrossAxis;
+  }
+}
+
 function timeVoltage(part: CircuitPart, timeSeconds: number): number | null {
   const rms = part.voltageVolts ?? DEFAULT_AC_RMS;
   const frequency = part.frequencyHz ?? DEFAULT_AC_FREQUENCY;
-  const phase = (part.phaseDegrees ?? DEFAULT_AC_PHASE) * Math.PI / 180;
+  const phaseDegrees = (part.phaseDegrees ?? DEFAULT_AC_PHASE) % 360;
   const offset = part.offsetVolts ?? DEFAULT_AC_OFFSET;
   if (!Number.isFinite(rms) || rms < 0 || !Number.isFinite(frequency) || frequency <= 0 ||
-      !Number.isFinite(phase) || !Number.isFinite(offset)) { return null; }
-  const angle = TWO_PI * frequency * timeSeconds + phase;
-  if (!Number.isFinite(angle)) { return null; }
-  const voltage = offset + Math.SQRT2 * rms * Math.cos(angle);
+      !Number.isFinite(phaseDegrees) || !Number.isFinite(offset) || !Number.isFinite(timeSeconds)) { return null; }
+  const turns = frequency * timeSeconds;
+  let acVoltage: number;
+  if (Math.abs(turns) < 2 ** -1022 && timeSeconds !== 0) {
+    acVoltage = subnormalTurnVoltage(rms, phaseDegrees, frequency, timeSeconds);
+  } else if (Math.abs(turns) < 2 ** 20) {
+    acVoltage = quadrantalTimeVoltage(rms, phaseDegrees, turns);
+  } else {
+    acVoltage = quadrantalTimeVoltage(rms, phaseDegrees, exactCycleFraction(frequency, timeSeconds));
+  }
+  let voltage = offset + Math.SQRT2 * acVoltage;
+  if (!Number.isFinite(voltage) && Number.isFinite(acVoltage)) {
+    // The peak alone can overflow even when the DC offset cancels enough of it
+    // to leave a representable instantaneous voltage.
+    voltage = Math.SQRT2 * (acVoltage + offset / Math.SQRT2);
+  }
   return Number.isFinite(voltage) ? voltage : null;
 }
 

@@ -4,6 +4,7 @@ import type { ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { circuitPartCatalog, type CircuitDocument } from "../circuit-model.js";
 import { createCircuitExample } from "../circuit-examples.js";
 import { analyzeCircuit } from "../circuit-solver.js";
 import { simulateTransient } from "../transient-solver.js";
@@ -40,6 +41,55 @@ function required<T extends Element>(container: ParentNode, selector: string): T
 }
 
 describe("CircuitEnergyPanel", () => {
+  it("shows small nonzero AC power instead of reporting every part as zero", () => {
+    const example = createCircuitExample("ac");
+    const document = {
+      ...example,
+      parts: example.parts.map((part) => part.kind === "ac-source" ? { ...part, voltageVolts: 1e-7 } : part),
+    };
+    const analysis = analyzeCircuit(document);
+    const markup = renderToStaticMarkup(<CircuitEnergyPanel document={document} analysis={analysis} />);
+
+    expect(analysis.status).toBe("closed");
+    expect(analysis.parts.resistor.powerWatts).toBeGreaterThan(0);
+    expect(analysis.parts.resistor.powerWatts).toBeLessThan(1e-15);
+    expect(markup).toContain('data-part-id="resistor" data-watts="');
+    expect(markup).not.toContain("表示対象の電力はすべて 0 W です。");
+  });
+
+  it("shows an AC battery's internal resistance with passive absorbed-power signs", () => {
+    const document: CircuitDocument = {
+      title: "交流源と電池内部抵抗",
+      parts: [
+        { id: "source", kind: "ac-source", x: 0, y: 0, ...circuitPartCatalog["ac-source"].defaults, voltageVolts: 10, frequencyHz: 50 },
+        { id: "load", kind: "resistor", x: 0, y: 0, ...circuitPartCatalog.resistor.defaults, resistanceOhms: 10 },
+        { id: "battery", kind: "battery", x: 0, y: 0, ...circuitPartCatalog.battery.defaults, internalResistanceOhms: 10 },
+      ],
+      wires: [
+        { id: "w1", from: { partId: "source", terminal: "a" }, to: { partId: "load", terminal: "a" } },
+        { id: "w2", from: { partId: "load", terminal: "b" }, to: { partId: "battery", terminal: "a" } },
+        { id: "w3", from: { partId: "battery", terminal: "b" }, to: { partId: "source", terminal: "b" } },
+      ],
+    };
+    const analysis = analyzeCircuit(document, {}, { mode: "ac", frequencyHz: 50 });
+    expect(analysis.status).toBe("closed");
+    expect(analysis.parts.source.powerWatts).toBeCloseTo(5, 10);
+    expect(analysis.parts.load.powerWatts).toBeCloseTo(2.5, 10);
+    expect(analysis.parts.battery.powerWatts).toBeCloseTo(2.5, 10);
+    const ui = mount(<CircuitEnergyPanel document={document} analysis={analysis} />);
+    const sourceGroup = required<HTMLElement>(ui.container, '[data-power-group="source"]');
+    const componentGroup = required<HTMLElement>(ui.container, '[data-power-group="component"]');
+    const batteryRow = required<HTMLElement>(componentGroup, '[data-part-id="battery"]');
+
+    expect(sourceGroup.querySelector('[data-part-id="source"]')).not.toBeNull();
+    expect(sourceGroup.querySelector('[data-part-id="battery"]')).toBeNull();
+    expect(componentGroup.querySelector('[data-part-id="load"]')).not.toBeNull();
+    expect(batteryRow.getAttribute("data-watts")).toBe("2.5");
+    expect(batteryRow.getAttribute("data-sign")).toBe("positive");
+    expect(componentGroup.textContent).toContain("吸収＋ / 放出−");
+    expect(sourceGroup.textContent).toContain("供給＋ / 吸収−");
+  });
+
   it("shows a valid transient frame when the steady analysis is invalid", () => {
     const document = createCircuitExample("charging");
     const transient = simulateTransient(document, { durationSeconds: 0.001, timeStepSeconds: 0.0001 });
@@ -187,6 +237,65 @@ describe("CircuitAcPanel", () => {
     expect(Number(dots[0]?.getAttribute("data-frequency-hz"))).toBeCloseTo(frequencyHz / 10, 8);
     expect(Number(dots.at(-1)?.getAttribute("data-frequency-hz"))).toBeCloseTo(frequencyHz * 10, 6);
     expect(document.parts.find((part) => part.kind === "ac-source")?.frequencyHz).toBe(frequencyHz);
+  });
+
+  it("keeps the sweep center consistent with the displayed analysis when source frequencies differ", () => {
+    const document: CircuitDocument = {
+      title: "異なる周波数の交流電源",
+      parts: [
+        { id: "load", kind: "resistor", x: 0, y: 0, ...circuitPartCatalog.resistor.defaults, resistanceOhms: 10 },
+        { id: "source-50", kind: "ac-source", x: 0, y: 0, ...circuitPartCatalog["ac-source"].defaults, voltageVolts: 3, frequencyHz: 50, phaseDegrees: 0 },
+        { id: "source-100", kind: "ac-source", x: 0, y: 0, ...circuitPartCatalog["ac-source"].defaults, voltageVolts: 4, frequencyHz: 100, phaseDegrees: 90 },
+      ],
+      wires: [
+        { id: "w1", from: { partId: "source-50", terminal: "a" }, to: { partId: "load", terminal: "a" } },
+        { id: "w2", from: { partId: "source-50", terminal: "b" }, to: { partId: "source-100", terminal: "a" } },
+        { id: "w3", from: { partId: "load", terminal: "b" }, to: { partId: "source-100", terminal: "b" } },
+      ],
+    };
+    const frequencyHz = 50;
+    const analysis = analyzeCircuit(document, {}, { mode: "ac", frequencyHz });
+    const ui = mount(<CircuitAcPanel document={document} analysis={analysis} options={{ mode: "ac", frequencyHz }} />);
+    const displayedVoltage = Number(required<HTMLElement>(ui.container, ".circuit-ac__waveform").getAttribute("data-voltage-rms"));
+
+    act(() => required<HTMLButtonElement>(ui.container, "button").click());
+
+    const dots = Array.from(ui.container.querySelectorAll<SVGCircleElement>(".circuit-ac__response-dot"));
+    expect(analysis.status).toBe("closed");
+    expect(displayedVoltage).toBeCloseTo(3, 10);
+    expect(dots).toHaveLength(41);
+    expect(Number(dots[20]?.getAttribute("data-frequency-hz"))).toBeCloseTo(frequencyHz, 10);
+    for (const dot of dots) {
+      expect(Number(dot.getAttribute("data-voltage-rms"))).toBeCloseTo(displayedVoltage, 10);
+    }
+    expect(ui.container.textContent).toContain("異なる周波数の電源は解析対象外にします。");
+  });
+
+  it("sweeps an AC source whose frequency uses the catalog default", () => {
+    const frequencyHz = circuitPartCatalog["ac-source"].defaults.frequencyHz ?? 1000;
+    const document: CircuitDocument = {
+      title: "既定周波数の交流電源",
+      parts: [
+        { id: "source", kind: "ac-source", x: 0, y: 0, label: "交流電源", voltageVolts: 5 },
+        { id: "load", kind: "resistor", x: 0, y: 0, ...circuitPartCatalog.resistor.defaults, resistanceOhms: 10 },
+      ],
+      wires: [
+        { id: "w1", from: { partId: "source", terminal: "a" }, to: { partId: "load", terminal: "a" } },
+        { id: "w2", from: { partId: "load", terminal: "b" }, to: { partId: "source", terminal: "b" } },
+      ],
+    };
+    const analysis = analyzeCircuit(document);
+    const ui = mount(<CircuitAcPanel document={document} analysis={analysis} options={{ mode: "auto" }} />);
+    const displayedVoltage = Number(required<HTMLElement>(ui.container, ".circuit-ac__waveform").getAttribute("data-voltage-rms"));
+
+    act(() => required<HTMLButtonElement>(ui.container, "button").click());
+
+    const dots = Array.from(ui.container.querySelectorAll<SVGCircleElement>(".circuit-ac__response-dot"));
+    expect(analysis.status).toBe("closed");
+    expect(analysis.frequencyHz).toBe(frequencyHz);
+    expect(displayedVoltage).toBeCloseTo(5, 10);
+    expect(Number(dots[20]?.getAttribute("data-frequency-hz"))).toBeCloseTo(frequencyHz, 10);
+    expect(Number(dots[20]?.getAttribute("data-voltage-rms"))).toBeCloseTo(displayedVoltage, 10);
   });
 
   it("tracks the current AC analysis frequency and renders an empty state when AC is disabled", () => {

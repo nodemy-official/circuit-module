@@ -90,7 +90,7 @@ describe("analysis controls and waveform integration", () => {
     expect(ui.container.textContent).not.toContain("交流 1000 Hz");
   });
 
-  it("applies the selected analysis frequency and preserves it when changing modes", () => {
+  it("explains why an off-frequency source reads zero and preserves the selected analysis frequency", () => {
     const ui = mount("ac");
     const original = ui.editor.document;
     const label = Array.from(ui.container.querySelectorAll("label"))
@@ -102,6 +102,9 @@ describe("analysis controls and waveform integration", () => {
     changeNumber(input, "2000");
     expect(ui.editor.analysis.frequencyHz).toBe(2000);
     expect(ui.editor.analysis.issues.some((issue) => issue.message.includes("解析周波数と異なる"))).toBe(true);
+    expect(ui.editor.analysis.parts.load?.voltageVolts).toBe(0);
+    expect(ui.container.querySelector(".circuit-ac__waveform")?.getAttribute("data-voltage-rms")).toBe("0");
+    expect(ui.container.textContent).toContain("解析周波数と異なる交流電源は、この結果では0 Vとして扱います。");
     expect(ui.editor.document).toBe(original);
     expect(input.value).toBe("2000");
 

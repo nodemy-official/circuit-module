@@ -63,7 +63,7 @@ export function CircuitSimulationPanel({
           const value = Number(nextValue);
           if (Number.isFinite(value) && value > 0) { onChange({ ...options, mode: "ac", frequencyHz: value }); }
         }} />
-        <p>計測値は実効値と位相です。異なる周波数の電源は個別に解析します。半導体は直流動作点まわりの小信号として計算します。</p>
+        <p>計測値は実効値と位相です。解析周波数と異なる交流電源は、この結果では0 Vとして扱います。別の周波数を確認するには解析周波数を変更してください。半導体は直流動作点まわりの小信号として計算します。</p>
       </>}
       {analysis.mode !== "ac" && <p>コンデンサは開放、コイルは短絡として定常状態を計算します。</p>}
     </>}

@@ -214,6 +214,34 @@ describe("AC series RLC analytic response", () => {
   const capacitance = 2e-6;
   const resonance = 1 / (2 * Math.PI * Math.sqrt(inductance * capacitance));
 
+  it("keeps a very small series current consistent across reactive branches", () => {
+    const frequencyHz = 6.666_255_255_133_77e-7;
+    const resistanceOhms = 1;
+    const inductanceHenries = 267_856.600_114_970_1;
+    const capacitanceFarads = 6.732_898_839_007_561e-18;
+    const reactance = 2 * Math.PI * frequencyHz * inductanceHenries -
+      1 / (2 * Math.PI * frequencyHz * capacitanceFarads);
+    const expectedCurrent = 5 / Math.hypot(resistanceOhms, reactance);
+    const document = network([
+      part("source", "ac-source", { voltageVolts: 5, phaseDegrees: 23, frequencyHz }),
+      part("r", "resistor", { resistanceOhms }),
+      part("l", "inductor", { inductanceHenries }),
+      part("c", "capacitor", { capacitanceFarads }),
+    ], [["source:a", "r:a"], ["r:b", "l:a"], ["l:b", "c:a"], ["c:b", "source:b"]]);
+
+    const result = analyzeAnalogCircuit(document, { mode: "ac" });
+
+    expect(result.status, result.message).toBe("valid");
+    for (const id of ["r", "l", "c"]) {
+      const current = result.parts[id].current;
+      expect(Math.hypot(current.real, current.imaginary) / expectedCurrent).toBeCloseTo(1, 10);
+      expect(phasorError(current, result.parts.r.current.real, result.parts.r.current.imaginary, expectedCurrent)).toBeLessThan(1e-10);
+    }
+    expect(currentImbalance(result, ["source:a", "r:a"])).toBeLessThan(1e-10);
+    expect(currentImbalance(result, ["r:b", "l:a"])).toBeLessThan(1e-10);
+    expect(currentImbalance(result, ["l:b", "c:a"])).toBeLessThan(1e-10);
+  });
+
   it.each(["capacitor", "inductor"] as const)(
     "preserves the small %s voltage drop and series current at a large impedance ratio",
     (kind) => {
@@ -297,6 +325,58 @@ describe("AC series RLC analytic response", () => {
     expect(phasorError(result.parts.l1.current, 2 * result.parts.l2.current.real, 2 * result.parts.l2.current.imaginary)).toBeLessThan(1e-9);
     expect(currentImbalance(result, ["r:b", "l1:a", "l2:a"])).toBeLessThan(1e-9);
     expect(powerImbalance(result)).toBeLessThan(1e-9);
+  });
+
+  it("matches impedance voltage division and KCL for a series resistor feeding parallel L and C", () => {
+    const frequencyHz = 1000;
+    const resistanceOhms = 100;
+    const inductanceHenries = 0.01;
+    const capacitanceFarads = 1e-6;
+    const sourceVoltage = 5;
+    const omega = 2 * Math.PI * frequencyHz;
+    const inductorReactance = omega * inductanceHenries;
+    const capacitorReactance = -1 / (omega * capacitanceFarads);
+    const parallelReactance = inductorReactance * capacitorReactance /
+      (inductorReactance + capacitorReactance);
+    const totalImpedanceSquared = resistanceOhms ** 2 + parallelReactance ** 2;
+    const expectedCurrent = {
+      real: sourceVoltage * resistanceOhms / totalImpedanceSquared,
+      imaginary: -sourceVoltage * parallelReactance / totalImpedanceSquared,
+    };
+    const expectedParallelVoltage = {
+      real: sourceVoltage * parallelReactance ** 2 / totalImpedanceSquared,
+      imaginary: sourceVoltage * resistanceOhms * parallelReactance / totalImpedanceSquared,
+    };
+    const document = network([
+      part("source", "ac-source", { voltageVolts: sourceVoltage, frequencyHz }),
+      part("r", "resistor", { resistanceOhms }),
+      part("l", "inductor", { inductanceHenries }),
+      part("c", "capacitor", { capacitanceFarads }),
+      part("ground", "ground"),
+    ], [
+      ["source:a", "r:a"], ["r:b", "l:a"], ["l:a", "c:a"],
+      ["l:b", "source:b"], ["c:b", "source:b"], ["ground:a", "source:b"],
+    ]);
+    const result = analyzeAnalogCircuit(document, { mode: "ac", frequencyHz });
+
+    expect(result.status, result.message).toBe("valid");
+    expect(phasorError(result.parts.r.current, expectedCurrent.real, expectedCurrent.imaginary, sourceVoltage / resistanceOhms))
+      .toBeLessThan(1e-10);
+    expect(phasorError(result.parts.r.voltage,
+      resistanceOhms * expectedCurrent.real, resistanceOhms * expectedCurrent.imaginary, sourceVoltage)).toBeLessThan(1e-10);
+    for (const id of ["l", "c"]) {
+      expect(phasorError(result.parts[id].voltage,
+        expectedParallelVoltage.real, expectedParallelVoltage.imaginary, sourceVoltage)).toBeLessThan(1e-10);
+    }
+    expect(phasorError({
+      real: result.parts.l.current.real + result.parts.c.current.real,
+      imaginary: result.parts.l.current.imaginary + result.parts.c.current.imaginary,
+    }, expectedCurrent.real, expectedCurrent.imaginary, sourceVoltage / resistanceOhms)).toBeLessThan(1e-10);
+    expect(currentImbalance(result, ["r:b", "l:a", "c:a"])).toBeLessThan(1e-10);
+    expect(phasorError({
+      real: result.parts.r.voltage.real + result.parts.c.voltage.real,
+      imaginary: result.parts.r.voltage.imaginary + result.parts.c.voltage.imaginary,
+    }, sourceVoltage, 0, sourceVoltage)).toBeLessThan(1e-10);
   });
 
   it("adds quadrature sources as phasors and balances their supplied complex power", () => {

@@ -27,7 +27,7 @@ function adjustableValues(part: CircuitPart): AdjustableValue[] {
 }
 
 function comparableValue(part: CircuitPart, key: AdjustableValue): number | boolean | undefined {
-  if (key === "initiallyClosed") { return part.initiallyClosed ?? false; }
+  if (key === "initiallyClosed") { return part.initiallyClosed ?? circuitPartCatalog.switch.defaults.initiallyClosed ?? false; }
   return part[key] ?? circuitPartCatalog[part.kind].defaults[key] as number | undefined;
 }
 
@@ -211,10 +211,10 @@ export function CircuitPreviewPanel({
                     <Switch
                       id={`${id}-${part.id}-switch`}
                       aria-label={`${part.label}のON / OFF`}
-                      checked={part.initiallyClosed ?? false}
+                      checked={part.initiallyClosed ?? circuitPartCatalog.switch.defaults.initiallyClosed ?? false}
                       onCheckedChange={(checked) => onChange(part.id, { initiallyClosed: checked })}
                     />
-                    <strong>{part.initiallyClosed ? "ON" : "OFF"}</strong>
+                    <strong>{(part.initiallyClosed ?? circuitPartCatalog.switch.defaults.initiallyClosed ?? false) ? "ON" : "OFF"}</strong>
                   </label>
                 )}
                 {circuitPartNumericFields(part.kind).map(({ key, label, unit, min, max, step }) =>
@@ -249,8 +249,8 @@ export function CircuitPreviewPanel({
                 <div data-measurement="current"><dt>{labels.current}</dt><dd>{format(reading?.currentAmps, "A")}</dd></div>
                 <div data-measurement="power"><dt>電力</dt><dd>{format(reading?.powerWatts, "W")}</dd></div>
                 {analysis.mode === "ac" && <>
-                  <div data-measurement="voltage-phase"><dt>電圧位相</dt><dd>{format(reading?.voltagePhaseDegrees, "°")}</dd></div>
-                  <div data-measurement="current-phase"><dt>電流位相</dt><dd>{format(reading?.currentPhaseDegrees, "°")}</dd></div>
+                  {reading && Math.abs(reading.voltageVolts) > 0 && <div data-measurement="voltage-phase"><dt>電圧位相</dt><dd>{format(reading.voltagePhaseDegrees, "°")}</dd></div>}
+                  {reading && Math.abs(reading.currentAmps) > 0 && <div data-measurement="current-phase"><dt>電流位相</dt><dd>{format(reading.currentPhaseDegrees, "°")}</dd></div>}
                   <div data-measurement="reactive-power"><dt>無効電力</dt><dd>{format(reading?.reactivePowerVars, "var")}</dd></div>
                 </>}
               </dl>}

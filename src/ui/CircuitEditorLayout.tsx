@@ -667,7 +667,7 @@ export function CircuitEditorLayout({
     setPreviewDocument((current) => current && {
       ...current,
       parts: current.parts.map((item) => item.id === partId && item.kind === "switch"
-        ? { ...item, initiallyClosed: !(item.initiallyClosed ?? false) } : item),
+        ? { ...item, initiallyClosed: !(item.initiallyClosed ?? circuitPartCatalog.switch.defaults.initiallyClosed ?? false) } : item),
     });
   }
 

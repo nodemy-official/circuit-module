@@ -8,6 +8,36 @@ const part = (id: string, kind: CircuitPartKind, values: Partial<CircuitPart> = 
 });
 
 describe("meterStatuses", () => {
+  it("uses the catalog default for a switch without an explicit initial state", () => {
+    const document: CircuitDocument = {
+      title: "既定状態のスイッチ",
+      parts: [{ id: "switch", kind: "switch", x: 0, y: 0 }, part("meter", "voltmeter")],
+      wires: [
+        { id: "w1", from: { partId: "switch", terminal: "a" }, to: { partId: "meter", terminal: "a" } },
+        { id: "w2", from: { partId: "switch", terminal: "b" }, to: { partId: "meter", terminal: "b" } },
+      ],
+    };
+
+    expect(meterStatuses(document, { mode: "ac" }).meter).toBe("connected");
+  });
+
+  it.each(["capacitor", "inductor"] as const)(
+    "uses the catalog default when %s has no explicit reactive value",
+    (kind) => {
+      const reactive = { id: "reactive", kind, x: 0, y: 0 } as CircuitPart;
+      const document: CircuitDocument = {
+        title: "既定値の交流リアクタンス",
+        parts: [reactive, part("meter", "voltmeter")],
+        wires: [
+          { id: "w1", from: { partId: "reactive", terminal: "a" }, to: { partId: "meter", terminal: "a" } },
+          { id: "w2", from: { partId: "reactive", terminal: "b" }, to: { partId: "meter", terminal: "b" } },
+        ],
+      };
+
+      expect(meterStatuses(document, { mode: "ac", frequencyHz: 1000 }).meter).toBe("connected");
+    },
+  );
+
   it("does not invent meter statuses for inherited names when the circuit has no meters", () => {
     const result = meterStatuses({
       title: "計器なし",

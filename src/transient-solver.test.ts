@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { CircuitDocument, CircuitPart, CircuitPartKind, CircuitWire } from "./circuit-model.js";
+import { analyzeCircuit } from "./circuit-solver.js";
 import {
   MAX_TRANSIENT_STEPS,
   simulateTransient,
@@ -669,6 +670,55 @@ describe("simulateTransient", () => {
     expect(result.samples[0]?.parts.source?.voltageVolts).toBeCloseTo(Math.SQRT2 * 5, 8);
     expect(result.samples[50]?.parts.source?.voltageVolts).toBeCloseTo(0, 8);
     expect(result.samples[100]?.parts.source?.voltageVolts).toBeCloseTo(-Math.SQRT2 * 5, 8);
+  });
+
+  it("uses a finite waveform for an AC source with a very large phase angle", () => {
+    const phaseDegrees = 1e308;
+    const document: CircuitDocument = {
+      title: "Large finite AC phase",
+      parts: [
+        part("source", "ac-source", { voltageVolts: 2, frequencyHz: 50, phaseDegrees }),
+        part("load", "resistor", { resistanceOhms: 100 }),
+      ],
+      wires: [
+        wire("wire-source-load", "source", "a", "load", "a"),
+        wire("wire-load-source", "load", "b", "source", "b"),
+      ],
+    };
+
+    const result = simulateTransient(document, { durationSeconds: 0.01, timeStepSeconds: 0.01 });
+
+    expect(result.status, result.message).toBe("valid");
+    const expected = Math.SQRT2 * 2 * Math.cos((phaseDegrees % 360) * Math.PI / 180);
+    expect(result.samples[0]?.parts.source?.voltageVolts).toBeCloseTo(expected, 8);
+    expect(result.samples[0]?.parts.load?.voltageVolts).toBeCloseTo(expected, 8);
+  });
+
+  it("keeps the AC phase finite when the frequency-time product is representable", () => {
+    const frequencyHz = 1e308;
+    const durationSeconds = 1e-308;
+    const document: CircuitDocument = {
+      title: "Finite high-frequency AC sample",
+      parts: [
+        part("source", "ac-source", { voltageVolts: 2, frequencyHz }),
+        part("load", "resistor", { resistanceOhms: 100 }),
+      ],
+      wires: [
+        wire("wire-source-load", "source", "a", "load", "a"),
+        wire("wire-load-source", "load", "b", "source", "b"),
+      ],
+    };
+    const steady = analyzeCircuit(document, {}, { mode: "ac", frequencyHz });
+    const result = simulateTransient(document, {
+      durationSeconds,
+      timeStepSeconds: durationSeconds,
+    });
+
+    expect(steady.status, steady.message).toBe("closed");
+    expect(steady.parts.load.voltageVolts).toBeCloseTo(2, 8);
+    expect(result.status, result.message).toBe("valid");
+    expect(result.samples.at(-1)?.parts.source?.voltageVolts).toBeCloseTo(Math.SQRT2 * 2, 8);
+    expect(result.samples.at(-1)?.parts.load?.voltageVolts).toBeCloseTo(Math.SQRT2 * 2, 8);
   });
 
   it("applies AC phase and offset at every sample and reports the corresponding load power", () => {

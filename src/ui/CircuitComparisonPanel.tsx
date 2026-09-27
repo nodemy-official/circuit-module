@@ -165,15 +165,31 @@ function baselineLabel(baseline: Snapshot): string {
   return `${baseline.document.title}・直流`;
 }
 
-function powerSignLabel(beforePart: CircuitPart | undefined, afterPart: CircuitPart | undefined): string {
-  const beforeRole = beforePart && sourceKinds.has(beforePart.kind) ? "供給（＋）" : beforePart ? "吸収（＋）" : undefined;
-  const afterRole = afterPart && sourceKinds.has(afterPart.kind) ? "供給（＋）" : afterPart ? "吸収（＋）" : undefined;
+function isPowerSource(part: CircuitPart, mode: "dc" | "ac"): boolean {
+  return mode === "ac" ? part.kind === "ac-source" : sourceKinds.has(part.kind);
+}
+
+function powerSignLabel(
+  beforePart: CircuitPart | undefined,
+  afterPart: CircuitPart | undefined,
+  beforeMode: "dc" | "ac",
+  afterMode: "dc" | "ac",
+): string {
+  const beforeRole = beforePart && isPowerSource(beforePart, beforeMode) ? "供給（＋）" : beforePart ? "吸収（＋）" : undefined;
+  const afterRole = afterPart && isPowerSource(afterPart, afterMode) ? "供給（＋）" : afterPart ? "吸収（＋）" : undefined;
   if (beforeRole && afterRole && beforeRole !== afterRole) {
     return `基準: ${beforeRole} / 現在: ${afterRole}`;
   }
   if (afterRole) { return afterRole; }
   if (beforeRole) { return `基準側: ${beforeRole}`; }
   return "—";
+}
+
+function powerSignNote(mode: "dc" | "ac"): string {
+  if (mode === "ac") {
+    return "符号の意味: 交流電源は供給（＋）、電池の内部抵抗など受動部品は吸収（＋）です。";
+  }
+  return "符号の意味: 電源は供給（＋）、その他の部品は吸収（＋）です。";
 }
 
 function partStatusLabel(status: string): string {
@@ -204,12 +220,16 @@ function ComparisonRow({
   reason,
   canCompare,
   maxAbsDelta,
+  beforeMode,
+  afterMode,
 }: {
   row: ReturnType<typeof comparisonRows>["rows"][number];
   metric: ComparisonMetric;
   reason?: string;
   canCompare: boolean;
   maxAbsDelta: number;
+  beforeMode: "dc" | "ac";
+  afterMode: "dc" | "ac";
 }) {
   const delta = row.deltas[metric];
   const deltaPercent = delta === undefined || maxAbsDelta === 0 ? 0 : Math.abs(delta) / maxAbsDelta * 50;
@@ -236,7 +256,7 @@ function ComparisonRow({
           </span>
         )}
       </td>
-      {metric === "powerWatts" && <td>{powerSignLabel(row.beforePart, row.afterPart)}</td>}
+      {metric === "powerWatts" && <td>{powerSignLabel(row.beforePart, row.afterPart, beforeMode, afterMode)}</td>}
     </tr>
   );
 }
@@ -247,12 +267,16 @@ function ComparisonTable({
   reason,
   canCompare,
   maxAbsDelta,
+  beforeMode,
+  afterMode,
 }: {
   rows: ReturnType<typeof comparisonRows>["rows"];
   metric: ComparisonMetric;
   reason?: string;
   canCompare: boolean;
   maxAbsDelta: number;
+  beforeMode: "dc" | "ac";
+  afterMode: "dc" | "ac";
 }) {
   return (
     <div className="circuit-comparison__table-wrap">
@@ -275,6 +299,8 @@ function ComparisonTable({
               reason={reason}
               canCompare={canCompare}
               maxAbsDelta={maxAbsDelta}
+              beforeMode={beforeMode}
+              afterMode={afterMode}
             />
           ))}
         </tbody>
@@ -298,6 +324,7 @@ export function CircuitComparisonPanel({
   const baseline = baselineOverride === undefined ? externalBaseline : baselineOverride ?? undefined;
   const current = { document, analysis };
   const currentMode = analysisMode(analysis);
+  const baselineMode = analysisMode(baseline?.analysis ?? analysis);
   const instant = isInstantAnalysis(analysis);
   const [selectedMetric, setSelectedMetric] = useState<ComparisonMetric>("voltageVolts");
   const reason = baseline ? incompatibilityReason(baseline, current) : undefined;
@@ -356,7 +383,7 @@ export function CircuitComparisonPanel({
               ))}
             </fieldset>
             {selectedMetric === "powerWatts" && (
-              <p className="circuit-comparison__power-note">符号の意味: 電源は供給（＋）、その他の部品は吸収（＋）です。</p>
+              <p className="circuit-comparison__power-note">{powerSignNote(currentMode)}</p>
             )}
             {rows.length === 0 ? (
               <p className="circuit-comparison__notice">比較できる部品がありません。</p>
@@ -367,6 +394,8 @@ export function CircuitComparisonPanel({
                 reason={reason}
                 canCompare={canCompare}
                 maxAbsDelta={maxAbsDelta}
+                beforeMode={baselineMode}
+                afterMode={currentMode}
               />
             )}
           </>

@@ -85,8 +85,67 @@ describe("solveRealLinearSystem", () => {
     expect(Array.from(solution ?? [])).toEqual([1, 2]);
   });
 
+  it("scales badly scaled rows before pivoting to preserve a small solution component", () => {
+    // The exact binary64 input has x = 1 + 1e-20 and y = 1 - 1e-20.
+    // Unscaled elimination loses x when subtracting two values near 1e20.
+    const solution = solveRealLinearSystem(
+      2,
+      new Float64Array([1, 1e20, 1, 1]),
+      new Float64Array([1e20, 2]),
+    );
+
+    expect(solution).not.toBeNull();
+    expect(solution?.[0]).toBeCloseTo(1, 14);
+    expect(solution?.[1]).toBeCloseTo(1, 14);
+    const x = solution?.[0] ?? Number.NaN;
+    const y = solution?.[1] ?? Number.NaN;
+    const rowResiduals = [x + 1e20 * y - 1e20, x + y - 2];
+    const rowScales = [Math.abs(x) + 1e20 * Math.abs(y) + 1e20, Math.abs(x) + Math.abs(y) + 2];
+    expect(rowResiduals.every((residual, row) =>
+      Math.abs(residual) / (rowScales[row] ?? Number.POSITIVE_INFINITY) < 1e-15
+    )).toBe(true);
+  });
+
+  it("preserves nonzero subnormal coefficients that affect a finite solution", () => {
+    const minimum = Number.MIN_VALUE;
+    const rhs = [
+      1e308 * 1e-308 + minimum * 1e308,
+      1e308 * 1e-308 + (2 * minimum) * 1e308,
+    ];
+    const solution = solveRealLinearSystem(
+      2,
+      new Float64Array([1e308, minimum, 1e308, 2 * minimum]),
+      new Float64Array(rhs),
+    );
+
+    expect(solution).not.toBeNull();
+    expect(solution?.[0]).toBe(1e-308);
+    expect(solution?.[1]).toBe(2 ** 1023);
+    expect(1e308 * (solution?.[0] ?? 0) + minimum * (solution?.[1] ?? 0)).toBe(rhs[0]);
+    expect(1e308 * (solution?.[0] ?? 0) + (2 * minimum) * (solution?.[1] ?? 0)).toBe(rhs[1]);
+  });
+
+  it("solves sparse rows across subnormal, normal, and extreme scales", () => {
+    const minimum = Number.MIN_VALUE;
+    const solution = solveRealLinearSystem(
+      3,
+      new Float64Array([minimum, 0, 0, 0, 1e308, 0, 0, 0, 3]),
+      new Float64Array([2 * minimum, 1, 12]),
+    );
+
+    expect(Array.from(solution ?? [])).toEqual([2, 1e-308, 4]);
+  });
+
   it("rejects a singular system", () => {
     expect(solveRealLinearSystem(2, new Float64Array([1, 2, 2, 4]), new Float64Array([5, 10]))).toBeNull();
+  });
+
+  it("still rejects an exactly singular system after extreme row scaling", () => {
+    expect(solveRealLinearSystem(
+      2,
+      new Float64Array([1e308, 5e307, 5e307, 2.5e307]),
+      new Float64Array([1e308, 5e307]),
+    )).toBeNull();
   });
 
   it.each([Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY])("rejects a nonfinite coefficient %s", (value) => {
@@ -146,6 +205,49 @@ describe("solveComplexLinearSystem", () => {
       new Float64Array([1]),
       new Float64Array([0]),
     )).toBeNull();
+  });
+
+  it("scales complex rows before pivoting to preserve a small solution component", () => {
+    const solution = solveComplexLinearSystem(
+      2,
+      new Float64Array([1, 1e20, 1, 1]),
+      new Float64Array([0, 0, 0, 0]),
+      new Float64Array([1e20, 2]),
+      new Float64Array([0, 0]),
+    );
+
+    expect(solution).not.toBeNull();
+    expect(solution?.[0].real).toBeCloseTo(1, 14);
+    expect(solution?.[1].real).toBeCloseTo(1, 14);
+    expect(solution?.[0].imaginary === 0).toBe(true);
+    expect(solution?.[1].imaginary === 0).toBe(true);
+    const x = solution?.[0].real ?? Number.NaN;
+    const y = solution?.[1].real ?? Number.NaN;
+    expect(Math.abs(x + 1e20 * y - 1e20) / (Math.abs(x) + 1e20 * Math.abs(y) + 1e20)).toBeLessThan(1e-15);
+    expect(Math.abs(x + y - 2) / (Math.abs(x) + Math.abs(y) + 2)).toBeLessThan(1e-15);
+  });
+
+  it("preserves complex subnormal coefficients that affect a finite solution", () => {
+    const minimum = Number.MIN_VALUE;
+    const rhs = [
+      1e308 * 1e-308 + minimum * 1e308,
+      1e308 * 1e-308 + (2 * minimum) * 1e308,
+    ];
+    const solution = solveComplexLinearSystem(
+      2,
+      new Float64Array([0, 0, 0, 0]),
+      new Float64Array([1e308, minimum, 1e308, 2 * minimum]),
+      new Float64Array([0, 0]),
+      new Float64Array(rhs),
+    );
+
+    expect(solution).not.toBeNull();
+    expect(solution?.[0].real).toBe(1e-308);
+    expect(solution?.[1].real).toBe(2 ** 1023);
+    expect(solution?.[0].imaginary === 0).toBe(true);
+    expect(solution?.[1].imaginary === 0).toBe(true);
+    expect(1e308 * (solution?.[0].real ?? 0) + minimum * (solution?.[1].real ?? 0)).toBe(rhs[0]);
+    expect(1e308 * (solution?.[0].real ?? 0) + (2 * minimum) * (solution?.[1].real ?? 0)).toBe(rhs[1]);
   });
 
   it.each([Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY])("rejects nonfinite inputs %s", (value) => {
