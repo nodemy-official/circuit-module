@@ -183,6 +183,8 @@ function potentialReferenceGroups(
 
 function nodeReading(endpoints: CircuitEndpoint[], document: CircuitDocument, analysis: CircuitAnalysis) {
   const currents: CircuitNodeCurrent[] = [];
+  const realCurrentComponents: number[] = [];
+  const imaginaryCurrentComponents: number[] = [];
   let voltageVolts: number | undefined;
   let voltagePhaseDegrees: number | undefined;
   let complete = true;
@@ -199,12 +201,18 @@ function nodeReading(endpoints: CircuitEndpoint[], document: CircuitDocument, an
     const phaseDegrees = reading?.terminalCurrentPhasesDegrees?.[endpoint.terminal];
     if (!finite(amps) || reading?.meterStatus === "floating" || (analysis.mode === "ac" && !finite(phaseDegrees))) { complete = false; continue; }
     currents.push({ endpoint, label: endpointName(part, endpoint.terminal), amps, phaseDegrees });
+    const value = phasor(amps, phaseDegrees);
+    realCurrentComponents.push(value.real);
+    imaginaryCurrentComponents.push(value.imaginary);
   }
-  const sum = currents.reduce((total, entry) => {
-    const value = phasor(entry.amps, entry.phaseDegrees);
-    return { real: total.real + value.real, imaginary: total.imaginary + value.imaginary };
-  }, { real: 0, imaginary: 0 });
-  return { voltageVolts, voltagePhaseDegrees, currents, currentResidualAmps: complete && currents.length > 0 ? Math.hypot(sum.real, sum.imaginary) : undefined };
+  const realCurrent = exactComponentSum(realCurrentComponents);
+  const imaginaryCurrent = exactComponentSum(imaginaryCurrentComponents);
+  return {
+    voltageVolts,
+    voltagePhaseDegrees,
+    currents,
+    currentResidualAmps: complete && currents.length > 0 ? Math.hypot(realCurrent, imaginaryCurrent) : undefined,
+  };
 }
 
 function markImplicitSupplyReturn(document: CircuitDocument, nodes: CircuitNode[]): CircuitNode[] {

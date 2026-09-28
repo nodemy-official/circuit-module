@@ -453,6 +453,37 @@ function backSubstituteReal(size: number, matrix: Float64Array, rhs: Float64Arra
   return solution;
 }
 
+function realRowCoefficientCounts(size: number, matrix: Float64Array) {
+  const counts = new Uint32Array(size);
+  for (let row = 0; row < size; row += 1) {
+    for (let column = 0; column < size; column += 1) {
+      if (matrix[row * size + column] !== 0) { counts[row] += 1; }
+    }
+  }
+  return counts;
+}
+
+/** Substitute exact zero constraints before elimination mixes their rows with
+ * large coefficients. In MNA, an unconnected terminal fixes its only branch
+ * current to zero; losing this constraint to roundoff can prevent convergence. */
+function substituteZeroConstraints(size: number, matrix: Float64Array, rhs: Float64Array) {
+  const counts = realRowCoefficientCounts(size, matrix);
+  const pending = Array.from({ length: size }, (_, row) => row)
+    .filter((row) => counts[row] === 1 && rhs[row] === 0);
+  for (const constrainedRow of pending) {
+    if (counts[constrainedRow] !== 1) { continue; }
+    let constrainedColumn = 0;
+    while (matrix[constrainedRow * size + constrainedColumn] === 0) { constrainedColumn += 1; }
+    for (let row = 0; row < size; row += 1) {
+      const index = row * size + constrainedColumn;
+      if (row === constrainedRow || matrix[index] === 0) { continue; }
+      matrix[index] = 0;
+      counts[row] -= 1;
+      if (counts[row] === 1 && rhs[row] === 0) { pending.push(row); }
+    }
+  }
+}
+
 /** Solves a dense real matrix in place; returns null for singular or nonfinite systems. */
 export function solveRealLinearSystem(
   size: number,
@@ -460,6 +491,7 @@ export function solveRealLinearSystem(
   rhs: Float64Array,
 ): Float64Array | null {
   if (!validSystem(size, matrix, rhs)) { return null; }
+  substituteZeroConstraints(size, matrix, rhs);
   scaleRealRows(size, matrix, rhs);
   for (let column = 0; column < size; column += 1) {
     const { pivot, magnitude } = realPivotRow(size, matrix, column);

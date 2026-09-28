@@ -1460,6 +1460,47 @@ function stampNonlinear(
   }
 }
 
+function nonlinearTerminalVoltages(
+  part: CircuitPart,
+  layout: MnaLayout,
+  state: Float64Array,
+) {
+  const values = terminalRealValues(part, layout, state);
+  if (part.kind !== "op-amp") { return values; }
+  const reference = nodeRealValue(layout, layout.physicalReferenceNode, state);
+  return values.map((value) => value - reference);
+}
+
+function stampDcOpAmp(
+  matrix: Float64Array,
+  residual: Float64Array,
+  layout: MnaLayout,
+  part: CircuitPart,
+  model: NonlinearModel,
+) {
+  const nodes = terminalsOf(part.kind).map((terminal) => nodeForTerminal(layout.topology, part, terminal));
+  const outputNode = nodes[2] ?? layout.topology.referenceNode;
+  const outputUnknown = layout.topology.nodeUnknowns[outputNode] ?? -1;
+  const referenceUnknown = layout.topology.nodeUnknowns[layout.physicalReferenceNode] ?? -1;
+  const outputCurrent = model.currents[2] ?? 0;
+  const referenceSlope = nonlinearReferenceDerivative(part, model, 2);
+
+  addResidual(residual, outputUnknown, outputCurrent);
+  for (let column = 0; column < nodes.length; column += 1) {
+    const columnUnknown = layout.topology.nodeUnknowns[nodes[column] ?? -1] ?? -1;
+    addMatrix(matrix, layout.size, outputUnknown, columnUnknown, model.jacobian[2]?.[column] ?? 0);
+  }
+  addMatrix(matrix, layout.size, outputUnknown, referenceUnknown, referenceSlope);
+
+  // The op-amp output stage returns its current to the physical reference node.
+  addResidual(residual, referenceUnknown, -outputCurrent);
+  for (let column = 0; column < nodes.length; column += 1) {
+    const columnUnknown = layout.topology.nodeUnknowns[nodes[column] ?? -1] ?? -1;
+    addMatrix(matrix, layout.size, referenceUnknown, columnUnknown, -(model.jacobian[2]?.[column] ?? 0));
+  }
+  addMatrix(matrix, layout.size, referenceUnknown, referenceUnknown, -referenceSlope);
+}
+
 function resistorValue(part: CircuitPart) {
   return part.resistanceOhms ?? 1;
 }
@@ -1498,8 +1539,13 @@ function stampDcNonlinearPart(
   state: Float64Array,
   part: CircuitPart,
 ) {
-  const model = nonlinearModel(part, terminalRealValues(part, layout, state));
-  if (model) { stampNonlinear(matrix, residual, layout, part, model); }
+  const model = nonlinearModel(part, nonlinearTerminalVoltages(part, layout, state));
+  if (!model) { return; }
+  if (part.kind === "op-amp") {
+    stampDcOpAmp(matrix, residual, layout, part, model);
+    return;
+  }
+  stampNonlinear(matrix, residual, layout, part, model);
 }
 
 interface ReferenceConstraint {
@@ -1524,6 +1570,81 @@ function inductorCutset(
     });
   }
   return derivatives;
+}
+
+interface ReferenceConductanceEdge {
+  a: number;
+  b: number;
+  logConductance?: number;
+  ideal?: boolean;
+}
+
+function appendImpedanceReferenceEdge(edges: ReferenceConductanceEdge[], branch: Branch) {
+  const scale = Math.max(Math.abs(branch.seriesResistanceOhms), Math.abs(branch.seriesReactanceOhms ?? 0));
+  if (scale === 0) {
+    if (branch.positiveNode !== branch.negativeNode) {
+      edges.push({ a: branch.positiveNode, b: branch.negativeNode, ideal: true });
+    }
+    return;
+  }
+  const normalizedMagnitude = Math.hypot(
+    branch.seriesResistanceOhms / scale,
+    (branch.seriesReactanceOhms ?? 0) / scale,
+  );
+  const logConductance = -Math.log(scale) - Math.log(normalizedMagnitude);
+  if (Number.isFinite(logConductance)) {
+    edges.push({ a: branch.positiveNode, b: branch.negativeNode, logConductance });
+  }
+}
+
+function appendAdmittanceReferenceEdge(
+  edges: ReferenceConductanceEdge[],
+  layout: MnaLayout,
+  part: CircuitPart | undefined,
+  admittance: ComplexValue,
+) {
+  if (!part) { return; }
+  const scale = Math.max(Math.abs(admittance.real), Math.abs(admittance.imaginary));
+  if (scale === 0 || !Number.isFinite(scale)) { return; }
+  const logConductance = Math.log(scale) + Math.log(Math.hypot(admittance.real / scale, admittance.imaginary / scale));
+  const a = nodeForTerminal(layout.topology, part, "a");
+  const b = nodeForTerminal(layout.topology, part, "b");
+  if (Number.isFinite(logConductance) && a !== b) { edges.push({ a, b, logConductance }); }
+}
+
+function strengthsFromReferenceEdges(layout: MnaLayout, edges: ReferenceConductanceEdge[]) {
+  const parent = Array.from({ length: layout.topology.nodeCount }, (_, node) => node);
+  for (const edge of edges) { unionNodes(parent, edge.a, edge.b); }
+  const maximumLogByComponent = new Map<number, number>();
+  for (const edge of edges) {
+    if (edge.logConductance === undefined) { continue; }
+    const component = findRoot(parent, edge.a);
+    maximumLogByComponent.set(component, Math.max(maximumLogByComponent.get(component) ?? Number.NEGATIVE_INFINITY, edge.logConductance));
+  }
+
+  const strengths = Array.from({ length: layout.topology.nodeCount }, () => 0);
+  for (const edge of edges) {
+    const component = findRoot(parent, edge.a);
+    const maximumLog = maximumLogByComponent.get(component) ?? 0;
+    const weight = edge.ideal || edge.logConductance === undefined
+      ? 1
+      : Math.exp(edge.logConductance - maximumLog);
+    strengths[edge.a] = (strengths[edge.a] ?? 0) + weight;
+    strengths[edge.b] = (strengths[edge.b] ?? 0) + weight;
+  }
+  return strengths;
+}
+
+function referenceNodeStrengths(document: CircuitDocument, layout: MnaLayout) {
+  const edges: ReferenceConductanceEdge[] = [];
+  for (const branch of [...layout.branches, ...layout.internalBranches]) {
+    appendImpedanceReferenceEdge(edges, branch);
+  }
+  const partById = new Map(document.parts.map((part) => [part.id, part]));
+  for (const [partId, admittance] of layout.unboundedReactiveAdmittances) {
+    appendAdmittanceReferenceEdge(edges, layout, partById.get(partId), admittance);
+  }
+  return strengthsFromReferenceEdges(layout, edges);
 }
 
 function referenceConstraints(document: CircuitDocument, layout: MnaLayout, mode: AnalogAnalysisMode): ReferenceConstraint[] {
@@ -1556,18 +1677,104 @@ function referenceConstraints(document: CircuitDocument, layout: MnaLayout, mode
   }
 
   const referenceRoot = findRoot(parent, layout.topology.referenceNode);
-  const anchorByRoot = new Map<number, number>();
+  const strengths = referenceNodeStrengths(document, layout);
+  const anchorByRoot = new Map<number, { node: number; strength: number }>();
   for (let node = 0; node < layout.topology.nodeCount; node += 1) {
     const root = findRoot(parent, node);
-    if (!anchorByRoot.has(root)) { anchorByRoot.set(root, node); }
+    const strength = strengths[node] ?? 0;
+    const current = anchorByRoot.get(root);
+    if (
+      !current ||
+      (!layout.initialInductorCurrents && strength > current.strength)
+    ) {
+      anchorByRoot.set(root, { node, strength });
+    }
   }
   if (!layout.initialInductorCurrents) {
     return [...anchorByRoot]
       .filter(([root]) => root !== referenceRoot)
-      .map(([, node]) => ({ node, derivatives: [] }));
+      .map(([, anchor]) => ({ node: anchor.node, derivatives: [] }));
   }
 
-  return initialInductorReferences(document, layout, parent, anchorByRoot, referenceRoot);
+  return initialInductorReferences(
+    document,
+    layout,
+    parent,
+    new Map([...anchorByRoot].map(([root, anchor]) => [root, anchor.node])),
+    referenceRoot,
+  );
+}
+
+function referenceComponentIds(
+  document: CircuitDocument,
+  layout: MnaLayout,
+  mode: AnalogAnalysisMode,
+) {
+  const parent = Array.from({ length: layout.topology.nodeCount }, (_, node) => node);
+  const switchStates = Object.fromEntries(document.parts
+    .filter((part) => part.kind === "switch")
+    .map((part) => [part.id, layout.branchByPartId.has(part.id)]));
+  for (const part of document.parts) {
+    const reactiveBranchIsModeled = layout.branchByPartId.has(part.id) ||
+      layout.unboundedReactiveAdmittances.has(part.id);
+    if (mode === "ac" && part.kind === "inductor" && !reactiveBranchIsModeled) { continue; }
+    unionPartConduction(
+      part,
+      layout.topology,
+      parent,
+      switchStates,
+      layout.initialInductorCurrents,
+      layout.physicalReferenceNode,
+    );
+    if (mode === "ac" && part.kind === "capacitor" && reactiveBranchIsModeled) {
+      joinConductiveNodes(
+        parent,
+        nodeForTerminal(layout.topology, part, "a"),
+        nodeForTerminal(layout.topology, part, "b"),
+      );
+    }
+  }
+  return Array.from({ length: layout.topology.nodeCount }, (_, node) => findRoot(parent, node));
+}
+
+function referenceComponentNodes(
+  document: CircuitDocument,
+  layout: MnaLayout,
+  seedNode: number,
+  mode: AnalogAnalysisMode,
+) {
+  const componentIds = referenceComponentIds(document, layout, mode);
+  const seedRoot = componentIds[seedNode];
+  return componentIds.map((root) => root === seedRoot);
+}
+
+function preferredReferenceNodes(
+  document: CircuitDocument,
+  layout: MnaLayout,
+  mode: AnalogAnalysisMode,
+) {
+  const component = referenceComponentNodes(document, layout, layout.topology.referenceNode, mode);
+  const strengths = referenceNodeStrengths(document, layout);
+  return Array.from({ length: layout.topology.nodeCount }, (_, node) => node)
+    .filter((node) => component[node] && node !== layout.topology.referenceNode)
+    .sort((left, right) =>
+      (strengths[right] ?? 0) - (strengths[left] ?? 0) || left - right,
+    );
+}
+
+function canAdjustDcReference(document: CircuitDocument, layout: MnaLayout) {
+  if (!layout.initialInductorCurrents) { return true; }
+  const referenceComponent = referenceComponentNodes(
+    document,
+    layout,
+    layout.physicalReferenceNode,
+    "dc",
+  );
+  return !document.parts.some((part) =>
+    part.kind === "inductor" &&
+    Boolean(referenceComponent[nodeForTerminal(layout.topology, part, "a")]) !==
+      Boolean(referenceComponent[nodeForTerminal(layout.topology, part, "b")]),
+  );
 }
 
 function initialInductorReferences(
@@ -1749,7 +1956,7 @@ function solveDcNewtonStep(
   return { nextState, singular: false };
 }
 
-function solveDc(
+function solveDcAtReference(
   document: CircuitDocument,
   layout: MnaLayout,
 ): { state?: Float64Array; converged: boolean; singular: boolean; invalidPhysicalSolution?: boolean } {
@@ -1998,7 +2205,7 @@ function stampAcSmallSignalPart(
   part: CircuitPart,
   dcState: Float64Array,
 ) {
-  const model = nonlinearModel(part, terminalRealValues(part, dcLayout, dcState));
+  const model = nonlinearModel(part, nonlinearTerminalVoltages(part, dcLayout, dcState));
   if (!model) { return; }
   const terminals = terminalsOf(part.kind);
   const nodes = terminals.map((terminal) => nodeForTerminal(layout.topology, part, terminal));
@@ -2242,9 +2449,7 @@ function acReferenceComponent(
   layout: MnaLayout,
   seedNode: number,
 ) {
-  const componentIds = acReferenceComponentIds(document, layout);
-  const seedRoot = componentIds[seedNode] ?? seedNode;
-  return componentIds.map((root) => root === seedRoot);
+  return referenceComponentNodes(document, layout, seedNode, "ac");
 }
 
 function nonlinearAcModelIsCommonModeInvariant(
@@ -2253,7 +2458,7 @@ function nonlinearAcModelIsCommonModeInvariant(
   dcState: Float64Array,
 ) {
   for (const part of document.parts) {
-    const model = nonlinearModel(part, terminalRealValues(part, layout, dcState));
+    const model = nonlinearModel(part, nonlinearTerminalVoltages(part, layout, dcState));
     if (!model) { continue; }
     for (let rowIndex = 0; rowIndex < model.jacobian.length; rowIndex += 1) {
       let sum = nonlinearReferenceDerivative(part, model, rowIndex);
@@ -2272,10 +2477,64 @@ function nonlinearAcModelIsCommonModeInvariant(
   return true;
 }
 
+function rebasedAcSolutionForQuality(
+  document: CircuitDocument,
+  layout: MnaLayout,
+  dcState: Float64Array,
+  frequencyHz: number,
+  originalKclQuality: number,
+  originalResidual: number,
+): AcSolution | null {
+  let bestSolution: AcSolution | null = null;
+  let bestScore = Number.POSITIVE_INFINITY;
+  for (const referenceNode of preferredReferenceNodes(document, layout, "ac").slice(0, 8)) {
+    const rebasedLayout = layoutWithReferenceNode(layout, referenceNode);
+    const rebasedValues = solveAcForLayout(document, rebasedLayout, layout, dcState);
+    if (!rebasedValues) { continue; }
+    const rebasedResidual = acBranchEquationResidual(rebasedLayout, rebasedValues);
+    if (rebasedResidual > 1e-10) { continue; }
+    const rebasedKclQuality = acKclQuality(
+      document,
+      rebasedLayout,
+      layout,
+      rebasedValues,
+      frequencyHz,
+      dcState,
+    );
+    const improvesKcl = rebasedKclQuality < originalKclQuality * 0.5;
+    const improvesBranchEquations = originalResidual > 1e-10 &&
+      rebasedResidual < originalResidual * 0.1 &&
+      rebasedKclQuality <= Math.max(originalKclQuality, 1e-12);
+    if (!improvesKcl && !improvesBranchEquations) { continue; }
+
+    const score = Math.max(rebasedKclQuality, rebasedResidual);
+    if (score < bestScore) {
+      const originalReferenceVoltage = nodeComplexValue(
+        rebasedLayout,
+        layout.topology.referenceNode,
+        rebasedValues,
+      );
+      const offset = complex(-originalReferenceVoltage.real, -originalReferenceVoltage.imaginary);
+      const component = acReferenceComponent(document, rebasedLayout, referenceNode);
+      bestSolution = {
+        layout: rebasedLayout,
+        biasLayout: layout,
+        values: rebasedValues,
+        nodeVoltageOffsets: component.map((isInReferenceComponent) =>
+          isInReferenceComponent ? offset : complex()),
+      };
+      bestScore = score;
+    }
+    if (rebasedKclQuality <= 1e-12) { return bestSolution; }
+  }
+  return bestSolution;
+}
+
 function solveAc(
   document: CircuitDocument,
   layout: MnaLayout,
   dcState: Float64Array,
+  frequencyHz: number,
 ): AcSolution | null {
   const values = solveAcForLayout(document, layout, layout, dcState);
   if (!values) { return null; }
@@ -2286,7 +2545,20 @@ function solveAc(
   // common-mode invariant. The op-amp stamp includes its physical GND return.
   if (!nonlinearAcModelIsCommonModeInvariant(document, layout, dcState)) { return solution; }
 
+  const originalKclQuality = acKclQuality(document, layout, layout, values, frequencyHz, dcState);
   const originalResidual = acBranchEquationResidual(layout, values);
+  if (originalKclQuality > 1e-12 || originalResidual > 1e-10) {
+    const rebasedSolution = rebasedAcSolutionForQuality(
+      document,
+      layout,
+      dcState,
+      frequencyHz,
+      originalKclQuality,
+      originalResidual,
+    );
+    if (rebasedSolution) { return rebasedSolution; }
+  }
+
   if (originalResidual <= 1e-10) { return solution; }
   for (const candidate of acReferenceCandidates(document, layout, values)) {
     const rebasedLayout = layoutWithReferenceNode(layout, candidate.node);
@@ -2427,7 +2699,7 @@ function nonlinearTerminalCurrents(
   dcState: Float64Array,
 ): ComplexValue[] {
   const terminals = terminalsOf(part.kind);
-  const model = nonlinearModel(part, terminalRealValues(part, biasLayout, dcState));
+  const model = nonlinearModel(part, nonlinearTerminalVoltages(part, biasLayout, dcState));
   if (!model) { return terminals.map(() => complex()); }
   if (mode === "dc") { return model.currents.map((current) => complex(current)); }
 
@@ -2473,6 +2745,166 @@ function terminalCurrentsForPart(
     return passiveTerminalCurrents(part, layout, solution, mode, frequencyHz) ?? [];
   }
   return nonlinearTerminalCurrents(part, layout, biasLayout, solution, mode, dcState);
+}
+
+function acKclQuality(
+  document: CircuitDocument,
+  layout: MnaLayout,
+  biasLayout: MnaLayout,
+  solution: ComplexValue[],
+  frequencyHz: number,
+  dcState: Float64Array,
+) {
+  const currentsByNode = Array.from({ length: layout.topology.nodeCount }, () => [] as ComplexValue[]);
+  for (const part of document.parts) {
+    const currents = terminalCurrentsForPart(part, layout, biasLayout, solution, "ac", frequencyHz, dcState);
+    const terminals = terminalsOf(part.kind);
+    for (let index = 0; index < terminals.length; index += 1) {
+      const node = nodeForTerminal(layout.topology, part, terminals[index] ?? "a");
+      currentsByNode[node]?.push(currents[index] ?? complex());
+    }
+    if (part.kind === "op-amp") {
+      const outputCurrent = currents[2] ?? complex();
+      currentsByNode[layout.physicalReferenceNode]?.push(complex(-outputCurrent.real, -outputCurrent.imaginary));
+    }
+  }
+
+  let quality = 0;
+  for (const currents of currentsByNode) {
+    const scale = Math.max(
+      0,
+      ...currents.flatMap((current) => [Math.abs(current.real), Math.abs(current.imaginary)]),
+    );
+    if (scale === 0) { continue; }
+    const normalizedReal = currents.map((current) => current.real / scale);
+    const normalizedImaginary = currents.map((current) => current.imaginary / scale);
+    const residualReal = exactComponentSum(normalizedReal);
+    const residualImaginary = exactComponentSum(normalizedImaginary);
+    const residual = Math.hypot(residualReal, residualImaginary);
+    const equationScale = currents.reduce(
+      (sum, current) => sum + Math.hypot(current.real / scale, current.imaginary / scale),
+      0,
+    );
+    if (equationScale > 0) { quality = Math.max(quality, residual / equationScale); }
+  }
+  return quality;
+}
+
+interface DcSolution {
+  state?: Float64Array;
+  converged: boolean;
+  singular: boolean;
+  invalidPhysicalSolution?: boolean;
+  layout?: MnaLayout;
+  nodeVoltageOffsets?: ComplexValue[];
+}
+
+function dcKclQuality(document: CircuitDocument, layout: MnaLayout, state: Float64Array) {
+  const values = Array.from({ length: layout.size }, (_, index) => complex(state[index] ?? 0));
+  const currentsByNode = Array.from({ length: layout.topology.nodeCount }, () => [] as number[]);
+  for (const part of document.parts) {
+    const currents = terminalCurrentsForPart(part, layout, layout, values, "dc", undefined, state);
+    const terminals = terminalsOf(part.kind);
+    for (let index = 0; index < terminals.length; index += 1) {
+      const node = nodeForTerminal(layout.topology, part, terminals[index] ?? "a");
+      currentsByNode[node]?.push(currents[index]?.real ?? 0);
+    }
+    if (part.kind === "op-amp") {
+      currentsByNode[layout.physicalReferenceNode]?.push(-(currents[2]?.real ?? 0));
+    }
+  }
+
+  let quality = 0;
+  for (const currents of currentsByNode) {
+    const scale = Math.max(0, ...currents.map(Math.abs));
+    if (scale === 0) { continue; }
+    const normalized = currents.map((current) => current / scale);
+    const residual = Math.abs(exactComponentSum(normalized));
+    const equationScale = normalized.reduce((sum, current) => sum + Math.abs(current), 0);
+    if (equationScale > 0) { quality = Math.max(quality, residual / equationScale); }
+  }
+  return quality;
+}
+
+function dcReferenceOffsets(document: CircuitDocument, layout: MnaLayout, state: Float64Array) {
+  const referenceNode = layout.physicalReferenceNode;
+  const offset = -nodeRealValue(layout, referenceNode, state);
+  const component = referenceComponentNodes(document, layout, referenceNode, "dc");
+  return component.map((isReferenceComponent) => complex(isReferenceComponent ? offset : 0));
+}
+
+function restoreFloatingReferenceOffsets(
+  document: CircuitDocument,
+  layout: MnaLayout,
+  solution: ComplexValue[],
+  initialOffsets: ComplexValue[],
+  mode: AnalogAnalysisMode,
+) {
+  if (layout.initialInductorCurrents) { return initialOffsets; }
+  const componentIds = referenceComponentIds(document, layout, mode);
+  const physicalReferenceRoot = componentIds[layout.physicalReferenceNode];
+  const firstNodeByRoot = new Map<number, number>();
+  for (let node = 0; node < componentIds.length; node += 1) {
+    const root = componentIds[node];
+    if (root !== undefined && !firstNodeByRoot.has(root)) { firstNodeByRoot.set(root, node); }
+  }
+
+  const offsets = Array.from({ length: layout.topology.nodeCount }, (_, node) => {
+    const offset = initialOffsets[node] ?? complex();
+    return complex(offset.real, offset.imaginary);
+  });
+  for (const [root, anchor] of firstNodeByRoot) {
+    if (root === physicalReferenceRoot) { continue; }
+    const potential = nodeComplexValue(layout, anchor, solution);
+    const offset = complex(-potential.real, -potential.imaginary);
+    for (let node = 0; node < componentIds.length; node += 1) {
+      if (componentIds[node] !== root) { continue; }
+      offsets[node] = complex(offset.real, offset.imaginary);
+    }
+  }
+  return offsets;
+}
+
+function solveDc(
+  document: CircuitDocument,
+  layout: MnaLayout,
+  adjustReference = false,
+): DcSolution {
+  const baseline = solveDcAtReference(document, layout);
+  const baselineResult: DcSolution = {
+    ...baseline,
+    layout,
+    nodeVoltageOffsets: Array.from({ length: layout.topology.nodeCount }, () => complex()),
+  };
+  if (!adjustReference || !canAdjustDcReference(document, layout)) { return baselineResult; }
+  if (baseline.converged && baseline.state && dcKclQuality(document, layout, baseline.state) <= 1e-12) {
+    return baselineResult;
+  }
+
+  const baselineQuality = baseline.converged && baseline.state
+    ? dcKclQuality(document, layout, baseline.state)
+    : Number.POSITIVE_INFINITY;
+  let best = baselineResult;
+  let bestQuality = baselineQuality;
+  // A second- or third-strongest node can yield a much better-scaled KCL row
+    // when the strongest candidate shares another badly conditioned branch.
+  for (const referenceNode of preferredReferenceNodes(document, layout, "dc").slice(0, 8)) {
+    const candidateLayout = layoutWithReferenceNode(layout, referenceNode);
+    const candidate = solveDcAtReference(document, candidateLayout);
+    if (!candidate.converged || !candidate.state) { continue; }
+    const candidateQuality = dcKclQuality(document, candidateLayout, candidate.state);
+    if (candidateQuality < bestQuality) {
+      best = {
+        ...candidate,
+        layout: candidateLayout,
+        nodeVoltageOffsets: dcReferenceOffsets(document, candidateLayout, candidate.state),
+      };
+      bestQuality = candidateQuality;
+    }
+    if (candidateQuality <= 1e-12) { return best; }
+  }
+  if (best === baselineResult || !(bestQuality < baselineQuality * 0.5)) { return baselineResult; }
+  return best;
 }
 
 function primaryVoltage(part: CircuitPart, values: ComplexValue[]) {
@@ -2862,7 +3294,12 @@ function makeReadings(
   nodeVoltageOffsets: ComplexValue[] = [],
 ): Record<string, AnalogCircuitPartReading> {
   const parts: Record<string, AnalogCircuitPartReading> = {};
-  const meterStatusByPart = meterStatuses(document, { mode, frequencyHz, switchStates });
+  const meterStatusByPart = meterStatuses(document, {
+    mode,
+    frequencyHz,
+    switchStates,
+    initialInductorCurrents: layout.initialInductorCurrents,
+  });
   const branchVoltagePaths = document.parts.some((part) => part.kind === "voltmeter")
     ? branchVoltagePathContext(layout)
     : null;
@@ -3015,7 +3452,7 @@ function dcResult(
     const message = prepared.issue?.message ?? "回路を計算できませんでした。接続を確認してください。";
     return result("invalid", mode, message, { issues: prepared.issue ? [prepared.issue] : [] });
   }
-  const solution = solveDc(document, prepared.layout);
+  const solution = solveDc(document, prepared.layout, true);
   if (!solution.converged || !solution.state) {
     const message = dcSolutionFailureMessage(solution);
     return result("invalid", mode, message, {
@@ -3023,20 +3460,29 @@ function dcResult(
     });
   }
 
+  const solvedLayout = solution.layout ?? prepared.layout;
   const values = Array.from({ length: prepared.layout.size }, (_, index) =>
     complex(solution.state?.[index] ?? 0),
   );
+  const nodeVoltageOffsets = restoreFloatingReferenceOffsets(
+    document,
+    solvedLayout,
+    values,
+    solution.nodeVoltageOffsets ?? [],
+    "dc",
+  );
   const readings = makeReadings(
     document,
-    prepared.layout,
-    prepared.layout,
+    solvedLayout,
+    solvedLayout,
     values,
     "dc",
     undefined,
     solution.state,
     options.switchStates ?? {},
+    nodeVoltageOffsets,
   );
-  const nodeVoltages = makeNodeVoltages(prepared.layout, values);
+  const nodeVoltages = makeNodeVoltages(solvedLayout, values, nodeVoltageOffsets);
   if (!hasOnlyFiniteReadings(readings, nodeVoltages)) {
     const message = "計算結果に有限でない電圧・電流・電力が含まれています。部品の値を確認してください。";
     return result("invalid", mode, message, { issues: [{ severity: "error", message }] });
@@ -3129,7 +3575,7 @@ function prepareAcSolution(
       issues: prepared.issue ? [prepared.issue] : [],
     });
   }
-  const solution = solveAc(document, prepared.layout, bias.state);
+  const solution = solveAc(document, prepared.layout, bias.state, frequencyHz);
   if (!solution) {
     const message = "交流回路を計算できません。理想電圧源のループや接続を確認してください。";
     return result("invalid", "ac", message, {
@@ -3163,6 +3609,13 @@ function acResult(document: CircuitDocument, options: AnalogStepOptions): Analog
   if ("status" in solution) { return solution; }
 
   const issues = analysisIssuesForAc(document, frequencyHz);
+  const nodeVoltageOffsets = restoreFloatingReferenceOffsets(
+    document,
+    solution.layout,
+    solution.values,
+    solution.nodeVoltageOffsets,
+    "ac",
+  );
   const readings = makeReadings(
     document,
     solution.layout,
@@ -3172,9 +3625,9 @@ function acResult(document: CircuitDocument, options: AnalogStepOptions): Analog
     frequencyHz,
     bias.state,
     options.switchStates ?? {},
-    solution.nodeVoltageOffsets,
+    nodeVoltageOffsets,
   );
-  const nodeVoltages = makeNodeVoltages(solution.layout, solution.values, solution.nodeVoltageOffsets);
+  const nodeVoltages = makeNodeVoltages(solution.layout, solution.values, nodeVoltageOffsets);
   if (!hasOnlyFiniteReadings(readings, nodeVoltages)) {
     const message = "計算結果に有限でない電圧・電流・電力が含まれています。部品の値を確認してください。";
     return result("invalid", "ac", message, {

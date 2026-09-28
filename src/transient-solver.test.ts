@@ -486,6 +486,83 @@ describe("simulateTransient", () => {
     expect(result.samples[0]?.parts.ammeter?.meterStatus).toBe("floating");
   });
 
+  it("reports a parallel ammeter as connected when the inductor initial current determines its branch current", () => {
+    const document: CircuitDocument = {
+      title: "Inductor initial current through a parallel ammeter",
+      parts: [
+        part("inductor", "inductor", { inductanceHenries: 1, initialCurrentAmps: 2 }),
+        part("ammeter", "ammeter"),
+      ],
+      wires: [
+        wire("wire-meter-a", "inductor", "a", "ammeter", "a"),
+        wire("wire-meter-b", "inductor", "b", "ammeter", "b"),
+      ],
+    };
+    const dc = analyzeCircuit(document);
+    const result = simulateTransient(document, { durationSeconds: 0.1, timeStepSeconds: 0.1 });
+    const operatingPointStart = simulateTransient(document, {
+      durationSeconds: 0.1,
+      timeStepSeconds: 0.1,
+      startFromOperatingPoint: true,
+    });
+
+    expect(dc.parts.ammeter.meterStatus).toBe("floating");
+    expect(result.status, result.message).toBe("valid");
+    expect(result.samples[0]?.parts.ammeter?.meterStatus).toBe("connected");
+    expect(result.samples[0]?.parts.ammeter?.currentAmps).toBe(-2);
+    expect(result.samples[1]?.parts.ammeter?.meterStatus).toBe("connected");
+    expect(result.samples[1]?.parts.ammeter?.currentAmps).toBe(-2);
+    expect(operatingPointStart.status, operatingPointStart.message).toBe("valid");
+    expect(operatingPointStart.samples[0]?.parts.ammeter?.meterStatus).toBe("floating");
+  });
+
+  it("preserves a defined inductor voltage probe at the initial sample", () => {
+    const document: CircuitDocument = {
+      title: "Initial inductor voltage follows the current derivative constraint",
+      parts: [
+        part("source", "current-source", { currentAmps: 2 }),
+        part("inductor", "inductor", { inductanceHenries: 1, initialCurrentAmps: 2 }),
+        part("voltmeter", "voltmeter"),
+      ],
+      wires: [
+        wire("wire-source-inductor", "source", "b", "inductor", "a"),
+        wire("wire-inductor-source", "inductor", "b", "source", "a"),
+        wire("wire-meter-a", "voltmeter", "a", "inductor", "a"),
+        wire("wire-meter-b", "voltmeter", "b", "inductor", "b"),
+      ],
+    };
+    const dc = analyzeCircuit(document);
+    const result = simulateTransient(document, { durationSeconds: 0.1, timeStepSeconds: 0.1 });
+
+    expect(dc.parts.voltmeter.meterStatus).toBe("connected");
+    expect(result.status, result.message).toBe("valid");
+    expect(result.samples[0]?.parts.voltmeter?.meterStatus).toBe("connected");
+    expect(result.samples[0]?.parts.voltmeter?.voltageVolts).toBe(0);
+    expect(result.samples[1]?.parts.voltmeter?.meterStatus).toBe("connected");
+    expect(result.samples[1]?.parts.voltmeter?.voltageVolts).toBe(0);
+  });
+
+  it("keeps a voltmeter across a capacitor connected at the initialized transient sample", () => {
+    const document: CircuitDocument = {
+      title: "Initial capacitor voltage probe",
+      parts: [
+        part("capacitor", "capacitor", { capacitanceFarads: 1e-3, initialVoltageVolts: 2 }),
+        part("voltmeter", "voltmeter"),
+      ],
+      wires: [
+        wire("wire-meter-a", "voltmeter", "a", "capacitor", "a"),
+        wire("wire-meter-b", "voltmeter", "b", "capacitor", "b"),
+      ],
+    };
+    const dc = analyzeCircuit(document);
+    const result = simulateTransient(document, { durationSeconds: 0.01, timeStepSeconds: 0.01 });
+
+    expect(dc.parts.voltmeter.meterStatus).toBe("floating");
+    expect(result.status, result.message).toBe("valid");
+    expect(result.samples[0]?.parts.voltmeter?.meterStatus).toBe("connected");
+    expect(result.samples[0]?.parts.voltmeter?.voltageVolts).toBe(2);
+  });
+
   it("preserves op-amp load current through a closed switch in the initial sample", () => {
     const document: CircuitDocument = {
       title: "Op-amp load through a switch",

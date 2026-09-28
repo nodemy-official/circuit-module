@@ -13,6 +13,8 @@ interface MeterStatusOptions {
   mode?: "dc" | "ac";
   frequencyHz?: number;
   switchStates?: Record<string, boolean>;
+  /** Initial transient solve fixes an inductor's current instead of shorting it. */
+  initialInductorCurrents?: boolean;
 }
 
 class DisjointSet {
@@ -218,7 +220,7 @@ function idealPathBypassingAmmeter(
       joinAcross(nodes, index, part, ["a", "b"]);
     } else if (part.kind === "switch" && isSwitchClosed(part, options.switchStates ?? {})) {
       joinAcross(nodes, index, part, ["a", "b"]);
-    } else if (part.kind === "inductor" && options.mode !== "ac") {
+    } else if (part.kind === "inductor" && options.mode !== "ac" && !options.initialInductorCurrents) {
       joinAcross(nodes, index, part, ["a", "b"]);
     }
   }

@@ -80,6 +80,75 @@ describe("learning quantities", () => {
     expect(supplyNode.currentResidualAmps).toBeLessThan(1e-8);
   });
 
+  it("sums node-current residuals without losing cancellation or overflowing", () => {
+    const document: CircuitDocument = {
+      title: "極端な節点電流",
+      parts: ["a", "b", "c", "d"].map((id) => ({
+        id,
+        kind: "resistor",
+        label: id,
+        x: 0,
+        y: 0,
+        resistanceOhms: 1,
+      })),
+      wires: [
+        { id: "w1", from: { partId: "a", terminal: "a" }, to: { partId: "b", terminal: "a" } },
+        { id: "w2", from: { partId: "b", terminal: "a" }, to: { partId: "c", terminal: "a" } },
+        { id: "w3", from: { partId: "c", terminal: "a" }, to: { partId: "d", terminal: "a" } },
+      ],
+    };
+    const largeOpposingCurrents = makeAnalysis(document, {
+      a: { terminalCurrents: { a: 1e308, b: 0 } },
+      b: { terminalCurrents: { a: 1e308, b: 0 } },
+      c: { terminalCurrents: { a: -1e308, b: 0 } },
+      d: { terminalCurrents: { a: -1e308, b: 0 } },
+    });
+    const smallRemainder = makeAnalysis(document, {
+      a: { terminalCurrents: { a: 1e308, b: 0 } },
+      b: { terminalCurrents: { a: 1, b: 0 } },
+      c: { terminalCurrents: { a: -1e308, b: 0 } },
+      d: { terminalCurrents: { a: 0, b: 0 } },
+    });
+
+    expect(nodeAt(circuitNodes(document, largeOpposingCurrents), "a", "a").currentResidualAmps).toBe(0);
+    expect(nodeAt(circuitNodes(document, smallRemainder), "a", "a").currentResidualAmps).toBe(1);
+  });
+
+  it.each([0, 90])("keeps small AC KCL residuals after large opposite phasors cancel at %s degrees", (phaseDegrees) => {
+    const document: CircuitDocument = {
+      title: "極端な交流節点電流",
+      parts: ["a", "b", "c"].map((id) => ({
+        id,
+        kind: "resistor",
+        label: id,
+        x: 0,
+        y: 0,
+        resistanceOhms: 1,
+      })),
+      wires: [
+        { id: "w1", from: { partId: "a", terminal: "a" }, to: { partId: "b", terminal: "a" } },
+        { id: "w2", from: { partId: "b", terminal: "a" }, to: { partId: "c", terminal: "a" } },
+      ],
+    };
+    const analysis = makeAnalysis(document, {
+      a: {
+        terminalCurrents: { a: 1e308, b: 0 },
+        terminalCurrentPhasesDegrees: { a: phaseDegrees, b: 0 },
+      },
+      b: {
+        terminalCurrents: { a: 1, b: 0 },
+        terminalCurrentPhasesDegrees: { a: phaseDegrees, b: 0 },
+      },
+      c: {
+        terminalCurrents: { a: 1e308, b: 0 },
+        terminalCurrentPhasesDegrees: { a: phaseDegrees + 180, b: 0 },
+      },
+    });
+    analysis.mode = "ac";
+
+    expect(nodeAt(circuitNodes(document, analysis), "a", "a").currentResidualAmps).toBe(1);
+  });
+
   it("subtracts AC phasors and sums currents with their phases", () => {
     const document = createCircuitExample("ac");
     const analysis = analyzeCircuit(document);

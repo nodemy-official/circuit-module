@@ -396,6 +396,28 @@ describe("analyzeAnalogCircuit", () => {
     expect(meterStatuses(inductorBypass, { mode: "ac" }).ammeter).toBe("connected");
   });
 
+  it("does not treat an initial-current inductor as an ammeter bypass", () => {
+    const document: CircuitDocument = {
+      title: "コイル初期電流と並列電流計",
+      parts: [
+        part("inductor", "inductor", { inductanceHenries: 1, initialCurrentAmps: 2 }),
+        part("ammeter", "ammeter"),
+      ],
+      wires: [
+        wire("wire-meter-a", "inductor", "a", "ammeter", "a"),
+        wire("wire-meter-b", "inductor", "b", "ammeter", "b"),
+      ],
+    };
+    const dc = solveAnalogStep(document, { mode: "dc" });
+    const initial = solveAnalogStep(document, { mode: "dc", initialInductorCurrents: true });
+
+    expect(dc.status, dc.message).toBe("valid");
+    expect(dc.parts.ammeter.meterStatus).toBe("floating");
+    expect(initial.status, initial.message).toBe("valid");
+    expect(initial.parts.ammeter.meterStatus).toBe("connected");
+    expect(initial.parts.ammeter.current.real).toBe(-2);
+  });
+
   it("joins every ground symbol into the same reference node", () => {
     const document: CircuitDocument = {
       title: "共通GND",
