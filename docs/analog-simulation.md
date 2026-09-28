@@ -31,7 +31,7 @@
 
 `analyzeCircuit(document, switchStates?, options?)` の `options.mode` は `"auto"`、`"dc"`、`"ac"` です。`auto` は交流電源を含む回路を交流解析、それ以外を直流解析にします。`frequencyHz` は小信号交流解析の周波数です。未指定なら回路内の最初の交流電源の周波数を使い、電源がなければ1 kHzを使います。
 
-解析APIには、`CircuitDocument`、各部品・導線、スイッチ状態、解析optionsとして、`Object.prototype` または `null` をプロトタイプに持つデータオブジェクトを渡してください。getter/setterを持つこれらのレコードやクラスインスタンスは入力不正として扱います。`parts` と `wires` は穴のない配列で指定してください。要素にgetter/setterを持つ配列も入力不正として扱い、getter/setterは実行しません。
+解析APIには、`CircuitDocument`、各部品・導線、スイッチ状態、解析optionsとして、`Object.prototype` または `null` をプロトタイプに持つデータオブジェクトを渡してください。getter/setterを持つこれらのレコードやクラスインスタンスは入力不正として扱います。`parts` と `wires` は穴のない通常の配列で指定してください。要素にgetter/setterを持つ配列、独自のプロパティ、独自prototype、または `map`・`entries`・iteratorなどの上書きを持つ配列も入力不正として扱い、accessorは実行しません。
 
 ```ts
 import { analyzeCircuit, createCircuitExample } from "@nodemy-official/circuit-module";

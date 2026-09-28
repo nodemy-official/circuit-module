@@ -608,13 +608,11 @@ function substituteZeroConstraints(size: number, matrix: Float64Array, rhs: Floa
   }
 }
 
-/** Solves a dense real matrix in place; returns null for singular or nonfinite systems. */
-export function solveRealLinearSystem(
+function solveRealLinearSystemInPlace(
   size: number,
   matrix: Float64Array,
   rhs: Float64Array,
 ): Float64Array | null {
-  if (!validSystem(size, matrix, rhs)) { return null; }
   substituteZeroConstraints(size, matrix, rhs);
   scaleRealRows(size, matrix, rhs);
   for (let column = 0; column < size; column += 1) {
@@ -629,4 +627,33 @@ export function solveRealLinearSystem(
   }
   const solution = backSubstituteReal(size, matrix, rhs);
   return solution.every(Number.isFinite) ? solution : null;
+}
+
+/** Solves a dense real matrix in place; returns null for singular or nonfinite systems. */
+export function solveRealLinearSystem(
+  size: number,
+  matrix: Float64Array,
+  rhs: Float64Array,
+): Float64Array | null {
+  if (!validSystem(size, matrix, rhs)) { return null; }
+  const rhsMagnitude = Math.max(...rhs.map(Math.abs));
+  if (rhsMagnitude > 0 && rhsMagnitude < 2 ** -1022) {
+    // As for the complex solver, postpone subnormal rounding until after
+    // elimination. Otherwise an ordinary pivot factor can erase the excitation.
+    const solutionScale = powerOfTwoAtMost(rhsMagnitude);
+    const originalMatrix = matrix.slice();
+    const originalRhs = rhs.slice();
+    for (let index = 0; index < size; index += 1) {
+      rhs[index] = (rhs[index] ?? 0) / solutionScale;
+    }
+    const scaledSolution = solveRealLinearSystemInPlace(size, matrix, rhs);
+    if (scaledSolution) {
+      const solution = scaledSolution.map((value) => scaledProduct([value, solutionScale]));
+      if (solution.every(Number.isFinite)) { return solution; }
+    }
+    // A finite original solution can overflow in the normalized coordinates.
+    matrix.set(originalMatrix);
+    rhs.set(originalRhs);
+  }
+  return solveRealLinearSystemInPlace(size, matrix, rhs);
 }

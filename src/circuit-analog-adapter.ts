@@ -252,6 +252,18 @@ export function analyzeExtendedCircuit(
   switchStates: Record<string, boolean>,
   options: CircuitAnalysisOptions,
 ): CircuitAnalysis {
+  try {
+    return analyzeExtendedCircuitFromInput(document, switchStates, options);
+  } catch {
+    return invalidAdapterResult("回路データまたは解析条件を読み取れません。");
+  }
+}
+
+function analyzeExtendedCircuitFromInput(
+  document: CircuitDocument,
+  switchStates: Record<string, boolean>,
+  options: CircuitAnalysisOptions,
+): CircuitAnalysis {
   const inputIssue = adapterInputIssue(document, switchStates, options);
   if (inputIssue) { return invalidAdapterResult(inputIssue); }
   let validatedOptions: CircuitAnalysisOptions;

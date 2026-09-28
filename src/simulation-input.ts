@@ -22,14 +22,61 @@ export function isSimulationRecord(value: unknown): value is Record<string, unkn
 }
 
 /** Checks array entries before iteration so indexed accessors are never called. */
+function arrayOwnKeysAreIndexes(descriptors: object, length: number) {
+  for (const key of Reflect.ownKeys(descriptors)) {
+    if (key === "length") { continue; }
+    if (typeof key !== "string") { return false; }
+    const index = Number(key);
+    if (!Number.isInteger(index) || index < 0 || index >= length || String(index) !== key) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function usesNativeArrayMethods(value: unknown[]) {
+  for (const key of Reflect.ownKeys(Array.prototype)) {
+    const descriptor = Object.getOwnPropertyDescriptor(Array.prototype, key);
+    if (!descriptor || !Object.hasOwn(descriptor, "value") || typeof descriptor.value !== "function") {
+      continue;
+    }
+    if (Reflect.get(value, key) !== descriptor.value) { return false; }
+  }
+  return true;
+}
+
+function arrayIndexesMatchDescriptors(
+  value: unknown[],
+  descriptors: object,
+  length: number,
+) {
+  for (let index = 0; index < length; index += 1) {
+    const key = String(index);
+    const descriptor = Reflect.get(descriptors, key) as PropertyDescriptor | undefined;
+    if (!descriptor || !Object.hasOwn(descriptor, "value") || Reflect.get(value, key) !== descriptor.value) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function hasValidSimulationArrayShape(value: unknown[]) {
+  if (Object.getPrototypeOf(value) !== Array.prototype) { return false; }
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const lengthDescriptor = Reflect.get(descriptors, "length") as PropertyDescriptor | undefined;
+  if (!lengthDescriptor || !Object.hasOwn(lengthDescriptor, "value") ||
+    typeof lengthDescriptor.value !== "number") { return false; }
+  const length = lengthDescriptor.value as number;
+  return arrayOwnKeysAreIndexes(descriptors, length) &&
+    Reflect.get(value, "length") === length &&
+    usesNativeArrayMethods(value) &&
+    arrayIndexesMatchDescriptors(value, descriptors, length);
+}
+
 export function isSimulationArray(value: unknown): value is unknown[] {
   if (!Array.isArray(value)) { return false; }
   try {
-    for (let index = 0; index < value.length; index += 1) {
-      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
-      if (!descriptor || !Object.hasOwn(descriptor, "value")) { return false; }
-    }
-    return true;
+    return hasValidSimulationArrayShape(value);
   } catch {
     return false;
   }
@@ -59,6 +106,9 @@ function partKindsAndIssue(values: unknown[]): { kinds: Map<string, CircuitPartK
   for (const [index, value] of values.entries()) {
     if (!isSimulationRecord(value) || typeof value.id !== "string" || value.id.trim() === "") {
       return { kinds, issue: `部品${index + 1}の ID が正しくありません。` };
+    }
+    if (value.label !== undefined && typeof value.label !== "string") {
+      return { kinds, issue: `部品「${value.id}」の名前が正しくありません。` };
     }
     if (kinds.has(value.id)) { return { kinds, issue: "部品 ID が重複しています。" }; }
     if (typeof value.kind !== "string" || !Object.hasOwn(circuitPartCatalog, value.kind)) {

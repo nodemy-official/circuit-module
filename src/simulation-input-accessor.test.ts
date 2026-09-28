@@ -27,6 +27,121 @@ function missingFrequencyProxy<T extends object>(target: T) {
 }
 
 describe("simulation input accessor validation", () => {
+  it.each(["map", "entries", Symbol.iterator] as const)(
+    "rejects a parts array with an own %s override without invoking it",
+    (key) => {
+      const parts = [...source.parts];
+      let calls = 0;
+      Object.defineProperty(parts, key, {
+        configurable: true,
+        value() {
+          calls += 1;
+          throw new Error("array method override ran");
+        },
+      });
+
+      expect(analyzeCircuit({ ...source, parts }).status).toBe("invalid");
+      expect(calls).toBe(0);
+    },
+  );
+
+  it("rejects an own array method accessor without invoking it", () => {
+    const parts = [...source.parts];
+    let reads = 0;
+    Object.defineProperty(parts, "map", {
+      configurable: true,
+      get() {
+        reads += 1;
+        throw new Error("array method accessor ran");
+      },
+    });
+
+    expect(analyzeCircuit({ ...source, parts }).status).toBe("invalid");
+    expect(reads).toBe(0);
+  });
+
+  it("rejects arrays with a custom prototype before invoking its methods", () => {
+    let calls = 0;
+    const prototype = Object.create(Array.prototype, {
+      map: {
+        value() {
+          calls += 1;
+          throw new Error("prototype method override ran");
+        },
+      },
+    });
+    const parts = Object.setPrototypeOf([...source.parts], prototype);
+
+    expect(analyzeCircuit({ ...source, parts }).status).toBe("invalid");
+    expect(calls).toBe(0);
+  });
+
+  it("rejects array proxies that override methods, length, or indexed reads across analysis APIs", () => {
+    const calls: [string, (parts: CircuitDocument["parts"]) => { status: string }][] = [
+      ["analyzeCircuit", (parts) => analyzeCircuit({ ...source, parts })],
+      ["analyzeExtendedCircuit", (parts) => analyzeExtendedCircuit({ ...source, parts }, {}, { mode: "ac" })],
+      ["analyzeAnalogCircuit", (parts) => analyzeAnalogCircuit({ ...source, parts }, { mode: "ac" })],
+      ["solveAnalogStep", (parts) => solveAnalogStep({ ...source, parts }, { mode: "ac" })],
+      ["simulateTransient", (parts) => simulateTransient({ ...source, parts }, { durationSeconds: 1, timeStepSeconds: 0.1 })],
+    ];
+    const overriddenArrays = [
+      new Proxy([...source.parts], {
+        get(target, key, receiver) {
+          if (key === "map") { throw new Error("proxy map trap"); }
+          return Reflect.get(target, key, receiver);
+        },
+      }),
+      new Proxy([...source.parts], {
+        get(target, key, receiver) {
+          if (key === "length") { return 0; }
+          return Reflect.get(target, key, receiver);
+        },
+      }),
+      new Proxy([...source.parts], {
+        get(target, key, receiver) {
+          if (key === "0") { return { ...source.parts[0], id: "substituted" }; }
+          return Reflect.get(target, key, receiver);
+        },
+      }),
+    ];
+
+    for (const [name, call] of calls) {
+      for (const parts of overriddenArrays) {
+        let result: { status: string } | undefined;
+        expect(() => { result = call(parts); }, name).not.toThrow();
+        expect(result?.status, name).toBe("invalid");
+      }
+    }
+  });
+
+  it("does not throw when an array proxy changes its method behavior after validation across public APIs", () => {
+    const calls: [string, (parts: CircuitDocument["parts"]) => { status: string }][] = [
+      ["analyzeCircuit", (parts) => analyzeCircuit({ ...source, parts })],
+      ["analyzeExtendedCircuit", (parts) => analyzeExtendedCircuit({ ...source, parts }, {}, { mode: "ac" })],
+      ["analyzeAnalogCircuit", (parts) => analyzeAnalogCircuit({ ...source, parts }, { mode: "ac" })],
+      ["solveAnalogStep", (parts) => solveAnalogStep({ ...source, parts }, { mode: "ac" })],
+      ["simulateTransient", (parts) => simulateTransient({ ...source, parts }, { durationSeconds: 1, timeStepSeconds: 0.1 })],
+    ];
+
+    for (const [name, call] of calls) {
+      let mapReads = 0;
+      const parts = new Proxy([...source.parts], {
+        get(target, key, receiver) {
+          if (key === "map") {
+            mapReads += 1;
+            if (mapReads > 1) { throw new Error("late proxy map trap"); }
+            return Array.prototype.map;
+          }
+          return Reflect.get(target, key, receiver);
+        },
+      });
+
+      let result: { status: string } | undefined;
+      expect(() => { result = call(parts); }, name).not.toThrow();
+      expect(result?.status, name).toBe("invalid");
+    }
+  });
+
   it("rejects indexed accessors without invoking them across public analysis APIs", () => {
     const partCalls: [string, (parts: CircuitDocument["parts"]) => { status: string }][] = [
       ["analyzeCircuit", (parts) => analyzeCircuit({ ...source, parts })],

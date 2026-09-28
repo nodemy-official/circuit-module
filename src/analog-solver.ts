@@ -10,7 +10,6 @@ import {
   complex,
   complexAdd,
   complexConjugate,
-  complexDivide,
   complexMagnitude,
   complexMultiply,
   complexPhaseDegrees,
@@ -99,7 +98,6 @@ const NEWTON_RELATIVE_TOLERANCE = 1e-10;
 const PHYSICAL_CURRENT_TOLERANCE_AMPS = 1e-9;
 const PHYSICAL_VOLTAGE_TOLERANCE_VOLTS = 1e-9;
 const PHYSICAL_RELATIVE_TOLERANCE = 1e-10;
-const EXPONENT_MIN = -60;
 const EXPONENT_MAX = 80;
 const OP_AMP_OUTPUT_RESISTANCE_OHMS = 20;
 
@@ -1160,7 +1158,7 @@ function diodeCurrentAndSlope(voltage: number, saturationCurrent: number, ideali
   // Divide in stages when forming n * Vt would round a subnormal value or zero.
   const subnormalScale = scale < 2 ** -1022;
   const rawExponent = subnormalScale ? (voltage / ideality) / THERMAL_VOLTAGE : voltage / scale;
-  const exponential = Math.exp(Math.max(EXPONENT_MIN, Math.min(EXPONENT_MAX, rawExponent)));
+  const exponential = Math.exp(Math.min(EXPONENT_MAX, rawExponent));
   const exponentialCurrent = saturationCurrent * exponential;
   const scaledSaturation = subnormalScale
     ? (saturationCurrent / ideality) / THERMAL_VOLTAGE
@@ -1170,10 +1168,15 @@ function diodeCurrentAndSlope(voltage: number, saturationCurrent: number, ideali
     : exponentialCurrent / scale;
   // Prefer a normal intermediate; if both are subnormal, use the larger one
   // so division by a small thermal scale does not amplify avoidable rounding.
-  const slope = Number.isFinite(exponentialCurrent) &&
+  let slope = Number.isFinite(exponentialCurrent) &&
     (exponentialCurrent >= 2 ** -1022 || !Number.isFinite(scaledSaturation) || exponentialCurrent >= scaledSaturation)
     ? exponentialSlope
     : scaledSaturation * exponential;
+  if (rawExponent < 0 && (exponential < 2 ** -1022 || !Number.isFinite(slope))) {
+    // Reverse bias has no conductance floor. Evaluate the combined exponent
+    // when exp(V/nVt) underflows before multiplication by Is or division by nVt.
+    slope = Math.exp(Math.log(saturationCurrent) - Math.log(ideality) - Math.log(THERMAL_VOLTAGE) + rawExponent);
+  }
   if (rawExponent > EXPONENT_MAX) {
     return {
       // Scale the exponential before the continuation factor. The current at
@@ -1181,12 +1184,6 @@ function diodeCurrentAndSlope(voltage: number, saturationCurrent: number, ideali
       current: Number.isFinite(rawExponent)
         ? exponentialCurrent * (1 + rawExponent - EXPONENT_MAX) - saturationCurrent
         : slope * (voltage - scale * (EXPONENT_MAX - 1)) - saturationCurrent,
-      slope,
-    };
-  }
-  if (rawExponent < EXPONENT_MIN) {
-    return {
-      current: saturationCurrent * Math.expm1(EXPONENT_MIN),
       slope,
     };
   }
@@ -3309,7 +3306,9 @@ function componentMeasurements(
       ? impedanceMeasurements(0, reactiveBranch.seriesReactanceOhms ?? 0, current)
       : unboundedReactiveAdmittance
         ? (() => {
-          const voltage = complexDivide(current, unboundedReactiveAdmittance);
+          // Norton currents are derived from these node voltages. Inverting a
+          // rounded subnormal current loses the original voltage (even to zero).
+          const voltage = primaryVoltage(part, terminalVoltages);
           const power = complexMultiply(voltage, complexConjugate(current));
           return { voltage, power: complex(0, power.imaginary) };
         })()
@@ -3734,6 +3733,21 @@ export function solveAnalogStep(
     const message = "解析条件はオブジェクトで指定してください。";
     return result("invalid", mode, message, { issues: [{ severity: "error", message }] });
   }
+  try {
+    return solveAnalogStepFromInput(inputDocument, options, mode);
+  } catch {
+    // A caller-owned Proxy can change behavior after shape validation. Keep
+    // failures at the public API boundary, as in transient analysis.
+    const message = "回路データまたは解析条件を読み取れません。";
+    return result("invalid", mode, message, { issues: [{ severity: "error", message }] });
+  }
+}
+
+function solveAnalogStepFromInput(
+  inputDocument: CircuitDocument,
+  options: AnalogStepOptions,
+  mode: AnalogAnalysisMode,
+): AnalogCircuitAnalysis {
   const shapeIssue = circuitDocumentShapeIssue(inputDocument);
   if (shapeIssue) {
     return result("invalid", mode, shapeIssue, { issues: [{ severity: "error", message: shapeIssue }] });

@@ -131,8 +131,8 @@ describe("diode exponential overflow audit", () => {
 
   it.each([
     { saturationCurrent: 1e-299, product: 0 },
-    { saturationCurrent: 1e-297, product: 1e-323 },
-  ])("retains reverse differential conductance at subnormal Is=$saturationCurrent", ({ saturationCurrent, product }) => {
+    { saturationCurrent: 1e-280, product: 5e-324 },
+  ])("retains reverse differential conductance with a subnormal exponential product at Is=$saturationCurrent", ({ saturationCurrent, product }) => {
     const scale = 1e-100;
     const ideality = scale / 0.025_85;
     const offsetVoltage = -100 * scale;
@@ -158,10 +158,10 @@ describe("diode exponential overflow audit", () => {
     const analysis = analyzeAnalogCircuit(document, { mode: "ac", frequencyHz: 1000 });
     expect(analysis.status, analysis.message).toBe("valid");
     const actualCurrent = analysis.parts.diode.current.real;
-    const expectedConductance = (saturationCurrent / scale) * Math.exp(-60);
+    const expectedConductance = (saturationCurrent / scale) * Math.exp(-100);
     const expectedCurrent = expectedConductance * analysis.parts.diode.voltage.real;
 
-    expect(saturationCurrent * Math.exp(-60)).toBe(product);
+    expect(saturationCurrent * Math.exp(-100)).toBe(product);
     expect(expectedCurrent).toBeGreaterThan(0);
     expect(actualCurrent / expectedCurrent).toBeCloseTo(1, 8);
   });

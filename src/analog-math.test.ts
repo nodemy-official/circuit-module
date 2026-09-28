@@ -140,6 +140,15 @@ describe("complexDivide", () => {
 });
 
 describe("solveRealLinearSystem", () => {
+  it("retains a finite solution when normalizing subnormal excitation would overflow", () => {
+    const solution = solveRealLinearSystem(
+      1,
+      new Float64Array([Number.MIN_VALUE]),
+      new Float64Array([Number.MIN_VALUE]),
+    );
+    expect(Array.from(solution ?? [])).toEqual([1]);
+  });
+
   it.each([1, 1e-200, 1e200])("solves the same equations at scale %s", (scale) => {
     // x + 2y = 5, 3x + 4y = 11 has x = 1, y = 2, independent of units.
     const solution = solveRealLinearSystem(

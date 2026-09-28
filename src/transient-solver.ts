@@ -734,12 +734,35 @@ function distributeInitialCapacitorCurrents(sample: TransientSample, groups: rea
     for (const member of group.members) {
       const reading = sample.parts[member.partId];
       if (!reading) { continue; }
-      const currentShare = member.capacitanceFarads / group.totalCapacitanceFarads;
-      reading.currentAmps = canonicalCurrent * member.orientation * currentShare;
+      reading.currentAmps = scaledRatioProduct(
+        [canonicalCurrent * member.orientation, member.capacitanceFarads],
+        group.totalCapacitanceFarads,
+      );
       reading.terminalCurrents = { a: reading.currentAmps, b: -reading.currentAmps };
       reading.powerWatts = reading.voltageVolts * reading.currentAmps;
     }
   }
+}
+
+/** Computes a scaled product quotient without rounding its denominator ratio to zero first. */
+function scaledRatioProduct(numerators: readonly number[], denominator: number) {
+  const exponent = Math.max(-1074, Math.min(1023, Math.floor(Math.log2(denominator))));
+  let mantissa = denominator / 2 ** exponent;
+  let adjustedExponent = exponent;
+  if (mantissa >= 2) {
+    mantissa /= 2;
+    adjustedExponent += 1;
+  } else if (mantissa < 1) {
+    mantissa *= 2;
+    adjustedExponent -= 1;
+  }
+  const firstExponent = Math.floor(adjustedExponent / 2);
+  return scaledProduct([
+    ...numerators,
+    1 / mantissa,
+    2 ** -firstExponent,
+    2 ** -(adjustedExponent - firstExponent),
+  ]);
 }
 
 interface InitialIdealBranch {

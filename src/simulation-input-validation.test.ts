@@ -17,6 +17,10 @@ const malformedDocuments: [string, unknown][] = [
   ["missing parts", { title: "bad", wires: [] }],
   ["non-array parts", { title: "bad", parts: null, wires: [] }],
   ["null part", { title: "bad", parts: [null], wires: [] }],
+  ["non-string part label", {
+    ...validDocument,
+    parts: [{ ...validDocument.parts[0], label: { toString() { throw new Error("label conversion ran"); } } }],
+  }],
   ["duplicate part id", { ...validDocument, parts: [...validDocument.parts, validDocument.parts[0]] }],
   ["non-array wires", { ...validDocument, wires: null }],
   ["null wire", { ...validDocument, wires: [null] }],

@@ -89,6 +89,7 @@ interface Conductance {
   a: number;
   b: number;
   g: number;
+  resistanceOhms: number;
   /** Present for the battery's internal resistance so loop checks can omit that source. */
   batteryId?: string;
   /** Open-circuit A−B voltage of a battery branch. */
@@ -238,6 +239,7 @@ function buildNetwork(
       a: index.get(key(wire.from)) ?? -1,
       b: index.get(key(wire.to)) ?? -1,
       g: 1 / IDEAL_OHMS,
+      resistanceOhms: IDEAL_OHMS,
     });
   }
   for (const part of document.parts) {
@@ -246,12 +248,12 @@ function buildNetwork(
       const ohms = batteryOhms(part);
       const a = node(part.id, "a");
       const b = node(part.id, "b");
-      conductances.push({ a, b, g: 1 / ohms, batteryId: part.id, voltage: part.voltageVolts });
+      conductances.push({ a, b, g: 1 / ohms, resistanceOhms: ohms, batteryId: part.id, voltage: part.voltageVolts });
       continue;
     }
     const ohms = partOhms(part, switchStates);
     if (ohms !== null) {
-      conductances.push({ a: node(part.id, "a"), b: node(part.id, "b"), g: 1 / ohms });
+      conductances.push({ a: node(part.id, "a"), b: node(part.id, "b"), g: 1 / ohms, resistanceOhms: ohms });
     }
   }
   return conductances;
@@ -444,9 +446,8 @@ function popDistance(heap: DistanceEntry[]) {
 
 function passiveAdjacency(size: number, conductances: readonly Conductance[]) {
   const adjacent = Array.from({ length: size }, () => [] as PassiveNeighbor[]);
-  for (const { a, b, g, batteryId } of conductances) {
+  for (const { a, b, resistanceOhms: resistance, batteryId } of conductances) {
     if (batteryId !== undefined) { continue; }
-    const resistance = 1 / g;
     adjacent[a]?.push({ node: b, resistance });
     adjacent[b]?.push({ node: a, resistance });
   }
@@ -594,27 +595,28 @@ function nodeVoltages(
   conductances: readonly Conductance[],
   currentSource?: { from: number; to: number; amps: number },
 ) {
-  if (conductances.some(({ g }) => !Number.isFinite(g))) {
-    return null;
-  }
   const tree = voltageTree(size, conductances);
   const count = tree.unknowns.size;
+  const rowResistance = conductances.some(({ g }) => !Number.isFinite(g))
+    ? treeRowResistances(tree, conductances)
+    : null;
   const matrix = new Float64Array(count * count);
   const rhs = new Float64Array(count);
-  for (const { a, b, g, voltage = 0 } of conductances) {
+  for (const { a, b, g, resistanceOhms, voltage = 0 } of conductances) {
     const path = treeVoltagePath(tree, a, b);
     const residualVoltage = sumVoltagePath(path, tree.baseline, voltage).value;
     for (const row of path) {
-      rhs[row.unknown] -= g * row.sign * residualVoltage;
+      const coefficient = rowResistance ? rowResistance[row.unknown]! / resistanceOhms : g;
+      rhs[row.unknown] -= coefficient * row.sign * residualVoltage;
       for (const column of path) {
-        matrix[row.unknown * count + column.unknown] += g * row.sign * column.sign;
+        matrix[row.unknown * count + column.unknown] += coefficient * row.sign * column.sign;
       }
     }
   }
   if (currentSource) {
     const path = treeVoltagePath(tree, currentSource.from, currentSource.to);
     for (const row of path) {
-      rhs[row.unknown] += row.sign * currentSource.amps;
+      rhs[row.unknown] += row.sign * currentSource.amps * (rowResistance?.[row.unknown] ?? 1);
     }
   }
   const solution = solveRealLinearSystem(count, matrix, rhs);
@@ -636,6 +638,19 @@ function nodeVoltages(
       return { value: baseline + correction.value, scale: Math.abs(baseline) + correction.scale };
     },
   };
+}
+
+/** Scale only tree equations containing overflowing conductances by their
+ * smallest branch resistance. Other equations retain their original units,
+ * including those of disconnected ordinary circuits. */
+function treeRowResistances(tree: ReturnType<typeof voltageTree>, conductances: readonly Conductance[]) {
+  const resistance = new Float64Array(tree.unknowns.size).fill(Number.POSITIVE_INFINITY);
+  for (const edge of conductances) {
+    for (const row of treeVoltagePath(tree, edge.a, edge.b)) {
+      resistance[row.unknown] = Math.min(resistance[row.unknown]!, edge.resistanceOhms);
+    }
+  }
+  return resistance.map((value) => Number.isFinite(1 / value) ? 1 : value);
 }
 
 /** Equivalent resistance of the passive network between two terminals. */
@@ -1074,7 +1089,7 @@ function localPassiveConductances(nodes: readonly number[], conductances: readon
 function passiveComponentAdjacency(nodes: readonly number[], localEdges: readonly LocalPassiveConductance[]) {
   const adjacent = nodes.map(() => [] as { edge: number; node: number; resistance: number }[]);
   for (const [edgeIndex, edge] of localEdges.entries()) {
-    const resistance = 1 / edge.g;
+    const resistance = edge.resistanceOhms;
     adjacent[edge.localA]?.push({ edge: edgeIndex, node: edge.localB, resistance });
     adjacent[edge.localB]?.push({ edge: edgeIndex, node: edge.localA, resistance });
   }
@@ -1121,7 +1136,7 @@ function passiveCoreNetwork(
     if (removedEdges.has(edgeIndex) || degree[edge.localA] === 0 || degree[edge.localB] === 0) { return []; }
     const a = nodes[edge.localA];
     const b = nodes[edge.localB];
-    return a === undefined || b === undefined ? [] : [{ a, b, g: edge.g }];
+    return a === undefined || b === undefined ? [] : [{ a, b, g: edge.g, resistanceOhms: edge.resistanceOhms }];
   });
   return { coreLocalNodes, coreNodes, coreConductances };
 }
@@ -1386,6 +1401,18 @@ export function analyzeCircuit(
   document: CircuitDocument,
   switchStates: Record<string, boolean> = {},
   options: CircuitAnalysisOptions = {},
+): CircuitAnalysis {
+  try {
+    return analyzeCircuitFromInput(document, switchStates, options);
+  } catch {
+    return invalidInputResult("回路データまたは解析条件を読み取れません。");
+  }
+}
+
+function analyzeCircuitFromInput(
+  document: CircuitDocument,
+  switchStates: Record<string, boolean>,
+  options: CircuitAnalysisOptions,
 ): CircuitAnalysis {
   const inputIssue = circuitAnalysisInputIssue(document, switchStates, options);
   if (inputIssue) { return invalidInputResult(inputIssue); }
