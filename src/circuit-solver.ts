@@ -53,6 +53,8 @@ export interface CircuitPartReading {
   meterStatus?: MeterStatus;
   /** Effective switch position used for this result, including analysis overrides. */
   switchClosed?: boolean;
+  /** MOS channel has current or a nonzero incremental response; AC uses the DC bias state. */
+  channelConducting?: boolean;
 }
 
 export interface CircuitAnalysisOptions {

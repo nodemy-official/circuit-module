@@ -3,3 +3,4 @@ dist/
 *.tgz
 coverage/
 storybook-static/
+.mdxr/

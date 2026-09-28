@@ -283,13 +283,18 @@ describe("Circuit wiring interactions", () => {
   });
 
   it("keeps the original wire and connection mode after an invalid reconnect, then cancels with Escape", () => {
-    const initial = fixture(true, 0, false);
+    const initial = fixture(true);
+    initial.wires.push({
+      id: "wire-2",
+      from: { partId: resistor.id, terminal: "a" },
+      to: { partId: junction.id, terminal: "a" },
+    });
     const ui = mount(initial);
     click(required(ui.container, '[data-wire-id="wire-1"]'));
     click(required(ui.container, '[data-wire-id="wire-1"][data-wire-handle="from"]'));
 
     expect(ui.editor.pendingEndpoint).toEqual({ partId: resistor.id, terminal: "a" });
-    clickTerminal(ui.container, resistor.id, "b");
+    clickTerminal(ui.container, junction.id, "a");
 
     expect(ui.editor.document).toEqual(initial);
     expect(ui.editor.pendingWire).toEqual({ wireId: "wire-1", end: "from" });

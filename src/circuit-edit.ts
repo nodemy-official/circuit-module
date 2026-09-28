@@ -461,10 +461,6 @@ function connectionError(
     return "接続先の端子が見つかりません。";
   }
   if (sameEndpoint(from, to)) { return "同じ端子同士は接続できません。"; }
-  if (from.partId === to.partId) {
-    const part = document.parts.find((item) => item.id === from.partId);
-    if (!part || terminalsOf(part.kind).length < 3) { return "同じ部品の端子同士は接続できません。"; }
-  }
   const duplicated = document.wires.some(
     (wire) => wire.id !== ignoredWireId &&
       ((sameEndpoint(wire.from, from) && sameEndpoint(wire.to, to)) ||
@@ -524,32 +520,46 @@ export function terminalAt(document: CircuitDocument, point: Point): CircuitEndp
   return null;
 }
 
+function preparePointConnection(
+  document: CircuitDocument,
+  point: Point,
+  existing: CircuitEndpoint | null,
+  ignoredWireId?: string,
+): EditResult<{ endpoint: CircuitEndpoint; crossedWires: CircuitWire[] }> {
+  // Find crossings before adding a junction so they match the displayed routes.
+  const crossedWires = wiresCrossingPoint(document, point, existing, ignoredWireId);
+  if (existing) { return { ok: true, document, endpoint: existing, crossedWires }; }
+
+  const placed = addPart(document, "junction", point);
+  if (!placed.ok) { return placed; }
+  return {
+    ok: true,
+    document: placed.document,
+    endpoint: { partId: placed.id, terminal: "a" },
+    crossedWires,
+  };
+}
+
 /** Connects a terminal to a cell, placing a junction there when no terminal is waiting. */
 export function connectToPoint(
   document: CircuitDocument,
   from: CircuitEndpoint,
   point: Point,
 ): EditResult<{ id: string }> {
-  const existing = terminalAt(document, point);
-  const crossed = wiresCrossingPoint(document, point, existing);
-  if (crossed.length === 0 && existing) { return connect(document, from, existing); }
-
-  const placed = existing ? null : addPart(document, "junction", point);
-  if (placed && !placed.ok) { return placed; }
-  const junction = placed ? { partId: placed.id, terminal: "a" as const } : existing;
-  if (!junction) { return { ok: false, reason: "接続先の端子が見つかりません。" }; }
-  const baseDocument = placed?.document ?? document;
-  if (crossed.length === 0) { return connect(baseDocument, from, junction); }
-  if (sameEndpoint(from, junction) || from.partId === junction.partId) {
-    return connect(document, from, junction);
+  const prepared = preparePointConnection(document, point, terminalAt(document, point));
+  if (!prepared.ok) { return prepared; }
+  const { document: baseDocument, endpoint, crossedWires } = prepared;
+  if (crossedWires.length === 0) { return connect(baseDocument, from, endpoint); }
+  if (from.partId === endpoint.partId) {
+    return connect(document, from, endpoint);
   }
 
-  const { document: splitDocument, splitWires } = splitWiresAtJunction(baseDocument, crossed, junction);
+  const { document: splitDocument, splitWires } = splitWiresAtJunction(baseDocument, crossedWires, endpoint);
   const attached = splitWires.find(
     (wire) => sameEndpoint(wire.from, from) || sameEndpoint(wire.to, from),
   );
   if (attached) { return { ok: true, id: attached.id, document: splitDocument }; }
-  return connect(splitDocument, from, junction);
+  return connect(splitDocument, from, endpoint);
 }
 
 /** Reconnects one wire end to a terminal or point on the board, splitting crossed wires. */
@@ -566,21 +576,13 @@ export function reconnectWireToPoint(
   const existing = terminalAt(document, point);
   if (existing && sameEndpoint(current, existing)) { return { ok: true, id: wireId, document }; }
 
-  const crossed = wiresCrossingPoint(document, point, existing, wireId);
-  if (crossed.length === 0 && existing) {
-    return reconnectWire(document, wireId, end, existing);
-  }
-
-  const placed = existing ? null : addPart(document, "junction", point);
-  if (placed && !placed.ok) { return placed; }
-  const junction = placed ? { partId: placed.id, terminal: "a" as const } : existing;
-  if (!junction) { return { ok: false, reason: "接続先の端子が見つかりません。" }; }
-
-  const baseDocument = placed?.document ?? document;
-  const splitDocument = crossed.length === 0
+  const prepared = preparePointConnection(document, point, existing, wireId);
+  if (!prepared.ok) { return prepared; }
+  const { document: baseDocument, endpoint, crossedWires } = prepared;
+  const splitDocument = crossedWires.length === 0
     ? baseDocument
-    : splitWiresAtJunction(baseDocument, crossed, junction).document;
-  return reconnectWire(splitDocument, wireId, end, junction);
+    : splitWiresAtJunction(baseDocument, crossedWires, endpoint).document;
+  return reconnectWire(splitDocument, wireId, end, endpoint);
 }
 
 /** Number of wires attached to a terminal. */

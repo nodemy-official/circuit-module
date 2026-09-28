@@ -13,6 +13,8 @@ interface MeterStatusOptions {
   mode?: "dc" | "ac";
   frequencyHz?: number;
   switchStates?: Record<string, boolean>;
+  /** MOS channels with no current or incremental response are open branches. */
+  channelConducting?: Readonly<Record<string, boolean>>;
   /** Initial transient solve fixes an inductor's current instead of shorting it. */
   initialInductorCurrents?: boolean;
 }
@@ -83,6 +85,15 @@ function joinAcross(nodes: DisjointSet, index: Map<string, number>, part: Circui
     const next = index.get(endpointKey(part.id, terminal));
     if (next !== undefined) { nodes.join(first, next); }
   }
+}
+
+function joinMosChannel(
+  nodes: DisjointSet,
+  index: Map<string, number>,
+  part: CircuitPart,
+  channelConducting: Readonly<Record<string, boolean>> | undefined,
+) {
+  if (channelConducting?.[part.id] !== false) { joinAcross(nodes, index, part, ["a", "c"]); }
 }
 
 /**
@@ -169,7 +180,7 @@ function joinElectricalParts(
         break;
       case "nmos":
       case "pmos":
-        joinAcross(nodes, index, part, ["a", "c"]);
+        joinMosChannel(nodes, index, part, options.channelConducting);
         break;
       case "op-amp": {
         const output = index.get(endpointKey(part.id, "c"));

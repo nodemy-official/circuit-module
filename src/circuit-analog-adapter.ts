@@ -112,6 +112,7 @@ function connectivityGraph(
   frequencyHz: number,
   switchStates: Record<string, boolean>,
   excludedPartId: string,
+  cutoffMosfetIds: ReadonlySet<string>,
 ) {
   const endpointKey = (partId: string, terminal: CircuitTerminal) => JSON.stringify([partId, terminal]);
   const graph: ConductivityGraph = { adjacent: new Map(), endpointKey };
@@ -129,7 +130,7 @@ function connectivityGraph(
   }
   const reference = referenceEndpointKey(document, graph);
   for (const part of document.parts) {
-    if (part.id === excludedPartId) { continue; }
+    if (part.id === excludedPartId || cutoffMosfetIds.has(part.id)) { continue; }
     connectPartInGraph(graph, part, document, mode, frequencyHz, switchStates, reference);
   }
   return graph;
@@ -156,8 +157,9 @@ function hasSourceReturnPath(
   mode: "dc" | "ac",
   frequencyHz: number,
   switchStates: Record<string, boolean>,
+  cutoffMosfetIds: ReadonlySet<string>,
 ) {
-  const graph = connectivityGraph(document, mode, frequencyHz, switchStates, source.id);
+  const graph = connectivityGraph(document, mode, frequencyHz, switchStates, source.id, cutoffMosfetIds);
   return connectedInGraph(
     graph.adjacent,
     graph.endpointKey(source.id, "a"),
@@ -171,8 +173,9 @@ function hasOpAmpOutputReturnPath(
   mode: "dc" | "ac",
   frequencyHz: number,
   switchStates: Record<string, boolean>,
+  cutoffMosfetIds: ReadonlySet<string>,
 ) {
-  const graph = connectivityGraph(document, mode, frequencyHz, switchStates, opAmp.id);
+  const graph = connectivityGraph(document, mode, frequencyHz, switchStates, opAmp.id, cutoffMosfetIds);
   const reference = referenceEndpointKey(document, graph);
   return reference !== undefined && connectedInGraph(
     graph.adjacent,
@@ -203,15 +206,19 @@ function analysisStatus(
   mode: "dc" | "ac",
   frequencyHz: number,
   switchStates: Record<string, boolean>,
+  readings: Record<string, CircuitPartReading>,
 ): CircuitAnalysis["status"] {
   if (analogStatus !== "valid") { return analogStatus; }
+  const cutoffMosfetIds = new Set(document.parts
+    .filter((part) => (part.kind === "nmos" || part.kind === "pmos") && readings[part.id]?.channelConducting === false)
+    .map((part) => part.id));
   const hasOpAmpOutputLoop = document.parts.some((part) =>
-    part.kind === "op-amp" && hasOpAmpOutputReturnPath(document, part, mode, frequencyHz, switchStates),
+    part.kind === "op-amp" && hasOpAmpOutputReturnPath(document, part, mode, frequencyHz, switchStates, cutoffMosfetIds),
   );
   const activeSources = sources.filter((source) => isActiveSourceForMode(source, mode, frequencyHz));
   if (activeSources.length === 0) { return hasOpAmpOutputLoop ? "closed" : "idle"; }
   const hasClosedSourceLoop = activeSources.some((source) =>
-    hasSourceReturnPath(document, source, mode, frequencyHz, switchStates),
+    hasSourceReturnPath(document, source, mode, frequencyHz, switchStates, cutoffMosfetIds),
   );
   return hasClosedSourceLoop || hasOpAmpOutputLoop ? "closed" : "open";
 }
@@ -233,6 +240,7 @@ function adaptReading(
     terminalCurrents: terminalValues(reading.terminalCurrents, ac),
     ...(reading.meterStatus ? { meterStatus: reading.meterStatus } : {}),
     ...(part.kind === "switch" ? { switchClosed: switchClosedState(part, switchStates) } : {}),
+    ...(reading.channelConducting === undefined ? {} : { channelConducting: reading.channelConducting }),
   };
   if (ac) {
     result.voltagePhaseDegrees = phase(reading.voltage);
@@ -313,7 +321,7 @@ function analyzeExtendedCircuitFromInput(
     };
   }
   const sources = document.parts.filter((part) => sourceKinds.has(part.kind));
-  const status = analysisStatus(document, analog.status, sources, mode, frequencyHz, switchStates);
+  const status = analysisStatus(document, analog.status, sources, mode, frequencyHz, switchStates, parts);
   const message = status === "open"
     ? "回路が開いているため電流は流れていません。導線とスイッチを確認してください。"
     : analog.message;

@@ -122,6 +122,7 @@ function partKindsAndIssue(values: unknown[]): { kinds: Map<string, CircuitPartK
 
 function wireShapeIssue(values: unknown[], kinds: ReadonlyMap<string, CircuitPartKind>) {
   const wireIds = new Set<string>();
+  const wireEndpointPairs = new Set<string>();
   for (const [index, wire] of values.entries()) {
     if (!isSimulationRecord(wire) || typeof wire.id !== "string" || wire.id.trim() === "") {
       return `導線${index + 1}の ID が正しくありません。`;
@@ -135,6 +136,11 @@ function wireShapeIssue(values: unknown[], kinds: ReadonlyMap<string, CircuitPar
     if (sameEndpoint(wire.from, wire.to)) {
       return `導線${index + 1}は同じ端子同士を接続しています。`;
     }
+    const endpointPair = unorderedWireKey(wire.from, wire.to);
+    if (wireEndpointPairs.has(endpointPair)) {
+      return `導線${index + 1}は既存の導線と同じ端子間を接続しています。`;
+    }
+    wireEndpointPairs.add(endpointPair);
   }
   return null;
 }
@@ -159,4 +165,14 @@ function endpointShapeIssue(
 function sameEndpoint(first: unknown, second: unknown) {
   return isSimulationRecord(first) && isSimulationRecord(second) &&
     first.partId === second.partId && first.terminal === second.terminal;
+}
+
+function unorderedWireKey(first: unknown, second: unknown) {
+  const endpoints = [endpointKey(first), endpointKey(second)].sort();
+  return JSON.stringify(endpoints);
+}
+
+function endpointKey(value: unknown) {
+  if (!isSimulationRecord(value)) { return ""; }
+  return JSON.stringify([value.partId, value.terminal]);
 }

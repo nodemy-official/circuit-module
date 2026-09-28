@@ -29,6 +29,8 @@ export interface TransientPartReading {
   terminalVoltages?: Partial<Record<CircuitTerminal, number>>;
   terminalCurrents?: Partial<Record<CircuitTerminal, number>>;
   meterStatus?: MeterStatus;
+  /** Whether the MOSFET channel is conducting at this sampled transient state. */
+  channelConducting?: boolean;
   /** Effective switch position used for this sampled transient state. */
   switchClosed?: boolean;
 }
@@ -632,6 +634,7 @@ function samplePart(
     reading: {
       voltageVolts, currentAmps, powerWatts,
       ...(reading.meterStatus ? { meterStatus: reading.meterStatus } : {}),
+      ...(reading.channelConducting === undefined ? {} : { channelConducting: reading.channelConducting }),
       terminalVoltages: Object.fromEntries(Object.entries(reading.terminalVoltages).map(([terminal, value]) => [terminal, value.real])),
       terminalCurrents: part.kind === "capacitor" || part.kind === "inductor"
         ? { a: currentAmps, b: -currentAmps }

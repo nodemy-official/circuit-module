@@ -27,9 +27,14 @@ const malformedDocuments: [string, unknown][] = [
   ["malformed endpoint", { ...validDocument, wires: [{ id: "w", from: null, to: { partId: "source", terminal: "a" } }] }],
   ["unknown endpoint", { ...validDocument, wires: [{ id: "w", from: { partId: "missing", terminal: "a" }, to: { partId: "source", terminal: "a" } }] }],
   ["invalid terminal", { ...validDocument, wires: [{ id: "w", from: { partId: "source", terminal: "c" }, to: { partId: "source", terminal: "b" } }] }],
+  ["same-terminal wire", { ...validDocument, wires: [{ id: "w", from: { partId: "source", terminal: "a" }, to: { partId: "source", terminal: "a" } }] }],
   ["duplicate wire id", { ...validDocument, wires: [
     { id: "w", from: { partId: "source", terminal: "a" }, to: { partId: "source", terminal: "b" } },
     { id: "w", from: { partId: "source", terminal: "b" }, to: { partId: "source", terminal: "a" } },
+  ] }],
+  ["duplicate endpoint pair with distinct IDs", { ...validDocument, wires: [
+    { id: "first", from: { partId: "source", terminal: "a" }, to: { partId: "source", terminal: "b" } },
+    { id: "second", from: { partId: "source", terminal: "b" }, to: { partId: "source", terminal: "a" } },
   ] }],
 ];
 
@@ -63,6 +68,27 @@ describe("simulation API runtime input validation", () => {
     for (const analyze of invalidCalls) {
       expect(() => analyze()).not.toThrow();
       expect(analyze().status).toBe("invalid");
+    }
+  });
+
+  it("accepts an ideal wire loop when every unordered endpoint pair is distinct", () => {
+    const wireLoop: CircuitDocument = {
+      title: "理想導線の三角形",
+      parts: [
+        { id: "j1", kind: "junction", x: 0, y: 0, label: "j1" },
+        { id: "j2", kind: "junction", x: 4, y: 0, label: "j2" },
+        { id: "j3", kind: "junction", x: 2, y: 3, label: "j3" },
+      ],
+      wires: [
+        { id: "w1", from: { partId: "j1", terminal: "a" }, to: { partId: "j2", terminal: "a" } },
+        { id: "w2", from: { partId: "j2", terminal: "a" }, to: { partId: "j3", terminal: "a" } },
+        { id: "w3", from: { partId: "j3", terminal: "a" }, to: { partId: "j1", terminal: "a" } },
+      ],
+    };
+
+    for (const [name, analyze] of publicAnalyzers) {
+      const result = analyze(wireLoop);
+      expect(result.status, name).not.toBe("invalid");
     }
   });
 

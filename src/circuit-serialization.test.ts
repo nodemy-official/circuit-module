@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 
+import { inspectCircuit } from "./circuit-diagnostics.js";
+import { analyzeCircuit } from "./circuit-solver.js";
 import {
   MAX_CIRCUIT_DOCUMENT_JSON_LENGTH,
   MAX_CIRCUIT_DOCUMENT_PARTS,
@@ -85,6 +87,54 @@ describe("circuit document serialization", () => {
     };
 
     expect(parseCircuitDocument(serializeCircuitDocument(document))).toEqual({ ok: true, document });
+  });
+
+  it("round trips direct terminal shorts and preserves their analysis and diagnostic meaning", () => {
+    const batteryShort: CircuitDocument = {
+      title: "電池短絡",
+      parts: [part("battery", "battery", { voltageVolts: 9, internalResistanceOhms: 0 })],
+      wires: [{
+        id: "short",
+        from: { partId: "battery", terminal: "a" },
+        to: { partId: "battery", terminal: "b" },
+      }],
+    };
+    const batteryShortViaJunction: CircuitDocument = {
+      title: batteryShort.title,
+      parts: [...batteryShort.parts, part("battery-junction", "junction", { x: 5 })],
+      wires: [
+        { id: "short-a", from: { partId: "battery", terminal: "a" }, to: { partId: "battery-junction", terminal: "a" } },
+        { id: "short-b", from: { partId: "battery-junction", terminal: "a" }, to: { partId: "battery", terminal: "b" } },
+      ],
+    };
+    const resistorBypass: CircuitDocument = {
+      title: "抵抗バイパス",
+      parts: [part("resistor", "resistor", { resistanceOhms: 10 })],
+      wires: [{
+        id: "bypass",
+        from: { partId: "resistor", terminal: "a" },
+        to: { partId: "resistor", terminal: "b" },
+      }],
+    };
+    const resistorBypassViaJunction: CircuitDocument = {
+      title: resistorBypass.title,
+      parts: [...resistorBypass.parts, part("resistor-junction", "junction", { x: 5 })],
+      wires: [
+        { id: "bypass-a", from: { partId: "resistor", terminal: "a" }, to: { partId: "resistor-junction", terminal: "a" } },
+        { id: "bypass-b", from: { partId: "resistor-junction", terminal: "a" }, to: { partId: "resistor", terminal: "b" } },
+      ],
+    };
+
+    for (const [direct, viaJunction, status, diagnosticCode] of [
+      [batteryShort, batteryShortViaJunction, "short", "wire-shorted-battery"],
+      [resistorBypass, resistorBypassViaJunction, "idle", "wire-bypassed-part"],
+    ] as const) {
+      expect(parseCircuitDocument(serializeCircuitDocument(direct))).toEqual({ ok: true, document: direct });
+      expect(analyzeCircuit(direct).status).toBe(status);
+      expect(analyzeCircuit(viaJunction).status).toBe(status);
+      expect(inspectCircuit(direct).map(({ code }) => code)).toContain(diagnosticCode);
+      expect(inspectCircuit(viaJunction).map(({ code }) => code)).toContain(diagnosticCode);
+    }
   });
 
   it("accepts legacy raw JSON and drops unknown fields while normalizing", () => {
@@ -226,10 +276,15 @@ describe("circuit document serialization", () => {
       parts: [part("junction", "junction"), part("right")],
       wires: [{ id: "wire", from: { partId: "junction", terminal: "b" }, to: { partId: "right", terminal: "a" } }],
     }],
-    ["same-part connection", {
+    ["same-terminal connection", {
       title: "",
       parts: [part("one")],
-      wires: [{ id: "wire", from: { partId: "one", terminal: "a" }, to: { partId: "one", terminal: "b" } }],
+      wires: [{ id: "wire", from: { partId: "one", terminal: "a" }, to: { partId: "one", terminal: "a" } }],
+    }],
+    ["same-terminal connection on a three-terminal part", {
+      title: "",
+      parts: [part("one", "nmos")],
+      wires: [{ id: "wire", from: { partId: "one", terminal: "a" }, to: { partId: "one", terminal: "a" } }],
     }],
     ["reversed duplicate wire", {
       title: "",

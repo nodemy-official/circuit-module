@@ -66,6 +66,15 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
     dispatch({ type: "edit", document: next, group });
   }
 
+  function applyEditResult(result: EditResult, group?: string) {
+    if (!result.ok) {
+      setError(result.reason);
+      return;
+    }
+    setDocument(result.document, group);
+    setError(null);
+  }
+
   function endEdit() {
     dispatch({ type: "end-group" });
   }
@@ -83,7 +92,6 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
     setDocument(result.document);
     setSelection({ parts: [result.id], wires: [] });
     cancelConnection();
-    setError(null);
   }
 
   function selectPart(id: string, additive = false) {
@@ -109,7 +117,6 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
         .filter((id) => document.wires.some((wire) => wire.id === id)),
     }));
     cancelConnection();
-    setError(null);
   }
 
   function selectAll() {
@@ -140,7 +147,6 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
     setDocument(result.document);
     setSelection(result.selection);
     cancelConnection();
-    setError(null);
   }
 
   function startConnection(endpoint: CircuitEndpoint) {
@@ -202,17 +208,12 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
     if (!dx && !dy) { return; }
     const moving = selection.parts.includes(id) ? selection.parts : [id];
     const result = moveParts(document, moving, dx, dy);
-    if (result.ok) {
-      setDocument(result.document, `move:${id}`);
-      setError(null);
-    } else { setError(result.reason); }
+    applyEditResult(result, `move:${id}`);
   }
 
   function updateWireRoute(id: string, waypoints?: readonly Point[]) {
     const result = setWireWaypoints(document, id, waypoints);
-    if (!result.ok) { setError(result.reason); return; }
-    setDocument(result.document, `wire-route:${id}`);
-    setError(null);
+    applyEditResult(result, `wire-route:${id}`);
   }
 
   function cancelWireRoute(id: string) {
@@ -225,18 +226,13 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
     if (!wire || wire.waypoints === undefined) { return; }
     endEdit();
     const result = setWireWaypoints(document, id, undefined);
-    if (!result.ok) { setError(result.reason); return; }
-    setDocument(result.document);
-    setError(null);
+    applyEditResult(result);
   }
 
   function rotateSelected() {
     if (selection.parts.length === 0) { return; }
     const result = rotateParts(document, selection.parts);
-    if (result.ok) {
-      setDocument(result.document);
-      setError(null);
-    } else { setError(result.reason); }
+    applyEditResult(result);
   }
 
   function removeSelected() {
@@ -244,7 +240,6 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
     setDocument(removeSelection(document, selection));
     setSelection(noSelection());
     cancelConnection();
-    setError(null);
   }
 
   function updatePart(id: string, patch: Partial<CircuitPart>) {
@@ -269,7 +264,6 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
     setDocument(next);
     setSelection(noSelection());
     cancelConnection();
-    setError(null);
   }
 
   function importDocument(json: string) {

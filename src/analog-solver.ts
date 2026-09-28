@@ -54,6 +54,8 @@ export interface AnalogCircuitPartReading {
    * `floating` means the voltage reference is indeterminate or an ammeter current is bypassed.
    */
   meterStatus?: MeterStatus;
+  /** MOS channel has current or a nonzero incremental response at its bias point. */
+  channelConducting?: boolean;
 }
 
 export interface AnalogCircuitAnalysis {
@@ -1362,6 +1364,24 @@ function nonlinearModel(part: CircuitPart, voltages: number[]): NonlinearModel |
   return null;
 }
 
+function mosChannelConductingByPartId(
+  document: CircuitDocument,
+  biasLayout: MnaLayout,
+  dcState: Float64Array,
+) {
+  const states: Record<string, boolean> = Object.create(null);
+  for (const part of document.parts) {
+    if (part.kind !== "nmos" && part.kind !== "pmos") { continue; }
+    const model = nonlinearModel(part, nonlinearTerminalVoltages(part, biasLayout, dcState));
+    const channelConducting = Boolean(model && (
+      model.currents.some((current) => current !== 0) ||
+      model.jacobian.some((row) => row.some((derivative) => derivative !== 0))
+    ));
+    setRecordValue(states, part.id, channelConducting);
+  }
+  return states;
+}
+
 function nodeRealValue(layout: MnaLayout, node: number, state: Float64Array) {
   const unknown = layout.topology.nodeUnknowns[node] ?? -1;
   return unknown < 0 ? 0 : (state[unknown] ?? 0);
@@ -1673,16 +1693,53 @@ function referenceNodeStrengths(document: CircuitDocument, layout: MnaLayout) {
   return strengthsFromReferenceEdges(layout, edges);
 }
 
-function referenceConstraints(document: CircuitDocument, layout: MnaLayout, mode: AnalogAnalysisMode): ReferenceConstraint[] {
-  // Each disconnected conductive network has an arbitrary common-mode voltage.
-  const parent = Array.from({ length: layout.topology.nodeCount }, (_, index) => index);
+function unbalancedCurrentSourceRoots(
+  document: CircuitDocument,
+  topology: Topology,
+  parent: number[],
+  includeInitialInductors: boolean,
+) {
+  const currentTermsByRoot = new Map<number, number[]>();
+  const addCurrent = (part: CircuitPart, current: number) => {
+    const positiveRoot = findRoot(parent, nodeForTerminal(topology, part, "a"));
+    const negativeRoot = findRoot(parent, nodeForTerminal(topology, part, "b"));
+    if (positiveRoot === negativeRoot) { return; }
+    const positiveTerms = currentTermsByRoot.get(positiveRoot) ?? [];
+    positiveTerms.push(current);
+    currentTermsByRoot.set(positiveRoot, positiveTerms);
+    const negativeTerms = currentTermsByRoot.get(negativeRoot) ?? [];
+    negativeTerms.push(-current);
+    currentTermsByRoot.set(negativeRoot, negativeTerms);
+  };
+  for (const part of document.parts) {
+    if (part.kind === "current-source") {
+      addCurrent(part, part.currentAmps ?? 0);
+    } else if (includeInitialInductors && part.kind === "inductor") {
+      addCurrent(part, part.initialCurrentAmps ?? 0);
+    }
+  }
+  return new Set(
+    [...currentTermsByRoot]
+      .filter(([, terms]) => exactComponentSum(terms) !== 0)
+      .map(([root]) => root),
+  );
+}
+
+function referenceConnectivityParents(
+  document: CircuitDocument,
+  layout: MnaLayout,
+  mode: AnalogAnalysisMode,
+  channelConducting?: Readonly<Record<string, boolean>>,
+) {
+  const parent = Array.from({ length: layout.topology.nodeCount }, (_, node) => node);
   const switchStates = Object.fromEntries(document.parts
     .filter((part) => part.kind === "switch")
     .map((part) => [part.id, layout.branchByPartId.has(part.id)]));
   for (const part of document.parts) {
     const reactiveBranchIsModeled = layout.branchByPartId.has(part.id) ||
       layout.unboundedReactiveAdmittances.has(part.id);
-    if (mode === "ac" && part.kind === "inductor" && !reactiveBranchIsModeled) {
+    if (mode === "ac" && part.kind === "inductor" && !reactiveBranchIsModeled) { continue; }
+    if ((part.kind === "nmos" || part.kind === "pmos") && channelConducting?.[part.id] === false) {
       continue;
     }
     unionPartConduction(
@@ -1701,12 +1758,32 @@ function referenceConstraints(document: CircuitDocument, layout: MnaLayout, mode
       );
     }
   }
+  return parent;
+}
+
+function referenceConstraints(
+  document: CircuitDocument,
+  layout: MnaLayout,
+  mode: AnalogAnalysisMode,
+  channelConducting?: Readonly<Record<string, boolean>>,
+): ReferenceConstraint[] {
+  // Each disconnected conductive network has an arbitrary common-mode voltage.
+  const parent = referenceConnectivityParents(document, layout, mode, channelConducting);
 
   const referenceRoot = findRoot(parent, layout.topology.referenceNode);
+  const unbalancedCurrentRoots = mode === "dc"
+    ? unbalancedCurrentSourceRoots(
+      document,
+      layout.topology,
+      parent,
+      layout.initialInductorCurrents,
+    )
+    : new Set<number>();
   const strengths = referenceNodeStrengths(document, layout);
   const anchorByRoot = new Map<number, { node: number; strength: number }>();
   for (let node = 0; node < layout.topology.nodeCount; node += 1) {
     const root = findRoot(parent, node);
+    if (unbalancedCurrentRoots.has(root)) { continue; }
     const strength = strengths[node] ?? 0;
     const current = anchorByRoot.get(root);
     if (
@@ -1735,31 +1812,9 @@ function referenceComponentIds(
   document: CircuitDocument,
   layout: MnaLayout,
   mode: AnalogAnalysisMode,
+  channelConducting?: Readonly<Record<string, boolean>>,
 ) {
-  const parent = Array.from({ length: layout.topology.nodeCount }, (_, node) => node);
-  const switchStates = Object.fromEntries(document.parts
-    .filter((part) => part.kind === "switch")
-    .map((part) => [part.id, layout.branchByPartId.has(part.id)]));
-  for (const part of document.parts) {
-    const reactiveBranchIsModeled = layout.branchByPartId.has(part.id) ||
-      layout.unboundedReactiveAdmittances.has(part.id);
-    if (mode === "ac" && part.kind === "inductor" && !reactiveBranchIsModeled) { continue; }
-    unionPartConduction(
-      part,
-      layout.topology,
-      parent,
-      switchStates,
-      layout.initialInductorCurrents,
-      layout.physicalReferenceNode,
-    );
-    if (mode === "ac" && part.kind === "capacitor" && reactiveBranchIsModeled) {
-      joinConductiveNodes(
-        parent,
-        nodeForTerminal(layout.topology, part, "a"),
-        nodeForTerminal(layout.topology, part, "b"),
-      );
-    }
-  }
+  const parent = referenceConnectivityParents(document, layout, mode, channelConducting);
   return Array.from({ length: layout.topology.nodeCount }, (_, node) => findRoot(parent, node));
 }
 
@@ -1768,8 +1823,9 @@ function referenceComponentNodes(
   layout: MnaLayout,
   seedNode: number,
   mode: AnalogAnalysisMode,
+  channelConducting?: Readonly<Record<string, boolean>>,
 ) {
-  const componentIds = referenceComponentIds(document, layout, mode);
+  const componentIds = referenceComponentIds(document, layout, mode, channelConducting);
   const seedRoot = componentIds[seedNode];
   return componentIds.map((root) => root === seedRoot);
 }
@@ -1778,8 +1834,15 @@ function preferredReferenceNodes(
   document: CircuitDocument,
   layout: MnaLayout,
   mode: AnalogAnalysisMode,
+  channelConducting?: Readonly<Record<string, boolean>>,
 ) {
-  const component = referenceComponentNodes(document, layout, layout.topology.referenceNode, mode);
+  const component = referenceComponentNodes(
+    document,
+    layout,
+    layout.topology.referenceNode,
+    mode,
+    channelConducting,
+  );
   const strengths = referenceNodeStrengths(document, layout);
   return Array.from({ length: layout.topology.nodeCount }, (_, node) => node)
     .filter((node) => component[node] && node !== layout.topology.referenceNode)
@@ -1788,13 +1851,18 @@ function preferredReferenceNodes(
     );
 }
 
-function canAdjustDcReference(document: CircuitDocument, layout: MnaLayout) {
+function canAdjustDcReference(
+  document: CircuitDocument,
+  layout: MnaLayout,
+  channelConducting?: Readonly<Record<string, boolean>>,
+) {
   if (!layout.initialInductorCurrents) { return true; }
   const referenceComponent = referenceComponentNodes(
     document,
     layout,
     layout.physicalReferenceNode,
     "dc",
+    channelConducting,
   );
   return !document.parts.some((part) =>
     part.kind === "inductor" &&
@@ -1835,8 +1903,11 @@ function stampDcReferences(
   state: Float64Array,
   matrix: Float64Array,
   residual: Float64Array,
+  channelConductingOverride?: Readonly<Record<string, boolean>>,
 ) {
-  for (const { node, derivatives } of referenceConstraints(document, layout, "dc")) {
+  const channelConducting = channelConductingOverride ??
+    mosChannelConductingByPartId(document, layout, state);
+  for (const { node, derivatives } of referenceConstraints(document, layout, "dc", channelConducting)) {
     const unknown = layout.topology.nodeUnknowns[node] ?? -1;
     if (unknown < 0) { continue; }
     // Replace a redundant KCL row with an exact reference. Adding a tiny
@@ -1867,6 +1938,7 @@ function assembleDc(
   layout: MnaLayout,
   state: Float64Array,
   includeReferences = true,
+  channelConductingForReferences?: Readonly<Record<string, boolean>>,
 ): DcAssembly {
   const matrix = new Float64Array(layout.size * layout.size);
   const residual = new Float64Array(layout.size);
@@ -1881,7 +1953,7 @@ function assembleDc(
     addVoltageBranch(matrix, residual, layout, state, branch);
   }
   if (includeReferences) {
-    stampDcReferences(document, layout, state, matrix, residual);
+    stampDcReferences(document, layout, state, matrix, residual, channelConductingForReferences);
   }
   return { matrix, residual };
 }
@@ -1949,6 +2021,28 @@ function residualScore(layout: MnaLayout, assembly: DcAssembly, tolerances: numb
   return score;
 }
 
+function currentBiasedDcSeed(document: CircuitDocument, layout: MnaLayout, state: Float64Array) {
+  const biasedAssembly = assembleDc(document, layout, state);
+  const biasedRhs = Float64Array.from(biasedAssembly.residual, (value) => -value);
+  if (solveRealLinearSystem(layout.size, biasedAssembly.matrix, biasedRhs)) { return state; }
+
+  // Independent voltage biases can already turn a MOS channel on. Preserve
+  // their device slopes before seeding a remaining current-driven zero row;
+  // I/GMIN alone can push a responsive channel into flat saturation instead.
+  const { matrix, residual } = assembleDc(document, layout, state, false);
+  for (let node = 0; node < layout.topology.nodeCount; node += 1) {
+    if (node !== layout.topology.referenceNode) {
+      stampConductance(matrix, residual, layout, state, node, layout.topology.referenceNode, GMIN_SIEMENS);
+    }
+  }
+  stampDcReferences(document, layout, state, matrix, residual);
+  const rhs = Float64Array.from(residual, (value) => -value);
+  const correction = solveRealLinearSystem(layout.size, matrix, rhs);
+  return correction
+    ? Float64Array.from(state, (value, index) => value + (correction[index] ?? 0))
+    : state;
+}
+
 function linearDcSeed(document: CircuitDocument, layout: MnaLayout) {
   // Seed independent voltage biases before retrying a singular off-state nonlinear Jacobian.
   const state = new Float64Array(layout.size);
@@ -1968,7 +2062,8 @@ function linearDcSeed(document: CircuitDocument, layout: MnaLayout) {
   }
   stampDcReferences(document, layout, state, matrix, residual);
   const rhs = Float64Array.from(residual, (value) => -value);
-  return solveRealLinearSystem(layout.size, matrix, rhs);
+  const voltageSeed = solveRealLinearSystem(layout.size, matrix, rhs);
+  return voltageSeed ? currentBiasedDcSeed(document, layout, voltageSeed) : null;
 }
 
 function solveDcNewtonStep(
@@ -1979,6 +2074,11 @@ function solveDcNewtonStep(
   tolerances: number[] | null,
   score: number,
 ) {
+  // Keep this iteration's floating-node constraints fixed while comparing
+  // line-search candidates. The next Newton iteration recalculates them from
+  // its new bias point, so a cutoff MOS can turn on without its candidate KCL
+  // residual being rejected against a different equation set.
+  const channelConductingForReferences = mosChannelConductingByPartId(document, layout, state);
   const rhs = Float64Array.from(assembly.residual, (value) => -value);
   const delta = solveRealLinearSystem(layout.size, assembly.matrix, rhs);
   if (!delta) { return { nextState: undefined, singular: true }; }
@@ -1990,7 +2090,13 @@ function solveDcNewtonStep(
     for (let index = 0; index < layout.size; index += 1) {
       candidate[index] = (state[index] ?? 0) + step * (delta[index] ?? 0);
     }
-    const candidateAssembly = assembleDc(document, layout, candidate);
+    const candidateAssembly = assembleDc(
+      document,
+      layout,
+      candidate,
+      true,
+      channelConductingForReferences,
+    );
     // Compare candidates using this iteration's scale so an exponential current cannot
     // increase its own tolerance and make a divergent step appear better.
     const candidateScore = residualScore(layout, candidateAssembly, tolerances);
@@ -2104,8 +2210,9 @@ function stampAcReferences(
   matrixReal: Float64Array,
   matrixImaginary: Float64Array,
   layout: MnaLayout,
+  channelConducting: Readonly<Record<string, boolean>>,
 ) {
-  for (const { node } of referenceConstraints(document, layout, "ac")) {
+  for (const { node } of referenceConstraints(document, layout, "ac", channelConducting)) {
     const unknown = layout.topology.nodeUnknowns[node] ?? -1;
     if (unknown < 0) { continue; }
     matrixReal.fill(0, unknown * layout.size, (unknown + 1) * layout.size);
@@ -2299,6 +2406,7 @@ function solveAcForLayout(
   const matrixImaginary = new Float64Array(layout.size * layout.size);
   const rhsReal = new Float64Array(layout.size);
   const rhsImaginary = new Float64Array(layout.size);
+  const channelConducting = mosChannelConductingByPartId(document, dcLayout, dcState);
 
   for (const part of document.parts) {
     const branch = layout.branchByPartId.get(part.id);
@@ -2321,7 +2429,7 @@ function solveAcForLayout(
   for (const branch of layout.internalBranches) {
     stampAcVoltageBranch(matrixReal, matrixImaginary, rhsReal, rhsImaginary, layout, branch);
   }
-  stampAcReferences(document, matrixReal, matrixImaginary, layout);
+  stampAcReferences(document, matrixReal, matrixImaginary, layout, channelConducting);
 
   return solveComplexLinearSystem(
     layout.size,
@@ -2392,6 +2500,7 @@ function acReferenceCandidates(
   document: CircuitDocument,
   layout: MnaLayout,
   values: ComplexValue[],
+  channelConducting: Readonly<Record<string, boolean>>,
 ): AcReferenceCandidate[] {
   const referenceNode = layout.topology.referenceNode;
   const candidatesByNode = new Map<number, AcReferenceCandidate>();
@@ -2409,7 +2518,7 @@ function acReferenceCandidates(
   // each connected component so it can become a numerical reference when
   // branch equations show that subtraction has lost a smaller voltage.
   const solvedCandidateByComponent = new Map<number, AcReferenceCandidate>();
-  const componentIds = acReferenceComponentIds(document, layout);
+  const componentIds = acReferenceComponentIds(document, layout, channelConducting);
   for (let node = 0; node < layout.topology.nodeCount; node += 1) {
     const candidate = acReferenceCandidate(node, referenceNode, nodeComplexValue(layout, node, values));
     if (!candidate) { continue; }
@@ -2467,7 +2576,11 @@ function layoutWithReferenceNode(layout: MnaLayout, referenceNode: number): MnaL
   };
 }
 
-function acReferenceComponentIds(document: CircuitDocument, layout: MnaLayout) {
+function acReferenceComponentIds(
+  document: CircuitDocument,
+  layout: MnaLayout,
+  channelConducting?: Readonly<Record<string, boolean>>,
+) {
   const parent = Array.from({ length: layout.topology.nodeCount }, (_, index) => index);
   const switchStates = Object.fromEntries(document.parts
     .filter((part) => part.kind === "switch")
@@ -2476,6 +2589,9 @@ function acReferenceComponentIds(document: CircuitDocument, layout: MnaLayout) {
     const reactiveBranchIsModeled = layout.branchByPartId.has(part.id) ||
       layout.unboundedReactiveAdmittances.has(part.id);
     if (part.kind === "inductor" && !reactiveBranchIsModeled) { continue; }
+    if ((part.kind === "nmos" || part.kind === "pmos") && channelConducting?.[part.id] === false) {
+      continue;
+    }
     unionPartConduction(
       part,
       layout.topology,
@@ -2499,8 +2615,9 @@ function acReferenceComponent(
   document: CircuitDocument,
   layout: MnaLayout,
   seedNode: number,
+  channelConducting: Readonly<Record<string, boolean>>,
 ) {
-  return referenceComponentNodes(document, layout, seedNode, "ac");
+  return referenceComponentNodes(document, layout, seedNode, "ac", channelConducting);
 }
 
 function nonlinearAcModelIsCommonModeInvariant(
@@ -2535,10 +2652,11 @@ function rebasedAcSolutionForQuality(
   frequencyHz: number,
   originalKclQuality: number,
   originalResidual: number,
+  channelConducting: Readonly<Record<string, boolean>>,
 ): AcSolution | null {
   let bestSolution: AcSolution | null = null;
   let bestScore = Number.POSITIVE_INFINITY;
-  for (const referenceNode of preferredReferenceNodes(document, layout, "ac").slice(0, 8)) {
+  for (const referenceNode of preferredReferenceNodes(document, layout, "ac", channelConducting).slice(0, 8)) {
     const rebasedLayout = layoutWithReferenceNode(layout, referenceNode);
     const rebasedValues = solveAcForLayout(document, rebasedLayout, layout, dcState);
     if (!rebasedValues) { continue; }
@@ -2566,7 +2684,7 @@ function rebasedAcSolutionForQuality(
         rebasedValues,
       );
       const offset = complex(-originalReferenceVoltage.real, -originalReferenceVoltage.imaginary);
-      const component = acReferenceComponent(document, rebasedLayout, referenceNode);
+      const component = acReferenceComponent(document, rebasedLayout, referenceNode, channelConducting);
       bestSolution = {
         layout: rebasedLayout,
         biasLayout: layout,
@@ -2587,6 +2705,7 @@ function solveAc(
   dcState: Float64Array,
   frequencyHz: number,
 ): AcSolution | null {
+  const channelConducting = mosChannelConductingByPartId(document, layout, dcState);
   const values = solveAcForLayout(document, layout, layout, dcState);
   if (!values) { return null; }
   const noOffsets = Array.from({ length: layout.topology.nodeCount }, () => complex());
@@ -2606,12 +2725,13 @@ function solveAc(
       frequencyHz,
       originalKclQuality,
       originalResidual,
+      channelConducting,
     );
     if (rebasedSolution) { return rebasedSolution; }
   }
 
   if (originalResidual <= 1e-10) { return solution; }
-  for (const candidate of acReferenceCandidates(document, layout, values)) {
+  for (const candidate of acReferenceCandidates(document, layout, values, channelConducting)) {
     const rebasedLayout = layoutWithReferenceNode(layout, candidate.node);
     const rebasedValues = solveAcForLayout(document, rebasedLayout, layout, dcState);
     if (!rebasedValues) { continue; }
@@ -2626,7 +2746,7 @@ function solveAc(
       rebasedValues,
     );
     const offset = complex(-originalReferenceVoltage.real, -originalReferenceVoltage.imaginary);
-    const component = acReferenceComponent(document, rebasedLayout, candidate.node);
+    const component = acReferenceComponent(document, rebasedLayout, candidate.node, channelConducting);
     return {
       layout: rebasedLayout,
       biasLayout: layout,
@@ -2877,10 +2997,15 @@ function dcKclQuality(document: CircuitDocument, layout: MnaLayout, state: Float
   return quality;
 }
 
-function dcReferenceOffsets(document: CircuitDocument, layout: MnaLayout, state: Float64Array) {
+function dcReferenceOffsets(
+  document: CircuitDocument,
+  layout: MnaLayout,
+  state: Float64Array,
+  channelConducting: Readonly<Record<string, boolean>>,
+) {
   const referenceNode = layout.physicalReferenceNode;
   const offset = -nodeRealValue(layout, referenceNode, state);
-  const component = referenceComponentNodes(document, layout, referenceNode, "dc");
+  const component = referenceComponentNodes(document, layout, referenceNode, "dc", channelConducting);
   return component.map((isReferenceComponent) => complex(isReferenceComponent ? offset : 0));
 }
 
@@ -2890,9 +3015,10 @@ function restoreFloatingReferenceOffsets(
   solution: ComplexValue[],
   initialOffsets: ComplexValue[],
   mode: AnalogAnalysisMode,
+  channelConducting?: Readonly<Record<string, boolean>>,
 ) {
   if (layout.initialInductorCurrents) { return initialOffsets; }
-  const componentIds = referenceComponentIds(document, layout, mode);
+  const componentIds = referenceComponentIds(document, layout, mode, channelConducting);
   const physicalReferenceRoot = componentIds[layout.physicalReferenceNode];
   const firstNodeByRoot = new Map<number, number>();
   for (let node = 0; node < componentIds.length; node += 1) {
@@ -2922,12 +3048,15 @@ function solveDc(
   adjustReference = false,
 ): DcSolution {
   const baseline = solveDcAtReference(document, layout);
+  const baselineChannelConducting = baseline.state
+    ? mosChannelConductingByPartId(document, layout, baseline.state)
+    : undefined;
   const baselineResult: DcSolution = {
     ...baseline,
     layout,
     nodeVoltageOffsets: Array.from({ length: layout.topology.nodeCount }, () => complex()),
   };
-  if (!adjustReference || !canAdjustDcReference(document, layout)) { return baselineResult; }
+  if (!adjustReference || !canAdjustDcReference(document, layout, baselineChannelConducting)) { return baselineResult; }
   if (baseline.converged && baseline.state && dcKclQuality(document, layout, baseline.state) <= 1e-12) {
     return baselineResult;
   }
@@ -2939,7 +3068,7 @@ function solveDc(
   let bestQuality = baselineQuality;
   // A second- or third-strongest node can yield a much better-scaled KCL row
     // when the strongest candidate shares another badly conditioned branch.
-  for (const referenceNode of preferredReferenceNodes(document, layout, "dc").slice(0, 8)) {
+  for (const referenceNode of preferredReferenceNodes(document, layout, "dc", baselineChannelConducting).slice(0, 8)) {
     const candidateLayout = layoutWithReferenceNode(layout, referenceNode);
     const candidate = solveDcAtReference(document, candidateLayout);
     if (!candidate.converged || !candidate.state) { continue; }
@@ -2948,7 +3077,12 @@ function solveDc(
       best = {
         ...candidate,
         layout: candidateLayout,
-        nodeVoltageOffsets: dcReferenceOffsets(document, candidateLayout, candidate.state),
+        nodeVoltageOffsets: dcReferenceOffsets(
+          document,
+          candidateLayout,
+          candidate.state,
+          mosChannelConductingByPartId(document, candidateLayout, candidate.state),
+        ),
       };
       bestQuality = candidateQuality;
     }
@@ -3341,9 +3475,14 @@ function layoutMeterStatuses(
   mode: AnalogAnalysisMode,
   frequencyHz: number | undefined,
   switchStates: Record<string, boolean>,
+  channelConducting: Readonly<Record<string, boolean>>,
 ) {
   const statuses = meterStatuses(document, {
-    mode, frequencyHz, switchStates, initialInductorCurrents: layout.initialInductorCurrents,
+    mode,
+    frequencyHz,
+    switchStates,
+    channelConducting,
+    initialInductorCurrents: layout.initialInductorCurrents,
   });
   const idealBranches = [...layout.branches, ...layout.internalBranches].filter(isIdealVoltageConstraint);
   for (const meter of idealBranches) {
@@ -3362,6 +3501,15 @@ function layoutMeterStatuses(
   return statuses;
 }
 
+function mosChannelReading(
+  part: CircuitPart,
+  channelConducting: Readonly<Record<string, boolean>>,
+): Pick<AnalogCircuitPartReading, "channelConducting"> {
+  return Object.hasOwn(channelConducting, part.id)
+    ? { channelConducting: channelConducting[part.id] }
+    : {};
+}
+
 function makeReadings(
   document: CircuitDocument,
   layout: MnaLayout,
@@ -3374,7 +3522,15 @@ function makeReadings(
   nodeVoltageOffsets: ComplexValue[] = [],
 ): Record<string, AnalogCircuitPartReading> {
   const parts: Record<string, AnalogCircuitPartReading> = {};
-  const meterStatusByPart = layoutMeterStatuses(document, layout, mode, frequencyHz, switchStates);
+  const channelConducting = mosChannelConductingByPartId(document, biasLayout, dcState);
+  const meterStatusByPart = layoutMeterStatuses(
+    document,
+    layout,
+    mode,
+    frequencyHz,
+    switchStates,
+    channelConducting,
+  );
   const branchVoltagePaths = document.parts.some((part) => part.kind === "voltmeter")
     ? branchVoltagePathContext(layout)
     : null;
@@ -3416,6 +3572,7 @@ function makeReadings(
       terminalVoltages: terminalVoltageMap,
       terminalCurrents: terminalCurrentMap,
       ...(meterStatusByPart[part.id] ? { meterStatus: meterStatusByPart[part.id] } : {}),
+      ...mosChannelReading(part, channelConducting),
     };
     if (part.kind === "bulb") {
       const rated = part.ratedPowerWatts ?? 2;
@@ -3545,6 +3702,7 @@ function dcResult(
     values,
     solution.nodeVoltageOffsets ?? [],
     "dc",
+    mosChannelConductingByPartId(document, solvedLayout, solution.state),
   );
   const readings = makeReadings(
     document,
@@ -3690,6 +3848,7 @@ function acResult(document: CircuitDocument, options: AnalogStepOptions): Analog
     solution.values,
     solution.nodeVoltageOffsets,
     "ac",
+    mosChannelConductingByPartId(document, solution.biasLayout, bias.state),
   );
   const readings = makeReadings(
     document,

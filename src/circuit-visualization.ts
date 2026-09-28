@@ -137,7 +137,7 @@ function referenceTerminalGroups(
       return [["a", "b", "c"]];
     case "nmos":
     case "pmos":
-      return [["a", "c"]];
+      return analysis.parts[part.id]?.channelConducting === false ? [] : [["a", "c"]];
     default:
       // Ideal current sources, voltmeters, MOS gates, and op-amp inputs do not
       // establish a voltage reference between their terminals.

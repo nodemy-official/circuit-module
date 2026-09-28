@@ -95,19 +95,22 @@ describe("moving and rotating", () => {
 });
 
 describe("wiring", () => {
-  it("rejects duplicate and self connections", () => {
+  it("rejects duplicate and same-terminal connections while allowing a battery short", () => {
     const document = createExampleCircuit();
     expect(
       connect(document, { partId: "part-1", terminal: "b" }, { partId: "part-2", terminal: "a" })
         .ok,
     ).toBe(false);
-    expect(
-      connect(document, { partId: "part-1", terminal: "a" }, { partId: "part-1", terminal: "b" })
-        .ok,
-    ).toBe(false);
+    expect(connect(document, { partId: "part-1", terminal: "a" }, { partId: "part-1", terminal: "a" }).ok).toBe(false);
+    const batteryShort = connect(document, { partId: "part-1", terminal: "a" }, { partId: "part-1", terminal: "b" });
+    expect(batteryShort.ok).toBe(true);
+    expect(batteryShort.ok && batteryShort.document.wires.at(-1)).toMatchObject({
+      from: { partId: "part-1", terminal: "a" },
+      to: { partId: "part-1", terminal: "b" },
+    });
   });
 
-  it("allows different terminals on three-terminal parts while rejecting two-terminal self-wires", () => {
+  it("allows different terminals on both two-terminal and three-terminal parts", () => {
     const document: CircuitDocument = {
       title: "多端子部品",
       parts: [
@@ -124,7 +127,7 @@ describe("wiring", () => {
 
     expect(feedback.ok).toBe(true);
     expect(wiperShort.ok).toBe(true);
-    expect(batteryShort.ok).toBe(false);
+    expect(batteryShort.ok).toBe(true);
   });
 
   it("uses the same multi-terminal self-connection rule when reconnecting a wire", () => {
@@ -204,7 +207,71 @@ describe("wiring", () => {
     expect(result.ok && result.document).toBe(document);
   });
 
-  it("rejects missing, invalid, same-part, and duplicate reconnects without changing the document", () => {
+  it("keeps the original document when reconnecting to the current point, even if another wire crosses it", () => {
+    const document: CircuitDocument = {
+      title: "現在の端子へ戻す",
+      parts: [
+        { id: "start", kind: "junction", x: 0, y: 0, label: "始点" },
+        { id: "target", kind: "junction", x: 10, y: 5, label: "現在の端子" },
+        { id: "cross-left", kind: "junction", x: 0, y: 5, label: "交差線左" },
+        { id: "cross-right", kind: "junction", x: 20, y: 5, label: "交差線右" },
+      ],
+      wires: [
+        {
+          id: "wire-1",
+          from: { partId: "start", terminal: "a" },
+          to: { partId: "target", terminal: "a" },
+        },
+        {
+          id: "wire-2",
+          from: { partId: "cross-left", terminal: "a" },
+          to: { partId: "cross-right", terminal: "a" },
+          waypoints: [{ x: 10, y: 5 }],
+        },
+      ],
+    };
+    const original = structuredClone(document);
+    expect(routeDocumentWires(document).get("wire-2")).toEqual([{ x: 0, y: 5 }, { x: 20, y: 5 }]);
+
+    const result = reconnectWireToPoint(document, "wire-1", "to", { x: 10, y: 5 });
+
+    expect(result).toEqual({ ok: true, id: "wire-1", document });
+    expect(result.ok && result.document).toBe(document);
+    expect(document).toEqual(original);
+    expect(document.wires).toHaveLength(2);
+  });
+
+  it("does not change the document when a point connection cannot place a junction inside a part", () => {
+    const document: CircuitDocument = {
+      title: "部品の内部",
+      parts: [
+        { id: "source", kind: "battery", x: 0, y: 5, label: "電池" },
+        { id: "obstacle", kind: "resistor", x: 10, y: 5, label: "抵抗" },
+        { id: "old", kind: "junction", x: 20, y: 5, label: "古い接続点" },
+      ],
+      wires: [{
+        id: "wire-1",
+        from: { partId: "source", terminal: "b" },
+        to: { partId: "old", terminal: "a" },
+      }],
+    };
+    const original = structuredClone(document);
+    const parts = document.parts;
+    const wires = document.wires;
+
+    const connected = connectToPoint(document, { partId: "source", terminal: "a" }, { x: 10, y: 5 });
+    const reconnected = reconnectWireToPoint(document, "wire-1", "to", { x: 10, y: 5 });
+
+    expect(connected.ok).toBe(false);
+    expect(reconnected.ok).toBe(false);
+    expect(document.parts).toBe(parts);
+    expect(document.wires).toBe(wires);
+    expect(document).toEqual(original);
+    expect(document.parts.map((part) => part.id)).toEqual(["source", "obstacle", "old"]);
+    expect(document.wires).toHaveLength(1);
+  });
+
+  it("rejects missing, invalid, and duplicate reconnects while allowing a same-part short", () => {
     const document: CircuitDocument = {
       title: "無効な接続先",
       parts: [
@@ -219,12 +286,13 @@ describe("wiring", () => {
     };
 
     const invalidTerminal = reconnectWire(document, "wire-1", "to", { partId: "missing", terminal: "a" });
-    const samePart = reconnectWire(document, "wire-1", "to", { partId: "source", terminal: "b" });
+    const samePartShort = reconnectWire(document, "wire-1", "to", { partId: "source", terminal: "b" });
     const duplicate = reconnectWire(document, "wire-1", "to", { partId: "target", terminal: "a" });
     const missingWire = reconnectWire(document, "wire-missing", "to", { partId: "target", terminal: "b" });
 
     expect(invalidTerminal.ok).toBe(false);
-    expect(samePart.ok).toBe(false);
+    expect(samePartShort.ok).toBe(true);
+    expect(samePartShort.ok && samePartShort.document.wires[0]?.to).toEqual({ partId: "source", terminal: "b" });
     expect(duplicate.ok).toBe(false);
     expect(missingWire.ok).toBe(false);
     expect(document.wires[0]?.to).toEqual({ partId: "old", terminal: "a" });
@@ -417,6 +485,37 @@ describe("wiring", () => {
     expect(result.ok && result.document.wires.at(-1)?.to).toEqual({
       partId: "part-4",
       terminal: "a",
+    });
+  });
+
+  it("reuses an existing terminal without splitting a wire that already ends there", () => {
+    const document: CircuitDocument = {
+      title: "既存端子への分岐",
+      parts: [
+        { id: "left", kind: "junction", x: 0, y: 5, label: "左" },
+        { id: "target", kind: "junction", x: 10, y: 5, label: "接続点" },
+        { id: "branch", kind: "battery", x: 10, y: 15, label: "枝の電池" },
+      ],
+      wires: [{
+        id: "wire-1",
+        from: { partId: "left", terminal: "a" },
+        to: { partId: "target", terminal: "a" },
+      }],
+    };
+    const existingWire = document.wires[0];
+    if (!existingWire) { throw new Error("missing existing wire"); }
+
+    const result = connectToPoint(document, { partId: "branch", terminal: "a" }, { x: 10, y: 5 });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) { throw new Error(result.reason); }
+    expect(result.document.parts).toHaveLength(3);
+    expect(result.document.parts.filter((part) => part.kind === "junction")).toHaveLength(2);
+    expect(result.document.wires).toHaveLength(2);
+    expect(result.document.wires[0]).toBe(existingWire);
+    expect(result.document.wires[1]).toMatchObject({
+      from: { partId: "branch", terminal: "a" },
+      to: { partId: "target", terminal: "a" },
     });
   });
 

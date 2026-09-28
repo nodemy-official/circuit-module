@@ -255,11 +255,8 @@ function normalizeWire(
   }
   const { endpoint: from } = fromResult;
   const { endpoint: to } = toResult;
-  if (from.partId === to.partId) {
-    const part = partsById.get(from.partId);
-    if (!part || terminalsOf(part.kind).length < 3) {
-      return { reason: `${label}は同じ部品の端子同士を接続しています。` };
-    }
+  if (from.partId === to.partId && from.terminal === to.terminal) {
+    return { reason: `${label}は同じ端子同士を接続しています。` };
   }
   const wireKey = unorderedWireKey(from, to);
   if (seenWireKeys.has(wireKey)) { return { reason: `${label}は既存の導線と同じ端子間を接続しています。` }; }
