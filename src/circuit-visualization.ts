@@ -1,5 +1,11 @@
 import { circuitPartCatalog, endpointName, terminalsOf, type CircuitDocument, type CircuitEndpoint, type CircuitPart, type CircuitTerminal } from "./circuit-model.js";
 import { exactComponentSum } from "./analog-math.js";
+import {
+  circuitEndpointsConnected,
+  connectCircuitEndpoints,
+  createCircuitConnectivityGraph,
+  joinCircuitPartTerminals,
+} from "./circuit-connectivity.js";
 import type { CircuitAnalysis, CircuitPartReading } from "./circuit-solver.js";
 import { acAnalysisFrequency, isAcReactiveConductive } from "./ac-reactive.js";
 import { formatCircuitNumber } from "./number-format.js";
@@ -55,6 +61,116 @@ function transientFrameParts(document: CircuitDocument, sample: TransientAnalysi
   return parts;
 }
 
+function transientSourceIsActive(part: CircuitPart, sample: TransientAnalysis["samples"][number]) {
+  if (part.kind === "battery") { return (part.voltageVolts ?? circuitPartCatalog.battery.defaults.voltageVolts ?? 0) !== 0; }
+  if (part.kind === "ac-source") {
+    return (part.voltageVolts ?? circuitPartCatalog["ac-source"].defaults.voltageVolts ?? 0) !== 0 ||
+      (part.offsetVolts ?? circuitPartCatalog["ac-source"].defaults.offsetVolts ?? 0) !== 0;
+  }
+  if (part.kind === "current-source") {
+    return (part.currentAmps ?? circuitPartCatalog["current-source"].defaults.currentAmps ?? 0) !== 0;
+  }
+  const reading = sample.parts[part.id];
+  return part.kind === "capacitor" ? reading?.voltageVolts !== undefined && reading.voltageVolts !== 0
+    : part.kind === "inductor" && reading?.currentAmps !== undefined && reading.currentAmps !== 0;
+}
+
+function transientConductiveTerminals(
+  part: CircuitPart,
+  sample: TransientAnalysis["samples"][number],
+): CircuitTerminal[] {
+  switch (part.kind) {
+    case "battery":
+    case "ac-source":
+    case "resistor":
+    case "bulb":
+    case "ammeter":
+    case "diode":
+    case "led":
+    case "capacitor":
+    case "inductor":
+      return ["a", "b"];
+    case "switch":
+      return sample.parts[part.id]?.switchClosed ?? part.initiallyClosed ?? circuitPartCatalog.switch.defaults.initiallyClosed ?? false
+        ? ["a", "b"] : [];
+    case "potentiometer":
+    case "npn-transistor":
+    case "pnp-transistor":
+      return ["a", "b", "c"];
+    case "nmos":
+    case "pmos":
+      return sample.parts[part.id]?.channelConducting !== false ? ["a", "c"] : [];
+    case "current-source":
+      return transientSourceIsActive(part, sample) ? ["a", "b"] : [];
+    default:
+      return [];
+  }
+}
+
+function transientConnectivityGraph(
+  document: CircuitDocument,
+  sample: TransientAnalysis["samples"][number],
+  excludedPartId: string,
+) {
+  const graph = createCircuitConnectivityGraph(document);
+  const { endpointKey } = graph;
+  const grounds = document.parts.filter((part) => part.kind === "ground");
+  const firstGround = grounds[0];
+  const firstPart = document.parts[0];
+  const referenceTerminal = firstPart ? terminalsOf(firstPart.kind)[0] : undefined;
+  const reference = firstGround
+    ? endpointKey(firstGround.id, "a")
+    : firstPart && referenceTerminal ? endpointKey(firstPart.id, referenceTerminal) : undefined;
+  for (const part of document.parts) {
+    if (part.id === excludedPartId) { continue; }
+    if (part.kind === "op-amp" && reference) {
+      connectCircuitEndpoints(graph, endpointKey(part.id, "c"), reference);
+    }
+    joinCircuitPartTerminals(graph, part.id, transientConductiveTerminals(part, sample));
+  }
+  return { ...graph, reference };
+}
+
+function transientReturnPath(
+  document: CircuitDocument,
+  sample: TransientAnalysis["samples"][number],
+  sourceId: string,
+) {
+  const graph = transientConnectivityGraph(document, sample, sourceId);
+  return circuitEndpointsConnected(
+    graph,
+    graph.endpointKey(sourceId, "a"),
+    graph.endpointKey(sourceId, "b"),
+  );
+}
+
+function transientOpAmpOutputReturnPath(
+  document: CircuitDocument,
+  sample: TransientAnalysis["samples"][number],
+  opAmpId: string,
+) {
+  const graph = transientConnectivityGraph(document, sample, opAmpId);
+  return graph.reference !== undefined && circuitEndpointsConnected(
+    graph,
+    graph.endpointKey(opAmpId, "c"),
+    graph.reference,
+  );
+}
+
+function transientAnalysisStatus(
+  document: CircuitDocument,
+  sample: TransientAnalysis["samples"][number],
+): CircuitAnalysis["status"] {
+  const sources = document.parts.filter((part) => transientSourceIsActive(part, sample));
+  const hasOpAmpOutputLoop = document.parts.some((part) =>
+    part.kind === "op-amp" && transientOpAmpOutputReturnPath(document, sample, part.id),
+  );
+  if (sources.length === 0) { return hasOpAmpOutputLoop ? "closed" : "idle"; }
+  return sources.some((part) => transientReturnPath(document, sample, part.id)) || hasOpAmpOutputLoop
+    ? "closed"
+    : "open";
+}
+
 /** Adapt a sampled state without re-solving it as a DC operating point. */
 export function analysisAtTransientFrame(document: CircuitDocument, frame: CircuitTransientFrame): CircuitAnalysis | null {
   if (frame.analysis.status !== "valid") { return null; }
@@ -65,7 +181,7 @@ export function analysisAtTransientFrame(document: CircuitDocument, frame: Circu
   const hasOpAmp = document.parts.some((part) => part.kind === "op-amp");
   const sourceCurrent = sources.length === 1 && !hasOpAmp ? parts[sources[0].id]?.currentAmps : undefined;
   return {
-    status: "closed", mode: "dc", timeSeconds: sample.timeSeconds, currentAmps: finite(sourceCurrent) ? Math.abs(sourceCurrent) : null,
+    status: transientAnalysisStatus(document, sample), mode: "dc", timeSeconds: sample.timeSeconds, currentAmps: finite(sourceCurrent) ? Math.abs(sourceCurrent) : null,
     message: `過渡解析：${formatCircuitQuantity(sample.timeSeconds, "s")} の瞬時値`,
     parts, wireCurrents: {}, issues: frame.analysis.issues,
     bulbPowerWatts: Object.fromEntries(document.parts.filter((part) => part.kind === "bulb").map((part) => [part.id, parts[part.id]?.powerWatts ?? 0])),

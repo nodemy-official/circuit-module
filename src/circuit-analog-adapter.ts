@@ -2,6 +2,13 @@ import { analyzeAnalogCircuit, type ComplexValue, type AnalogCircuitPartReading 
 import { complexPhaseDegrees } from "./analog-math.js";
 import { acAnalysisFrequency, frequencyMatches, isAcReactiveConductive } from "./ac-reactive.js";
 import { circuitPartCatalog, terminalsOf, type CircuitDocument, type CircuitPart, type CircuitTerminal } from "./circuit-model.js";
+import {
+  circuitEndpointsConnected,
+  connectCircuitEndpoints,
+  createCircuitConnectivityGraph,
+  joinCircuitPartTerminals,
+  type CircuitConnectivityGraph,
+} from "./circuit-connectivity.js";
 import { circuitDocumentShapeIssue, isSimulationRecord, simulationRecordField } from "./simulation-input.js";
 import type { CircuitAnalysis, CircuitAnalysisOptions, CircuitPartReading } from "./circuit-solver.js";
 
@@ -34,23 +41,8 @@ function switchClosedState(part: CircuitPart, switchStates: Record<string, boole
   return override ?? part.initiallyClosed ?? circuitPartCatalog.switch.defaults.initiallyClosed ?? false;
 }
 
-interface ConductivityGraph {
-  adjacent: Map<string, string[]>;
-  endpointKey: (partId: string, terminal: CircuitTerminal) => string;
+interface ConductivityGraph extends CircuitConnectivityGraph {
   firstGround?: CircuitPart;
-}
-
-function connectGraphEndpoints(graph: ConductivityGraph, first: string, second: string) {
-  graph.adjacent.get(first)?.push(second);
-  graph.adjacent.get(second)?.push(first);
-}
-
-function joinGraphPart(graph: ConductivityGraph, part: CircuitPart, terminals: CircuitTerminal[]) {
-  const first = terminals[0];
-  if (!first) { return; }
-  for (const terminal of terminals.slice(1)) {
-    connectGraphEndpoints(graph, graph.endpointKey(part.id, first), graph.endpointKey(part.id, terminal));
-  }
 }
 
 function partEstablishesPotentialPath(part: CircuitPart, mode: "dc" | "ac", frequencyHz: number) {
@@ -79,30 +71,30 @@ function connectPartInGraph(
   reference: string | undefined,
 ) {
   if (partEstablishesPotentialPath(part, mode, frequencyHz)) {
-    joinGraphPart(graph, part, ["a", "b"]);
+    joinCircuitPartTerminals(graph, part.id, ["a", "b"]);
     return;
   }
   if (part.kind === "switch") {
-    if (switchClosedState(part, switchStates)) { joinGraphPart(graph, part, ["a", "b"]); }
+    if (switchClosedState(part, switchStates)) { joinCircuitPartTerminals(graph, part.id, ["a", "b"]); }
     return;
   }
   if (part.kind === "capacitor" || part.kind === "inductor") { return; }
   if (part.kind === "current-source") {
     const currentAmps = part.currentAmps ?? circuitPartCatalog["current-source"].defaults.currentAmps ?? 0;
-    if (mode === "dc" && currentAmps !== 0) { joinGraphPart(graph, part, ["a", "b"]); }
+    if (mode === "dc" && currentAmps !== 0) { joinCircuitPartTerminals(graph, part.id, ["a", "b"]); }
     return;
   }
   if (part.kind === "potentiometer" || part.kind === "npn-transistor" || part.kind === "pnp-transistor") {
-    joinGraphPart(graph, part, ["a", "b", "c"]);
+    joinCircuitPartTerminals(graph, part.id, ["a", "b", "c"]);
     return;
   }
   if (part.kind === "nmos" || part.kind === "pmos") {
-    joinGraphPart(graph, part, ["a", "c"]);
+    joinCircuitPartTerminals(graph, part.id, ["a", "c"]);
     return;
   }
   if (part.kind === "op-amp") {
     const target = reference ?? referenceEndpointKey(document, graph);
-    if (target) { connectGraphEndpoints(graph, graph.endpointKey(part.id, "c"), target); }
+    if (target) { connectCircuitEndpoints(graph, graph.endpointKey(part.id, "c"), target); }
   }
 }
 
@@ -114,41 +106,16 @@ function connectivityGraph(
   excludedPartId: string,
   cutoffMosfetIds: ReadonlySet<string>,
 ) {
-  const endpointKey = (partId: string, terminal: CircuitTerminal) => JSON.stringify([partId, terminal]);
-  const graph: ConductivityGraph = { adjacent: new Map(), endpointKey };
-  for (const part of document.parts) {
-    for (const terminal of terminalsOf(part.kind)) { graph.adjacent.set(endpointKey(part.id, terminal), []); }
-  }
-  graph.firstGround = document.parts.find((part) => part.kind === "ground");
-  for (const wire of document.wires) {
-    connectGraphEndpoints(graph, endpointKey(wire.from.partId, wire.from.terminal), endpointKey(wire.to.partId, wire.to.terminal));
-  }
-  for (const ground of document.parts.filter((part) => part.kind === "ground").slice(1)) {
-    if (graph.firstGround) {
-      connectGraphEndpoints(graph, endpointKey(graph.firstGround.id, "a"), endpointKey(ground.id, "a"));
-    }
-  }
+  const graph: ConductivityGraph = {
+    ...createCircuitConnectivityGraph(document),
+    firstGround: document.parts.find((part) => part.kind === "ground"),
+  };
   const reference = referenceEndpointKey(document, graph);
   for (const part of document.parts) {
     if (part.id === excludedPartId || cutoffMosfetIds.has(part.id)) { continue; }
     connectPartInGraph(graph, part, document, mode, frequencyHz, switchStates, reference);
   }
   return graph;
-}
-
-function connectedInGraph(adjacent: Map<string, string[]>, start: string, goal: string) {
-  const visited = new Set<string>([start]);
-  const pending = [start];
-  while (pending.length > 0) {
-    const current = pending.pop();
-    if (current === goal) { return true; }
-    for (const next of adjacent.get(current ?? "") ?? []) {
-      if (visited.has(next)) { continue; }
-      visited.add(next);
-      pending.push(next);
-    }
-  }
-  return false;
 }
 
 function hasSourceReturnPath(
@@ -160,8 +127,8 @@ function hasSourceReturnPath(
   cutoffMosfetIds: ReadonlySet<string>,
 ) {
   const graph = connectivityGraph(document, mode, frequencyHz, switchStates, source.id, cutoffMosfetIds);
-  return connectedInGraph(
-    graph.adjacent,
+  return circuitEndpointsConnected(
+    graph,
     graph.endpointKey(source.id, "a"),
     graph.endpointKey(source.id, "b"),
   );
@@ -177,8 +144,8 @@ function hasOpAmpOutputReturnPath(
 ) {
   const graph = connectivityGraph(document, mode, frequencyHz, switchStates, opAmp.id, cutoffMosfetIds);
   const reference = referenceEndpointKey(document, graph);
-  return reference !== undefined && connectedInGraph(
-    graph.adjacent,
+  return reference !== undefined && circuitEndpointsConnected(
+    graph,
     graph.endpointKey(opAmp.id, "c"),
     reference,
   );

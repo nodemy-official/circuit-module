@@ -198,6 +198,15 @@ function floatFromExactUnits(value: bigint) {
 
 /** Sums finite binary64 values exactly before rounding the final result once. */
 export function exactComponentSum(values: readonly number[]) {
+  // A single IEEE-754 addition already rounds the exact sum once. Most MNA
+  // rows have at most two nonzero terms, so avoid BigInt work for those rows.
+  if (values.length <= 2) {
+    const first = values.length > 0 ? values[0] as number : 0;
+    const second = values.length > 1 ? values[1] as number : 0;
+    if (!Number.isFinite(first) || !Number.isFinite(second)) { return Number.NaN; }
+    const sum = first + second;
+    return sum === 0 ? 0 : sum;
+  }
   let sum = 0n;
   for (const value of values) {
     const units = exactFloatUnits(value);
