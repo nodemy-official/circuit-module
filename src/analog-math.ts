@@ -43,16 +43,26 @@ export const complexSubtract = (left: ComplexValue, right: ComplexValue): Comple
 });
 
 export const complexMultiply = (left: ComplexValue, right: ComplexValue): ComplexValue => ({
-  real: left.real * right.real - left.imaginary * right.imaginary,
-  imaginary: left.real * right.imaginary + left.imaginary * right.real,
+  real: productSum(left.real, right.real, -left.imaginary, right.imaginary),
+  imaginary: productSum(left.real, right.imaginary, left.imaginary, right.real),
 });
 
 function rescaleQuotient(value: number, numeratorScale: number, denominatorScale: number) {
   if (value === 0) { return value; }
   const ratio = numeratorScale / denominatorScale;
-  return Number.isFinite(ratio) && ratio !== 0
-    ? value * ratio
-    : (value * numeratorScale) / denominatorScale;
+  if (Number.isFinite(ratio) && ratio >= 2 ** -1022) { return value * ratio; }
+  // Apply all factors before rounding a subnormal quotient. Neither forming
+  // the scale ratio nor multiplying the numerator first preserves those bits.
+  // Split the divisor's power of two so its reciprocal is always representable.
+  const exponent = Math.max(-1074, Math.min(1023, Math.floor(Math.log2(denominatorScale))));
+  const firstExponent = Math.floor(exponent / 2);
+  return scaledProduct([
+    value,
+    numeratorScale,
+    1 / (denominatorScale / 2 ** exponent),
+    2 ** -firstExponent,
+    2 ** -(exponent - firstExponent),
+  ]);
 }
 
 export const complexDivide = (left: ComplexValue, right: ComplexValue): ComplexValue => {
@@ -137,6 +147,30 @@ function exactFloatUnits(value: number) {
   const significand = (2n ** 52n) + fraction;
   const units = significand * (2n ** BigInt(exponent - 1));
   return negative ? -units : units;
+}
+
+/** Preserve products below one subnormal unit until their sum is rounded. */
+function productSum(a: number, b: number, c: number, d: number) {
+  const first = a * b;
+  const second = c * d;
+  if (Math.abs(first) >= 2 ** -1022 || Math.abs(second) >= 2 ** -1022 ||
+      (first === 0 && (a === 0 || b === 0) && second === 0 && (c === 0 || d === 0))) {
+    return first + second;
+  }
+  const values = [a, b, c, d].map(exactFloatUnits);
+  const [aUnits, bUnits, cUnits, dUnits] = values;
+  if (aUnits === undefined || bUnits === undefined || cUnits === undefined || dUnits === undefined) {
+    return first + second;
+  }
+  const sum = aUnits * bUnits + cUnits * dUnits;
+  const magnitude = sum < 0n ? -sum : sum;
+  const divisor = 2n ** 1074n;
+  let units = magnitude / divisor;
+  const remainder = magnitude % divisor;
+  if (remainder > divisor / 2n || (remainder === divisor / 2n && units % 2n === 1n)) {
+    units += 1n;
+  }
+  return (sum < 0n ? -1 : 1) * Number(units) * Number.MIN_VALUE;
 }
 
 function floatFromExactUnits(value: bigint) {
@@ -378,17 +412,13 @@ function scaleComplexRows(
   }
 }
 
-/** Solves a dense complex matrix in place; returns null for singular or nonfinite systems. */
-export function solveComplexLinearSystem(
+function solveComplexLinearSystemInPlace(
   size: number,
   matrixReal: Float64Array,
   matrixImaginary: Float64Array,
   rhsReal: Float64Array,
   rhsImaginary: Float64Array,
 ): ComplexValue[] | null {
-  if (!validSystem(size, matrixReal, rhsReal) || !validSystem(size, matrixImaginary, rhsImaginary)) {
-    return null;
-  }
   scaleComplexRows(size, matrixReal, matrixImaginary, rhsReal, rhsImaginary);
   for (let column = 0; column < size; column += 1) {
     const { pivot, magnitude } = complexPivotRow(size, matrixReal, matrixImaginary, column);
@@ -413,6 +443,72 @@ export function solveComplexLinearSystem(
   return solution.every((value) => Number.isFinite(value.real) && Number.isFinite(value.imaginary))
     ? solution
     : null;
+}
+
+/** Solves a dense complex matrix in place; returns null for singular or nonfinite systems. */
+export function solveComplexLinearSystem(
+  size: number,
+  matrixReal: Float64Array,
+  matrixImaginary: Float64Array,
+  rhsReal: Float64Array,
+  rhsImaginary: Float64Array,
+): ComplexValue[] | null {
+  if (!validSystem(size, matrixReal, rhsReal) || !validSystem(size, matrixImaginary, rhsImaginary)) {
+    return null;
+  }
+
+  const rhsMagnitude = Math.max(
+    ...rhsReal.map(Math.abs),
+    ...rhsImaginary.map(Math.abs),
+  );
+  if (rhsMagnitude > 0 && rhsMagnitude < 2 ** -1022) {
+    // A subnormal excitation can disappear when elimination multiplies its RHS
+    // by an ordinary-sized pivot factor. Since every RHS is subnormal here,
+    // scaling the whole solution by an exact power of two keeps the matrix
+    // untouched and postpones subnormal rounding until the solution is restored.
+    const solutionScale = powerOfTwoAtMost(rhsMagnitude);
+    const originalMatrixReal = matrixReal.slice();
+    const originalMatrixImaginary = matrixImaginary.slice();
+    const originalRhsReal = rhsReal.slice();
+    const originalRhsImaginary = rhsImaginary.slice();
+    for (let index = 0; index < size; index += 1) {
+      rhsReal[index] = (rhsReal[index] ?? 0) / solutionScale;
+      rhsImaginary[index] = (rhsImaginary[index] ?? 0) / solutionScale;
+    }
+
+    const scaledSolution = solveComplexLinearSystemInPlace(
+      size,
+      matrixReal,
+      matrixImaginary,
+      rhsReal,
+      rhsImaginary,
+    );
+    if (scaledSolution) {
+      const solution = scaledSolution.map((value) => complex(
+        scaledProduct([value.real, solutionScale]),
+        scaledProduct([value.imaginary, solutionScale]),
+      ));
+      if (solution.every((value) => Number.isFinite(value.real) && Number.isFinite(value.imaginary))) {
+        return solution;
+      }
+    }
+
+    // Normalizing the RHS can expose an otherwise finite solution to an
+    // intermediate overflow in a highly ill-conditioned system. Retry the
+    // original equations before reporting failure.
+    matrixReal.set(originalMatrixReal);
+    matrixImaginary.set(originalMatrixImaginary);
+    rhsReal.set(originalRhsReal);
+    rhsImaginary.set(originalRhsImaginary);
+  }
+
+  return solveComplexLinearSystemInPlace(
+    size,
+    matrixReal,
+    matrixImaginary,
+    rhsReal,
+    rhsImaginary,
+  );
 }
 
 function realPivotRow(size: number, matrix: Float64Array, column: number) {

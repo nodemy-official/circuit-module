@@ -3,10 +3,31 @@ import { describe, expect, it } from "vitest";
 import {
   complex,
   complexDivide,
+  complexMultiply,
   scaledProduct,
   solveComplexLinearSystem,
   solveRealLinearSystem,
 } from "./analog-math.js";
+
+describe("complexMultiply", () => {
+  it("adds tiny power contributions before rounding to subnormal units", () => {
+    const value = complex(1.4e-162, 1.4e-162);
+    const power = complexMultiply(value, complex(value.real, -value.imaginary));
+    expect(power.real).toBe(Number.MIN_VALUE);
+    expect(power.imaginary).toBe(0);
+    const rotated = complexMultiply(value, value);
+    expect(rotated.real).toBe(0);
+    expect(rotated.imaginary).toBe(Number.MIN_VALUE);
+  });
+
+  it("retains a tiny real result after cancellation of subnormal products", () => {
+    const value = complex(2.6e-162, 1.6e-162);
+    const square = complexMultiply(value, value);
+
+    expect(square.real).toBe(Number.MIN_VALUE);
+    expect(square.imaginary).toBe(2 * Number.MIN_VALUE);
+  });
+});
 
 describe("scaledProduct", () => {
   it("rounds a subnormal energy only after applying all factors", () => {
@@ -32,6 +53,17 @@ describe("scaledProduct", () => {
 });
 
 describe("complexDivide", () => {
+  it("rounds a subnormal quotient only after applying its normalized component", () => {
+    // (m + mi) / (1 + 2i) = 3m/5 - mi/5, which rounds to m + 0i.
+    const minimum = Number.MIN_VALUE;
+    const quotient = complexDivide(complex(minimum, minimum), complex(1, 2));
+    expect(quotient.real).toBe(minimum);
+    expect(quotient.imaginary === 0).toBe(true);
+    const rotated = complexDivide(complex(-minimum, minimum), complex(1, 2));
+    expect(rotated.real === 0).toBe(true);
+    expect(rotated.imaginary).toBe(minimum);
+  });
+
   it.each([1, 1e-200, 1e200, Number.MAX_VALUE])(
     "preserves a finite quotient when both operands have scale %s",
     (scale) => {
