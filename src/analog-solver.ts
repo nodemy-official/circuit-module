@@ -1122,7 +1122,9 @@ function buildLayout(
     }
   }
 
-  const idealVoltageCycleIssue = markRedundantIdealVoltageCycles(document, branches, topology.nodeCount);
+  const idealVoltageCycleIssue = markRedundantIdealVoltageCycles(
+    document, [...branches, ...internalBranches], topology.nodeCount,
+  );
   if (idealVoltageCycleIssue) { return { issue: idealVoltageCycleIssue }; }
 
   if (mode === "ac") {
@@ -1155,25 +1157,46 @@ function buildLayout(
 
 function diodeCurrentAndSlope(voltage: number, saturationCurrent: number, ideality: number) {
   const scale = ideality * THERMAL_VOLTAGE;
-  const rawExponent = voltage / scale;
+  // Divide in stages when forming n * Vt would round a subnormal value or zero.
+  const subnormalScale = scale < 2 ** -1022;
+  const rawExponent = subnormalScale ? (voltage / ideality) / THERMAL_VOLTAGE : voltage / scale;
+  const exponential = Math.exp(Math.max(EXPONENT_MIN, Math.min(EXPONENT_MAX, rawExponent)));
+  const exponentialCurrent = saturationCurrent * exponential;
+  const scaledSaturation = subnormalScale
+    ? (saturationCurrent / ideality) / THERMAL_VOLTAGE
+    : saturationCurrent / scale;
+  const exponentialSlope = subnormalScale
+    ? (exponentialCurrent / ideality) / THERMAL_VOLTAGE
+    : exponentialCurrent / scale;
+  // Prefer a normal intermediate; if both are subnormal, use the larger one
+  // so division by a small thermal scale does not amplify avoidable rounding.
+  const slope = Number.isFinite(exponentialCurrent) &&
+    (exponentialCurrent >= 2 ** -1022 || !Number.isFinite(scaledSaturation) || exponentialCurrent >= scaledSaturation)
+    ? exponentialSlope
+    : scaledSaturation * exponential;
   if (rawExponent > EXPONENT_MAX) {
-    const exponential = Math.exp(EXPONENT_MAX);
     return {
-      current: saturationCurrent * (exponential * (1 + rawExponent - EXPONENT_MAX) - 1),
-      slope: (saturationCurrent * exponential) / scale,
+      // Scale the exponential before the continuation factor. The current at
+      // the knee stays normal even for subnormal saturation, unlike the slope.
+      current: Number.isFinite(rawExponent)
+        ? exponentialCurrent * (1 + rawExponent - EXPONENT_MAX) - saturationCurrent
+        : slope * (voltage - scale * (EXPONENT_MAX - 1)) - saturationCurrent,
+      slope,
     };
   }
   if (rawExponent < EXPONENT_MIN) {
-    const exponential = Math.exp(EXPONENT_MIN);
     return {
       current: saturationCurrent * Math.expm1(EXPONENT_MIN),
-      slope: (saturationCurrent * exponential) / scale,
+      slope,
     };
   }
-  const exponential = Math.exp(rawExponent);
   return {
-    current: saturationCurrent * Math.expm1(rawExponent),
-    slope: (saturationCurrent * exponential) / scale,
+    // In the subnormal exponent range expm1(x) = x to binary64 accuracy, but
+    // rounding V / (n * Vt) first can erase a representable Is * x current.
+    current: voltage === 0 ? 0 : Math.abs(rawExponent) < 2 ** -1022
+      ? slope * voltage
+      : saturationCurrent * Math.expm1(rawExponent),
+    slope,
   };
 }
 
@@ -1186,20 +1209,25 @@ function bjtModel(
   const base = voltages[1] ?? 0;
   const emitter = voltages[2] ?? 0;
   const beta = part.currentGain ?? 100;
-  const alphaForward = beta / (beta + 1);
-  const alphaReverse = 0.5;
   const saturation = part.saturationCurrentAmps ?? 1e-14;
-  const forwardSaturation = saturation / alphaForward;
-  const reverseSaturation = saturation / alphaReverse;
   const vbe = sign * (base - emitter);
   const vbc = sign * (base - collector);
-  const forward = diodeCurrentAndSlope(vbe, forwardSaturation, 1);
-  const reverse = diodeCurrentAndSlope(vbc, reverseSaturation, 1);
+  // Express Ebers–Moll in transport and base currents. Computing 1 - alpha
+  // loses the base current when beta / (beta + 1) rounds to one, and scaling
+  // saturation by 1 / alpha can overflow before a zero bias is evaluated.
+  const forward = diodeCurrentAndSlope(vbe, saturation, 1);
+  const reverse = diodeCurrentAndSlope(vbc, saturation, 1);
+  const baseSaturation = saturation / beta;
+  // For beta < 1, scale saturation up before the transport current can
+  // underflow. For beta >= 1, divide last to avoid rounding saturation down.
+  const forwardBase = beta < 1 && Number.isFinite(baseSaturation)
+    ? diodeCurrentAndSlope(vbe, baseSaturation, 1)
+    : { current: forward.current / beta, slope: forward.slope / beta };
 
   const canonicalCurrents = [
-    alphaForward * forward.current - reverse.current,
-    (1 - alphaForward) * forward.current + (1 - alphaReverse) * reverse.current,
-    -forward.current + alphaReverse * reverse.current,
+    forward.current - 2 * reverse.current,
+    forwardBase.current + reverse.current,
+    -forward.current - forwardBase.current + reverse.current,
   ];
   const currents = canonicalCurrents.map((current) => sign * current);
   const jacobian = Array.from({ length: 3 }, () => Array.from({ length: 3 }, () => 0));
@@ -1207,16 +1235,16 @@ function bjtModel(
     positiveTerminal: number,
     negativeTerminal: number,
     slopes: [number, number, number],
-    conductance: number,
   ) => {
     for (let row = 0; row < 3; row += 1) {
-      const branchCurrentDerivative = slopes[row] * conductance;
+      const branchCurrentDerivative = slopes[row];
       jacobian[row]![positiveTerminal] += branchCurrentDerivative;
       jacobian[row]![negativeTerminal] -= branchCurrentDerivative;
     }
   };
-  addBranchSlope(1, 2, [alphaForward, 1 - alphaForward, -1], forward.slope);
-  addBranchSlope(1, 0, [-1, 1 - alphaReverse, alphaReverse], reverse.slope);
+  addBranchSlope(1, 2, [forward.slope, forwardBase.slope, -forward.slope - forwardBase.slope]);
+  // The reverse transport factor is 0.5, so reverse beta is one.
+  addBranchSlope(1, 0, [-2 * reverse.slope, reverse.slope, reverse.slope]);
   return { currents, jacobian };
 }
 
@@ -1508,10 +1536,11 @@ function resistorValue(part: CircuitPart) {
 function potentiometerSegments(part: CircuitPart) {
   const total = part.resistanceOhms ?? 1000;
   const position = part.wiperPosition ?? 0.5;
-  return {
-    ac: total * position,
-    cb: total * (1 - position),
-  };
+  const smallerPosition = Math.min(position, 1 - position);
+  const smallerResistance = total * smallerPosition;
+  return position <= 0.5
+    ? { ac: smallerResistance, cb: total - smallerResistance }
+    : { ac: total - smallerResistance, cb: smallerResistance };
 }
 
 function isSwitchClosed(part: CircuitPart, switchStates: Record<string, boolean>) {
@@ -1860,6 +1889,25 @@ function assembleDc(
   return { matrix, residual };
 }
 
+function rowRelativeEquationScale(
+  layout: MnaLayout,
+  assembly: DcAssembly,
+  state: Float64Array,
+  row: number,
+  relativeTolerance: number,
+) {
+  let scale = 0;
+  for (let column = 0; column < layout.size; column += 1) {
+    const term = (assembly.matrix[row * layout.size + column] ?? 0) * (state[column] ?? 0);
+    if (!Number.isFinite(term)) { return null; }
+    // Scale each term before summing so finite equations near Number.MAX_VALUE
+    // do not overflow while computing a relative convergence tolerance.
+    scale += relativeTolerance * Math.abs(term);
+    if (!Number.isFinite(scale)) { return null; }
+  }
+  return scale;
+}
+
 function residualTolerances(
   layout: MnaLayout,
   assembly: DcAssembly,
@@ -1870,21 +1918,23 @@ function residualTolerances(
 ): number[] | null {
   const tolerances: number[] = [];
   for (let row = 0; row < layout.size; row += 1) {
-    let equationScale = 0;
-    for (let column = 0; column < layout.size; column += 1) {
-      const term = (assembly.matrix[row * layout.size + column] ?? 0) * (state[column] ?? 0);
-      if (!Number.isFinite(term)) { return null; }
-      equationScale += Math.abs(term);
-      if (!Number.isFinite(equationScale)) { return null; }
-    }
+    const relativeEquationScale = rowRelativeEquationScale(
+      layout,
+      assembly,
+      state,
+      row,
+      relativeTolerance,
+    );
+    if (relativeEquationScale === null) { return null; }
     // Keep an initially zero state relative to the source current or voltage that drives it.
     const residualScale = Math.abs(assembly.residual[row] ?? 0);
     if (!Number.isFinite(residualScale)) { return null; }
-    equationScale = Math.max(equationScale, residualScale);
+    const relativeResidualScale = relativeTolerance * residualScale;
+    if (!Number.isFinite(relativeResidualScale)) { return null; }
     const absoluteTolerance = row < layout.topology.nodeUnknownCount
       ? currentTolerance
       : voltageTolerance;
-    const tolerance = absoluteTolerance + relativeTolerance * equationScale;
+    const tolerance = absoluteTolerance + Math.max(relativeEquationScale, relativeResidualScale);
     if (!Number.isFinite(tolerance) || tolerance <= 0) { return null; }
     tolerances.push(tolerance);
   }
@@ -1959,9 +2009,10 @@ function solveDcNewtonStep(
 function solveDcAtReference(
   document: CircuitDocument,
   layout: MnaLayout,
+  initialState?: Float64Array,
 ): { state?: Float64Array; converged: boolean; singular: boolean; invalidPhysicalSolution?: boolean } {
-  let state = new Float64Array(layout.size);
-  let usedLinearSeed = false;
+  let state = initialState ? new Float64Array(initialState) : new Float64Array(layout.size);
+  let usedLinearSeed = initialState !== undefined;
   if (layout.size === 0) { return { state, converged: true, singular: false }; }
 
   for (let iteration = 0; iteration < MAX_NEWTON_ITERATIONS; iteration += 1) {
@@ -1989,9 +2040,12 @@ function solveDcAtReference(
   const finalAssembly = assembleDc(document, layout, state);
   const finalTolerances = residualTolerances(layout, finalAssembly, state);
   const finalScore = residualScore(layout, finalAssembly, finalTolerances);
-  return finalScore <= 1
-    ? validatePhysicalDcSolution(document, layout, state)
-    : { converged: false, singular: false };
+  if (finalScore <= 1) { return validatePhysicalDcSolution(document, layout, state); }
+  // A nearly zero device slope can stall line search before an independent
+  // bias is reached. Retry once with those linear voltage biases established.
+  const seed = usedLinearSeed ? null : linearDcSeed(document, layout);
+  if (seed) { return solveDcAtReference(document, layout, seed); }
+  return { converged: false, singular: false };
 }
 
 function validatePhysicalDcSolution(
@@ -3282,6 +3336,33 @@ function componentMeasurements(
   return { voltage, power };
 }
 
+function layoutMeterStatuses(
+  document: CircuitDocument,
+  layout: MnaLayout,
+  mode: AnalogAnalysisMode,
+  frequencyHz: number | undefined,
+  switchStates: Record<string, boolean>,
+) {
+  const statuses = meterStatuses(document, {
+    mode, frequencyHz, switchStates, initialInductorCurrents: layout.initialInductorCurrents,
+  });
+  const idealBranches = [...layout.branches, ...layout.internalBranches].filter(isIdealVoltageConstraint);
+  for (const meter of idealBranches) {
+    if (meter.kind !== "ammeter" || statuses[meter.partId] !== "connected") { continue; }
+    // Every ideal voltage branch fixes a voltage difference, even when that
+    // difference is nonzero. A cycle leaves all its branch currents nonunique,
+    // including branches retained in the solver's chosen spanning tree.
+    const parent = Array.from({ length: layout.topology.nodeCount }, (_, node) => node);
+    for (const branch of idealBranches) {
+      if (branch !== meter) { unionNodes(parent, branch.positiveNode, branch.negativeNode); }
+    }
+    if (findRoot(parent, meter.positiveNode) === findRoot(parent, meter.negativeNode)) {
+      statuses[meter.partId] = "floating";
+    }
+  }
+  return statuses;
+}
+
 function makeReadings(
   document: CircuitDocument,
   layout: MnaLayout,
@@ -3294,12 +3375,7 @@ function makeReadings(
   nodeVoltageOffsets: ComplexValue[] = [],
 ): Record<string, AnalogCircuitPartReading> {
   const parts: Record<string, AnalogCircuitPartReading> = {};
-  const meterStatusByPart = meterStatuses(document, {
-    mode,
-    frequencyHz,
-    switchStates,
-    initialInductorCurrents: layout.initialInductorCurrents,
-  });
+  const meterStatusByPart = layoutMeterStatuses(document, layout, mode, frequencyHz, switchStates);
   const branchVoltagePaths = document.parts.some((part) => part.kind === "voltmeter")
     ? branchVoltagePathContext(layout)
     : null;

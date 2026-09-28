@@ -2,6 +2,7 @@ import { circuitPartCatalog, endpointName, terminalsOf, type CircuitDocument, ty
 import { exactComponentSum } from "./analog-math.js";
 import type { CircuitAnalysis, CircuitPartReading } from "./circuit-solver.js";
 import { acAnalysisFrequency, isAcReactiveConductive } from "./ac-reactive.js";
+import { formatCircuitNumber } from "./number-format.js";
 import type { TransientAnalysis } from "./transient-solver.js";
 
 export interface CircuitPotentialContext {
@@ -315,6 +316,7 @@ function preciseBranchVoltage(
 ) {
   const voltage = preciseBranchPhasor(pair, context);
   if (!voltage) { return; }
+  if (context.analysis.mode !== "ac") { return { volts: voltage.real, phaseDegrees: 0 }; }
   const volts = Math.hypot(voltage.real, voltage.imaginary);
   return Number.isFinite(volts)
     ? { volts, phaseDegrees: volts === 0 ? 0 : Math.atan2(voltage.imaginary, voltage.real) * 180 / Math.PI }
@@ -336,9 +338,10 @@ function terminalBranchPhasor(
   reading: CircuitPartReading,
   terminal: CircuitTerminal,
   resistance: number,
+  ac: boolean,
 ): ComplexPotential | undefined {
   const current = reading.terminalCurrents?.[terminal];
-  const phaseDegrees = reading.terminalCurrentPhasesDegrees?.[terminal];
+  const phaseDegrees = ac ? reading.terminalCurrentPhasesDegrees?.[terminal] : 0;
   if (!finite(current) || !finite(phaseDegrees) || !Number.isFinite(resistance)) { return; }
   const voltage = phasor(current * resistance, phaseDegrees);
   return Number.isFinite(voltage.real) && Number.isFinite(voltage.imaginary) ? voltage : undefined;
@@ -348,8 +351,10 @@ function negativePotential(value: ComplexPotential): ComplexPotential {
   return { real: -value.real, imaginary: -value.imaginary };
 }
 
-function primaryReadingPhasor(reading: CircuitPartReading, reverse: boolean): ComplexPotential | undefined {
-  if (!finite(reading.voltageVolts) || !finite(reading.voltagePhaseDegrees)) { return; }
+function primaryReadingPhasor(reading: CircuitPartReading, reverse: boolean, ac: boolean): ComplexPotential | undefined {
+  if (!finite(reading.voltageVolts)) { return; }
+  if (!ac) { return { real: reading.voltageVolts * (reverse ? -1 : 1), imaginary: 0 }; }
+  if (!finite(reading.voltagePhaseDegrees)) { return; }
   const voltage = phasor(
     Math.abs(reading.voltageVolts),
     reading.voltagePhaseDegrees + (reverse ? 180 : 0),
@@ -370,15 +375,16 @@ function potentiometerBranchPhasor(
   part: CircuitPart,
   reading: CircuitPartReading,
   pair: PreciseBranchPair,
+  ac: boolean,
 ): ComplexPotential | undefined {
-  if (pair.fromTerminal === "a" && pair.toTerminal === "b") { return primaryReadingPhasor(reading, false); }
-  if (pair.fromTerminal === "b" && pair.toTerminal === "a") { return primaryReadingPhasor(reading, true); }
+  if (pair.fromTerminal === "a" && pair.toTerminal === "b") { return primaryReadingPhasor(reading, false, ac); }
+  if (pair.fromTerminal === "b" && pair.toTerminal === "a") { return primaryReadingPhasor(reading, true, ac); }
   const segment = potentiometerSegmentForPair(pair);
   if (!segment) { return; }
   const position = part.wiperPosition ?? 0.5;
   const totalResistance = part.resistanceOhms ?? 1000;
   const resistance = totalResistance * (segment.terminal === "a" ? position : 1 - position);
-  const voltage = terminalBranchPhasor(reading, segment.terminal, resistance);
+  const voltage = terminalBranchPhasor(reading, segment.terminal, resistance, ac);
   if (!voltage) { return; }
   return segment.reverse ? negativePotential(voltage) : voltage;
 }
@@ -390,11 +396,12 @@ function preciseBranchPhasor(
   const part = context.document.parts.find((item) => item.id === pair.partId);
   const reading = context.analysis.parts[pair.partId];
   if (!part || !reading) { return; }
-  if (part.kind === "potentiometer") { return potentiometerBranchPhasor(part, reading, pair); }
+  const ac = context.analysis.mode === "ac";
+  if (part.kind === "potentiometer") { return potentiometerBranchPhasor(part, reading, pair, ac); }
   if (!hasPreciseTwoTerminalVoltage(part, reading) ||
     !((pair.fromTerminal === "a" && pair.toTerminal === "b") ||
       (pair.fromTerminal === "b" && pair.toTerminal === "a"))) { return; }
-  return primaryReadingPhasor(reading, pair.fromTerminal === "b");
+  return primaryReadingPhasor(reading, pair.fromTerminal === "b", ac);
 }
 
 interface PotentialPathEdge {
@@ -534,7 +541,7 @@ function precisePathPotential(
   reference: CircuitNode,
   context: CircuitPotentialContext | undefined,
 ): { volts: number; phaseDegrees: number } | undefined {
-  if (context?.analysis.mode !== "ac" || node.id === reference.id) { return undefined; }
+  if (!context || node.id === reference.id) { return undefined; }
   let pathTrees = potentialPathTreeCache.get(context);
   if (!pathTrees) {
     pathTrees = new Map();
@@ -558,6 +565,9 @@ function precisePathPotential(
   }
   const real = exactComponentSum(realParts);
   const imaginary = exactComponentSum(imaginaryParts);
+  if (context.analysis.mode !== "ac") {
+    return Number.isFinite(real) ? { volts: real, phaseDegrees: 0 } : undefined;
+  }
   const volts = Math.hypot(real, imaginary);
   return Number.isFinite(volts)
     ? { volts, phaseDegrees: volts === 0 ? 0 : Math.atan2(imaginary, real) * 180 / Math.PI }
@@ -569,7 +579,7 @@ function precisePartPotential(
   reference: CircuitNode,
   context: CircuitPotentialContext | undefined,
 ): { volts: number; phaseDegrees: number } | undefined {
-  if (context?.analysis.mode !== "ac" || node.id === reference.id) { return undefined; }
+  if (!context || node.id === reference.id) { return undefined; }
   for (const pair of sharedPartTerminalPairs(node, reference, context)) {
     const precise = preciseBranchVoltage(pair, context);
     if (precise) { return precise; }
@@ -585,12 +595,12 @@ export function circuitPotential(
   context?: CircuitPotentialContext,
 ) {
   if (!node || !reference || node.referenceGroup !== reference.referenceGroup) { return null; }
+  const precise = precisePartPotential(node, reference, context);
+  if (precise) { return precise; }
   if (!ac) {
     if (!finite(node.voltageVolts) || !finite(reference.voltageVolts)) { return null; }
     return { volts: node.voltageVolts - reference.voltageVolts, phaseDegrees: 0 };
   }
-  const precise = precisePartPotential(node, reference, context);
-  if (precise) { return precise; }
   if (!finite(node.voltageVolts) || !finite(reference.voltageVolts)) { return null; }
   if (!finite(node.voltagePhaseDegrees) || !finite(reference.voltagePhaseDegrees)) { return null; }
   const first = phasor(node.voltageVolts, node.voltagePhaseDegrees);
@@ -609,8 +619,8 @@ export function circuitPotentialColor(volts: number, scale: number) {
 export function formatCircuitQuantity(value: number | undefined, unit: string): string {
   if (!finite(value)) { return "—"; }
   if (value === 0) { return `0 ${unit}`; }
-  if (Math.abs(value) < 1e-24) { return `${Number(value.toPrecision(4))} ${unit}`; }
+  if (Math.abs(value) < 1e-24) { return `${formatCircuitNumber(value)} ${unit}`; }
   const prefixes: [number, string][] = [[1e-24, "y"], [1e-21, "z"], [1e-18, "a"], [1e-15, "f"], [1e-12, "p"], [1e-9, "n"], [1e-6, "μ"], [1e-3, "m"], [1, ""], [1e3, "k"], [1e6, "M"], [1e9, "G"]];
   const [scale, prefix] = prefixes.find(([threshold]) => Math.abs(value) < threshold * 1000) ?? prefixes.at(-1)!;
-  return `${Number((value / scale).toPrecision(4))} ${prefix}${unit}`;
+  return `${formatCircuitNumber(value / scale)} ${prefix}${unit}`;
 }

@@ -3,9 +3,33 @@ import { describe, expect, it } from "vitest";
 import {
   complex,
   complexDivide,
+  scaledProduct,
   solveComplexLinearSystem,
   solveRealLinearSystem,
 } from "./analog-math.js";
+
+describe("scaledProduct", () => {
+  it("rounds a subnormal energy only after applying all factors", () => {
+    expect(scaledProduct([0.5, Number.MIN_VALUE, 1.5, 1.5])).toBe(Number.MIN_VALUE);
+    expect(scaledProduct([1.5, 1.5, Number.MIN_VALUE, 0.5])).toBe(Number.MIN_VALUE);
+    expect(scaledProduct([Number.MIN_VALUE, 1.5, 1.5])).toBe(2 * Number.MIN_VALUE);
+  });
+
+  it("preserves products across intermediate overflow and underflow", () => {
+    expect(scaledProduct([1e300, 1e300, 1e-300, 1e-300])).toBeCloseTo(1, 14);
+    expect(scaledProduct([1e-300, 1e-300, 1e300, 1e300])).toBeCloseTo(1, 14);
+    expect(scaledProduct([0.5, 1e-200, -1e200, -1e200]) / 5e199).toBeCloseTo(1, 14);
+  });
+
+  it("preserves zero, sign, and genuine numeric range limits", () => {
+    expect(scaledProduct([Number.MAX_VALUE, 2, 0])).toBe(0);
+    expect(scaledProduct([-2, 3, 4])).toBe(-24);
+    expect(scaledProduct([Number.MAX_VALUE, 2])).toBe(Number.POSITIVE_INFINITY);
+    expect(scaledProduct([Number.MIN_VALUE, 0.5])).toBe(0);
+    expect(scaledProduct([Number.MIN_VALUE, 1.5])).toBe(2 * Number.MIN_VALUE);
+    expect(scaledProduct([Number.NaN])).toBeNaN();
+  });
+});
 
 describe("complexDivide", () => {
   it.each([1, 1e-200, 1e200, Number.MAX_VALUE])(
@@ -55,6 +79,24 @@ describe("complexDivide", () => {
 
     expect(quotient.real).toBe(Number.POSITIVE_INFINITY);
     expect(quotient.imaginary / 1e-150).toBeCloseTo(1, 14);
+  });
+
+  it("preserves normal quotient components when the normalized divisor is subnormal", () => {
+    const quotient = complexDivide(complex(1e308), complex(1e100, 1e-220));
+    const rotated = complexDivide(complex(1e308), complex(1e-220, 1e100));
+
+    expect(quotient.real / 1e208).toBeCloseTo(1, 14);
+    expect(quotient.imaginary / -1e-112).toBeCloseTo(1, 14);
+    expect(rotated.real / 1e-112).toBeCloseTo(1, 14);
+    expect(rotated.imaginary / -1e208).toBeCloseTo(1, 14);
+  });
+
+  it("retains a finite minor component even when the dominant quotient overflows", () => {
+    const quotient = complexDivide(complex(1e308), complex(1e-15, Number.MIN_VALUE));
+    const expectedImaginary = -(1e308 * Number.MIN_VALUE) / 1e-15 / 1e-15;
+
+    expect(quotient.real).toBe(Number.POSITIVE_INFINITY);
+    expect(quotient.imaginary / expectedImaginary).toBeCloseTo(1, 14);
   });
 
   it("divides independently by an imaginary divisor", () => {

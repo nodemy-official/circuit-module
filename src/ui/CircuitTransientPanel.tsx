@@ -1,11 +1,11 @@
 import { useEffect, useId, useRef, useState, type ComponentPropsWithoutRef, type Dispatch, type SetStateAction } from "react";
 import type { CircuitDocument } from "../circuit-model.js";
+import { formatCircuitNumber } from "../number-format.js";
 import type { CircuitTransientFrame } from "../circuit-visualization.js";
 import { simulateTransient, type TransientAnalysis, type TransientSample } from "../transient-solver.js";
 import { measurementLabels } from "./measurement-labels.js";
 
-const format = (value: number | undefined) =>
-  value === undefined || !Number.isFinite(value) ? "—" : Number(value.toPrecision(4)).toString();
+const format = (value: number | undefined) => value === undefined ? "—" : formatCircuitNumber(value);
 const MAX_WAVEFORM_PARTS = 3;
 const PLAYBACK_INTERVAL_MS = 50;
 type ValidTransientAnalysis = TransientAnalysis & { status: "valid" };
@@ -41,7 +41,12 @@ function useStopPlaybackWhenInactive(
 }
 
 function valuesFor(samples: readonly TransientSample[], partId: string, quantity: Quantity) {
-  return samples.map((sample) => sample.parts[partId]?.[quantity]);
+  return samples.map((sample) => measuredReading(sample, partId)?.[quantity]);
+}
+
+function measuredReading(sample: TransientSample | undefined, partId: string) {
+  const reading = sample?.parts[partId];
+  return reading?.meterStatus === "floating" || reading?.meterStatus === "unconnected" ? undefined : reading;
 }
 
 function lineSegments(samples: readonly TransientSample[], values: readonly (number | undefined)[], x: (time: number) => number, y: (value: number) => number) {
@@ -87,9 +92,14 @@ function Waveform({
     .filter((value): value is number => value !== undefined && Number.isFinite(value));
   const low = Math.min(0, ...scaleValues);
   const high = Math.max(0, ...scaleValues);
-  const span = high - low || 1;
+  const magnitude = Math.max(Math.abs(low), Math.abs(high));
+  const normalizedMagnitude = magnitude || 1;
+  const scaledHigh = high / normalizedMagnitude;
+  const span = scaledHigh - low / normalizedMagnitude || 1;
   const x = (time: number) => 48 + time / (duration || 1) * 298;
-  const y = (value: number) => 16 + (high - value) / span * 112;
+  const y = (value: number) => magnitude === 0
+    ? 72
+    : 16 + (scaledHigh - value / normalizedMagnitude) / span * 112;
   const cursorSample = samples[sampleIndex];
   const unit = quantity === "voltageVolts" ? "V" : "A";
   const title = quantity === "voltageVolts" ? "電圧" : "電流";
@@ -127,7 +137,7 @@ function Waveform({
 }
 
 function readingAt(analysis: TransientAnalysis | undefined, partId: string, sampleIndex: number) {
-  return analysis?.status === "valid" ? analysis.samples[sampleIndex]?.parts[partId] : undefined;
+  return analysis?.status === "valid" ? measuredReading(analysis.samples[sampleIndex], partId) : undefined;
 }
 
 function PartSelection({

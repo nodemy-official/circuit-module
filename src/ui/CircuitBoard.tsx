@@ -42,6 +42,7 @@ import {
   type CircuitPartNumericKey,
   type CircuitTerminal,
 } from "../circuit-model.js";
+import { formatCircuitNumber } from "../number-format.js";
 
 export type CircuitBoardSlot =
   | "root"
@@ -211,7 +212,7 @@ function engineeringValue(value: number, unit: string) {
   const prefixes: [number, string][] = [[1e-12, "p"], [1e-9, "n"], [1e-6, "μ"], [1e-3, "m"], [1, ""], [1e3, "k"], [1e6, "M"]];
   const [scale, prefix] = prefixes.find(([threshold]) => magnitude < threshold * 1000) ?? prefixes.at(-1)!;
   const scaled = value / scale;
-  return `${Number(scaled.toPrecision(3))} ${prefix}${unit}`;
+  return `${formatCircuitNumber(scaled, 3)} ${prefix}${unit}`;
 }
 
 const partDetailKeys: Partial<Record<CircuitPartKind, readonly CircuitPartNumericKey[]>> = {

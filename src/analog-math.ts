@@ -6,6 +6,32 @@ export interface ComplexValue {
 
 export const complex = (real = 0, imaginary = 0): ComplexValue => ({ real, imaginary });
 
+/** Multiplies finite factors without rounding intermediate products into the subnormal range. */
+export function scaledProduct(values: readonly number[]): number {
+  if (values.some((value) => !Number.isFinite(value))) { return Number.NaN; }
+  if (values.some((value) => value === 0)) { return 0; }
+  let sign = 1;
+  let mantissa = 1;
+  let exponent = 0;
+  for (const value of values) {
+    if (value < 0) { sign = -sign; }
+    const magnitude = Math.abs(value);
+    const factorExponent = Math.max(-1074, Math.min(1023, Math.floor(Math.log2(magnitude))));
+    mantissa *= magnitude / 2 ** factorExponent;
+    exponent += factorExponent;
+    // log2 can round across an exact power-of-two boundary.
+    while (mantissa >= 2) { mantissa /= 2; exponent += 1; }
+    while (mantissa < 1) { mantissa *= 2; exponent -= 1; }
+  }
+  if (exponent > 1023) { return sign * Number.POSITIVE_INFINITY; }
+  if (exponent < -1075) { return sign * 0; }
+  // Round to subnormal units only once, after every factor has contributed.
+  const product = exponent < -1022
+    ? (mantissa * 2 ** (exponent + 1074)) * Number.MIN_VALUE
+    : mantissa * 2 ** exponent;
+  return sign * product;
+}
+
 export const complexAdd = (left: ComplexValue, right: ComplexValue): ComplexValue => ({
   real: left.real + right.real,
   imaginary: left.imaginary + right.imaginary,
@@ -44,20 +70,22 @@ export const complexDivide = (left: ComplexValue, right: ComplexValue): ComplexV
   const leftImaginary = left.imaginary / numeratorScale;
   const rightReal = right.real / denominatorScale;
   const rightImaginary = right.imaginary / denominatorScale;
-  // A normalized minor component can underflow even though its contribution to
-  // the quotient is representable. Divide the large numerator before multiplying
-  // by that component; the omitted squared ratio is below floating-point range.
-  if (rightImaginary === 0 && right.imaginary !== 0) {
+  // A normalized minor component can lose precision in the subnormal range
+  // even though its contribution to the quotient is normal. Keep that component
+  // unscaled until all product factors are available; its squared ratio is negligible.
+  if (Math.abs(rightImaginary) < 2 ** -1022 && right.imaginary !== 0) {
     const real = left.real / right.real;
     const imaginary = left.imaginary / right.real;
-    return complex(real + (imaginary / right.real) * right.imaginary,
-      imaginary - (real / right.real) * right.imaginary);
+    const inverse = 1 / right.real;
+    return complex(real + scaledProduct([left.imaginary, right.imaginary, inverse, inverse]),
+      imaginary - scaledProduct([left.real, right.imaginary, inverse, inverse]));
   }
-  if (rightReal === 0 && right.real !== 0) {
+  if (Math.abs(rightReal) < 2 ** -1022 && right.real !== 0) {
     const real = left.real / right.imaginary;
     const imaginary = left.imaginary / right.imaginary;
-    return complex(imaginary + (real / right.imaginary) * right.real,
-      -real + (imaginary / right.imaginary) * right.real);
+    const inverse = 1 / right.imaginary;
+    return complex(imaginary + scaledProduct([left.real, right.real, inverse, inverse]),
+      -real + scaledProduct([left.imaginary, right.real, inverse, inverse]));
   }
   const denominator = rightReal * rightReal + rightImaginary * rightImaginary;
   return {

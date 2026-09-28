@@ -1,5 +1,6 @@
 import type { CircuitPartKind } from "../circuit-model.js";
 import type { CircuitAnalysis, CircuitPartReading } from "../circuit-solver.js";
+import { formatCircuitNumber } from "../number-format.js";
 import type { ComponentPropsWithoutRef } from "react";
 
 export type CircuitMeterStatus = "connected" | "unconnected" | "floating" | "unmeasured" | "invalid" | "short";
@@ -30,7 +31,7 @@ function formatEngineering(value: number, unit: "A" | "V", signed: boolean) {
   const absolute = Math.abs(value);
   const prefix = engineeringPrefixes.find(([candidateScale]) => absolute < candidateScale * 1000) ?? engineeringPrefixes.at(-1)!;
   const [scale, symbol] = prefix;
-  const number = Number((absolute / scale).toPrecision(4)).toString();
+  const number = formatCircuitNumber(absolute / scale);
   const sign = signed && value !== 0 ? value < 0 ? "−" : "+" : "";
   return `${sign}${number} ${symbol}${unit}`;
 }
@@ -86,7 +87,7 @@ function statusNote(status: CircuitMeterStatus, kind: "ammeter" | "voltmeter", i
 }
 
 function phaseLabel(kind: "ammeter" | "voltmeter", phase: number) {
-  const value = Number(Math.abs(phase).toPrecision(4)).toString();
+  const value = formatCircuitNumber(Math.abs(phase));
   const sign = phase === 0 ? "" : phase < 0 ? "−" : "+";
   return `${kind === "ammeter" ? "電流" : "電圧"}位相 ${sign}${value}°`;
 }

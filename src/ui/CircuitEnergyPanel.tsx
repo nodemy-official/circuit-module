@@ -1,6 +1,8 @@
 import { useMemo } from "react";
+import { scaledProduct } from "../analog-math.js";
 import type { CircuitDocument, CircuitPart } from "../circuit-model.js";
 import type { CircuitAnalysis } from "../circuit-solver.js";
+import { formatCircuitNumber } from "../number-format.js";
 import { formatCircuitQuantity, type CircuitTransientFrame } from "../circuit-visualization.js";
 import type { TransientPartReading, TransientSample } from "../transient-solver.js";
 
@@ -13,19 +15,21 @@ function finite(value: number | null | undefined): value is number {
 }
 
 function formatNumber(value: number): string {
-  if (!Number.isFinite(value)) { return "—"; }
-  if (value === 0) { return "0"; }
-  return Number(value.toPrecision(4)).toString();
+  return formatCircuitNumber(value);
 }
 
 function storedEnergy(part: CircuitPart, voltageVolts: number, currentAmps: number): number | null {
   if (part.kind === "capacitor") {
     const capacitance = part.capacitanceFarads ?? 1e-6;
-    return finite(capacitance) && capacitance >= 0 ? 0.5 * capacitance * voltageVolts ** 2 : null;
+    return finite(capacitance) && capacitance >= 0
+      ? scaledProduct([0.5, capacitance, voltageVolts, voltageVolts])
+      : null;
   }
   if (part.kind === "inductor") {
     const inductance = part.inductanceHenries ?? 0.01;
-    return finite(inductance) && inductance >= 0 ? 0.5 * inductance * currentAmps ** 2 : null;
+    return finite(inductance) && inductance >= 0
+      ? scaledProduct([0.5, inductance, currentAmps, currentAmps])
+      : null;
   }
   return null;
 }
@@ -49,8 +53,22 @@ function resistorEnergySeries(samples: readonly TransientSample[], partId: strin
       series.push(null);
       continue;
     }
-    // Integrate sampled resistor power with the trapezoidal rule; do not infer a circuit-wide balance.
-    accumulated += (Math.max(0, previousPower) + Math.max(0, currentPower)) * 0.5 * duration;
+    // Normalize the endpoints before averaging to avoid both overflow in the sum
+    // and underflow when halving the smallest positive power.
+    const positivePreviousPower = Math.max(0, previousPower);
+    const positiveCurrentPower = Math.max(0, currentPower);
+    const maximumPower = Math.max(positivePreviousPower, positiveCurrentPower);
+    const averageFactor = maximumPower === 0
+      ? 0
+      : (positivePreviousPower / maximumPower + positiveCurrentPower / maximumPower) * 0.5;
+    const intervalEnergy = scaledProduct([maximumPower, averageFactor, duration]);
+    const nextAccumulated: number = accumulated + intervalEnergy;
+    if (!Number.isFinite(nextAccumulated)) {
+      accumulated = null;
+      series.push(null);
+      continue;
+    }
+    accumulated = nextAccumulated;
     series.push(accumulated);
   }
   return series;

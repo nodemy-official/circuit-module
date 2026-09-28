@@ -1,4 +1,5 @@
 import { solveAnalogStep } from "./analog-solver.js";
+import { exactComponentSum, scaledProduct } from "./analog-math.js";
 import type { MeterStatus } from "./meter-status.js";
 import {
   circuitPartCatalog,
@@ -11,6 +12,7 @@ import {
   MAX_CIRCUIT_ANALYSIS_TERMINALS,
   type CircuitIssue,
 } from "./circuit-solver.js";
+import { isSimulationArray, isSimulationRecord } from "./simulation-input.js";
 
 export const MAX_TRANSIENT_STEPS = 2000;
 /** Maximum estimated dense MNA scalar operations across every sample. */
@@ -113,12 +115,8 @@ function stepCount(duration: number, timeStep: number): number | null {
   return count <= MAX_TRANSIENT_STEPS ? count : null;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 function validateOptions(options: unknown, document: CircuitDocument): string | null {
-  if (!isRecord(options)) { return "解析条件はオブジェクトで指定してください。"; }
+  if (!isSimulationRecord(options)) { return "解析条件はオブジェクトで指定してください。"; }
   const duration = options.durationSeconds;
   const timeStep = options.timeStepSeconds;
   if (typeof duration !== "number" || !Number.isFinite(duration) || duration <= 0 ||
@@ -129,7 +127,7 @@ function validateOptions(options: unknown, document: CircuitDocument): string | 
     return "直流動作点から開始する設定は真偽値で指定してください。";
   }
   if (options.switchStates !== undefined) {
-    if (!isRecord(options.switchStates) || options.switchStates instanceof Map || options.switchStates instanceof Set) {
+    if (!isSimulationRecord(options.switchStates) || options.switchStates instanceof Map || options.switchStates instanceof Set) {
       return "スイッチ状態は部品 ID ごとの真偽値で指定してください。";
     }
     const switchIds = new Set(document.parts.filter((part) => part.kind === "switch").map(({ id }) => id));
@@ -146,7 +144,7 @@ function validateOptions(options: unknown, document: CircuitDocument): string | 
 }
 
 function validatePartShape(value: unknown, index: number, parts: Map<string, Record<string, unknown>>) {
-  if (!isRecord(value) || typeof value.id !== "string" || value.id.trim() === "") {
+  if (!isSimulationRecord(value) || typeof value.id !== "string" || value.id.trim() === "") {
     return `部品${index + 1}の ID が正しくありません。`;
   }
   if (parts.has(value.id)) { return `部品 ID「${value.id}」が重複しています。`; }
@@ -173,7 +171,7 @@ function validateWireShape(
   parts: ReadonlyMap<string, Record<string, unknown>>,
   wireIds: Set<string>,
 ) {
-  if (!isRecord(value) || typeof value.id !== "string" || value.id.trim() === "") {
+  if (!isSimulationRecord(value) || typeof value.id !== "string" || value.id.trim() === "") {
     return `導線${index + 1}の ID が正しくありません。`;
   }
   if (wireIds.has(value.id)) { return `導線 ID「${value.id}」が重複しています。`; }
@@ -198,7 +196,7 @@ function validateWiresShape(values: unknown[], parts: ReadonlyMap<string, Record
 }
 
 function validateDocumentShape(input: unknown): string | null {
-  if (!isRecord(input) || !Array.isArray(input.parts) || !Array.isArray(input.wires)) {
+  if (!isSimulationRecord(input) || !isSimulationArray(input.parts) || !isSimulationArray(input.wires)) {
     return "回路データには部品一覧と導線一覧が必要です。";
   }
   const partResult = validatePartsShape(input.parts);
@@ -211,7 +209,7 @@ function validateEndpointShape(
   parts: ReadonlyMap<string, Record<string, unknown>>,
   label: string,
 ): string | null {
-  if (!isRecord(value) || typeof value.partId !== "string" ||
+  if (!isSimulationRecord(value) || typeof value.partId !== "string" ||
       (value.terminal !== "a" && value.terminal !== "b" && value.terminal !== "c")) {
     return `${label}の端子指定が正しくありません。`;
   }
@@ -225,7 +223,7 @@ function validateEndpointShape(
 }
 
 function sameEndpointValues(first: unknown, second: unknown) {
-  if (!isRecord(first) || !isRecord(second)) { return false; }
+  if (!isSimulationRecord(first) || !isSimulationRecord(second)) { return false; }
   return first.partId === second.partId && first.terminal === second.terminal;
 }
 
@@ -395,24 +393,12 @@ function exceedsLimits(document: CircuitDocument, steps: number): string | null 
   if (terminalCount > MAX_CIRCUIT_ANALYSIS_TERMINALS) {
     return `過渡解析の端子数が上限の${MAX_CIRCUIT_ANALYSIS_TERMINALS}端子を超えています。`;
   }
-  const capacitorCount = document.parts.filter((part) => part.kind === "capacitor").length;
   const potentiometerCount = document.parts.filter((part) => part.kind === "potentiometer").length;
-  const dimensionBound = Math.max(1, terminalCount + document.parts.length + capacitorCount * 3 + potentiometerCount);
+  const dimensionBound = Math.max(1, terminalCount + document.parts.length + potentiometerCount);
   if (dimensionBound ** 3 * steps > MAX_TRANSIENT_SOLVER_WORK) {
     return "過渡解析の演算量が上限を超えています。部品数または時間分割数を減らしてください。";
   }
   return null;
-}
-
-function uniqueId(base: string, used: Set<string>) {
-  let candidate = base;
-  let suffix = 1;
-  while (used.has(candidate)) {
-    candidate = `${base}-${suffix}`;
-    suffix += 1;
-  }
-  used.add(candidate);
-  return candidate;
 }
 
 function binaryFactor(value: number) {
@@ -426,45 +412,47 @@ function binaryFactor(value: number) {
     : { mantissa: fraction + 2n ** 52n, exponent: exponentBits - 1075 };
 }
 
-function exactCycleFraction(frequencyHz: number, timeSeconds: number) {
-  // Multiplying large cycle counts as doubles can erase a whole half-cycle.
-  // Reduce the exact product of the two supplied binary64 values modulo one.
-  const frequency = binaryFactor(frequencyHz);
-  const time = binaryFactor(timeSeconds);
-  const exponent = frequency.exponent + time.exponent;
-  if (exponent >= 0) { return 0; }
-  const denominator = 2n ** BigInt(-exponent);
-  let remainder = (frequency.mantissa * time.mantissa) % denominator;
-  // Keep fractions near a full turn as small negative offsets, so converting
-  // to Number does not round them to an exact zero crossing.
-  if (remainder * 2n > denominator) { remainder -= denominator; }
-  return Math.sign(timeSeconds) * Number(remainder) / Number(denominator);
+function binaryIntegerValue(value: bigint, exponent: number) {
+  const magnitude = value < 0n ? -value : value;
+  const shift = Math.max(0, magnitude.toString(2).length - 53);
+  const leading = Number(magnitude / 2n ** BigInt(shift));
+  const scaledExponent = exponent + shift;
+  return scaledProduct([
+    value < 0n ? -leading : leading,
+    2 ** Math.max(scaledExponent, -1022),
+    2 ** Math.min(scaledExponent + 1022, 0),
+  ]);
 }
 
-function quadrantalTimeVoltage(rms: number, phaseDegrees: number, turns: number) {
-  // Reduce time and source phase separately before converting to radians.
-  // This preserves exact zero crossings at quadrantal phases and the small
-  // voltage component beside a large, nearly axis-aligned AC source.
-  const timeQuarters = (turns % 1) * 4;
-  const timeQuadrant = Math.round(timeQuarters);
-  const timeOffsetQuarters = timeQuarters - timeQuadrant;
+function exactTimeQuadrant(frequencyHz: number, timeSeconds: number, phaseDegrees: number) {
+  // Form 360*f*t + phase exactly, then reduce at a quarter-cycle before
+  // rounding. Separate rounding of either the product or its phase sum can
+  // erase a nonzero voltage at a zero crossing.
+  const frequency = binaryFactor(frequencyHz);
+  const time = binaryFactor(timeSeconds);
+  const phase = binaryFactor(phaseDegrees);
+  const timeExponent = frequency.exponent + time.exponent;
+  const exponent = Math.min(0, timeExponent, phase.exponent);
+  const timeDegrees = BigInt(Math.sign(timeSeconds)) * 360n * frequency.mantissa * time.mantissa * 2n ** BigInt(timeExponent - exponent);
+  const phaseUnits = BigInt(Math.sign(phaseDegrees)) * phase.mantissa * 2n ** BigInt(phase.exponent - exponent);
+  const total = timeDegrees + phaseUnits;
+  const sign = total < 0n ? -1 : 1;
+  const magnitude = total < 0n ? -total : total;
+  const denominator = 2n ** BigInt(-exponent);
+  const quarter = (magnitude + 45n * denominator) / (90n * denominator);
+  const remainder = magnitude - quarter * 90n * denominator;
+  return {
+    quadrant: ((sign * Number(quarter % 4n)) + 4) % 4,
+    offsetDegrees: sign * binaryIntegerValue(remainder, exponent),
+  };
+}
+
+function quadrantalTimeVoltage(rms: number, phaseDegrees: number, timeQuadrant = 0) {
   const phaseQuadrant = Math.round(phaseDegrees / 90);
-  const phaseOffsetDegrees = phaseDegrees - phaseQuadrant * 90;
-  // The two offsets can add to another exact quadrantal angle (for example
-  // 45° of elapsed time plus a 45° source phase). Keep the rounding residue
-  // from converting turns to degrees before reducing their sum once more.
-  const split = (2 ** 27 + 1) * timeOffsetQuarters;
-  const timeHigh = split - (split - timeOffsetQuarters);
-  const timeLow = timeOffsetQuarters - timeHigh;
-  const timeOffsetDegrees = timeOffsetQuarters * 90;
-  const timeDegreeError = (timeHigh * 90 - timeOffsetDegrees) + timeLow * 90;
-  const combinedOffsetDegrees = timeOffsetDegrees + phaseOffsetDegrees;
-  const phaseContribution = combinedOffsetDegrees - timeOffsetDegrees;
-  const additionError = (timeOffsetDegrees - (combinedOffsetDegrees - phaseContribution)) +
-    (phaseOffsetDegrees - phaseContribution);
-  const extraQuadrant = Math.round(combinedOffsetDegrees / 90);
-  const offsetDegrees = (combinedOffsetDegrees - extraQuadrant * 90) + timeDegreeError + additionError;
-  const quadrant = ((timeQuadrant + phaseQuadrant + extraQuadrant) % 4 + 4) % 4;
+  return quadrantVoltage(rms, ((timeQuadrant + phaseQuadrant) % 4 + 4) % 4, phaseDegrees - phaseQuadrant * 90);
+}
+
+function quadrantVoltage(rms: number, quadrant: number, offsetDegrees: number) {
   const nearAxis = Math.abs(offsetDegrees) < 1e-7;
   const offsetRadians = offsetDegrees * (Math.PI / 180);
   const alongAxis = nearAxis ? rms : rms * Math.cos(offsetRadians);
@@ -475,24 +463,36 @@ function quadrantalTimeVoltage(rms: number, phaseDegrees: number, turns: number)
     : quadrant === 2 ? -alongAxis : acrossAxis;
 }
 
-function subnormalTurnVoltage(rms: number, phaseDegrees: number, frequency: number, timeSeconds: number) {
-  const quadrant = Math.round(phaseDegrees / 90);
-  const offsetDegrees = phaseDegrees - quadrant * 90;
-  if (Math.abs(offsetDegrees) >= 1e-7) {
-    return quadrantalTimeVoltage(rms, phaseDegrees, 0);
+function offsetPeakVoltage(offset: number, acVoltage: number) {
+  const voltage = offset + Math.SQRT2 * acVoltage;
+  // The peak can overflow even when the offset leaves a finite voltage.
+  return !Number.isFinite(voltage) && Number.isFinite(acVoltage)
+    ? Math.SQRT2 * (acVoltage + offset / Math.SQRT2)
+    : voltage;
+}
+
+function smallTurnVoltage(rms: number, phaseDegrees: number, frequency: number, timeSeconds: number, offset: number) {
+  const cosine = quadrantalTimeVoltage(rms, phaseDegrees);
+  const sine = quadrantalTimeVoltage(rms, phaseDegrees, 3);
+  const turns = frequency * timeSeconds;
+  if (Math.abs(turns) >= 2 ** -1022) {
+    const halfSine = Math.sin(Math.PI * turns);
+    // cos(p+t)-cos(p) = -sin(p)sin(t)-2cos(p)sin(t/2)^2.
+    // Apply the offset to the initial value before adding either difference.
+    return exactComponentSum([
+      offsetPeakVoltage(offset, cosine),
+      scaledProduct([-Math.SQRT2, sine, Math.sin(TWO_PI * turns)]),
+      scaledProduct([-2, Math.SQRT2, cosine, halfSine, halfSine]),
+    ]);
   }
-  // frequency × time can round to zero or lose most of its significant bits
-  // before multiplying by the voltage, although the contribution to a
-  // near-quadrantal zero crossing remains representable.
-  const phaseAcross = (rms * (Math.PI / 180)) * offsetDegrees;
-  const timeAcross = ((rms * frequency) * timeSeconds) * TWO_PI;
-  const acrossAxis = phaseAcross + timeAcross;
-  switch (((quadrant % 4) + 4) % 4) {
-    case 0: return rms;
-    case 1: return -acrossAxis;
-    case 2: return -rms;
-    default: return acrossAxis;
-  }
+  // Apply the DC offset before tiny time corrections so cancellation of the
+  // initial voltage cannot erase a representable derivative. At subnormal
+  // turns, all terms beyond the quadratic term underflow even at maximum RMS.
+  return exactComponentSum([
+    offsetPeakVoltage(offset, cosine),
+    scaledProduct([-Math.SQRT2, sine, frequency, timeSeconds, TWO_PI]),
+    scaledProduct([-0.5, Math.SQRT2, cosine, frequency, timeSeconds, TWO_PI, frequency, timeSeconds, TWO_PI]),
+  ]);
 }
 
 function timeVoltage(part: CircuitPart, timeSeconds: number): number | null {
@@ -503,19 +503,13 @@ function timeVoltage(part: CircuitPart, timeSeconds: number): number | null {
   if (!Number.isFinite(rms) || rms < 0 || !Number.isFinite(frequency) || frequency <= 0 ||
       !Number.isFinite(phaseDegrees) || !Number.isFinite(offset) || !Number.isFinite(timeSeconds)) { return null; }
   const turns = frequency * timeSeconds;
-  let acVoltage: number;
-  if (Math.abs(turns) < 2 ** -1022 && timeSeconds !== 0) {
-    acVoltage = subnormalTurnVoltage(rms, phaseDegrees, frequency, timeSeconds);
-  } else if (Math.abs(turns) < 2 ** 20) {
-    acVoltage = quadrantalTimeVoltage(rms, phaseDegrees, turns);
+  let voltage: number;
+  if (timeSeconds !== 0 && (Math.abs(turns) < 2 ** -1022 ||
+      (Math.abs(turns) < 1e-8 && offset !== 0))) {
+    voltage = smallTurnVoltage(rms, phaseDegrees, frequency, timeSeconds, offset);
   } else {
-    acVoltage = quadrantalTimeVoltage(rms, phaseDegrees, exactCycleFraction(frequency, timeSeconds));
-  }
-  let voltage = offset + Math.SQRT2 * acVoltage;
-  if (!Number.isFinite(voltage) && Number.isFinite(acVoltage)) {
-    // The peak alone can overflow even when the DC offset cancels enough of it
-    // to leave a representable instantaneous voltage.
-    voltage = Math.SQRT2 * (acVoltage + offset / Math.SQRT2);
+    const time = exactTimeQuadrant(frequency, timeSeconds, phaseDegrees);
+    voltage = offsetPeakVoltage(offset, quadrantVoltage(rms, time.quadrant, time.offsetDegrees));
   }
   return Number.isFinite(voltage) ? voltage : null;
 }
@@ -572,35 +566,24 @@ function initialDocument(
 }
 
 function makeStepDocument(document: CircuitDocument, state: StoredState, dt: number): TransformedStep | null {
-  const usedIds = new Set([...document.parts.map(({ id }) => id), ...document.wires.map(({ id }) => id)]);
-  const additionalParts: CircuitPart[] = [];
-  const additionalWires: CircuitDocument["wires"] = [];
   const voltageOverrides = Object.create(null) as Record<string, number>;
   const parts = document.parts.map((part): CircuitPart => {
     if (part.kind === "capacitor") {
       const capacitance = part.capacitanceFarads ?? DEFAULT_CAPACITANCE;
       const previousVoltage = state.capacitorVoltages.get(part.id) ?? part.initialVoltageVolts ?? DEFAULT_INITIAL_VOLTAGE;
-      const conductance = capacitance / dt;
       const resistance = dt / capacitance;
-      const historyCurrent = -conductance * previousVoltage;
-      if (!Number.isFinite(conductance) || conductance <= 0 || !Number.isFinite(resistance) ||
-          resistance <= 0 || !Number.isFinite(historyCurrent)) { return part; }
+      if (!Number.isFinite(resistance) || resistance <= 0 || !Number.isFinite(previousVoltage)) { return part; }
 
-      const historyPartId = uniqueId(`__transient_${part.id}_history`, usedIds);
-      const wireA = uniqueId(`__transient_${part.id}_history_a`, usedIds);
-      const wireB = uniqueId(`__transient_${part.id}_history_b`, usedIds);
-      additionalParts.push({
+      // The Thevenin companion keeps the capacitor branch current as an MNA
+      // unknown. A Norton conductance plus history source loses small physical
+      // currents when two very large currents nearly cancel.
+      voltageOverrides[part.id] = previousVoltage;
+      return {
         ...part,
-        id: historyPartId,
-        kind: "current-source",
-        label: `${part.label} の履歴電流`,
-        currentAmps: historyCurrent,
-      });
-      additionalWires.push(
-        { id: wireA, from: { partId: part.id, terminal: "a" }, to: { partId: historyPartId, terminal: "a" } },
-        { id: wireB, from: { partId: part.id, terminal: "b" }, to: { partId: historyPartId, terminal: "b" } },
-      );
-      return { ...part, kind: "resistor", resistanceOhms: resistance };
+        kind: "battery",
+        voltageVolts: 1,
+        internalResistanceOhms: resistance,
+      };
     }
     if (part.kind === "inductor") {
       const inductance = part.inductanceHenries ?? DEFAULT_INDUCTANCE;
@@ -616,7 +599,7 @@ function makeStepDocument(document: CircuitDocument, state: StoredState, dt: num
 
   if (parts.some((part) => part.kind === "capacitor" || part.kind === "inductor")) { return null; }
   return {
-    document: { ...document, parts: [...parts, ...additionalParts], wires: [...document.wires, ...additionalWires] },
+    document: { ...document, parts, wires: document.wires },
     voltageOverrides,
   };
 }
@@ -633,21 +616,12 @@ type PartSampleResult =
 function samplePart(
   part: CircuitPart,
   reading: ReturnType<typeof solveAnalogStep>["parts"][string] | undefined,
-  previousState: StoredState | null,
-  dt: number,
 ): PartSampleResult {
   if (!reading || !readingFinite(reading)) {
     return { reason: `${part.label || part.id}の電圧・電流を有限値で計算できません。` };
   }
   const voltageVolts = reading.voltage.real;
-  let currentAmps = reading.current.real;
-  if (part.kind === "capacitor") {
-    const previousVoltage = previousState?.capacitorVoltages.get(part.id);
-    if (previousVoltage !== undefined) {
-      const capacitance = part.capacitanceFarads ?? DEFAULT_CAPACITANCE;
-      currentAmps = capacitance / dt * (voltageVolts - previousVoltage);
-    }
-  }
+  const currentAmps = reading.current.real;
   const powerWatts = part.kind === "capacitor" || part.kind === "inductor"
     ? voltageVolts * currentAmps
     : reading.power.real;
@@ -671,15 +645,13 @@ function samplePart(
 function createSample(
   document: CircuitDocument,
   analysis: ReturnType<typeof solveAnalogStep>,
-  previousState: StoredState | null,
-  dt: number,
   switchStates: Record<string, boolean> = {},
 ): { sample?: TransientSample; state?: StoredState; reason?: string } {
   const parts = Object.create(null) as Record<string, TransientPartReading>;
   const capacitorVoltages = new Map<string, number>();
   const inductorCurrents = new Map<string, number>();
   for (const part of document.parts) {
-    const result = samplePart(part, analysis.parts[part.id], previousState, dt);
+    const result = samplePart(part, analysis.parts[part.id]);
     if ("reason" in result) { return { reason: result.reason }; }
     if (part.kind === "switch") { result.reading.switchClosed = isSwitchClosed(part, switchStates); }
     parts[part.id] = result.reading;
@@ -725,7 +697,7 @@ function initializeTransient(
     const context = useOperatingPoint ? "直流動作点" : "初期状態";
     return { reason: `${context}を満たす回路を計算できません。 ${analysis.message}`, issues: analysis.issues };
   }
-  const measured = createSample(document, analysis, null, options.timeStepSeconds, options.switchStates);
+  const measured = createSample(document, analysis, options.switchStates);
   if (!measured.sample || !measured.state) {
     return { reason: measured.reason ?? "初期波形を作成できませんでした。", issues: analysis.issues };
   }
@@ -977,7 +949,7 @@ function solveNextStep(
   if (analysis.status !== "valid") {
     return { analysis, reason: `t=${timeSeconds} s の解析に失敗しました。${analysis.message}` };
   }
-  const measured = createSample(document, analysis, state, dt, options.switchStates);
+  const measured = createSample(document, analysis, options.switchStates);
   if (!measured.sample || !measured.state) {
     return { analysis, reason: `t=${timeSeconds} s の波形を作成できませんでした。${measured.reason ?? ""}` };
   }

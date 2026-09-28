@@ -27,6 +27,55 @@ function missingFrequencyProxy<T extends object>(target: T) {
 }
 
 describe("simulation input accessor validation", () => {
+  it("rejects indexed accessors without invoking them across public analysis APIs", () => {
+    const partCalls: [string, (parts: CircuitDocument["parts"]) => { status: string }][] = [
+      ["analyzeCircuit", (parts) => analyzeCircuit({ ...source, parts })],
+      ["analyzeExtendedCircuit", (parts) => analyzeExtendedCircuit({ ...source, parts }, {}, { mode: "ac" })],
+      ["analyzeAnalogCircuit", (parts) => analyzeAnalogCircuit({ ...source, parts }, { mode: "ac" })],
+      ["solveAnalogStep", (parts) => solveAnalogStep({ ...source, parts }, { mode: "ac" })],
+      ["simulateTransient", (parts) => simulateTransient({ ...source, parts }, { durationSeconds: 1, timeStepSeconds: 0.1 })],
+    ];
+    for (const [name, call] of partCalls) {
+      let reads = 0;
+      const parts: unknown[] = [];
+      Object.defineProperty(parts, "0", {
+        configurable: true,
+        enumerable: true,
+        get() {
+          reads += 1;
+          return source.parts[0];
+        },
+      });
+      parts.length = 1;
+
+      expect(call(parts as CircuitDocument["parts"]).status, name).toBe("invalid");
+      expect(reads, name).toBe(0);
+    }
+
+    const wireCalls: [string, (wires: CircuitDocument["wires"]) => { status: string }][] = [
+      ["analyzeCircuit", (wires) => analyzeCircuit({ ...source, wires })],
+      ["analyzeExtendedCircuit", (wires) => analyzeExtendedCircuit({ ...source, wires }, {}, { mode: "ac" })],
+      ["analyzeAnalogCircuit", (wires) => analyzeAnalogCircuit({ ...source, wires }, { mode: "ac" })],
+      ["solveAnalogStep", (wires) => solveAnalogStep({ ...source, wires }, { mode: "ac" })],
+      ["simulateTransient", (wires) => simulateTransient({ ...source, wires }, { durationSeconds: 1, timeStepSeconds: 0.1 })],
+    ];
+    for (const [name, call] of wireCalls) {
+      let reads = 0;
+      const wires: unknown[] = [];
+      Object.defineProperty(wires, "0", {
+        configurable: true,
+        enumerable: true,
+        get() {
+          reads += 1;
+        },
+      });
+      wires.length = 1;
+
+      expect(call(wires as CircuitDocument["wires"]).status, name).toBe("invalid");
+      expect(reads, name).toBe(0);
+    }
+  });
+
   it("returns invalid rather than invoking accessor properties", () => {
     const throwingMode = Object.defineProperty({}, "mode", { get() { throw new Error("bad mode"); } });
     const throwingFrequency = Object.defineProperty({ mode: "ac" }, "frequencyHz", { get() { throw new Error("bad frequency"); } });

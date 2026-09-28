@@ -1,6 +1,7 @@
 import { useId, useState } from "react";
 import type { CircuitAnalysis } from "../circuit-solver.js";
 import type { CircuitDocument, CircuitPart } from "../circuit-model.js";
+import { formatCircuitNumber } from "../number-format.js";
 
 type ComparisonMetric = "voltageVolts" | "currentAmps" | "powerWatts";
 interface Snapshot {
@@ -60,7 +61,9 @@ function isFiniteValue(value: unknown): value is number {
 }
 
 function measurement(analysis: CircuitAnalysis | undefined, partId: string, metric: ComparisonMetric): number | undefined {
-  const value = analysis?.parts[partId]?.[metric];
+  const reading = analysis?.parts[partId];
+  if (reading?.meterStatus === "unconnected" || reading?.meterStatus === "floating") { return undefined; }
+  const value = reading?.[metric];
   return isFiniteValue(value) ? value : undefined;
 }
 
@@ -115,9 +118,9 @@ function incompatibilityReason(before: Snapshot, after: Snapshot): string | unde
 
 function formatNumber(value: number | undefined, signed = false): string {
   if (value === undefined || !Number.isFinite(value)) { return "—"; }
-  const rounded = Number(value.toPrecision(4));
-  if (rounded === 0) { return "0"; }
-  return `${signed && rounded > 0 ? "+" : ""}${rounded}`;
+  const formatted = formatCircuitNumber(value);
+  if (Number(formatted) === 0) { return "0"; }
+  return `${signed && value > 0 ? "+" : ""}${formatted}`;
 }
 
 function partLabel(part: CircuitPart | undefined): string {

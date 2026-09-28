@@ -1,4 +1,5 @@
 import type { ComponentPropsWithoutRef } from "react";
+import { formatCircuitNumber } from "../number-format.js";
 import { formatCircuitQuantity } from "../circuit-visualization.js";
 import type { CircuitAnalysis } from "../circuit-solver.js";
 import { circuitSlot, type CircuitStyleProps } from "./style-props.js";
@@ -84,7 +85,7 @@ export function CircuitAnalysisPanel({
         <strong {...circuitSlot(undefined, slotProps?.stateValue)}>{analysis.mode && analysis.status === "closed" ? "解析完了" : statusLabel[analysis.status]}</strong>
       </div>
       {analysis.mode === "ac" && <p className="circuit-analysis__mode">交流 {analysis.frequencyHz} Hz · 電圧・電流は実効値</p>}
-      {analysis.timeSeconds !== undefined && <p className="circuit-analysis__mode">過渡 {Number(analysis.timeSeconds.toPrecision(4))} s · 瞬時値</p>}
+      {analysis.timeSeconds !== undefined && <p className="circuit-analysis__mode">過渡 {formatCircuitNumber(analysis.timeSeconds)} s · 瞬時値</p>}
       {showReason && <p {...circuitSlot("circuit-analysis__reason", slotProps?.reason)}>{analysis.mode ? analysis.message : statusReason[analysis.status]}</p>}
       <div {...circuitSlot("circuit-analysis__metric", slotProps?.metric)}>
         <span {...circuitSlot(undefined, slotProps?.metricLabel)}>{analysis.mode === "ac" ? "電源電流（実効値）" : analysis.mode ? "電源電流" : "電流"}</span>

@@ -190,7 +190,8 @@ describe("transient AC source phase axes", () => {
     { phaseDegrees: 0, turns: 0.25, description: "quarter-cycle sample" },
     { phaseDegrees: 0, turns: 0.75, description: "three-quarter-cycle sample" },
   ])("returns the exact zero crossing for $description even at huge RMS voltage", ({ phaseDegrees, turns }) => {
-    const frequencyHz = 50;
+    // A power-of-two frequency keeps these sample times exact in binary64.
+    const frequencyHz = 64;
     const targetTimeSeconds = turns / frequencyHz;
     const durationSeconds = turns === 0 ? 0.001 : targetTimeSeconds;
     const document: CircuitDocument = {

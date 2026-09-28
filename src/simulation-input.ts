@@ -21,6 +21,20 @@ export function isSimulationRecord(value: unknown): value is Record<string, unkn
   }
 }
 
+/** Checks array entries before iteration so indexed accessors are never called. */
+export function isSimulationArray(value: unknown): value is unknown[] {
+  if (!Array.isArray(value)) { return false; }
+  try {
+    for (let index = 0; index < value.length; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+      if (!descriptor || !Object.hasOwn(descriptor, "value")) { return false; }
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Reads a record's own data property without invoking a Proxy `get` trap. */
 export function simulationRecordField(record: object, key: string) {
   const descriptor = Object.getOwnPropertyDescriptor(record, key);
@@ -30,7 +44,7 @@ export function simulationRecordField(record: object, key: string) {
 /** Checks the object shape used before the numeric validators run. */
 export function circuitDocumentShapeIssue(input: unknown): string | null {
   try {
-    if (!isSimulationRecord(input) || !Array.isArray(input.parts) || !Array.isArray(input.wires)) {
+    if (!isSimulationRecord(input) || !isSimulationArray(input.parts) || !isSimulationArray(input.wires)) {
       return "回路データには部品一覧と導線一覧が必要です。";
     }
     const parts = partKindsAndIssue(input.parts);

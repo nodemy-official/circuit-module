@@ -4,6 +4,7 @@ import type { ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createCircuitExample } from "../circuit-examples.js";
+import type { CircuitDocument } from "../circuit-model.js";
 import { analyzeCircuit, type CircuitAnalysisOptions } from "../circuit-solver.js";
 import { CircuitSimulationPanel, type CircuitSimulationPanelProps } from "./CircuitSimulationPanel.js";
 
@@ -46,6 +47,45 @@ function panelProps(
 }
 
 describe("CircuitSimulationPanel learning feature visibility", () => {
+  it("uses the displayed switch state for transient calculation and clears stale frames", () => {
+    const document: CircuitDocument = {
+      title: "Switch override",
+      parts: [
+        { id: "source", kind: "battery", label: "電源", x: 0, y: 0, voltageVolts: 5 },
+        { id: "load", kind: "resistor", label: "抵抗", x: 0, y: 0, resistanceOhms: 100 },
+        { id: "switch", kind: "switch", label: "スイッチ", x: 0, y: 0, initiallyClosed: false },
+      ],
+      wires: [
+        { id: "a", from: { partId: "source", terminal: "a" }, to: { partId: "switch", terminal: "a" } },
+        { id: "b", from: { partId: "switch", terminal: "b" }, to: { partId: "load", terminal: "a" } },
+        { id: "c", from: { partId: "load", terminal: "b" }, to: { partId: "source", terminal: "b" } },
+      ],
+    };
+    const onFrameChange = vi.fn();
+    const props = panelProps(document, { mode: "dc" }, {
+      analysis: analyzeCircuit(document, { switch: true }), onFrameChange,
+    });
+    const ui = mount(<CircuitSimulationPanel {...props} />);
+    const calculate = () => {
+      const button = [...ui.container.querySelectorAll("button")].find((item) => item.textContent === "波形を計算");
+      if (!button) { throw new Error("Missing calculate button"); }
+      act(() => button.click());
+    };
+    calculate();
+    expect(ui.container.querySelector('[data-part-id="load"] td')?.textContent).toBe("5");
+    expect(onFrameChange.mock.calls.at(-1)?.[0]?.analysis.samples[0].parts.switch.switchClosed).toBe(true);
+    act(() => ui.root.render(<CircuitSimulationPanel {...props} analysis={analyzeCircuit(document, { switch: true })} />));
+    expect(ui.container.querySelector('[data-part-id="load"] td')?.textContent).toBe("5");
+    expect(ui.container.querySelector(".circuit-energy__time")).not.toBeNull();
+    act(() => ui.root.render(<CircuitSimulationPanel {...props} analysis={analyzeCircuit(document, { switch: false })} />));
+    expect(ui.container.querySelector(".circuit-waveform")).toBeNull();
+    expect(ui.container.querySelector(".circuit-energy__time")).toBeNull();
+    expect(onFrameChange.mock.calls.at(-1)?.[0]).toBeNull();
+    calculate();
+    expect(ui.container.querySelector('[data-part-id="load"] td')?.textContent).toBe("0");
+    expect(onFrameChange.mock.calls.at(-1)?.[0]?.analysis.samples[0].parts.switch.switchClosed).toBe(false);
+  });
+
   it("hides AC tools and its analysis option by default when the circuit has no AC source", () => {
     const props = panelProps();
     const ui = mount(<CircuitSimulationPanel {...props} />);

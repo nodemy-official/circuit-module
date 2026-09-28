@@ -958,8 +958,31 @@ describe("simulateTransient", () => {
       .toBe("invalid");
   });
 
-  it("rejects a time step whose capacitor companion values overflow", () => {
+  it("keeps the RC charging current when the time step is subnormal", () => {
     const result = simulateTransient(rcCircuit(), {
+      durationSeconds: Number.MIN_VALUE,
+      timeStepSeconds: Number.MIN_VALUE,
+    });
+    const sample = result.samples[1];
+    const companionResistance = Number.MIN_VALUE / 1e-3;
+    const expectedCurrent = 1 / (1000 + companionResistance);
+    const expectedVoltage = expectedCurrent * companionResistance;
+
+    expect(result.status, result.message).toBe("valid");
+    expect(result.samples).toHaveLength(2);
+    expect(sample?.timeSeconds).toBe(Number.MIN_VALUE);
+    expect(expectedVoltage).toBe(Number.MIN_VALUE);
+    expect(sample?.parts.capacitor?.voltageVolts).toBe(expectedVoltage);
+    expect(sample?.parts.capacitor?.currentAmps).toBeCloseTo(expectedCurrent, 12);
+    expect(sample?.parts.resistor?.currentAmps).toBeCloseTo(expectedCurrent, 12);
+  });
+
+  it("rejects a time step when the capacitor companion resistance underflows to zero", () => {
+    const document = rcCircuit();
+    const capacitor = document.parts.find(({ kind }) => kind === "capacitor");
+    if (capacitor?.kind !== "capacitor") { throw new Error("Missing capacitor"); }
+    capacitor.capacitanceFarads = Number.MAX_VALUE;
+    const result = simulateTransient(document, {
       durationSeconds: Number.MIN_VALUE,
       timeStepSeconds: Number.MIN_VALUE,
     });

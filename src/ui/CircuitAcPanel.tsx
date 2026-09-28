@@ -2,6 +2,7 @@ import { useId, useState, type ChangeEvent } from "react";
 import { frequencyMatches } from "../ac-reactive.js";
 import { circuitPartCatalog, type CircuitDocument, type CircuitPart } from "../circuit-model.js";
 import { analyzeCircuit, type CircuitAnalysis, type CircuitAnalysisOptions, type CircuitPartReading } from "../circuit-solver.js";
+import { formatCircuitNumber } from "../number-format.js";
 
 const MIN_SWEEP_POINTS = 3;
 const MAX_SWEEP_POINTS = 81;
@@ -18,9 +19,7 @@ function finite(value: number | undefined): value is number {
 }
 
 function formatNumber(value: number): string {
-  if (!Number.isFinite(value)) { return "—"; }
-  if (value === 0) { return "0"; }
-  return Number(value.toPrecision(4)).toString();
+  return formatCircuitNumber(value);
 }
 
 function formatFrequency(value: number): string {
@@ -50,6 +49,7 @@ interface SweepPoint {
 
 interface StoredSweep {
   document: CircuitDocument;
+  analysis: CircuitAnalysis;
   selectedPartId: string;
   centerFrequencyHz: number;
   decades: number;
@@ -75,6 +75,7 @@ function usableAcAnalysis(
 
 function createFrequencySweep(
   document: CircuitDocument,
+  analysis: CircuitAnalysis,
   partId: string,
   centerFrequencyHz: number,
   decades: number,
@@ -84,7 +85,7 @@ function createFrequencySweep(
   const minFrequency = Math.max(Number.MIN_VALUE, centerFrequencyHz / span);
   const maxFrequency = Math.min(Number.MAX_VALUE, centerFrequencyHz * span);
   if (!Number.isFinite(minFrequency) || !Number.isFinite(maxFrequency) || minFrequency <= 0 || maxFrequency <= minFrequency) {
-    return { document, selectedPartId: partId, centerFrequencyHz, decades, pointCount, points: [] };
+    return { document, analysis, selectedPartId: partId, centerFrequencyHz, decades, pointCount, points: [] };
   }
   const lowerSteps = Math.floor((pointCount - 1) / 2);
   const upperSteps = pointCount - 1 - lowerSteps;
@@ -100,6 +101,10 @@ function createFrequencySweep(
   for (let index = 1; index <= upperSteps; index += 1) {
     frequencies.add(logFrequency(centerFrequencyHz, maxFrequency, index, upperSteps));
   }
+  const switchStates = Object.fromEntries(document.parts.flatMap((part) => {
+    const closed = analysis.parts[part.id]?.switchClosed;
+    return part.kind === "switch" && closed !== undefined ? [[part.id, closed]] : [];
+  }));
   const points: SweepPoint[] = [...frequencies].sort((first, second) => first - second).map((frequencyHz) => {
     // Keep the same excitation set as the displayed analysis. Sources at other
     // frequencies are out of band there, so they must stay out of the whole sweep.
@@ -112,24 +117,27 @@ function createFrequencySweep(
           : { ...part, voltageVolts: 0 };
       }),
     };
-    const pointAnalysis = analyzeCircuit(sweptDocument, {}, { mode: "ac", frequencyHz });
-    const voltage = pointAnalysis.status === "closed" || pointAnalysis.status === "idle"
-      ? pointAnalysis.parts[partId]?.voltageVolts
+    const pointAnalysis = analyzeCircuit(sweptDocument, switchStates, { mode: "ac", frequencyHz });
+    const reading = pointAnalysis.parts[partId];
+    const voltage = (pointAnalysis.status === "closed" || pointAnalysis.status === "idle") &&
+      reading?.meterStatus !== "floating" && reading?.meterStatus !== "unconnected"
+      ? reading?.voltageVolts
       : undefined;
     return { frequencyHz, voltageVolts: finite(voltage) ? voltage : null };
   });
-  return { document, selectedPartId: partId, centerFrequencyHz, decades, pointCount, points };
+  return { document, analysis, selectedPartId: partId, centerFrequencyHz, decades, pointCount, points };
 }
 
 function matchingSweep(
   sweep: StoredSweep | null,
   document: CircuitDocument,
+  analysis: CircuitAnalysis,
   partId: string | undefined,
   centerFrequencyHz: number,
   decades: number,
   pointCount: number,
 ): StoredSweep | null {
-  if (!sweep || sweep.document !== document || sweep.selectedPartId !== partId ||
+  if (!sweep || sweep.document !== document || sweep.analysis !== analysis || sweep.selectedPartId !== partId ||
     sweep.centerFrequencyHz !== centerFrequencyHz || sweep.decades !== decades || sweep.pointCount !== pointCount) { return null; }
   return sweep;
 }
@@ -203,8 +211,9 @@ function PhaseSummary({ difference, hasUnknownPhase }: { difference: number | nu
 
 function Waveform({ reading, frequencyHz, partLabel }: { reading: CircuitPartReading; frequencyHz: number; partLabel: string }) {
   const id = useId();
-  const voltageRms = finite(reading.voltageVolts) ? Math.max(0, reading.voltageVolts) : null;
-  const currentRms = finite(reading.currentAmps) ? Math.max(0, reading.currentAmps) : null;
+  const measured = reading.meterStatus !== "floating" && reading.meterStatus !== "unconnected";
+  const voltageRms = measured && finite(reading.voltageVolts) ? Math.max(0, reading.voltageVolts) : null;
+  const currentRms = measured && finite(reading.currentAmps) ? Math.max(0, reading.currentAmps) : null;
   const voltagePeak = voltageRms === null ? null : Math.SQRT2 * voltageRms;
   const currentPeak = currentRms === null ? null : Math.SQRT2 * currentRms;
   const voltagePhase = finite(reading.voltagePhaseDegrees) ? reading.voltagePhaseDegrees * Math.PI / 180 : null;
@@ -214,6 +223,7 @@ function Waveform({ reading, frequencyHz, partLabel }: { reading: CircuitPartRea
   const difference = phaseDifference(reading, voltageRms, currentRms);
   const hasUnknownPhase = missingPhase(voltageRms, voltagePhase, currentRms, currentPhase);
   return <div className="circuit-ac__waveform" data-voltage-rms={voltageRms ?? "undefined"} data-current-rms={currentRms ?? "undefined"}>
+    {!measured && <p role="status">{reading.meterStatus === "unconnected" ? "計器の端子が未接続のため、波形を表示できません。" : "計器の値が定まらないため、波形を表示できません。"}</p>}
     <svg viewBox="0 0 480 190" role="img" aria-labelledby={`${id}-title`} aria-describedby={`${id}-description`}>
       <title id={`${id}-title`}>{`${partLabel}の電圧と電流の交流波形`}</title>
       <desc id={`${id}-description`}>1周期を表示しています。電圧と電流は実効値から作った正弦波で、縦軸は独立した尺度です。</desc>
@@ -320,11 +330,11 @@ export function CircuitAcPanel({ document, analysis, options }: CircuitAcPanelPr
   const reading = selectedPart ? analysis.parts[selectedPart.id] : undefined;
   const hasAcSource = document.parts.some((part) => part.kind === "ac-source");
   const active = usableAcAnalysis(document, analysis, options, centerFrequencyHz, requestedFrequencyHz, selectedPart, reading);
-  const visibleSweep = matchingSweep(sweep, document, selectedPart?.id, centerFrequencyHz, decades, pointCount);
+  const visibleSweep = matchingSweep(sweep, document, analysis, selectedPart?.id, centerFrequencyHz, decades, pointCount);
 
   const runSweep = () => {
     if (active && selectedPart) {
-      setSweep(createFrequencySweep(document, selectedPart.id, centerFrequencyHz, decades, pointCount));
+      setSweep(createFrequencySweep(document, analysis, selectedPart.id, centerFrequencyHz, decades, pointCount));
     }
   };
 

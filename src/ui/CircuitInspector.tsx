@@ -1,5 +1,6 @@
 import { circuitPartCatalog, circuitPartNumericFields, type CircuitPart, type CircuitPartNumericKey, type CircuitWire } from "../circuit-model.js";
 import type { CircuitAnalysis, CircuitPartReading } from "../circuit-solver.js";
+import { formatCircuitNumber } from "../number-format.js";
 import { circuitSlot, type CircuitStyleProps } from "./style-props.js";
 import { CircuitIcon } from "./CircuitIcon.js";
 import { measurementLabels } from "./measurement-labels.js";
@@ -76,7 +77,7 @@ export interface CircuitInspectorProps extends Omit<ComponentPropsWithoutRef<"se
   slotProps?: Partial<Record<CircuitInspectorSlot, CircuitStyleProps>>;
 }
 
-const format = (value: number | undefined) => value === undefined || !Number.isFinite(value) ? "—" : Number(value.toPrecision(4)).toString();
+const format = (value: number | undefined) => value === undefined ? "—" : formatCircuitNumber(value);
 const formatTimeNote = (timeSeconds?: number) => timeSeconds === undefined || !Number.isFinite(timeSeconds)
   ? undefined
   : `時間カーソル ${format(timeSeconds)} s の瞬時値です。`;

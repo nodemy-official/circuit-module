@@ -70,6 +70,7 @@ function AnalysisSettings({
 
 function LearningPanels({
   document,
+  transientDocument,
   analysis,
   options,
   baselineDocument,
@@ -85,6 +86,7 @@ function LearningPanels({
   onFrameChange,
 }: {
   document: CircuitDocument;
+  transientDocument: CircuitDocument;
   analysis: CircuitAnalysis;
   options: CircuitAnalysisOptions;
   baselineDocument?: CircuitDocument;
@@ -101,13 +103,28 @@ function LearningPanels({
 }) {
   return <>
     {showTransient && <>
-      <CircuitTransientPanel document={document} baselineDocument={baselineDocument} onFrameChange={onFrameChange} active={active} defaultOpen={!showAnalysisSettings} />
+      <CircuitTransientPanel document={transientDocument} baselineDocument={baselineDocument} onFrameChange={onFrameChange} active={active} defaultOpen={!showAnalysisSettings} />
       {frame && <button className="circuit-button" type="button" onClick={() => onFrameChange(null)}>回路図を定常表示に戻す</button>}
     </>}
     {showEnergy && <details className="circuit-learning-section"><summary>電力とエネルギー</summary><CircuitEnergyPanel document={document} analysis={sampledAnalysis ?? analysis} frame={frame} /></details>}
     {showAc && <details className="circuit-learning-section"><summary>交流の位相・周波数応答</summary><CircuitAcPanel document={document} analysis={analysis} options={options} /></details>}
     {showComparison && <CircuitComparisonPanel document={document} analysis={analysis} baselineDocument={baselineDocument} baselineAnalysis={baselineAnalysis} />}
   </>;
+}
+
+function analyzedSwitchOverrides(document: CircuitDocument, analysis: CircuitAnalysis) {
+  return JSON.stringify(document.parts.flatMap((part) => {
+    const closed = analysis.parts[part.id]?.switchClosed;
+    return part.kind === "switch" && closed !== undefined && closed !== (part.initiallyClosed ?? true)
+      ? [[part.id, closed]] : [];
+  }));
+}
+
+function documentWithSwitchOverrides(document: CircuitDocument, serializedOverrides: string): CircuitDocument {
+  const overrides = new Map<string, boolean>(JSON.parse(serializedOverrides));
+  if (overrides.size === 0) { return document; }
+  return { ...document, parts: document.parts.map((part) => overrides.has(part.id)
+    ? { ...part, initiallyClosed: overrides.get(part.id) } : part) };
 }
 
 /** Analysis settings are session state; changing them does not alter the circuit. */
@@ -129,14 +146,16 @@ export function CircuitSimulationPanel({
   const showEnergy = showLearningPanels && (learningFeatures?.energy ?? true);
   const showAc = showLearningPanels && resolveAcFeature(learningFeatures?.ac, document, analysis, options);
   const showComparison = showLearningPanels && (learningFeatures?.comparison ?? true);
+  const switchOverrides = analyzedSwitchOverrides(document, analysis);
+  const transientDocument = useMemo(() => documentWithSwitchOverrides(document, switchOverrides), [document, switchOverrides]);
   const [frameState, setFrameState] = useState<{ document: CircuitDocument; frame: CircuitTransientFrame | null } | null>(null);
-  const frame = showTransient && frameState?.document === document ? frameState.frame : null;
+  const frame = showTransient && frameState?.document === transientDocument ? frameState.frame : null;
   const sampledAnalysis = useMemo(() => frame ? analysisAtTransientFrame(document, frame) : null, [document, frame]);
   const baselineAnalysis = useMemo(() => baselineDocument && showComparison ? analyzeCircuit(baselineDocument, {}, options) : undefined, [baselineDocument, options, showComparison]);
   const changeFrame = useCallback((next: CircuitTransientFrame | null) => {
-    setFrameState({ document, frame: next });
+    setFrameState({ document: transientDocument, frame: next });
     onFrameChange?.(next);
-  }, [document, onFrameChange]);
+  }, [transientDocument, onFrameChange]);
   const frequency = options.frequencyHz ?? document.parts.find((part) => part.kind === "ac-source")?.frequencyHz ?? 1000;
   const ariaLabel = props["aria-label"] ?? (showAnalysisSettings ? "解析の設定" : "解析結果と学習ビュー");
   if (!showAnalysisSettings && !showTransient && !showEnergy && !showAc && !showComparison) { return null; }
@@ -144,6 +163,7 @@ export function CircuitSimulationPanel({
     {showAnalysisSettings && <AnalysisSettings analysis={analysis} options={options} onChange={onChange} frequency={frequency} acAvailable={resolveAcFeature(learningFeatures?.ac, document, analysis, options)} />}
     {(showTransient || showEnergy || showAc || showComparison) && <LearningPanels
       document={document}
+      transientDocument={transientDocument}
       analysis={analysis}
       options={options}
       baselineDocument={baselineDocument}

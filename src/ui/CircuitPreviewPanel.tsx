@@ -1,6 +1,7 @@
 import { useId, useState, type ReactNode } from "react";
 import { circuitPartCatalog, circuitPartNumericFields, type CircuitDocument, type CircuitPart, type CircuitPartNumericKey } from "../circuit-model.js";
 import type { CircuitAnalysis } from "../circuit-solver.js";
+import { formatCircuitNumber } from "../number-format.js";
 import { CircuitPartIcon } from "./CircuitPalette.js";
 import { getMeterDisplay, CircuitMeterReadout } from "./CircuitMeterReadout.js";
 import { measurementLabels } from "./measurement-labels.js";
@@ -63,7 +64,7 @@ function format(value: number | undefined, unit: string) {
     ? [1, ""]
     : engineeringPrefixes.find(([threshold]) => Math.abs(value) < threshold * 1000) ?? engineeringPrefixes.at(-1)!;
   const suffix = `${prefix}${unit}`;
-  const formatted = Number((value / scale).toPrecision(4)).toString();
+  const formatted = formatCircuitNumber(value / scale);
   return suffix ? `${formatted} ${suffix}` : formatted;
 }
 
