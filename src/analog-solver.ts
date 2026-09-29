@@ -118,6 +118,12 @@ export interface AnalogStepOptions {
   initialInductorCurrents?: boolean;
 }
 
+/** Internal initial-time data for capacitor and ideal voltage-source branches. */
+export interface InitialVoltageConstraint {
+  capacitanceFarads?: number;
+  voltageDerivative?: ExactRational;
+}
+
 /** Maximum terminal count accepted by this dense MNA solver. */
 export const MAX_ANALOG_ANALYSIS_TERMINALS = 512;
 /** Maximum number of MNA unknowns, including ideal-source branch currents. */
@@ -154,6 +160,7 @@ interface Branch {
   positiveNode: number;
   negativeNode: number;
   seriesResistanceOhms: number;
+  exactSeriesResistance?: ExactRational;
   seriesReactanceOhms?: number;
   exactSeriesReactance?: ExactRational;
   sourceVoltage: ComplexValue;
@@ -164,6 +171,13 @@ interface Branch {
   unknownIndex: number;
   /** Redundant compatible ideal voltage constraint; its current is fixed to zero. */
   redundantIdealSource?: boolean;
+  initialCapacitanceFarads?: number;
+  initialVoltageDerivative?: ExactRational;
+  /** Differentiated KVL fixes capacitor currents in an initial voltage loop. */
+  initialDerivativeEquation?: {
+    terms: Array<{ unknownIndex: number; coefficient: ExactRational }>;
+    rhs: ExactRational;
+  };
   /** Outer terminal tied to the wiper by an ideal internal potentiometer segment. */
   internalPotentiometerTerminal?: "a" | "b";
 }
@@ -192,6 +206,9 @@ interface AcSolution {
 interface NonlinearModel {
   currents: number[];
   jacobian: number[][];
+  /** Preserve algebraic combinations after each device's approximation boundary. */
+  exactCurrents?: readonly ExactRational[];
+  exactJacobian?: readonly (readonly ExactRational[])[];
 }
 
 interface DcAssembly {
@@ -935,6 +952,8 @@ function compatibleIdealVoltageConstraint(
 interface IdealVoltageConstraintNeighbor {
   node: number;
   partId: string;
+  branch: Branch;
+  orientation: 1 | -1;
   /** V(current node) − V(neighbor node). */
   voltageDifference: ComplexValue;
   voltageUncertainty: ComplexValue;
@@ -944,11 +963,15 @@ interface IdealVoltageConstraintPath {
   voltageDifference: ComplexValue;
   voltageUncertainty: ComplexValue;
   partIds: string[];
+  edges: IdealVoltageConstraintNeighbor[];
 }
 
 function isIdealVoltageConstraint(branch: Branch) {
   return !branch.transientCompanion &&
-    branch.seriesResistanceOhms === 0 && (branch.seriesReactanceOhms ?? 0) === 0 &&
+    (branch.exactSeriesResistance
+      ? branch.exactSeriesResistance.numerator === 0n
+      : branch.seriesResistanceOhms === 0) &&
+    (branch.seriesReactanceOhms ?? 0) === 0 &&
     (branch.exactSeriesReactance?.numerator ?? 0n) === 0n;
 }
 
@@ -977,6 +1000,7 @@ function idealVoltageConstraintPath(
   const realUncertaintyTerms: number[] = [];
   const imaginaryUncertaintyTerms: number[] = [];
   const partIds: string[] = [];
+  const edges: IdealVoltageConstraintNeighbor[] = [];
   for (let node = to; node !== from; node = parent[node] ?? -1) {
     const edge = parentEdge[node];
     if (!edge) { return undefined; }
@@ -985,6 +1009,7 @@ function idealVoltageConstraintPath(
     realUncertaintyTerms.push(edge.voltageUncertainty.real);
     imaginaryUncertaintyTerms.push(edge.voltageUncertainty.imaginary);
     partIds.push(edge.partId);
+    edges.push(edge);
   }
   return {
     voltageDifference: {
@@ -996,6 +1021,7 @@ function idealVoltageConstraintPath(
       imaginary: exactComponentSum(imaginaryUncertaintyTerms),
     },
     partIds,
+    edges,
   };
 }
 
@@ -1006,12 +1032,16 @@ function addIdealVoltageConstraint(
   adjacency[branch.positiveNode]?.push({
     node: branch.negativeNode,
     partId: branch.partId,
+    branch,
+    orientation: 1,
     voltageDifference: branch.sourceVoltage,
     voltageUncertainty: branch.sourceVoltageUncertainty ?? complex(),
   });
   adjacency[branch.negativeNode]?.push({
     node: branch.positiveNode,
     partId: branch.partId,
+    branch,
+    orientation: -1,
     voltageDifference: complexSubtract(complex(), branch.sourceVoltage),
     voltageUncertainty: branch.sourceVoltageUncertainty ?? complex(),
   });
@@ -1038,6 +1068,28 @@ function idealVoltageConstraintIssue(
   };
 }
 
+function initialCapacitorLoopEquation(branch: Branch, path: IdealVoltageConstraintPath) {
+  const terms: Array<{ unknownIndex: number; coefficient: ExactRational }> = [];
+  const derivatives: ExactRational[] = [];
+  const cycle = [
+    { branch, orientation: 1 as const },
+    ...path.edges.map((edge) => ({ branch: edge.branch, orientation: -edge.orientation })),
+  ];
+  for (const edge of cycle) {
+    const capacitance = edge.branch.initialCapacitanceFarads;
+    if (capacitance !== undefined) {
+      const coefficient = exactProductSumRatio([{ factors: [edge.orientation] }], capacitance);
+      if (!coefficient) { return; }
+      terms.push({ unknownIndex: edge.branch.unknownIndex, coefficient });
+    } else if (edge.branch.initialVoltageDerivative) {
+      derivatives.push(edge.orientation === 1
+        ? edge.branch.initialVoltageDerivative
+        : negativeExact(edge.branch.initialVoltageDerivative));
+    }
+  }
+  return { terms, rhs: negativeExact(sumExactRationals(derivatives)) };
+}
+
 function markRedundantIdealVoltageCycles(
   document: CircuitDocument,
   branches: Branch[],
@@ -1048,7 +1100,12 @@ function markRedundantIdealVoltageCycles(
     { length: nodeCount },
     () => [] as IdealVoltageConstraintNeighbor[],
   );
-  for (const branch of branches) {
+  // Build the source-only forest first. Otherwise two source loops sharing
+  // a capacitor can produce the same derivative equation and leave source
+  // currents underdetermined instead of choosing their usual zero gauge.
+  const orderedBranches = branches.toSorted((left, right) =>
+    Number(left.initialCapacitanceFarads !== undefined) - Number(right.initialCapacitanceFarads !== undefined));
+  for (const branch of orderedBranches) {
     if (!isIdealVoltageConstraint(branch)) { continue; }
     if (branch.positiveNode === branch.negativeNode) { continue; }
 
@@ -1065,6 +1122,11 @@ function markRedundantIdealVoltageCycles(
       branch.sourceVoltageUncertainty ?? complex(),
     )) {
       return idealVoltageConstraintIssue(branch, path, partById);
+    }
+
+    if (branch.initialCapacitanceFarads !== undefined) {
+      branch.initialDerivativeEquation = initialCapacitorLoopEquation(branch, path);
+      continue;
     }
 
     // A source edge that closes a compatible cycle adds no new node-voltage
@@ -1085,11 +1147,18 @@ function addPotentiometerBranches(
   const segments = potentiometerSegments(part);
   const positiveNode = nodeForTerminal(topology, part, "a");
   const negativeNode = nodeForTerminal(topology, part, "c");
-  const specs: Array<{ terminal: "a" | "b"; resistance: number; positiveNode: number; negativeNode: number }> = [
-    { terminal: "a", resistance: segments.ac, positiveNode, negativeNode },
+  const specs: Array<{
+    terminal: "a" | "b";
+    resistance: number;
+    exactResistance: ExactRational;
+    positiveNode: number;
+    negativeNode: number;
+  }> = [
+    { terminal: "a", resistance: segments.ac, exactResistance: segments.exactAc, positiveNode, negativeNode },
     {
       terminal: "b",
       resistance: segments.cb,
+      exactResistance: segments.exactCb,
       positiveNode: nodeForTerminal(topology, part, "b"),
       negativeNode: nodeForTerminal(topology, part, "c"),
     },
@@ -1102,6 +1171,7 @@ function addPotentiometerBranches(
       positiveNode: spec.positiveNode,
       negativeNode: spec.negativeNode,
       seriesResistanceOhms: spec.resistance,
+      exactSeriesResistance: spec.exactResistance,
       sourceVoltage: complex(),
       unknownIndex: 0,
       internalPotentiometerTerminal: spec.terminal,
@@ -1122,6 +1192,7 @@ function buildLayout(
   switchStates: Record<string, boolean>,
   initialInductorCurrents = false,
   transientCompanions?: ReadonlyMap<string, TransientCompanionConstraint>,
+  initialVoltageConstraints?: ReadonlyMap<string, InitialVoltageConstraint>,
 ): { layout?: MnaLayout; issue?: AnalogCircuitIssue } {
   const branches: Branch[] = [];
   const branchByPartId = new Map<string, Branch>();
@@ -1155,6 +1226,11 @@ function buildLayout(
     }
   }
 
+  for (const branch of branches) {
+    const initialConstraint = initialVoltageConstraints?.get(branch.partId);
+    branch.initialCapacitanceFarads = initialConstraint?.capacitanceFarads;
+    branch.initialVoltageDerivative = initialConstraint?.voltageDerivative;
+  }
   const idealVoltageCycleIssue = markRedundantIdealVoltageCycles(
     document, [...branches, ...internalBranches], topology.nodeCount,
   );
@@ -1248,32 +1324,106 @@ function bjtModel(
   const baseSaturation = saturation / beta;
   // For beta < 1, scale saturation up before the transport current can
   // underflow. For beta >= 1, divide last to avoid rounding saturation down.
-  const forwardBase = beta < 1 && Number.isFinite(baseSaturation)
+  const scaledForwardBase = beta < 1 && Number.isFinite(baseSaturation)
     ? diodeCurrentAndSlope(vbe, baseSaturation, 1)
-    : { current: forward.current / beta, slope: forward.slope / beta };
+    : undefined;
+  const exactBeta = numberToExactRational(beta);
+  const exactForward = numberToExactRational(forward.current);
+  const exactReverse = numberToExactRational(reverse.current);
+  const exactForwardSlope = numberToExactRational(forward.slope);
+  const exactReverseSlope = numberToExactRational(reverse.slope);
+  if (
+    !exactBeta || exactBeta.numerator === 0n || !exactForward || !exactReverse ||
+    !exactForwardSlope || !exactReverseSlope
+  ) {
+    return {
+      currents: [Number.NaN, Number.NaN, Number.NaN],
+      jacobian: Array.from({ length: 3 }, () => Array.from({ length: 3 }, () => Number.NaN)),
+    };
+  }
 
-  const canonicalCurrents = [
-    forward.current - 2 * reverse.current,
-    forwardBase.current + reverse.current,
-    -forward.current - forwardBase.current + reverse.current,
+  const exactForwardBase = scaledForwardBase
+    ? numberToExactRational(scaledForwardBase.current)
+    : divideExactRational(exactForward, exactBeta);
+  const exactForwardBaseSlope = scaledForwardBase
+    ? numberToExactRational(scaledForwardBase.slope)
+    : divideExactRational(exactForwardSlope, exactBeta);
+  if (!exactForwardBase || !exactForwardBaseSlope) {
+    return {
+      currents: [Number.NaN, Number.NaN, Number.NaN],
+      jacobian: Array.from({ length: 3 }, () => Array.from({ length: 3 }, () => Number.NaN)),
+    };
+  }
+
+  const exactSum = (terms: Parameters<typeof exactProductSumRatio>[0]) =>
+    exactProductSumRatio(terms, 1);
+  const exactCurrents = [
+    exactSum([
+      { factors: [sign, exactForward] },
+      { factors: [sign, 2, exactReverse], sign: -1 },
+    ]),
+    exactSum([
+      { factors: [sign, exactForwardBase] },
+      { factors: [sign, exactReverse] },
+    ]),
+    exactSum([
+      { factors: [sign, exactForward], sign: -1 },
+      { factors: [sign, exactForwardBase], sign: -1 },
+      { factors: [sign, exactReverse] },
+    ]),
   ];
-  const currents = canonicalCurrents.map((current) => sign * current);
-  const jacobian = Array.from({ length: 3 }, () => Array.from({ length: 3 }, () => 0));
-  const addBranchSlope = (
-    positiveTerminal: number,
-    negativeTerminal: number,
-    slopes: [number, number, number],
-  ) => {
-    for (let row = 0; row < 3; row += 1) {
-      const branchCurrentDerivative = slopes[row];
-      jacobian[row]![positiveTerminal] += branchCurrentDerivative;
-      jacobian[row]![negativeTerminal] -= branchCurrentDerivative;
+  const exactJacobianEntries = [
+    exactSum([{ factors: [2, exactReverseSlope] }]),
+    exactSum([
+      { factors: [exactForwardSlope] },
+      { factors: [2, exactReverseSlope], sign: -1 },
+    ]),
+    exactSum([{ factors: [exactForwardSlope], sign: -1 }]),
+    exactSum([{ factors: [exactReverseSlope], sign: -1 }]),
+    exactSum([
+      { factors: [exactForwardBaseSlope] },
+      { factors: [exactReverseSlope] },
+    ]),
+    exactSum([{ factors: [exactForwardBaseSlope], sign: -1 }]),
+    exactSum([{ factors: [exactReverseSlope], sign: -1 }]),
+    exactSum([
+      { factors: [exactForwardSlope], sign: -1 },
+      { factors: [exactForwardBaseSlope], sign: -1 },
+      { factors: [exactReverseSlope] },
+    ]),
+    exactSum([
+      { factors: [exactForwardSlope] },
+      { factors: [exactForwardBaseSlope] },
+    ]),
+  ];
+  const exactValues = (values: readonly (ExactRational | null)[]) => {
+    const resolved: ExactRational[] = [];
+    for (const value of values) {
+      if (!value) { return null; }
+      resolved.push(value);
     }
+    return resolved;
   };
-  addBranchSlope(1, 2, [forward.slope, forwardBase.slope, -forward.slope - forwardBase.slope]);
-  // The reverse transport factor is 0.5, so reverse beta is one.
-  addBranchSlope(1, 0, [-2 * reverse.slope, reverse.slope, reverse.slope]);
-  return { currents, jacobian };
+  const resolvedCurrents = exactValues(exactCurrents);
+  const resolvedJacobian = exactValues(exactJacobianEntries);
+  if (!resolvedCurrents || !resolvedJacobian) {
+    return {
+      currents: [Number.NaN, Number.NaN, Number.NaN],
+      jacobian: Array.from({ length: 3 }, () => Array.from({ length: 3 }, () => Number.NaN)),
+    };
+  }
+
+  const jacobianExact = [
+    resolvedJacobian.slice(0, 3),
+    resolvedJacobian.slice(3, 6),
+    resolvedJacobian.slice(6, 9),
+  ];
+  return {
+    currents: resolvedCurrents.map(exactRationalToNumber),
+    jacobian: jacobianExact.map((row) => row.map(exactRationalToNumber)),
+    exactCurrents: resolvedCurrents,
+    exactJacobian: jacobianExact,
+  };
 }
 
 function mosChannel(vgs: number, vds: number, threshold: number, beta: number, lambda: number) {
@@ -1444,7 +1594,7 @@ function nodeRealValue(layout: MnaLayout, node: number, state: Float64Array) {
   return unknown < 0 ? 0 : (state[unknown] ?? 0);
 }
 
-function addMatrix(matrix: Float64Array, size: number, row: number, column: number, value: number) {
+function addMatrix(matrix: Float64Array, size: number, row: number, column: number, value: number | ExactRational) {
   if (row < 0 || column < 0 || row >= size || column >= size) { return; }
   const index = row * size + column;
   addRealStateValue(matrix, index, value);
@@ -1588,6 +1738,18 @@ function addVoltageBranch(
   addResidual(residual, negativeUnknown, negatedResidualTerm(exactBranchCurrent));
   addMatrix(matrix, layout.size, positiveUnknown, branch.unknownIndex, 1);
   addMatrix(matrix, layout.size, negativeUnknown, branch.unknownIndex, -1);
+  if (branch.initialDerivativeEquation) {
+    const equation = branch.initialDerivativeEquation;
+    addResidual(residual, branch.unknownIndex, negativeExact(equation.rhs));
+    for (const term of equation.terms) {
+      addExactMatrixValue(matrix, layout.size, branch.unknownIndex, term.unknownIndex, term.coefficient);
+      const value = exactProductSumRatio([{
+        factors: [term.coefficient, exactStateValue(state, term.unknownIndex)],
+      }], 1);
+      addResidual(residual, branch.unknownIndex, value ?? Number.NaN);
+    }
+    return;
+  }
   if (branch.transientCompanion) {
     const companion = branch.transientCompanion;
     const coefficients = companion.kind === "capacitor"
@@ -1607,27 +1769,45 @@ function addVoltageBranch(
     return;
   }
   const exactSourceVoltage = exactComplexValue(branch.sourceVoltage)?.real ?? branch.sourceVoltage.real;
-  const branchEquation = exactDotProductRational(
-    [1, -1, -branch.seriesResistanceOhms, -1],
-    [
-      exactStateValue(state, positiveUnknown),
-      exactStateValue(state, negativeUnknown),
-      exactBranchCurrent,
-      exactSourceVoltage,
-    ],
-  );
+  const resistanceCoefficient = branch.exactSeriesResistance
+    ? negativeExact(branch.exactSeriesResistance)
+    : -branch.seriesResistanceOhms;
+  const branchEquation = exactProductSumRatio([
+    { factors: [exactStateValue(state, positiveUnknown)] },
+    { factors: [exactStateValue(state, negativeUnknown)], sign: -1 },
+    { factors: [resistanceCoefficient, exactBranchCurrent] },
+    { factors: [exactSourceVoltage], sign: -1 },
+  ], 1);
   addResidual(residual, branch.unknownIndex, branchEquation ?? (
     positiveVoltage - negativeVoltage - branch.seriesResistanceOhms * branchCurrent - branch.sourceVoltage.real
   ));
   addMatrix(matrix, layout.size, branch.unknownIndex, positiveUnknown, 1);
   addMatrix(matrix, layout.size, branch.unknownIndex, negativeUnknown, -1);
-  addMatrix(
-    matrix,
-    layout.size,
-    branch.unknownIndex,
-    branch.unknownIndex,
-    -branch.seriesResistanceOhms,
-  );
+  if (branch.exactSeriesResistance) {
+    addExactMatrixValue(
+      matrix,
+      layout.size,
+      branch.unknownIndex,
+      branch.unknownIndex,
+      negativeExact(branch.exactSeriesResistance),
+    );
+  } else {
+    addMatrix(
+      matrix,
+      layout.size,
+      branch.unknownIndex,
+      branch.unknownIndex,
+      -branch.seriesResistanceOhms,
+    );
+  }
+}
+
+function nonlinearModelCurrent(model: NonlinearModel, row: number): ResidualTerm {
+  return model.exactCurrents?.[row] ?? model.currents[row] ?? 0;
+}
+
+function nonlinearModelCoefficients(model: NonlinearModel, row: number): readonly ResidualTerm[] {
+  return model.exactJacobian?.[row] ?? model.jacobian[row] ?? [];
 }
 
 function stampNonlinear(
@@ -1643,8 +1823,8 @@ function stampNonlinear(
   );
   for (let row = 0; row < terminals.length; row += 1) {
     const rowUnknown = layout.topology.nodeUnknowns[nodes[row] ?? -1] ?? -1;
-    addResidual(residual, rowUnknown, model.currents[row] ?? 0);
-    const coefficients = model.jacobian[row] ?? [];
+    addResidual(residual, rowUnknown, nonlinearModelCurrent(model, row));
+    const coefficients = nonlinearModelCoefficients(model, row);
     for (let column = 0; column < terminals.length - 1; column += 1) {
       const columnUnknown = layout.topology.nodeUnknowns[nodes[column] ?? -1] ?? -1;
       addMatrix(
@@ -1657,7 +1837,7 @@ function stampNonlinear(
     }
     // The model's terminal voltages are expressed relative to its final
     // terminal. Make that gauge relation exact in the stamped MNA row.
-    const referenceCoefficient = exactNumberSum(coefficients.slice(0, terminals.length - 1));
+    const referenceCoefficient = exactResidualSum(coefficients.slice(0, terminals.length - 1));
     const referenceUnknown = layout.topology.nodeUnknowns[nodes.at(-1) ?? -1] ?? -1;
     if (referenceCoefficient) {
       addExactMatrixValue(matrix, layout.size, rowUnknown, referenceUnknown, negativeExact(referenceCoefficient));
@@ -1732,10 +1912,28 @@ function potentiometerSegments(part: CircuitPart) {
   const total = part.resistanceOhms ?? 1000;
   const position = part.wiperPosition ?? 0.5;
   const smallerPosition = Math.min(position, 1 - position);
-  const smallerResistance = total * smallerPosition;
+  const exactTotal = numberToExactRational(total);
+  const exactSmallerPosition = numberToExactRational(smallerPosition);
+  if (!exactTotal || !exactSmallerPosition) {
+    throw new Error("可変抵抗の値を正確な有理数へ変換できません。");
+  }
+  const exactSmallerResistance = multiplyExactRational(exactTotal, exactSmallerPosition);
+  const exactLargerResistance = subtractExactRational(exactTotal, exactSmallerResistance);
+  const smallerResistance = exactRationalToNumber(exactSmallerResistance);
+  const largerResistance = exactRationalToNumber(exactLargerResistance);
   return position <= 0.5
-    ? { ac: smallerResistance, cb: total - smallerResistance }
-    : { ac: total - smallerResistance, cb: smallerResistance };
+    ? {
+      ac: smallerResistance,
+      cb: largerResistance,
+      exactAc: exactSmallerResistance,
+      exactCb: exactLargerResistance,
+    }
+    : {
+      ac: largerResistance,
+      cb: smallerResistance,
+      exactAc: exactLargerResistance,
+      exactCb: exactSmallerResistance,
+    };
 }
 
 function isSwitchClosed(part: CircuitPart, switchStates: Record<string, boolean>) {
@@ -1803,9 +2001,28 @@ interface ReferenceConductanceEdge {
   ideal?: boolean;
 }
 
+function logPositiveExactRational(value: ExactRational) {
+  if (value.numerator <= 0n || value.denominator <= 0n) { return Number.NaN; }
+  const logPositiveInteger = (integer: bigint) => {
+    const shift = Math.max(0, integer.toString(2).length - 53);
+    const leadingBits = Number.parseInt(integer.toString(2).slice(0, 53), 2);
+    return Math.log(leadingBits) + shift * Math.LN2;
+  };
+  return logPositiveInteger(value.numerator) - logPositiveInteger(value.denominator);
+}
+
 function appendImpedanceReferenceEdge(edges: ReferenceConductanceEdge[], branch: Branch) {
   const scale = Math.max(Math.abs(branch.seriesResistanceOhms), Math.abs(branch.seriesReactanceOhms ?? 0));
   if (scale === 0) {
+    const exactResistance = branch.exactSeriesResistance;
+    const exactReactanceIsZero = (branch.exactSeriesReactance?.numerator ?? 0n) === 0n;
+    if (exactResistance && exactResistance.numerator > 0n && exactReactanceIsZero) {
+      const logConductance = -logPositiveExactRational(exactResistance);
+      if (Number.isFinite(logConductance)) {
+        edges.push({ a: branch.positiveNode, b: branch.negativeNode, logConductance });
+        return;
+      }
+    }
     if (branch.positiveNode !== branch.negativeNode) {
       edges.push({ a: branch.positiveNode, b: branch.negativeNode, ideal: true });
     }
@@ -2101,20 +2318,17 @@ function stampDcReferences(
     // Its time derivative fixes the otherwise arbitrary relative potential:
     // sum of outward V_L / L = 0, since independent current sources are constant.
     for (const branch of derivatives) {
-      const conductance = 1 / branch.inductance;
+      const conductance = exactProductSumRatio([{ factors: [1] }], branch.inductance);
+      if (!conductance) { continue; }
       const inside = layout.topology.nodeUnknowns[branch.inside] ?? -1;
       const outside = layout.topology.nodeUnknowns[branch.outside] ?? -1;
-      addMatrix(matrix, layout.size, unknown, inside, conductance);
-      addMatrix(matrix, layout.size, unknown, outside, -conductance);
-      const derivativeResidual = exactDotProductRational(
-        [conductance, -conductance],
-        [exactStateValue(state, inside), exactStateValue(state, outside)],
-      );
-      addResidual(residual, unknown, derivativeResidual ?? (
-        conductance * (
-          nodeRealValue(layout, branch.inside, state) - nodeRealValue(layout, branch.outside, state)
-        )
-      ));
+      addExactMatrixValue(matrix, layout.size, unknown, inside, conductance);
+      addExactMatrixValue(matrix, layout.size, unknown, outside, negativeExact(conductance));
+      const derivativeResidual = exactProductSumRatio([
+        { factors: [conductance, exactStateValue(state, inside)] },
+        { factors: [conductance, exactStateValue(state, outside)], sign: -1 },
+      ], 1);
+      addResidual(residual, unknown, derivativeResidual ?? Number.NaN);
     }
   }
 }
@@ -2165,6 +2379,10 @@ function addCurrentSourceAbsoluteRhs(
 
 function addBranchAbsoluteRhs(rhs: ResidualTerms, branch: Branch) {
   if (branch.redundantIdealSource) { return true; }
+  if (branch.initialDerivativeEquation) {
+    addResidual(rhs, branch.unknownIndex, branch.initialDerivativeEquation.rhs);
+    return true;
+  }
   if (branch.transientCompanion) {
     const companion = branch.transientCompanion;
     const history = companion.exactHistoryValue ?? companion.historyValue;
@@ -2208,12 +2426,12 @@ function nonlinearAbsoluteRhs(
 
   const terminals = terminalsOf(part.kind);
   for (let row = 0; row < terminals.length; row += 1) {
-    const coefficients = model.jacobian[row] ?? [];
+    const coefficients = nonlinearModelCoefficients(model, row);
     const linearizedCurrent = exactDotProductRational(
-      coefficients.slice(0, terminals.length - 1),
       center.slice(0, terminals.length - 1),
+      coefficients.slice(0, terminals.length - 1),
     );
-    const current = numberToExactRational(model.currents[row] ?? 0);
+    const current = model.exactCurrents?.[row] ?? numberToExactRational(model.currents[row] ?? 0);
     if (!linearizedCurrent || !current) { return false; }
     const offset = subtractExactRational(linearizedCurrent, current);
     const node = nodeForTerminal(layout.topology, part, terminals[row] ?? terminals.at(-1)!);
@@ -2677,6 +2895,12 @@ function nodeComplexValue(layout: MnaLayout, node: number, solution: ComplexValu
   return unknown < 0 ? complex() : (solution[unknown] ?? complex());
 }
 
+function complexFromScalar(value: number | ExactRational) {
+  return typeof value === "number"
+    ? complex(value)
+    : complexFromExact({ real: value, imaginary: { numerator: 0n, denominator: 1n } });
+}
+
 function complexFromRealState(state: Float64Array, index: number) {
   const real = exactRealStateValue(state, index);
   const imaginary = numberToExactRational(0);
@@ -2747,7 +2971,9 @@ function stampAcVoltageBranch(
     layout.size,
     branch.unknownIndex,
     branch.unknownIndex,
-    -branch.seriesResistanceOhms,
+    branch.exactSeriesResistance
+      ? negativeExact(branch.exactSeriesResistance)
+      : -branch.seriesResistanceOhms,
     branch.exactSeriesReactance ? negatedResidualTerm(branch.exactSeriesReactance) : -reactance,
   );
   const exactSource = exactComplexValue(branch.sourceVoltage);
@@ -2848,7 +3074,7 @@ function stampAcSmallSignalPart(
   const nodes = terminals.map((terminal) => nodeForTerminal(layout.topology, part, terminal));
   for (let row = 0; row < terminals.length; row += 1) {
     const rowUnknown = layout.topology.nodeUnknowns[nodes[row] ?? -1] ?? -1;
-    const coefficients = model.jacobian[row] ?? [];
+    const coefficients = nonlinearModelCoefficients(model, row);
     const columnCount = part.kind === "op-amp" ? terminals.length : terminals.length - 1;
     for (let column = 0; column < columnCount; column += 1) {
       const columnUnknown = layout.topology.nodeUnknowns[nodes[column] ?? -1] ?? -1;
@@ -2863,7 +3089,7 @@ function stampAcSmallSignalPart(
       );
     }
     if (part.kind !== "op-amp") {
-      const sum = exactNumberSum(coefficients.slice(0, columnCount));
+      const sum = exactResidualSum(coefficients.slice(0, columnCount));
       const referenceUnknown = layout.topology.nodeUnknowns[nodes.at(-1) ?? -1] ?? -1;
       addComplexMatrix(
         matrixReal,
@@ -3114,6 +3340,26 @@ function acReferenceComponent(
   return referenceComponentNodes(document, layout, seedNode, "ac", channelConducting);
 }
 
+function nonlinearModelIsCommonModeInvariant(part: CircuitPart, model: NonlinearModel) {
+  if (model.exactJacobian) {
+    return model.exactJacobian.every((row) => sumExactRationals(row).numerator === 0n);
+  }
+  for (let rowIndex = 0; rowIndex < model.jacobian.length; rowIndex += 1) {
+    let sum = nonlinearReferenceDerivative(part, model, rowIndex);
+    let scale = Math.abs(sum);
+    const row = model.jacobian[rowIndex] ?? [];
+    for (const value of row) {
+      if (!Number.isFinite(value)) { return false; }
+      sum += value;
+      scale += Math.abs(value);
+    }
+    if (!Number.isFinite(sum) || !Number.isFinite(scale) || Math.abs(sum) > 32 * Number.EPSILON * scale) {
+      return false;
+    }
+  }
+  return true;
+}
+
 function nonlinearAcModelIsCommonModeInvariant(
   document: CircuitDocument,
   layout: MnaLayout,
@@ -3121,20 +3367,7 @@ function nonlinearAcModelIsCommonModeInvariant(
 ) {
   for (const part of document.parts) {
     const model = nonlinearModel(part, nonlinearTerminalVoltages(part, layout, dcState));
-    if (!model) { continue; }
-    for (let rowIndex = 0; rowIndex < model.jacobian.length; rowIndex += 1) {
-      let sum = nonlinearReferenceDerivative(part, model, rowIndex);
-      let scale = Math.abs(sum);
-      const row = model.jacobian[rowIndex] ?? [];
-      for (const value of row) {
-        if (!Number.isFinite(value)) { return false; }
-        sum += value;
-        scale += Math.abs(value);
-      }
-      if (!Number.isFinite(sum) || !Number.isFinite(scale) || Math.abs(sum) > 32 * Number.EPSILON * scale) {
-        return false;
-      }
-    }
+    if (model && !nonlinearModelIsCommonModeInvariant(part, model)) { return false; }
   }
   return true;
 }
@@ -3356,7 +3589,9 @@ function nonlinearTerminalCurrents(
   const terminals = terminalsOf(part.kind);
   const model = nonlinearModel(part, nonlinearTerminalVoltages(part, biasLayout, dcState));
   if (!model) { return terminals.map(() => complex()); }
-  if (mode === "dc") { return model.currents.map((current) => complex(current)); }
+  if (mode === "dc") {
+    return terminals.map((_, row) => complexFromScalar(nonlinearModelCurrent(model, row)));
+  }
 
   const phasors = terminalComplexValues(part, layout, solution);
   return terminals.map((_, row) => {
@@ -3365,8 +3600,8 @@ function nonlinearTerminalCurrents(
     const deviceReference = part.kind === "op-amp" ? complex() : phasors.at(-1) ?? complex();
     for (let column = 0; column < columnCount; column += 1) {
       const delta = complexSubtract(phasors[column] ?? complex(), deviceReference);
-      const slope = model.jacobian[row]?.[column] ?? 0;
-      current = complexAdd(current, complexMultiply(complex(slope), delta));
+      const slope = nonlinearModelCoefficients(model, row)[column] ?? 0;
+      current = complexAdd(current, complexMultiply(complexFromScalar(slope), delta));
     }
     const referenceSlope = nonlinearReferenceDerivative(part, model, row);
     if (referenceSlope !== 0) {
@@ -3659,10 +3894,16 @@ function componentPower(
   return power;
 }
 
-function exactImpedance(resistance: number, reactance: number, exactReactance?: ExactRational) {
-  const real = numberToExactRational(resistance);
-  return exactReactance && real
-    ? complexFromExact({ real, imaginary: exactReactance })
+function exactImpedance(
+  resistance: number,
+  reactance: number,
+  exactReactance?: ExactRational,
+  exactResistance?: ExactRational,
+) {
+  const real = exactResistance ?? numberToExactRational(resistance);
+  const imaginary = exactReactance ?? numberToExactRational(reactance);
+  return (exactResistance || exactReactance) && real && imaginary
+    ? complexFromExact({ real, imaginary })
     : complex(resistance, reactance);
 }
 
@@ -3684,8 +3925,12 @@ function impedanceMeasurements(
   current: ComplexValue,
   exactReactance?: ExactRational,
   retainExactPower = false,
+  exactResistance?: ExactRational,
 ) {
-  const voltage = complexMultiply(exactImpedance(resistance, reactance, exactReactance), current);
+  const voltage = complexMultiply(
+    exactImpedance(resistance, reactance, exactReactance, exactResistance),
+    current,
+  );
   const power = retainExactPower
     ? complexMultiply(voltage, complexConjugate(current))
     : measuredPower(voltage, current);
@@ -3693,7 +3938,8 @@ function impedanceMeasurements(
     voltage,
     power: retainExactPower
       ? power
-      : complex(resistance === 0 ? 0 : power.real,
+      : complex(
+        resistance === 0 && (exactResistance?.numerator ?? 0n) === 0n ? 0 : power.real,
         reactance === 0 && (exactReactance?.numerator ?? 0n) === 0n ? 0 : power.imaginary),
   };
 }
@@ -3750,7 +3996,12 @@ function voltageFromBranch(branch: Branch, solution: ComplexValue[]) {
   return complexAdd(
     branch.sourceVoltage,
     complexMultiply(
-      exactImpedance(branch.seriesResistanceOhms, branch.seriesReactanceOhms ?? 0, branch.exactSeriesReactance),
+      exactImpedance(
+        branch.seriesResistanceOhms,
+        branch.seriesReactanceOhms ?? 0,
+        branch.exactSeriesReactance,
+        branch.exactSeriesResistance,
+      ),
       current,
     ),
   );
@@ -3770,8 +4021,13 @@ function branchVoltageMeasurement(branch: Branch, layout: MnaLayout, solution: C
   let voltage = voltageFromBranch(branch, solution);
   const sourceScale = Math.max(Math.abs(branch.sourceVoltage.real), Math.abs(branch.sourceVoltage.imaginary));
   const voltageScale = Math.max(Math.abs(voltage.real), Math.abs(voltage.imaginary));
+  const exactVoltage = exactComplexValue(voltage);
+  const underflowedVoltageScale = voltageScale === 0 && exactVoltage &&
+    (exactVoltage.real.numerator !== 0n || exactVoltage.imaginary.numerator !== 0n)
+    ? Number.MIN_VALUE
+    : 0;
   const ideal = isIdealVoltageConstraint(branch);
-  let roundingScale = ideal ? 0 : Math.max(sourceScale, voltageScale);
+  let roundingScale = ideal ? 0 : Math.max(sourceScale, voltageScale, underflowedVoltageScale);
   const cancellation = !ideal && sourceScale > 0 && voltageScale < sourceScale / 2;
   if (cancellation) {
     const positiveVoltage = nodeComplexValue(layout, branch.positiveNode, solution);
@@ -4022,8 +4278,22 @@ function resistiveMeasurements(part: CircuitPart, currents: ComplexValue[]) {
   }
   if (part.kind !== "potentiometer") { return null; }
   const segments = potentiometerSegments(part);
-  const ac = impedanceMeasurements(segments.ac, 0, currents[0] ?? complex(), undefined, true);
-  const bc = impedanceMeasurements(segments.cb, 0, currents[1] ?? complex(), undefined, true);
+  const ac = impedanceMeasurements(
+    segments.ac,
+    0,
+    currents[0] ?? complex(),
+    undefined,
+    true,
+    segments.exactAc,
+  );
+  const bc = impedanceMeasurements(
+    segments.cb,
+    0,
+    currents[1] ?? complex(),
+    undefined,
+    true,
+    segments.exactCb,
+  );
   return {
     voltage: voltageDifference(ac.voltage, bc.voltage),
     power: complexAdd(ac.power, bc.power),
@@ -4106,7 +4376,10 @@ function layoutMeterStatuses(
     channelConducting,
     initialInductorCurrents: layout.initialInductorCurrents,
   });
-  const idealBranches = [...layout.branches, ...layout.internalBranches].filter(isIdealVoltageConstraint);
+  // Capacitor loop derivatives determine their currents at initialization;
+  // only cycles made entirely of ideal sources leave meter currents free.
+  const idealBranches = [...layout.branches, ...layout.internalBranches].filter((branch) =>
+    isIdealVoltageConstraint(branch) && branch.initialCapacitanceFarads === undefined);
   for (const meter of idealBranches) {
     if (meter.kind !== "ammeter" || statuses[meter.partId] !== "connected") { continue; }
     // Every ideal voltage branch fixes a voltage difference, even when that
@@ -4272,6 +4545,7 @@ function dcResult(
   options: AnalogStepOptions,
   initialIssues: AnalogCircuitIssue[] = [],
   transientCompanions?: ReadonlyMap<string, TransientCompanionConstraint>,
+  initialVoltageConstraints?: ReadonlyMap<string, InitialVoltageConstraint>,
 ): AnalogCircuitAnalysis {
   const mode = options.mode;
   const switchStates = options.switchStates === undefined ? {} : options.switchStates;
@@ -4305,6 +4579,7 @@ function dcResult(
     switchStates,
     options.initialInductorCurrents ?? false,
     transientCompanions,
+    initialVoltageConstraints,
   );
   if (!prepared.layout) {
     const message = prepared.issue?.message ?? "回路を計算できませんでした。接続を確認してください。";
@@ -4511,6 +4786,7 @@ export function solveAnalogStep(
   inputDocument: CircuitDocument,
   options: AnalogStepOptions,
   transientCompanions?: ReadonlyMap<string, TransientCompanionConstraint>,
+  initialVoltageConstraints?: ReadonlyMap<string, InitialVoltageConstraint>,
 ): AnalogCircuitAnalysis {
   let mode: AnalogAnalysisMode = "dc";
   try {
@@ -4520,7 +4796,7 @@ export function solveAnalogStep(
     return result("invalid", mode, message, { issues: [{ severity: "error", message }] });
   }
   try {
-    return solveAnalogStepFromInput(inputDocument, options, mode, transientCompanions);
+    return solveAnalogStepFromInput(inputDocument, options, mode, transientCompanions, initialVoltageConstraints);
   } catch {
     // A caller-owned Proxy can change behavior after shape validation. Keep
     // failures at the public API boundary, as in transient analysis.
@@ -4534,6 +4810,7 @@ function solveAnalogStepFromInput(
   options: AnalogStepOptions,
   mode: AnalogAnalysisMode,
   transientCompanions?: ReadonlyMap<string, TransientCompanionConstraint>,
+  initialVoltageConstraints?: ReadonlyMap<string, InitialVoltageConstraint>,
 ): AnalogCircuitAnalysis {
   const shapeIssue = circuitDocumentShapeIssue(inputDocument);
   if (shapeIssue) {
@@ -4564,7 +4841,7 @@ function solveAnalogStepFromInput(
     return result("invalid", validatedOptions.mode, message, { issues: [{ severity: "error", message }] });
   }
   return validatedOptions.mode === "dc"
-    ? dcResult(document, validatedOptions, [], transientCompanions)
+    ? dcResult(document, validatedOptions, [], transientCompanions, initialVoltageConstraints)
     : acResult(document, validatedOptions);
 }
 

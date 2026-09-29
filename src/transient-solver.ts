@@ -1,5 +1,5 @@
-import { solveAnalogStep, type TransientCompanionConstraint } from "./analog-solver.js";
-import { exactComponentSum, exactProductQuotient, scaledProduct } from "./analog-math.js";
+import { solveAnalogStep, type InitialVoltageConstraint, type TransientCompanionConstraint } from "./analog-solver.js";
+import { exactComponentSum, exactProductQuotient, exactProductSumRatio, scaledProduct } from "./analog-math.js";
 import { exactComplexValue } from "./exact-numeric-state.js";
 import {
   numberToExactRational,
@@ -68,16 +68,12 @@ interface StoredState {
 
 interface CapacitorMember {
   partId: string;
-  capacitanceFarads: number;
   initialVoltageVolts: number;
   orientation: 1 | -1;
 }
 
 interface CapacitorGroup {
   members: CapacitorMember[];
-  representativeId: string;
-  representativeVoltageVolts: number;
-  totalCapacitanceFarads: number;
   isShorted: boolean;
 }
 
@@ -343,20 +339,14 @@ function capacitorGroupFor(part: CircuitPart, nodes: EndpointSet, groupsByNodes:
   const pairKey = JSON.stringify([firstNode, secondNode]);
   const group = groupsByNodes.get(pairKey) ?? {
     members: [],
-    representativeId: part.id,
-    representativeVoltageVolts: part.initialVoltageVolts ?? DEFAULT_INITIAL_VOLTAGE,
-    totalCapacitanceFarads: 0,
     isShorted: nodeA === nodeB,
   };
-  const capacitanceFarads = part.capacitanceFarads ?? DEFAULT_CAPACITANCE;
   const initialVoltageVolts = part.initialVoltageVolts ?? DEFAULT_INITIAL_VOLTAGE;
   group.members.push({
     partId: part.id,
-    capacitanceFarads,
     initialVoltageVolts,
     orientation: nodeA === firstNode ? 1 : -1,
   });
-  group.totalCapacitanceFarads += capacitanceFarads;
   groupsByNodes.set(pairKey, group);
 }
 
@@ -369,9 +359,6 @@ function capacitorGroupIssue(group: CapacitorGroup): string | null {
   }
   if (group.isShorted && canonicalVoltage !== 0) {
     return `短絡されたコンデンサの初期電圧は0 Vでなければなりません（${firstMember.partId}）。`;
-  }
-  if (!Number.isFinite(group.totalCapacitanceFarads) || group.totalCapacitanceFarads <= 0) {
-    return "並列コンデンサの合成容量が数値範囲を超えています。";
   }
   return null;
 }
@@ -537,32 +524,24 @@ function sourceOverrides(document: CircuitDocument, timeSeconds: number): Record
 
 function initialOverrides(
   document: CircuitDocument,
-  groups: readonly CapacitorGroup[],
 ): Record<string, number> | null {
   const overrides = sourceOverrides(document, 0);
   if (overrides === null) { return null; }
-  for (const group of groups) {
-    if (!group.isShorted) { overrides[group.representativeId] = group.representativeVoltageVolts; }
+  for (const part of document.parts) {
+    if (part.kind === "capacitor") {
+      overrides[part.id] = part.initialVoltageVolts ?? DEFAULT_INITIAL_VOLTAGE;
+    }
   }
   return overrides;
 }
 
 function initialDocument(
   document: CircuitDocument,
-  groups: readonly CapacitorGroup[],
 ): CircuitDocument {
-  const capacitorGroupById = new Map<string, CapacitorGroup>();
-  for (const group of groups) {
-    for (const member of group.members) { capacitorGroupById.set(member.partId, group); }
-  }
   return {
     ...document,
     parts: document.parts.map((part): CircuitPart => {
       if (part.kind === "capacitor") {
-        const group = capacitorGroupById.get(part.id);
-        if (!group || group.isShorted || group.representativeId !== part.id) {
-          return { ...part, kind: "current-source", currentAmps: 0 };
-        }
         return {
           ...part,
           kind: "battery",
@@ -573,6 +552,47 @@ function initialDocument(
       return part;
     }),
   };
+}
+
+function acSourceInitialVoltageDerivative(part: CircuitPart) {
+  if (part.kind !== "ac-source") { return null; }
+  const phase = (part.phaseDegrees ?? DEFAULT_AC_PHASE) % 360;
+  const quarter = Math.round(phase / 90);
+  const quadrant = ((quarter % 4) + 4) % 4;
+  const offsetDegrees = phase - quarter * 90;
+  const oddQuadrant = quadrant % 2 !== 0;
+  const factors = [
+    quadrant < 2 ? -1 : 1,
+    Math.SQRT2,
+    part.voltageVolts ?? DEFAULT_AC_RMS,
+    2,
+    Math.PI,
+    part.frequencyHz ?? DEFAULT_AC_FREQUENCY,
+  ];
+  // The trig boundary is approximate. Below 1e-7 degrees, sin(x)=x
+  // and cos(x)=1 have errors below binary64 precision; keeping the
+  // remaining factors exact also preserves tiny slopes before C scaling.
+  const nearAxis = Math.abs(offsetDegrees) < 1e-7;
+  return nearAxis && !oddQuadrant
+    ? exactProductSumRatio([{ factors: [...factors, offsetDegrees, Math.PI] }], 180)
+    : exactProductSumRatio([{
+      factors: [...factors, nearAxis ? 1 : oddQuadrant
+        ? Math.cos((offsetDegrees * Math.PI) / 180)
+        : Math.sin((offsetDegrees * Math.PI) / 180)],
+    }], 1);
+}
+
+function initialVoltageConstraints(document: CircuitDocument) {
+  const constraints = new Map<string, InitialVoltageConstraint>();
+  for (const part of document.parts) {
+    if (part.kind === "capacitor") {
+      constraints.set(part.id, { capacitanceFarads: part.capacitanceFarads ?? DEFAULT_CAPACITANCE });
+      continue;
+    }
+    const voltageDerivative = acSourceInitialVoltageDerivative(part);
+    if (voltageDerivative) { constraints.set(part.id, { voltageDerivative }); }
+  }
+  return constraints;
 }
 
 function capacitorStepPart(
@@ -694,7 +714,7 @@ function samplePart(
       ...(reading.channelConducting === undefined ? {} : { channelConducting: reading.channelConducting }),
       terminalVoltages: Object.fromEntries(Object.entries(reading.terminalVoltages).map(([terminal, value]) => [terminal, value.real])),
       terminalCurrents: part.kind === "capacitor" || part.kind === "inductor"
-        ? { a: currentAmps, b: -currentAmps }
+        ? { a: currentAmps, b: exactCurrent.numerator === 0n ? 0 : -currentAmps }
         : Object.fromEntries(Object.entries(reading.terminalCurrents).map(([terminal, value]) => [terminal, value.real])),
     },
     ...(part.kind === "capacitor"
@@ -751,16 +771,15 @@ function initializeTransient(
     ? { groups: [] as CapacitorGroup[] }
     : findCapacitorGroups(document, options.switchStates ?? {});
   if (capacitorGroups.reason) { return { reason: capacitorGroups.reason }; }
-  const groups = capacitorGroups.groups ?? [];
-  const overrides = useOperatingPoint ? {} : initialOverrides(document, groups);
+  const overrides = useOperatingPoint ? {} : initialOverrides(document);
   if (overrides === null) { return { reason: "交流電源の初期値を有限な数値で計算できません。" }; }
-  const initialDocumentForSolve = useOperatingPoint ? document : initialDocument(document, groups);
+  const initialDocumentForSolve = useOperatingPoint ? document : initialDocument(document);
   const analysis = solveAnalogStep(initialDocumentForSolve, {
     mode: "dc",
     switchStates: options.switchStates,
     voltageOverrides: overrides,
     initialInductorCurrents: !useOperatingPoint,
-  });
+  }, undefined, useOperatingPoint ? undefined : initialVoltageConstraints(document));
   if (analysis.status !== "valid") {
     const context = useOperatingPoint ? "直流動作点" : "初期状態";
     return { reason: `${context}を満たす回路を計算できません。 ${analysis.message}`, issues: analysis.issues };
@@ -769,228 +788,7 @@ function initializeTransient(
   if (!measured.sample || !measured.state) {
     return { reason: measured.reason ?? "初期波形を作成できませんでした。", issues: analysis.issues };
   }
-  if (!useOperatingPoint) {
-    const originalCapacitorCurrents = capacitorTerminalCurrents(document, measured.sample);
-    distributeInitialCapacitorCurrents(measured.sample, groups);
-    reconstructInitialIdealBranchCurrents(
-      document,
-      measured.sample,
-      options.switchStates ?? {},
-      originalCapacitorCurrents,
-    );
-  }
   return { result: { sample: measured.sample, state: measured.state, issues: analysis.issues } };
-}
-
-function distributeInitialCapacitorCurrents(sample: TransientSample, groups: readonly CapacitorGroup[]) {
-  for (const group of groups) {
-    if (group.isShorted) {
-      for (const member of group.members) {
-        const reading = sample.parts[member.partId];
-        if (reading) {
-          reading.currentAmps = 0;
-          reading.terminalCurrents = { a: 0, b: 0 };
-          reading.powerWatts = reading.voltageVolts * reading.currentAmps;
-        }
-      }
-      continue;
-    }
-    const representative = group.members.find(({ partId }) => partId === group.representativeId);
-    const sourceReading = sample.parts[group.representativeId];
-    if (!representative || !sourceReading) { continue; }
-    const canonicalCurrent = sourceReading.currentAmps * representative.orientation;
-    for (const member of group.members) {
-      const reading = sample.parts[member.partId];
-      if (!reading) { continue; }
-      reading.currentAmps = exactProductQuotient(
-        [canonicalCurrent * member.orientation, member.capacitanceFarads],
-        group.totalCapacitanceFarads,
-      );
-      reading.terminalCurrents = { a: reading.currentAmps, b: -reading.currentAmps };
-      reading.powerWatts = reading.voltageVolts * reading.currentAmps;
-    }
-  }
-}
-
-interface InitialIdealBranch {
-  part: CircuitPart;
-  nodeA: string;
-  nodeB: string;
-  currentAmps: number;
-}
-
-type CapacitorTerminalCurrents = Partial<Record<CircuitTerminal, number>>;
-
-function capacitorTerminalCurrents(document: CircuitDocument, sample: TransientSample) {
-  const currents = new Map<string, CapacitorTerminalCurrents>();
-  for (const part of document.parts) {
-    if (part.kind !== "capacitor") { continue; }
-    const reading = sample.parts[part.id];
-    if (reading) { currents.set(part.id, { ...reading.terminalCurrents }); }
-  }
-  return currents;
-}
-
-function initialIdealBranches(
-  document: CircuitDocument,
-  sample: TransientSample,
-  switchStates: Record<string, boolean>,
-  wireNodes: EndpointSet,
-) {
-  const branches: InitialIdealBranch[] = [];
-  for (const part of document.parts) {
-    if (part.kind !== "ammeter" && !(part.kind === "switch" && isSwitchClosed(part, switchStates))) {
-      continue;
-    }
-    const reading = sample.parts[part.id];
-    if (!reading) { continue; }
-    const nodeA = wireNodes.find(endpointKey(part.id, "a"));
-    const nodeB = wireNodes.find(endpointKey(part.id, "b"));
-    if (nodeA === nodeB) { continue; }
-    const branch = {
-      part,
-      nodeA,
-      nodeB,
-      currentAmps: reading.terminalCurrents?.a ?? reading.currentAmps,
-    };
-    branches.push(branch);
-  }
-  return branches;
-}
-
-function initialCapacitorCurrentDeltas(
-  document: CircuitDocument,
-  sample: TransientSample,
-  originalCapacitorCurrents: ReadonlyMap<string, CapacitorTerminalCurrents>,
-  wireNodes: EndpointSet,
-) {
-  const residualByNode = new Map<string, number>();
-  const addResidual = (node: string, current: number) => {
-    residualByNode.set(node, (residualByNode.get(node) ?? 0) + current);
-  };
-  for (const part of document.parts) {
-    if (part.kind !== "capacitor") { continue; }
-    const reading = sample.parts[part.id];
-    if (!reading) { continue; }
-    for (const terminal of circuitPartCatalog[part.kind].terminals) {
-      const currentDelta = (reading.terminalCurrents?.[terminal] ?? 0) -
-        (originalCapacitorCurrents.get(part.id)?.[terminal] ?? 0);
-      if (currentDelta !== 0) { addResidual(wireNodes.find(endpointKey(part.id, terminal)), currentDelta); }
-    }
-  }
-  return residualByNode;
-}
-
-function idealBranchAdjacency(branches: readonly InitialIdealBranch[]) {
-  const adjacency = new Map<string, InitialIdealBranch[]>();
-  for (const branch of branches) {
-    const nodeAEdges = adjacency.get(branch.nodeA) ?? [];
-    nodeAEdges.push(branch);
-    adjacency.set(branch.nodeA, nodeAEdges);
-    const nodeBEdges = adjacency.get(branch.nodeB) ?? [];
-    nodeBEdges.push(branch);
-    adjacency.set(branch.nodeB, nodeBEdges);
-  }
-  return adjacency;
-}
-
-interface IdealBranchForest {
-  parentBranches: Map<string, InitialIdealBranch>;
-  treeBranches: Set<InitialIdealBranch>;
-  roots: string[];
-}
-
-function idealBranchForest(adjacency: Map<string, InitialIdealBranch[]>): IdealBranchForest {
-  const parentBranches = new Map<string, InitialIdealBranch>();
-  const treeBranches = new Set<InitialIdealBranch>();
-  const visited = new Set<string>();
-  const roots: string[] = [];
-  for (const start of adjacency.keys()) {
-    if (visited.has(start)) { continue; }
-    roots.push(start);
-    visited.add(start);
-    const pending = [start];
-    while (pending.length > 0) {
-      const node = pending.pop();
-      if (node === undefined) { continue; }
-      for (const branch of adjacency.get(node) ?? []) {
-        const other = branch.nodeA === node ? branch.nodeB : branch.nodeA;
-        if (visited.has(other)) { continue; }
-        visited.add(other);
-        parentBranches.set(other, branch);
-        treeBranches.add(branch);
-        pending.push(other);
-      }
-    }
-  }
-  return {
-    parentBranches,
-    treeBranches,
-    roots,
-  };
-}
-
-function idealBranchCurrentDeltas(
-  adjacency: Map<string, InitialIdealBranch[]>,
-  residualByNode: ReadonlyMap<string, number>,
-  forest: IdealBranchForest,
-) {
-  const balancedBranches = new Map<InitialIdealBranch, number>();
-  const balanceSubtree = (node: string, parentBranch?: InitialIdealBranch): number => {
-    let subtreeResidual = residualByNode.get(node) ?? 0;
-    for (const branch of adjacency.get(node) ?? []) {
-      if (branch === parentBranch || !forest.treeBranches.has(branch)) { continue; }
-      const child = branch.nodeA === node ? branch.nodeB : branch.nodeA;
-      if (forest.parentBranches.get(child) !== branch) { continue; }
-      const childResidual = balanceSubtree(child, branch);
-      const childSign = child === branch.nodeA ? 1 : -1;
-      balancedBranches.set(branch, -childResidual / childSign);
-      subtreeResidual += childResidual;
-    }
-    return subtreeResidual;
-  };
-  for (const root of forest.roots) { balanceSubtree(root); }
-  return balancedBranches;
-}
-
-function applyInitialIdealBranchCurrentDeltas(
-  sample: TransientSample,
-  branchDeltas: ReadonlyMap<InitialIdealBranch, number>,
-) {
-  for (const [branch, currentDelta] of branchDeltas) {
-    const correctedCurrent = branch.currentAmps + currentDelta;
-    if (!Number.isFinite(correctedCurrent)) { continue; }
-    const reading = sample.parts[branch.part.id];
-    if (!reading) { continue; }
-    reading.currentAmps = correctedCurrent;
-    reading.terminalCurrents = { a: correctedCurrent, b: -correctedCurrent };
-    reading.powerWatts = reading.voltageVolts * correctedCurrent;
-  }
-}
-
-function reconstructInitialIdealBranchCurrents(
-  document: CircuitDocument,
-  sample: TransientSample,
-  switchStates: Record<string, boolean>,
-  originalCapacitorCurrents: ReadonlyMap<string, CapacitorTerminalCurrents>,
-) {
-  const wireNodes = createWireNodes(document);
-  const branches = initialIdealBranches(document, sample, switchStates, wireNodes);
-  if (branches.length === 0) { return; }
-
-  // Only capacitor redistribution deltas are balanced. This preserves currents
-  // already solved for op-amp reference returns and other implicit branches.
-  // Cycle currents are indeterminate, so only tree branch corrections are made.
-  const residualByNode = initialCapacitorCurrentDeltas(
-    document,
-    sample,
-    originalCapacitorCurrents,
-    wireNodes,
-  );
-  const adjacency = idealBranchAdjacency(branches);
-  const forest = idealBranchForest(adjacency);
-  const branchDeltas = idealBranchCurrentDeltas(adjacency, residualByNode, forest);
-  applyInitialIdealBranchCurrentDeltas(sample, branchDeltas);
 }
 
 interface NextStepResult {
