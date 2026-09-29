@@ -1,5 +1,5 @@
 import { analyzeAnalogCircuit, type ComplexValue, type AnalogCircuitPartReading } from "./analog-solver.js";
-import { complexPhaseDegrees } from "./analog-math.js";
+import { complexMagnitude, complexPhaseDegrees } from "./analog-math.js";
 import { acAnalysisFrequency, frequencyMatches, isAcReactiveConductive } from "./ac-reactive.js";
 import { circuitPartCatalog, terminalsOf, type CircuitDocument, type CircuitPart, type CircuitTerminal } from "./circuit-model.js";
 import {
@@ -16,9 +16,8 @@ const sourceKinds = new Set(["battery", "ac-source", "current-source"]);
 const directlyConductiveKinds = new Set<CircuitPart["kind"]>([
   "battery", "ac-source", "resistor", "bulb", "ammeter", "diode", "led",
 ]);
-const magnitude = (value: ComplexValue) => Math.hypot(value.real, value.imaginary);
-const phase = (value: ComplexValue) =>
-  value.real === 0 && value.imaginary === 0 ? 0 : complexPhaseDegrees(value);
+const magnitude = complexMagnitude;
+const phase = complexPhaseDegrees;
 
 function setRecordValue<T>(record: Record<string, T>, property: string, value: T) {
   Object.defineProperty(record, property, {

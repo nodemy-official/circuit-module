@@ -1,5 +1,5 @@
 import { circuitPartCatalog, endpointName, terminalsOf, type CircuitDocument, type CircuitEndpoint, type CircuitPart, type CircuitTerminal } from "./circuit-model.js";
-import { exactComponentSum } from "./analog-math.js";
+import { complexMagnitude, complexPhaseDegrees, exactComponentSum } from "./analog-math.js";
 import {
   circuitEndpointsConnected,
   connectCircuitEndpoints,
@@ -433,9 +433,9 @@ function preciseBranchVoltage(
   const voltage = preciseBranchPhasor(pair, context);
   if (!voltage) { return; }
   if (context.analysis.mode !== "ac") { return { volts: voltage.real, phaseDegrees: 0 }; }
-  const volts = Math.hypot(voltage.real, voltage.imaginary);
+  const volts = complexMagnitude(voltage);
   return Number.isFinite(volts)
-    ? { volts, phaseDegrees: volts === 0 ? 0 : Math.atan2(voltage.imaginary, voltage.real) * 180 / Math.PI }
+    ? { volts, phaseDegrees: complexPhaseDegrees(voltage) }
     : undefined;
 }
 
@@ -473,9 +473,13 @@ function primaryReadingPhasor(reading: CircuitPartReading, reverse: boolean, ac:
   if (!finite(reading.voltagePhaseDegrees)) { return; }
   const voltage = phasor(
     Math.abs(reading.voltageVolts),
-    reading.voltagePhaseDegrees + (reverse ? 180 : 0),
+    reading.voltagePhaseDegrees,
   );
-  return Number.isFinite(voltage.real) && Number.isFinite(voltage.imaginary) ? voltage : undefined;
+  // Adding 180 degrees first can erase an offset near an axis before its
+  // quadrature voltage is reconstructed. Reverse the components instead.
+  return Number.isFinite(voltage.real) && Number.isFinite(voltage.imaginary)
+    ? reverse ? negativePotential(voltage) : voltage
+    : undefined;
 }
 
 function potentiometerSegmentForPair(pair: PreciseBranchPair) {
@@ -615,7 +619,7 @@ function precisePotentialParts(
       if (!first || !second || first.id === second.id || first.referenceGroup !== second.referenceGroup) { continue; }
       const voltage = preciseBranchPhasor({ partId: part.id, fromTerminal, toTerminal }, context);
       if (!voltage) { continue; }
-      const magnitude = Math.hypot(voltage.real, voltage.imaginary);
+      const magnitude = complexMagnitude(voltage);
       if (!Number.isFinite(magnitude)) { continue; }
       parts.push({ first, second, voltage, magnitude });
     }
@@ -684,9 +688,10 @@ function precisePathPotential(
   if (context.analysis.mode !== "ac") {
     return Number.isFinite(real) ? { volts: real, phaseDegrees: 0 } : undefined;
   }
-  const volts = Math.hypot(real, imaginary);
+  const value = { real, imaginary };
+  const volts = complexMagnitude(value);
   return Number.isFinite(volts)
-    ? { volts, phaseDegrees: volts === 0 ? 0 : Math.atan2(imaginary, real) * 180 / Math.PI }
+    ? { volts, phaseDegrees: complexPhaseDegrees(value) }
     : undefined;
 }
 
@@ -723,8 +728,9 @@ export function circuitPotential(
   const second = phasor(reference.voltageVolts, reference.voltagePhaseDegrees);
   const real = first.real - second.real;
   const imaginary = first.imaginary - second.imaginary;
-  const volts = Math.hypot(real, imaginary);
-  return { volts, phaseDegrees: volts === 0 ? 0 : Math.atan2(imaginary, real) * 180 / Math.PI };
+  const value = { real, imaginary };
+  const volts = complexMagnitude(value);
+  return { volts, phaseDegrees: complexPhaseDegrees(value) };
 }
 
 export function circuitPotentialColor(volts: number, scale: number) {

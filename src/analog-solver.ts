@@ -17,6 +17,7 @@ import {
   complexSubtract,
   exactComponentSum,
   exactDotProductRational,
+  exactProductSumQuotient,
   exactProductSumRatio,
   solveComplexLinearSystem,
   solveRealLinearSystem,
@@ -1278,23 +1279,41 @@ function bjtModel(
 function mosChannel(vgs: number, vds: number, threshold: number, beta: number, lambda: number) {
   const overdrive = vgs - threshold;
   if (overdrive <= 0) { return { current: 0, gm: 0, gds: 0 }; }
+  // Expand the square-law and channel modulation before evaluating products.
+  // The unscaled square or modulation can overflow (or the base current can
+  // underflow) even when the final current and its derivatives are finite.
   if (vds < overdrive) {
-    const base = beta * (overdrive * vds - (vds * vds) / 2);
-    const baseGm = beta * vds;
-    const baseGds = beta * (overdrive - vds);
-    const modulation = 1 + lambda * vds;
     return {
-      current: base * modulation,
-      gm: baseGm * modulation,
-      gds: baseGds * modulation + lambda * base,
+      current: exactProductSumQuotient([
+        { factors: [beta, overdrive, vds] },
+        { factors: [0.5, beta, vds, vds], sign: -1 },
+        { factors: [lambda, beta, overdrive, vds, vds] },
+        { factors: [0.5, lambda, beta, vds, vds, vds], sign: -1 },
+      ], 1),
+      gm: exactProductSumQuotient([
+        { factors: [beta, vds] },
+        { factors: [lambda, beta, vds, vds] },
+      ], 1),
+      gds: exactProductSumQuotient([
+        { factors: [beta, overdrive] },
+        { factors: [beta, vds], sign: -1 },
+        { factors: [2, lambda, beta, overdrive, vds] },
+        { factors: [1.5, lambda, beta, vds, vds], sign: -1 },
+      ], 1),
     };
   }
-  const base = (beta * overdrive * overdrive) / 2;
-  const modulation = 1 + lambda * vds;
   return {
-    current: base * modulation,
-    gm: beta * overdrive * modulation,
-    gds: lambda * base,
+    current: exactProductSumQuotient([
+      { factors: [0.5, beta, overdrive, overdrive] },
+      { factors: [0.5, lambda, beta, overdrive, overdrive, vds] },
+    ], 1),
+    gm: exactProductSumQuotient([
+      { factors: [beta, overdrive] },
+      { factors: [lambda, beta, overdrive, vds] },
+    ], 1),
+    gds: exactProductSumQuotient([
+      { factors: [0.5, lambda, beta, overdrive, overdrive] },
+    ], 1),
   };
 }
 
@@ -1330,7 +1349,7 @@ function mosfetModel(part: CircuitPart, voltages: number[]): NonlinearModel {
     gds = channel.gm + channel.gds;
   }
 
-  const drainCurrent = sign * normalizedCurrent;
+  const drainCurrent = normalizedCurrent === 0 ? 0 : sign * normalizedCurrent;
   const jacobian = [
     [gds, gm, -gm - gds],
     [0, 0, 0],
