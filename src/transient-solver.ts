@@ -762,33 +762,158 @@ interface InitialResult {
   issues: CircuitIssue[];
 }
 
+function documentWithOperatingPointState(document: CircuitDocument, sample: TransientSample): CircuitDocument | null {
+  const parts = document.parts.map((part): CircuitPart => {
+    const reading = sample.parts[part.id];
+    if (part.kind === "capacitor") {
+      return reading ? { ...part, initialVoltageVolts: reading.voltageVolts } : part;
+    }
+    if (part.kind === "inductor") {
+      return reading ? { ...part, initialCurrentAmps: reading.currentAmps } : part;
+    }
+    return part;
+  });
+  if (parts.some((part) => (part.kind === "capacitor" || part.kind === "inductor") && !sample.parts[part.id])) {
+    return null;
+  }
+  return { ...document, parts };
+}
+
+function initialConstraintsWithOperatingPointState(
+  document: CircuitDocument,
+  state: StoredState,
+): Map<string, InitialVoltageConstraint> | null {
+  const constraints = initialVoltageConstraints(document);
+  for (const part of document.parts) {
+    if (part.kind === "capacitor") {
+      const voltageValue = state.exactCapacitorVoltages.get(part.id);
+      if (!voltageValue) { return null; }
+      constraints.set(part.id, { ...constraints.get(part.id), voltageValue });
+    } else if (part.kind === "inductor") {
+      const currentValue = state.exactInductorCurrents.get(part.id);
+      if (!currentValue) { return null; }
+      constraints.set(part.id, { ...constraints.get(part.id), currentValue });
+    }
+  }
+  return constraints;
+}
+
+type OperatingPointInitialization =
+  | { kind: "ready"; document: CircuitDocument; state: StoredState; issues: CircuitIssue[] }
+  | { kind: "complete"; result: InitialResult }
+  | { kind: "invalid"; reason: string; issues: CircuitIssue[] };
+
+function initializeFromOperatingPoint(
+  document: CircuitDocument,
+  options: TransientAnalysisOptions,
+): OperatingPointInitialization {
+  const operatingPoint = solveAnalogStep(document, {
+    mode: "dc",
+    switchStates: options.switchStates,
+  });
+  if (operatingPoint.status !== "valid") {
+    return {
+      kind: "invalid",
+      reason: `直流動作点を満たす回路を計算できません。 ${operatingPoint.message}`,
+      issues: operatingPoint.issues,
+    };
+  }
+  const measured = createSample(document, operatingPoint, options.switchStates);
+  if (!measured.sample || !measured.state) {
+    return {
+      kind: "invalid",
+      reason: measured.reason ?? "直流動作点から蓄積状態を取得できませんでした。",
+      issues: operatingPoint.issues,
+    };
+  }
+  const hasTimeVaryingAcSource = document.parts.some(
+    (part) => part.kind === "ac-source" && (part.voltageVolts ?? DEFAULT_AC_RMS) !== 0,
+  );
+  if (!hasTimeVaryingAcSource) {
+    return {
+      kind: "complete",
+      result: { sample: measured.sample, state: measured.state, issues: operatingPoint.issues },
+    };
+  }
+  const documentWithState = documentWithOperatingPointState(document, measured.sample);
+  if (!documentWithState) {
+    return {
+      kind: "invalid",
+      reason: "直流動作点からコンデンサ・コイルの状態を取得できませんでした。",
+      issues: operatingPoint.issues,
+    };
+  }
+  return {
+    kind: "ready",
+    document: documentWithState,
+    state: measured.state,
+    issues: operatingPoint.issues,
+  };
+}
+
 function initializeTransient(
   document: CircuitDocument,
   options: TransientAnalysisOptions,
 ): { result?: InitialResult; reason?: string; issues?: CircuitIssue[] } {
-  const useOperatingPoint = options.startFromOperatingPoint ?? false;
-  const capacitorGroups = useOperatingPoint
-    ? { groups: [] as CapacitorGroup[] }
-    : findCapacitorGroups(document, options.switchStates ?? {});
-  if (capacitorGroups.reason) { return { reason: capacitorGroups.reason }; }
-  const overrides = useOperatingPoint ? {} : initialOverrides(document);
-  if (overrides === null) { return { reason: "交流電源の初期値を有限な数値で計算できません。" }; }
-  const initialDocumentForSolve = useOperatingPoint ? document : initialDocument(document);
-  const analysis = solveAnalogStep(initialDocumentForSolve, {
+  const hasStoredState = document.parts.some((part) => part.kind === "capacitor" || part.kind === "inductor");
+  const useOperatingPoint = (options.startFromOperatingPoint ?? false) && hasStoredState;
+  let initialConditionDocument = document;
+  let operatingPointIssues: CircuitIssue[] = [];
+  let operatingPointState: StoredState | undefined;
+
+  if (useOperatingPoint) {
+    const operatingPoint = initializeFromOperatingPoint(document, options);
+    if (operatingPoint.kind === "invalid") {
+      return { reason: operatingPoint.reason, issues: operatingPoint.issues };
+    }
+    if (operatingPoint.kind === "complete") { return { result: operatingPoint.result }; }
+    initialConditionDocument = operatingPoint.document;
+    operatingPointIssues = operatingPoint.issues;
+    operatingPointState = operatingPoint.state;
+  }
+
+  const capacitorGroups = findCapacitorGroups(initialConditionDocument, options.switchStates ?? {});
+  if (capacitorGroups.reason) { return { reason: capacitorGroups.reason, issues: operatingPointIssues }; }
+  const overrides = initialOverrides(initialConditionDocument);
+  if (overrides === null) {
+    return { reason: "交流電源の初期値を有限な数値で計算できません。", issues: operatingPointIssues };
+  }
+  const initialConstraints = operatingPointState
+    ? initialConstraintsWithOperatingPointState(initialConditionDocument, operatingPointState)
+    : initialVoltageConstraints(initialConditionDocument);
+  if (!initialConstraints) {
+    return {
+      reason: "直流動作点からコンデンサ・コイルの厳密な蓄積状態を取得できませんでした。",
+      issues: operatingPointIssues,
+    };
+  }
+  const analysis = solveAnalogStep(initialDocument(initialConditionDocument), {
     mode: "dc",
     switchStates: options.switchStates,
     voltageOverrides: overrides,
-    initialInductorCurrents: !useOperatingPoint,
-  }, undefined, useOperatingPoint ? undefined : initialVoltageConstraints(document));
+    initialInductorCurrents: true,
+  }, undefined, initialConstraints);
   if (analysis.status !== "valid") {
-    const context = useOperatingPoint ? "直流動作点" : "初期状態";
-    return { reason: `${context}を満たす回路を計算できません。 ${analysis.message}`, issues: analysis.issues };
+    const context = useOperatingPoint ? "直流動作点からの初期状態" : "初期状態";
+    return {
+      reason: `${context}を満たす回路を計算できません。 ${analysis.message}`,
+      issues: [...operatingPointIssues, ...analysis.issues],
+    };
   }
   const measured = createSample(document, analysis, options.switchStates);
   if (!measured.sample || !measured.state) {
-    return { reason: measured.reason ?? "初期波形を作成できませんでした。", issues: analysis.issues };
+    return {
+      reason: measured.reason ?? "初期波形を作成できませんでした。",
+      issues: [...operatingPointIssues, ...analysis.issues],
+    };
   }
-  return { result: { sample: measured.sample, state: measured.state, issues: analysis.issues } };
+  return {
+    result: {
+      sample: measured.sample,
+      state: measured.state,
+      issues: [...operatingPointIssues, ...analysis.issues],
+    },
+  };
 }
 
 interface NextStepResult {

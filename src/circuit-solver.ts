@@ -64,6 +64,10 @@ export interface CircuitPartReading {
   switchClosed?: boolean;
   /** MOS channel has current or a nonzero incremental response; AC uses the DC bias state. */
   channelConducting?: boolean;
+  /** AC terminal groups that share a voltage reference through the bias-point small-signal model. */
+  acReferenceTerminalGroups?: readonly (readonly CircuitTerminal[])[];
+  /** AC terminal groups coupled by nonzero terminal-current Jacobian entries. */
+  acCurrentResponseTerminalGroups?: readonly (readonly CircuitTerminal[])[];
 }
 
 export interface CircuitAnalysisOptions {

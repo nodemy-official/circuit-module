@@ -228,7 +228,10 @@ function referenceTerminalGroups(
   part: CircuitPart,
   analysis: CircuitAnalysis,
   frequencyHz: number,
-): CircuitTerminal[][] {
+): readonly (readonly CircuitTerminal[])[] {
+  const acGroups = analysis.mode === "ac" ? analysis.parts[part.id]?.acReferenceTerminalGroups : undefined;
+  if (acGroups !== undefined) { return acGroups; }
+
   switch (part.kind) {
     case "battery":
     case "ac-source":
@@ -387,17 +390,6 @@ export function defaultReferenceNode(document: CircuitDocument, nodes: CircuitNo
 const preciseTwoTerminalVoltageKinds = new Set<CircuitPart["kind"]>([
   "battery", "ac-source", "resistor", "bulb", "capacitor", "inductor", "ammeter", "diode", "led",
 ]);
-const potentiometerIdsCache = new WeakMap<CircuitPotentialContext, Set<string>>();
-
-function potentiometerIds(context: CircuitPotentialContext) {
-  const cached = potentiometerIdsCache.get(context);
-  if (cached) { return cached; }
-  const ids = new Set(context.document.parts
-    .filter((part) => part.kind === "potentiometer")
-    .map((part) => part.id));
-  potentiometerIdsCache.set(context, ids);
-  return ids;
-}
 
 function hasPreciseTwoTerminalVoltage(part: CircuitPart, reading: CircuitPartReading): boolean {
   if (part.kind === "switch") { return reading.switchClosed === true; }
@@ -408,10 +400,9 @@ function hasPreciseTwoTerminalVoltage(part: CircuitPart, reading: CircuitPartRea
 function sharedPartTerminalPairs(
   node: CircuitNode,
   reference: CircuitNode,
-  context: CircuitPotentialContext,
+  potentiometers: ReadonlySet<string>,
 ): { partId: string; fromTerminal: CircuitTerminal; toTerminal: CircuitTerminal }[] {
   const pairs: { partId: string; fromTerminal: CircuitTerminal; toTerminal: CircuitTerminal }[] = [];
-  const potentiometers = potentiometerIds(context);
   for (const endpoint of node.endpoints) {
     for (const referenceEndpoint of reference.endpoints) {
       if (endpoint.partId !== referenceEndpoint.partId || endpoint.terminal === referenceEndpoint.terminal) { continue; }
@@ -544,8 +535,127 @@ interface PotentialPathTree {
   predecessors: Map<string, PotentialPathPredecessor>;
 }
 
-const potentialPathGraphCache = new WeakMap<CircuitPotentialContext, PotentialPathGraph>();
-const potentialPathTreeCache = new WeakMap<CircuitPotentialContext, Map<string, PotentialPathTree>>();
+interface PotentialContextCache {
+  snapshot: unknown[];
+  potentiometerIds: Set<string>;
+  trees: Map<string, PotentialPathTree>;
+  graph?: PotentialPathGraph;
+}
+
+const potentialContextCaches = new WeakMap<CircuitPotentialContext, PotentialContextCache>();
+
+function appendTerminalSnapshot(snapshot: unknown[], values: Partial<Record<CircuitTerminal, number>> | undefined) {
+  snapshot.push(values);
+  for (const terminal of ["a", "b", "c"] as const) { snapshot.push(values?.[terminal]); }
+}
+
+function appendTerminalGroupsSnapshot(
+  snapshot: unknown[],
+  groups: readonly (readonly CircuitTerminal[])[] | undefined,
+) {
+  snapshot.push(groups, groups?.length);
+  for (const group of groups ?? []) {
+    snapshot.push(group, group.length);
+    for (const terminal of group) { snapshot.push(terminal); }
+  }
+}
+
+function potentialContextSnapshot(context: CircuitPotentialContext) {
+  const { document, analysis } = context;
+  const snapshot: unknown[] = [
+    document,
+    document.parts,
+    document.wires,
+    analysis,
+    analysis.parts,
+    context.nodes,
+    analysis.status,
+    analysis.mode,
+    analysis.frequencyHz,
+    analysis.timeSeconds,
+    document.parts.length,
+  ];
+
+  for (const part of document.parts) {
+    const reading = analysis.parts[part.id];
+    snapshot.push(
+      part,
+      part.id,
+      part.kind,
+      part.resistanceOhms,
+      part.wiperPosition,
+      part.initiallyClosed,
+      part.frequencyHz,
+      part.capacitanceFarads,
+      part.inductanceHenries,
+      reading,
+      reading?.meterStatus,
+      reading?.switchClosed,
+      reading?.channelConducting,
+      reading?.acReferenceTerminalGroups,
+      reading?.voltageVolts,
+      reading?.voltagePhaseDegrees,
+    );
+    appendTerminalGroupsSnapshot(snapshot, reading?.acReferenceTerminalGroups);
+    appendTerminalSnapshot(snapshot, reading?.terminalVoltages);
+    appendTerminalSnapshot(snapshot, reading?.terminalCurrents);
+    appendTerminalSnapshot(snapshot, reading?.terminalVoltagePhasesDegrees);
+    appendTerminalSnapshot(snapshot, reading?.terminalCurrentPhasesDegrees);
+  }
+
+  snapshot.push(document.wires.length);
+  for (const wire of document.wires) {
+    snapshot.push(
+      wire,
+      wire.from,
+      wire.from.partId,
+      wire.from.terminal,
+      wire.to,
+      wire.to.partId,
+      wire.to.terminal,
+    );
+  }
+
+  if (context.nodes) {
+    snapshot.push(context.nodes.length);
+    for (const node of context.nodes) {
+      snapshot.push(
+        node,
+        node.id,
+        node.referenceGroup,
+        node.endpoints,
+        node.endpoints.length,
+        node.voltageVolts,
+        node.voltagePhaseDegrees,
+      );
+      for (const endpoint of node.endpoints) {
+        snapshot.push(endpoint, endpoint.partId, endpoint.terminal);
+      }
+    }
+  }
+
+  return snapshot;
+}
+
+function samePotentialContextSnapshot(first: readonly unknown[], second: readonly unknown[]) {
+  return first.length === second.length && first.every((value, index) => Object.is(value, second[index]));
+}
+
+function potentialContextCache(context: CircuitPotentialContext) {
+  const snapshot = potentialContextSnapshot(context);
+  const cached = potentialContextCaches.get(context);
+  if (cached && samePotentialContextSnapshot(cached.snapshot, snapshot)) { return cached; }
+
+  const next: PotentialContextCache = {
+    snapshot,
+    potentiometerIds: new Set(context.document.parts
+      .filter((part) => part.kind === "potentiometer")
+      .map((part) => part.id)),
+    trees: new Map(),
+  };
+  potentialContextCaches.set(context, next);
+  return next;
+}
 
 function leastCostPotentialNode(
   nodeIds: string[],
@@ -572,9 +682,11 @@ function improvesPotentialPath(candidateCost: number, candidateHops: number, kno
   return candidateCost === knownCost && candidateHops < knownHops;
 }
 
-function potentialPathGraph(context: CircuitPotentialContext): PotentialPathGraph {
-  const cached = potentialPathGraphCache.get(context);
-  if (cached) { return cached; }
+function potentialPathGraph(
+  context: CircuitPotentialContext,
+  cache: PotentialContextCache,
+): PotentialPathGraph {
+  if (cache.graph) { return cache.graph; }
 
   const nodes = context.nodes ?? circuitNodes(context.document, context.analysis);
   const byEndpoint = new Map<string, CircuitNode>();
@@ -595,7 +707,7 @@ function potentialPathGraph(context: CircuitPotentialContext): PotentialPathGrap
     });
   }
   const graph = { nodeIds: nodes.map((node) => node.id), adjacency };
-  potentialPathGraphCache.set(context, graph);
+  cache.graph = graph;
   return graph;
 }
 
@@ -659,18 +771,14 @@ function shortestPotentialPathTree(startId: string, graph: PotentialPathGraph): 
 function precisePathPotential(
   node: CircuitNode,
   reference: CircuitNode,
-  context: CircuitPotentialContext | undefined,
+  context: CircuitPotentialContext,
+  cache: PotentialContextCache,
 ): { volts: number; phaseDegrees: number } | undefined {
-  if (!context || node.id === reference.id) { return undefined; }
-  let pathTrees = potentialPathTreeCache.get(context);
-  if (!pathTrees) {
-    pathTrees = new Map();
-    potentialPathTreeCache.set(context, pathTrees);
-  }
-  let tree = pathTrees.get(reference.id);
+  if (node.id === reference.id) { return undefined; }
+  let tree = cache.trees.get(reference.id);
   if (!tree) {
-    tree = shortestPotentialPathTree(reference.id, potentialPathGraph(context));
-    pathTrees.set(reference.id, tree);
+    tree = shortestPotentialPathTree(reference.id, potentialPathGraph(context, cache));
+    cache.trees.set(reference.id, tree);
   }
 
   const realParts: number[] = [];
@@ -701,11 +809,12 @@ function precisePartPotential(
   context: CircuitPotentialContext | undefined,
 ): { volts: number; phaseDegrees: number } | undefined {
   if (!context || node.id === reference.id) { return undefined; }
-  for (const pair of sharedPartTerminalPairs(node, reference, context)) {
+  const cache = potentialContextCache(context);
+  for (const pair of sharedPartTerminalPairs(node, reference, cache.potentiometerIds)) {
     const precise = preciseBranchVoltage(pair, context);
     if (precise) { return precise; }
   }
-  return precisePathPotential(node, reference, context);
+  return precisePathPotential(node, reference, context, cache);
 }
 
 /** AC differences subtract complex phasors, never their RMS magnitudes. */

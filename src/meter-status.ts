@@ -15,6 +15,8 @@ interface MeterStatusOptions {
   switchStates?: Record<string, boolean>;
   /** MOS channels with no current or incremental response are open branches. */
   channelConducting?: Readonly<Record<string, boolean>>;
+  /** AC-bias terminal groups joined by each nonlinear device's small-signal conductance. */
+  smallSignalConnections?: Readonly<Record<string, readonly (readonly CircuitTerminal[])[]>>;
   /** Initial transient solve fixes an inductor's current instead of shorting it. */
   initialInductorCurrents?: boolean;
 }
@@ -78,13 +80,30 @@ function isSwitchClosed(part: CircuitPart, switchStates: Record<string, boolean>
   return override ?? part.initiallyClosed ?? circuitPartCatalog.switch.defaults.initiallyClosed ?? false;
 }
 
-function joinAcross(nodes: DisjointSet, index: Map<string, number>, part: CircuitPart, terminals: CircuitTerminal[]) {
+function joinAcross(
+  nodes: DisjointSet,
+  index: Map<string, number>,
+  part: CircuitPart,
+  terminals: readonly CircuitTerminal[],
+) {
   const first = terminals[0] === undefined ? undefined : index.get(endpointKey(part.id, terminals[0]));
   if (first === undefined) { return; }
   for (const terminal of terminals.slice(1)) {
     const next = index.get(endpointKey(part.id, terminal));
     if (next !== undefined) { nodes.join(first, next); }
   }
+}
+
+function joinSmallSignalGroups(
+  nodes: DisjointSet,
+  index: Map<string, number>,
+  part: CircuitPart,
+  options: MeterStatusOptions,
+) {
+  const groups = options.mode === "ac" ? options.smallSignalConnections?.[part.id] : undefined;
+  if (groups === undefined) { return false; }
+  for (const group of groups) { joinAcross(nodes, index, part, group); }
+  return true;
 }
 
 function joinMosChannel(
@@ -140,6 +159,92 @@ function wiredTerminalSet(document: CircuitDocument) {
   return wired;
 }
 
+interface ElectricalConnectionContext {
+  index: Map<string, number>,
+  nodes: DisjointSet,
+  referenceNode: number,
+  options: MeterStatusOptions,
+  frequencyHz: number;
+}
+
+type ElectricalPartJoiner = (part: CircuitPart, context: ElectricalConnectionContext) => void;
+
+function joinPartTerminals(
+  part: CircuitPart,
+  context: ElectricalConnectionContext,
+  terminals: readonly CircuitTerminal[],
+) {
+  joinAcross(context.nodes, context.index, part, terminals);
+}
+
+function joinAlwaysConnectedPart(part: CircuitPart, context: ElectricalConnectionContext) {
+  joinPartTerminals(part, context, ["a", "b"]);
+}
+
+function joinDiodeTerminals(part: CircuitPart, context: ElectricalConnectionContext) {
+  if (!joinSmallSignalGroups(context.nodes, context.index, part, context.options)) {
+    joinPartTerminals(part, context, ["a", "b"]);
+  }
+}
+
+function joinInductorTerminals(part: CircuitPart, context: ElectricalConnectionContext) {
+  if (context.options.mode !== "ac" || isAcReactiveConductive(part, context.frequencyHz)) {
+    joinPartTerminals(part, context, ["a", "b"]);
+  }
+}
+
+function joinSwitchTerminals(part: CircuitPart, context: ElectricalConnectionContext) {
+  if (isSwitchClosed(part, context.options.switchStates ?? {})) {
+    joinPartTerminals(part, context, ["a", "b"]);
+  }
+}
+
+function joinCapacitorTerminals(part: CircuitPart, context: ElectricalConnectionContext) {
+  if (context.options.mode === "ac" && isAcReactiveConductive(part, context.frequencyHz)) {
+    joinPartTerminals(part, context, ["a", "b"]);
+  }
+}
+
+function joinPotentiometerTerminals(part: CircuitPart, context: ElectricalConnectionContext) {
+  joinPartTerminals(part, context, ["a", "b", "c"]);
+}
+
+function joinTransistorTerminals(part: CircuitPart, context: ElectricalConnectionContext) {
+  if (!joinSmallSignalGroups(context.nodes, context.index, part, context.options)) {
+    joinPartTerminals(part, context, ["a", "b", "c"]);
+  }
+}
+
+function joinMosTerminals(part: CircuitPart, context: ElectricalConnectionContext) {
+  if (!joinSmallSignalGroups(context.nodes, context.index, part, context.options)) {
+    joinMosChannel(context.nodes, context.index, part, context.options.channelConducting);
+  }
+}
+
+function joinOpAmpOutput(part: CircuitPart, context: ElectricalConnectionContext) {
+  const output = context.index.get(endpointKey(part.id, "c"));
+  if (output !== undefined) { context.nodes.join(output, context.referenceNode); }
+}
+
+const electricalPartJoiners: Partial<Record<CircuitPart["kind"], ElectricalPartJoiner>> = {
+  battery: joinAlwaysConnectedPart,
+  "ac-source": joinAlwaysConnectedPart,
+  resistor: joinAlwaysConnectedPart,
+  bulb: joinAlwaysConnectedPart,
+  ammeter: joinAlwaysConnectedPart,
+  diode: joinDiodeTerminals,
+  led: joinDiodeTerminals,
+  inductor: joinInductorTerminals,
+  switch: joinSwitchTerminals,
+  capacitor: joinCapacitorTerminals,
+  potentiometer: joinPotentiometerTerminals,
+  "npn-transistor": joinTransistorTerminals,
+  "pnp-transistor": joinTransistorTerminals,
+  nmos: joinMosTerminals,
+  pmos: joinMosTerminals,
+  "op-amp": joinOpAmpOutput,
+};
+
 function joinElectricalParts(
   document: CircuitDocument,
   index: Map<string, number>,
@@ -147,50 +252,14 @@ function joinElectricalParts(
   referenceNode: number,
   options: MeterStatusOptions,
 ) {
-  const switchStates = options.switchStates ?? {};
-  const frequencyHz = acAnalysisFrequency(document, options.frequencyHz);
-  for (const part of document.parts) {
-    switch (part.kind) {
-      case "battery":
-      case "ac-source":
-      case "resistor":
-      case "bulb":
-      case "ammeter":
-      case "diode":
-      case "led":
-        joinAcross(nodes, index, part, ["a", "b"]);
-        break;
-      case "inductor":
-        if (options.mode !== "ac" || isAcReactiveConductive(part, frequencyHz)) {
-          joinAcross(nodes, index, part, ["a", "b"]);
-        }
-        break;
-      case "switch":
-        if (isSwitchClosed(part, switchStates)) { joinAcross(nodes, index, part, ["a", "b"]); }
-        break;
-      case "capacitor":
-        if (options.mode === "ac" && isAcReactiveConductive(part, frequencyHz)) {
-          joinAcross(nodes, index, part, ["a", "b"]);
-        }
-        break;
-      case "potentiometer":
-      case "npn-transistor":
-      case "pnp-transistor":
-        joinAcross(nodes, index, part, ["a", "b", "c"]);
-        break;
-      case "nmos":
-      case "pmos":
-        joinMosChannel(nodes, index, part, options.channelConducting);
-        break;
-      case "op-amp": {
-        const output = index.get(endpointKey(part.id, "c"));
-        if (output !== undefined) { nodes.join(output, referenceNode); }
-        break;
-      }
-      default:
-        break;
-    }
-  }
+  const context = {
+    index,
+    nodes,
+    referenceNode,
+    options,
+    frequencyHz: acAnalysisFrequency(document, options.frequencyHz),
+  };
+  for (const part of document.parts) { electricalPartJoiners[part.kind]?.(part, context); }
 }
 
 function meterStatusForPart(

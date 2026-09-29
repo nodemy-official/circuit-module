@@ -16,6 +16,9 @@ const sourceKinds = new Set(["battery", "ac-source", "current-source"]);
 const directlyConductiveKinds = new Set<CircuitPart["kind"]>([
   "battery", "ac-source", "resistor", "bulb", "ammeter", "diode", "led",
 ]);
+const smallSignalCurrentKinds = new Set<CircuitPart["kind"]>([
+  "diode", "led", "npn-transistor", "pnp-transistor", "nmos", "pmos",
+]);
 const magnitude = complexMagnitude;
 const phase = complexPhaseDegrees;
 
@@ -103,7 +106,7 @@ function connectivityGraph(
   frequencyHz: number,
   switchStates: Record<string, boolean>,
   excludedPartId: string,
-  cutoffMosfetIds: ReadonlySet<string>,
+  readings: Record<string, CircuitPartReading>,
 ) {
   const graph: ConductivityGraph = {
     ...createCircuitConnectivityGraph(document),
@@ -111,7 +114,16 @@ function connectivityGraph(
   };
   const reference = referenceEndpointKey(document, graph);
   for (const part of document.parts) {
-    if (part.id === excludedPartId || cutoffMosfetIds.has(part.id)) { continue; }
+    if (part.id === excludedPartId) { continue; }
+    const reading = readings[part.id];
+    if (mode === "ac" && smallSignalCurrentKinds.has(part.kind) &&
+        reading?.acCurrentResponseTerminalGroups !== undefined) {
+      for (const group of reading.acCurrentResponseTerminalGroups) {
+        if (group.length > 1) { joinCircuitPartTerminals(graph, part.id, group); }
+      }
+      continue;
+    }
+    if ((part.kind === "nmos" || part.kind === "pmos") && reading?.channelConducting === false) { continue; }
     connectPartInGraph(graph, part, document, mode, frequencyHz, switchStates, reference);
   }
   return graph;
@@ -123,9 +135,9 @@ function hasSourceReturnPath(
   mode: "dc" | "ac",
   frequencyHz: number,
   switchStates: Record<string, boolean>,
-  cutoffMosfetIds: ReadonlySet<string>,
+  readings: Record<string, CircuitPartReading>,
 ) {
-  const graph = connectivityGraph(document, mode, frequencyHz, switchStates, source.id, cutoffMosfetIds);
+  const graph = connectivityGraph(document, mode, frequencyHz, switchStates, source.id, readings);
   return circuitEndpointsConnected(
     graph,
     graph.endpointKey(source.id, "a"),
@@ -139,9 +151,9 @@ function hasOpAmpOutputReturnPath(
   mode: "dc" | "ac",
   frequencyHz: number,
   switchStates: Record<string, boolean>,
-  cutoffMosfetIds: ReadonlySet<string>,
+  readings: Record<string, CircuitPartReading>,
 ) {
-  const graph = connectivityGraph(document, mode, frequencyHz, switchStates, opAmp.id, cutoffMosfetIds);
+  const graph = connectivityGraph(document, mode, frequencyHz, switchStates, opAmp.id, readings);
   const reference = referenceEndpointKey(document, graph);
   return reference !== undefined && circuitEndpointsConnected(
     graph,
@@ -175,16 +187,13 @@ function analysisStatus(
   readings: Record<string, CircuitPartReading>,
 ): CircuitAnalysis["status"] {
   if (analogStatus !== "valid") { return analogStatus; }
-  const cutoffMosfetIds = new Set(document.parts
-    .filter((part) => (part.kind === "nmos" || part.kind === "pmos") && readings[part.id]?.channelConducting === false)
-    .map((part) => part.id));
   const hasOpAmpOutputLoop = document.parts.some((part) =>
-    part.kind === "op-amp" && hasOpAmpOutputReturnPath(document, part, mode, frequencyHz, switchStates, cutoffMosfetIds),
+    part.kind === "op-amp" && hasOpAmpOutputReturnPath(document, part, mode, frequencyHz, switchStates, readings),
   );
   const activeSources = sources.filter((source) => isActiveSourceForMode(source, mode, frequencyHz));
   if (activeSources.length === 0) { return hasOpAmpOutputLoop ? "closed" : "idle"; }
   const hasClosedSourceLoop = activeSources.some((source) =>
-    hasSourceReturnPath(document, source, mode, frequencyHz, switchStates, cutoffMosfetIds),
+    hasSourceReturnPath(document, source, mode, frequencyHz, switchStates, readings),
   );
   return hasClosedSourceLoop || hasOpAmpOutputLoop ? "closed" : "open";
 }
@@ -207,6 +216,12 @@ function adaptReading(
     ...(reading.meterStatus ? { meterStatus: reading.meterStatus } : {}),
     ...(part.kind === "switch" ? { switchClosed: switchClosedState(part, switchStates) } : {}),
     ...(reading.channelConducting === undefined ? {} : { channelConducting: reading.channelConducting }),
+    ...(reading.acReferenceTerminalGroups === undefined
+      ? {}
+      : { acReferenceTerminalGroups: reading.acReferenceTerminalGroups }),
+    ...(reading.acCurrentResponseTerminalGroups === undefined
+      ? {}
+      : { acCurrentResponseTerminalGroups: reading.acCurrentResponseTerminalGroups }),
   };
   if (ac) {
     result.voltagePhaseDegrees = phase(reading.voltage);
