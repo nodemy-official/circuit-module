@@ -12,6 +12,8 @@ const samplesPerCycle = 200;
 const cycles = 10;
 const timeStepSeconds = 1 / (frequencyHz * samplesPerCycle);
 const durationSeconds = cycles / frequencyHz;
+// Exact transient histories grow with the step count, so long circuit comparisons need more time.
+const longTransientTimeoutMs = 60_000;
 
 function part(id: string, kind: CircuitPartKind, properties: Partial<CircuitPart> = {}): CircuitPart {
   return { id, kind, x: 0, y: 0, label: id, ...properties };
@@ -195,7 +197,7 @@ describe("AC phasor and transient steady-state consistency", () => {
       expect(comparison.relativeMagnitudeError, `${comparison.partId} ${comparison.quantity} magnitude`).toBeLessThan(0.02);
       expect(comparison.phaseError, `${comparison.partId} ${comparison.quantity} phase`).toBeLessThan(1.5);
     }
-  });
+  }, longTransientTimeoutMs);
 
   it("agrees for a series RL circuit", () => {
     const result = compareWithSteadyState(rlCircuit(), ["source", "resistor", "inductor"]);
@@ -207,7 +209,7 @@ describe("AC phasor and transient steady-state consistency", () => {
       expect(comparison.relativeMagnitudeError, `${comparison.partId} ${comparison.quantity} magnitude`).toBeLessThan(0.02);
       expect(comparison.phaseError, `${comparison.partId} ${comparison.quantity} phase`).toBeLessThan(1.5);
     }
-  });
+  }, longTransientTimeoutMs);
 
   it("agrees for a series RLC circuit", () => {
     const result = compareWithSteadyState(rlcCircuit(), ["source", "resistor", "inductor", "capacitor"]);
@@ -219,7 +221,7 @@ describe("AC phasor and transient steady-state consistency", () => {
       expect(comparison.relativeMagnitudeError, `${comparison.partId} ${comparison.quantity} magnitude`).toBeLessThan(0.02);
       expect(comparison.phaseError, `${comparison.partId} ${comparison.quantity} phase`).toBeLessThan(1.5);
     }
-  });
+  }, longTransientTimeoutMs);
 
   it("agrees for multiple same-frequency sources with different phases and DC offsets", () => {
     const result = compareWithSteadyState(multiplePhaseSourceCircuit(), ["source-a", "source-b", "resistor"]);

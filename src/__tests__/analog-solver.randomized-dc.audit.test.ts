@@ -60,53 +60,67 @@ function makeRandomizedCircuits() {
   });
 }
 
+const randomizedCircuits = makeRandomizedCircuits();
+const randomizedCaseBatches = Array.from({ length: 10 }, (_, batchIndex) => {
+  const firstCaseIndex = batchIndex * 100;
+  return {
+    firstCaseIndex,
+    lastCaseIndex: firstCaseIndex + 99,
+    cases: randomizedCircuits.slice(firstCaseIndex, firstCaseIndex + 100),
+  };
+});
+
 describe("analog DC randomized KCL audit", () => {
-  it("solves 1000 seeded 3-source, 9-resistor five-node networks with balanced junction currents", () => {
-    const invalidCases: { caseIndex: number; status: string; message: string }[] = [];
-    const missingCurrents: { caseIndex: number; node: number; partId: string; terminal: "a" | "b" }[] = [];
-    const residualViolations: {
-      caseIndex: number;
-      node: number;
-      residualAmps: number;
-      scaleAmps: number;
-      relativeResidual: number;
-    }[] = [];
+  it.each(randomizedCaseBatches)(
+    "solves seeded DC KCL cases $firstCaseIndex–$lastCaseIndex with balanced junction currents",
+    ({ firstCaseIndex, cases }) => {
+      const invalidCases: { caseIndex: number; status: string; message: string }[] = [];
+      const missingCurrents: { caseIndex: number; node: number; partId: string; terminal: "a" | "b" }[] = [];
+      const residualViolations: {
+        caseIndex: number;
+        node: number;
+        residualAmps: number;
+        scaleAmps: number;
+        relativeResidual: number;
+      }[] = [];
 
-    for (const [caseIndex, { document, branchNodes }] of makeRandomizedCircuits().entries()) {
-      const analysis = analyzeAnalogCircuit(document);
-      if (analysis.status !== "valid") {
-        invalidCases.push({ caseIndex, status: analysis.status, message: analysis.message });
-        continue;
-      }
+      for (const [caseOffset, { document, branchNodes }] of cases.entries()) {
+        const caseIndex = firstCaseIndex + caseOffset;
+        const analysis = analyzeAnalogCircuit(document);
+        if (analysis.status !== "valid") {
+          invalidCases.push({ caseIndex, status: analysis.status, message: analysis.message });
+          continue;
+        }
 
-      const nodeCurrents: ComplexValue[][] = Array.from({ length: 5 }, () => []);
-      for (const branch of branchNodes) {
-        const reading = analysis.parts[branch.partId];
-        const currentA = reading?.terminalCurrents.a;
-        const currentB = reading?.terminalCurrents.b;
-        if (!currentA) { missingCurrents.push({ caseIndex, node: branch.nodeA, partId: branch.partId, terminal: "a" }); }
-        else { nodeCurrents[branch.nodeA]?.push(currentA); }
-        if (!currentB) { missingCurrents.push({ caseIndex, node: branch.nodeB, partId: branch.partId, terminal: "b" }); }
-        else { nodeCurrents[branch.nodeB]?.push(currentB); }
-      }
+        const nodeCurrents: ComplexValue[][] = Array.from({ length: 5 }, () => []);
+        for (const branch of branchNodes) {
+          const reading = analysis.parts[branch.partId];
+          const currentA = reading?.terminalCurrents.a;
+          const currentB = reading?.terminalCurrents.b;
+          if (!currentA) { missingCurrents.push({ caseIndex, node: branch.nodeA, partId: branch.partId, terminal: "a" }); }
+          else { nodeCurrents[branch.nodeA]?.push(currentA); }
+          if (!currentB) { missingCurrents.push({ caseIndex, node: branch.nodeB, partId: branch.partId, terminal: "b" }); }
+          else { nodeCurrents[branch.nodeB]?.push(currentB); }
+        }
 
-      for (const [node, currents] of nodeCurrents.entries()) {
-        if (missingCurrents.some((missing) => missing.caseIndex === caseIndex && missing.node === node)) { continue; }
-        const realResidual = exactComponentSum(currents.map((current) => current.real));
-        const imaginaryResidual = exactComponentSum(currents.map((current) => current.imaginary));
-        const residualAmps = Math.hypot(realResidual, imaginaryResidual);
-        const scaleAmps = Math.max(0, ...currents.map(complexMagnitude));
-        const relativeResidual = scaleAmps === 0
-          ? residualAmps === 0 ? 0 : Number.POSITIVE_INFINITY
-          : residualAmps / scaleAmps;
-        if (!Number.isFinite(relativeResidual) || relativeResidual > 1e-8) {
-          residualViolations.push({ caseIndex, node, residualAmps, scaleAmps, relativeResidual });
+        for (const [node, currents] of nodeCurrents.entries()) {
+          if (missingCurrents.some((missing) => missing.caseIndex === caseIndex && missing.node === node)) { continue; }
+          const realResidual = exactComponentSum(currents.map((current) => current.real));
+          const imaginaryResidual = exactComponentSum(currents.map((current) => current.imaginary));
+          const residualAmps = Math.hypot(realResidual, imaginaryResidual);
+          const scaleAmps = Math.max(0, ...currents.map(complexMagnitude));
+          const relativeResidual = scaleAmps === 0
+            ? residualAmps === 0 ? 0 : Number.POSITIVE_INFINITY
+            : residualAmps / scaleAmps;
+          if (!Number.isFinite(relativeResidual) || relativeResidual > 1e-8) {
+            residualViolations.push({ caseIndex, node, residualAmps, scaleAmps, relativeResidual });
+          }
         }
       }
-    }
 
-    expect(invalidCases).toEqual([]);
-    expect(missingCurrents).toEqual([]);
-    expect(residualViolations).toEqual([]);
-  });
+      expect(invalidCases).toEqual([]);
+      expect(missingCurrents).toEqual([]);
+      expect(residualViolations).toEqual([]);
+    },
+  );
 });

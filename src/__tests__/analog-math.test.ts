@@ -3,13 +3,74 @@ import { describe, expect, it } from "vitest";
 import {
   complex,
   complexDivide,
+  complexMagnitude,
   complexMultiply,
+  complexPhaseDegrees,
   scaledProduct,
   solveComplexLinearSystem,
   solveRealLinearSystem,
 } from "../analog-math.js";
+import { multiplyExactRational, numberToExactRational } from "../exact-linear-algebra.js";
+import { complexFromExact } from "../exact-numeric-state.js";
+
+describe("complex magnitude and phase", () => {
+  it("uses exact components when the rounded rectangular values underflow", () => {
+    const minimum = numberToExactRational(Number.MIN_VALUE);
+    expect(minimum).not.toBeNull();
+    const component = multiplyExactRational(minimum!, { numerator: 2n, denominator: 5n });
+    const value = complexFromExact({ real: component, imaginary: component });
+
+    expect(value.real).toBe(0);
+    expect(value.imaginary).toBe(0);
+    expect(complexMagnitude(value)).toBe(Number.MIN_VALUE);
+    expect(complexPhaseDegrees(value)).toBe(45);
+  });
+
+  it("retains a representable degree phase when the component ratio underflows", () => {
+    const real = numberToExactRational(1);
+    expect(real).not.toBeNull();
+    const value = complexFromExact({
+      real: real!,
+      imaginary: { numerator: 1n, denominator: 2n ** 1075n },
+    });
+
+    expect(value.imaginary).toBe(0);
+    expect(complexPhaseDegrees(value)).toBe(29 * Number.MIN_VALUE);
+  });
+});
 
 describe("complexMultiply", () => {
+  it("rounds only the completed sum of products in ordinary arithmetic", () => {
+    const result = complexMultiply(complex(0.1, 0.2), complex(0.3, 0.4));
+    expect(result.real).toBe(-0.050_000_000_000_000_01);
+    expect(result.imaginary).toBe(0.1);
+    const cancelled = complexMultiply(complex(1e154, 1e154), complex(1e-154, 1.000_000_000_000_000_1e-154));
+    expect(cancelled.real).toBe(-1.656_084_321_055_619e-16);
+    expect(cancelled.imaginary).toBe(2);
+  });
+
+  it("cancels overflowing intermediate products before rounding finite components", () => {
+    const value = complex(1.4e154, 5e153);
+    const square = complexMultiply(value, value);
+
+    expect(square.real / 1.71e308).toBeCloseTo(1, 14);
+    expect(square.imaginary / 1.4e308).toBeCloseTo(1, 14);
+    const rotated = complexMultiply(value, complex(-value.imaginary, value.real));
+    expect(rotated.real / -1.4e308).toBeCloseTo(1, 14);
+    expect(rotated.imaginary / 1.71e308).toBeCloseTo(1, 14);
+  });
+
+  it("distinguishes cancelled and genuinely unrepresentable products", () => {
+    const value = complex(Number.MAX_VALUE, Number.MAX_VALUE);
+    const square = complexMultiply(value, value);
+    const power = complexMultiply(value, complex(value.real, -value.imaginary));
+
+    expect(square.real).toBe(0);
+    expect(square.imaginary).toBe(Number.POSITIVE_INFINITY);
+    expect(power.real).toBe(Number.POSITIVE_INFINITY);
+    expect(power.imaginary).toBe(0);
+  });
+
   it("adds tiny power contributions before rounding to subnormal units", () => {
     const value = complex(1.4e-162, 1.4e-162);
     const power = complexMultiply(value, complex(value.real, -value.imaginary));
@@ -30,6 +91,14 @@ describe("complexMultiply", () => {
 });
 
 describe("scaledProduct", () => {
+  it("avoids intermediate rounding for ordinary and extreme products", () => {
+    // Expected values are the correctly rounded products of the exact binary64 inputs.
+    expect(scaledProduct([0.1, 0.2, 0.3])).toBe(0.006);
+    expect(scaledProduct([0.3, 0.2, 0.1])).toBe(0.006);
+    expect(scaledProduct([1e308, 1e-308, 1e308])).toBe(1e308);
+    expect(scaledProduct([])).toBe(1);
+  });
+
   it("rounds a subnormal energy only after applying all factors", () => {
     expect(scaledProduct([0.5, Number.MIN_VALUE, 1.5, 1.5])).toBe(Number.MIN_VALUE);
     expect(scaledProduct([1.5, 1.5, Number.MIN_VALUE, 0.5])).toBe(Number.MIN_VALUE);

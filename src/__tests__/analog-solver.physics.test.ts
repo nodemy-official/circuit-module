@@ -270,7 +270,7 @@ describe("analog solver physical model regressions", () => {
     const frequencyHz = 1e-308;
     const inductanceHenries = 7.4e-16;
     const sourceVoltage = 1e-308;
-    const reactance = (2 * Math.PI * frequencyHz) * inductanceHenries;
+    const expectedCurrentImaginary = -1 / (2 * Math.PI * inductanceHenries);
     const document: CircuitDocument = {
       title: "サブノーマル領域のコイルリアクタンス",
       parts: [
@@ -286,16 +286,15 @@ describe("analog solver physical model regressions", () => {
     const result = analyzeAnalogCircuit(document, { mode: "ac" });
 
     expect(result.status, result.message).toBe("valid");
-    expect(reactance).toBeGreaterThan(0);
-    expect(result.parts.inductor.current.imaginary / (-sourceVoltage / reactance)).toBeCloseTo(1, 10);
+    expect(result.parts.inductor.current.imaginary / expectedCurrentImaginary).toBeCloseTo(1, 10);
   });
 
   it.each([
-    { kind: "capacitor" as const, frequencyHz: 1e-308, capacitanceFarads: 1e-308 },
-    { kind: "inductor" as const, frequencyHz: 1e308, inductanceHenries: 1e308 },
-  ])("treats an unrepresentably small $kind admittance as an open AC branch", (reactive) => {
+    { kind: "capacitor" as const, frequencyHz: 1e-308, capacitanceFarads: 1e-308, expectedCurrentImaginary: 0 },
+    { kind: "inductor" as const, frequencyHz: 1e308, inductanceHenries: 1e308, expectedCurrentImaginary: -0 },
+  ])("keeps the sign of the rounded sub-binary64 $kind branch current", (reactive) => {
     const document: CircuitDocument = {
-      title: "極大リアクタンスの開放回路",
+      title: "極大リアクタンスで微小電流が流れる回路",
       parts: [
         part("source", "ac-source", { voltageVolts: 5, frequencyHz: reactive.frequencyHz }),
         part("resistor", "resistor", { resistanceOhms: 100 }),
@@ -313,8 +312,9 @@ describe("analog solver physical model regressions", () => {
     expect(result.status, result.message).toBe("valid");
     expect(result.parts.reactive.voltage.real).toBeCloseTo(5, 10);
     expect(result.parts.reactive.current.real).toBe(0);
-    expect(result.parts.reactive.current.imaginary).toBe(0);
+    expect(result.parts.reactive.current.imaginary).toBe(reactive.expectedCurrentImaginary);
     expect(result.parts.resistor.voltage.real).toBe(0);
+    expect(result.parts.resistor.voltage.imaginary).toBe(reactive.expectedCurrentImaginary);
   });
 
   it.each([

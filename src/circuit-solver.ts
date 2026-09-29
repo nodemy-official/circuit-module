@@ -8,6 +8,15 @@ import {
 } from "./circuit-model.js";
 import { analyzeExtendedCircuit } from "./circuit-analog-adapter.js";
 import { solveRealLinearSystem } from "./analog-math.js";
+import {
+  divideExactRational,
+  exactRationalToNumber,
+  multiplyExactRational,
+  numberToExactRational,
+  subtractExactRational,
+  type ExactRational,
+} from "./exact-linear-algebra.js";
+import { addRealStateValue, exactRealStateValue } from "./exact-numeric-state.js";
 import { meterStatuses, type MeterStatus } from "./meter-status.js";
 import { circuitDocumentShapeIssue, isSimulationRecord, simulationRecordField } from "./simulation-input.js";
 
@@ -275,14 +284,6 @@ function conductiveComponents(size: number, conductances: readonly Conductance[]
   return parent.map((_, node) => findRoot(parent, node));
 }
 
-/** One reference node per connected group, so every group has a solvable system. */
-function referenceNodes(size: number, conductances: readonly Conductance[]) {
-  const components = conductiveComponents(size, conductances);
-  const references = new Set<number>();
-  for (const component of components) { references.add(component); }
-  return references;
-}
-
 interface SourceConstraintEdge {
   from: number;
   to: number;
@@ -502,157 +503,119 @@ function hasExternalBatteryPath(
   return false;
 }
 
-interface TreeCoordinate {
-  unknown: number;
-  sign: number;
+const EXACT_ZERO: ExactRational = { numerator: 0n, denominator: 1n };
+const EXACT_ONE: ExactRational = { numerator: 1n, denominator: 1n };
+
+function exactInput(value: number) {
+  return numberToExactRational(value);
 }
 
-/** Keep the strongest connections in the tree so weak conductances are not lost
- * when they would otherwise be added to an ideal conductor's large diagonal. */
-function voltageTree(size: number, conductances: readonly Conductance[]) {
-  const references = referenceNodes(size, conductances);
-  const adjacent = Array.from({ length: size }, () => [] as { node: number; g: number; voltage: number }[]);
-  for (const { a, b, g, voltage = 0 } of conductances) {
-    adjacent[a].push({ node: b, g, voltage });
-    adjacent[b].push({ node: a, g, voltage: -voltage });
-  }
-  const parent = Array.from({ length: size }, () => -1);
-  const depth = Array.from({ length: size }, () => 0);
-  const offset = Array.from({ length: size }, () => 0);
-  const strongest = Array.from({ length: size }, (_, node) =>
-    references.has(node) ? Number.POSITIVE_INFINITY : Number.NEGATIVE_INFINITY,
-  );
-  const visited = new Set<number>();
-  const unknowns = new Map<number, number>();
-  const order: number[] = [];
-  while (order.length < size) {
-    let next = -1;
-    for (let node = 0; node < size; node += 1) {
-      if (!visited.has(node) && (next === -1 || strongest[node] > strongest[next])) { next = node; }
-    }
-    visited.add(next);
-    order.push(next);
-    if (parent[next] !== -1) {
-      unknowns.set(next, unknowns.size);
-      depth[next] = depth[parent[next]] + 1;
-    }
-    for (const edge of adjacent[next]) {
-      if (!visited.has(edge.node) && edge.g > strongest[edge.node]) {
-        parent[edge.node] = next;
-        strongest[edge.node] = edge.g;
-        offset[edge.node] = -edge.voltage;
-      }
-    }
-  }
-  const baseline = new Float64Array(unknowns.size);
-  for (const [node, unknown] of unknowns) { baseline[unknown] = offset[node]; }
-  return { parent, depth, unknowns, order, baseline };
+function negateExact(value: ExactRational): ExactRational {
+  return { numerator: -value.numerator, denominator: value.denominator };
 }
 
-function treeVoltagePath(
-  tree: ReturnType<typeof voltageTree>,
+function nodalUnknownIndices(size: number, conductances: readonly Conductance[]) {
+  const components = conductiveComponents(size, conductances);
+  const references = new Set(components);
+  const unknownByNode = Array.from({ length: size }, () => -1);
+  let count = 0;
+  for (let node = 0; node < size; node += 1) {
+    if (!references.has(node)) { unknownByNode[node] = count++; }
+  }
+  return { unknownByNode, count };
+}
+
+function stampConductanceBranch(
+  matrix: Float64Array,
+  rhs: Float64Array,
+  count: number,
+  unknownByNode: readonly number[],
+  branch: Conductance,
+) {
+  const resistance = exactInput(branch.resistanceOhms);
+  const conductance = resistance && divideExactRational(EXACT_ONE, resistance);
+  const sourceVoltage = exactInput(branch.voltage ?? 0);
+  if (!conductance || !sourceVoltage) { return false; }
+
+  const a = unknownByNode[branch.a] ?? -1;
+  const b = unknownByNode[branch.b] ?? -1;
+  if (a >= 0) { addRealStateValue(matrix, a * count + a, conductance); }
+  if (b >= 0) { addRealStateValue(matrix, b * count + b, conductance); }
+  if (a >= 0 && b >= 0) {
+    const offDiagonal = negateExact(conductance);
+    addRealStateValue(matrix, a * count + b, offDiagonal);
+    addRealStateValue(matrix, b * count + a, offDiagonal);
+  }
+
+  if (branch.voltage) {
+    const sourceTerm = multiplyExactRational(conductance, sourceVoltage);
+    if (a >= 0) { addRealStateValue(rhs, a, sourceTerm); }
+    if (b >= 0) { addRealStateValue(rhs, b, negateExact(sourceTerm)); }
+  }
+  return true;
+}
+
+function stampCurrentSource(
+  rhs: Float64Array,
+  unknownByNode: readonly number[],
+  source: { from: number; to: number; amps: number },
+) {
+  const amps = exactInput(source.amps);
+  if (!amps) { return false; }
+  const from = unknownByNode[source.from] ?? -1;
+  const to = unknownByNode[source.to] ?? -1;
+  if (from >= 0) { addRealStateValue(rhs, from, amps); }
+  if (to >= 0) { addRealStateValue(rhs, to, negateExact(amps)); }
+  return true;
+}
+
+function exactNodeDifference(
+  exactVoltages: readonly ExactRational[],
   from: number,
   to: number,
-): TreeCoordinate[] {
-  const path: TreeCoordinate[] = [];
-  let a = from;
-  let b = to;
-  while (a !== b) {
-    // Separate floating groups both end at the implicit -1 reference. Their
-    // potential difference is arbitrary and meterStatuses marks it as such.
-    if ((tree.depth[a] ?? -1) >= (tree.depth[b] ?? -1)) {
-      const unknown = tree.unknowns.get(a);
-      if (unknown !== undefined) { path.push({ unknown, sign: 1 }); }
-      a = tree.parent[a] ?? -1;
-    } else {
-      const unknown = tree.unknowns.get(b);
-      if (unknown !== undefined) { path.push({ unknown, sign: -1 }); }
-      b = tree.parent[b] ?? -1;
-    }
-  }
-  return path;
+  offset: number,
+) {
+  const exactOffset = exactInput(offset);
+  if (!exactOffset) { return { value: Number.NaN, scale: Number.NaN }; }
+  const exactDifference = subtractExactRational(
+    subtractExactRational(exactVoltages[from] ?? EXACT_ZERO, exactVoltages[to] ?? EXACT_ZERO),
+    exactOffset,
+  );
+  const value = exactRationalToNumber(exactDifference);
+  return { value, scale: Math.abs(value), valueExact: exactDifference };
 }
 
-function sumVoltagePath(path: readonly TreeCoordinate[], solution: Float64Array, offset = 0) {
-  let value = -offset;
-  let correction = 0;
-  let scale = 0;
-  for (const { unknown, sign } of path) {
-    const term = sign * solution[unknown];
-    const next = value + term;
-    correction += Math.abs(value) >= Math.abs(term) ? (value - next) + term : (term - next) + value;
-    value = next;
-    scale += Math.abs(term);
-  }
-  return { value: value + correction, scale };
-}
-
-/** Solve nodal analysis in tree-edge voltage coordinates. This is an exact
- * change of variables: each branch contributes g p pᵀ, where p is its signed
- * tree path. Battery voltages on the tree provide a known baseline; solving
- * its corrections avoids subtracting full source voltages to find tiny currents.
- * The 1 μΩ conductor model is unchanged. */
+/** Solve conductance nodal equations with one exact reference per component. */
 function nodeVoltages(
   size: number,
   conductances: readonly Conductance[],
   currentSource?: { from: number; to: number; amps: number },
 ) {
-  const tree = voltageTree(size, conductances);
-  const count = tree.unknowns.size;
-  const rowResistance = conductances.some(({ g }) => !Number.isFinite(g))
-    ? treeRowResistances(tree, conductances)
-    : null;
+  const { unknownByNode, count } = nodalUnknownIndices(size, conductances);
   const matrix = new Float64Array(count * count);
   const rhs = new Float64Array(count);
-  for (const { a, b, g, resistanceOhms, voltage = 0 } of conductances) {
-    const path = treeVoltagePath(tree, a, b);
-    const residualVoltage = sumVoltagePath(path, tree.baseline, voltage).value;
-    for (const row of path) {
-      const coefficient = rowResistance ? rowResistance[row.unknown]! / resistanceOhms : g;
-      rhs[row.unknown] -= coefficient * row.sign * residualVoltage;
-      for (const column of path) {
-        matrix[row.unknown * count + column.unknown] += coefficient * row.sign * column.sign;
-      }
-    }
+  for (const branch of conductances) {
+    if (!stampConductanceBranch(matrix, rhs, count, unknownByNode, branch)) { return null; }
   }
-  if (currentSource) {
-    const path = treeVoltagePath(tree, currentSource.from, currentSource.to);
-    for (const row of path) {
-      rhs[row.unknown] += row.sign * currentSource.amps * (rowResistance?.[row.unknown] ?? 1);
-    }
-  }
+  if (currentSource && !stampCurrentSource(rhs, unknownByNode, currentSource)) { return null; }
   const solution = solveRealLinearSystem(count, matrix, rhs);
   if (!solution) { return null; }
-  const voltages = Array.from({ length: size }, () => 0);
-  for (const node of tree.order) {
-    const unknown = tree.unknowns.get(node);
-    if (unknown !== undefined) {
-      voltages[node] = voltages[tree.parent[node]] + tree.baseline[unknown] + solution[unknown];
+  const exactVoltages = Array.from({ length: size }, () => EXACT_ZERO);
+  for (let node = 0; node < size; node += 1) {
+    const unknown = unknownByNode[node] ?? -1;
+    if (unknown >= 0) {
+      const value = exactRealStateValue(solution, unknown);
+      if (!value) { return null; }
+      exactVoltages[node] = value;
     }
   }
+  const voltages = exactVoltages.map(exactRationalToNumber);
   if (!voltages.every(Number.isFinite)) { return null; }
   return {
     voltages,
-    difference: (from: number, to: number, offset = 0) => {
-      const path = treeVoltagePath(tree, from, to);
-      const baseline = sumVoltagePath(path, tree.baseline, offset).value;
-      const correction = sumVoltagePath(path, solution);
-      return { value: baseline + correction.value, scale: Math.abs(baseline) + correction.scale };
-    },
+    difference: (from: number, to: number, offset = 0) =>
+      exactNodeDifference(exactVoltages, from, to, offset),
   };
-}
-
-/** Scale only tree equations containing overflowing conductances by their
- * smallest branch resistance. Other equations retain their original units,
- * including those of disconnected ordinary circuits. */
-function treeRowResistances(tree: ReturnType<typeof voltageTree>, conductances: readonly Conductance[]) {
-  const resistance = new Float64Array(tree.unknowns.size).fill(Number.POSITIVE_INFINITY);
-  for (const edge of conductances) {
-    for (const row of treeVoltagePath(tree, edge.a, edge.b)) {
-      resistance[row.unknown] = Math.min(resistance[row.unknown]!, edge.resistanceOhms);
-    }
-  }
-  return resistance.map((value) => Number.isFinite(1 / value) ? 1 : value);
 }
 
 /** Equivalent resistance of the passive network between two terminals. */
@@ -683,20 +646,46 @@ function externalResistance(
   return Number.isFinite(resistance) && resistance >= 0 ? resistance : null;
 }
 
+interface VoltageDifference {
+  value: number;
+  scale: number;
+  valueExact?: ExactRational;
+}
+
+function exactDifferenceValue(difference: VoltageDifference) {
+  return difference.valueExact ?? exactInput(difference.value);
+}
+
+function exactDifferenceQuotient(difference: VoltageDifference, denominator: number) {
+  const numerator = exactDifferenceValue(difference);
+  const exactDenominator = exactInput(denominator);
+  return numerator && exactDenominator ? divideExactRational(numerator, exactDenominator) : null;
+}
+
 function readPart(
   part: CircuitPart,
-  voltageVolts: number,
-  currentVoltage: number,
+  voltageDrop: VoltageDifference,
+  currentDrop: VoltageDifference,
   switchStates: Record<string, boolean>,
 ): CircuitPartReading {
-  if (part.kind === "battery") {
-    const currentAmps = currentVoltage / batteryOhms(part);
-    return { voltageVolts, currentAmps, powerWatts: -voltageVolts * currentAmps };
+  const voltageVolts = voltageDrop.value;
+  const ohms = part.kind === "battery" ? batteryOhms(part) : partOhms(part, switchStates);
+  const currentExact = ohms === null ? EXACT_ZERO : exactDifferenceQuotient(currentDrop, ohms);
+  const currentAmps = ohms === null
+    ? 0
+    : currentExact
+      ? exactRationalToNumber(currentExact)
+      : currentDrop.value / ohms;
+  const voltageExact = exactDifferenceValue(voltageDrop);
+  const absorbsPower = part.kind === "resistor" || part.kind === "bulb";
+  const deliversPower = part.kind === "battery";
+  let powerWatts = 0;
+  if ((absorbsPower || deliversPower) && voltageExact && currentExact) {
+    const exactPower = multiplyExactRational(voltageExact, currentExact);
+    powerWatts = exactRationalToNumber(deliversPower ? negateExact(exactPower) : exactPower);
+  } else if (absorbsPower || deliversPower) {
+    powerWatts = voltageVolts * currentAmps * (deliversPower ? -1 : 1);
   }
-  const ohms = partOhms(part, switchStates);
-  const currentAmps = ohms === null ? 0 : voltageVolts / ohms;
-  const powerWatts =
-    part.kind === "resistor" || part.kind === "bulb" ? voltageVolts * currentAmps : 0;
   if (part.kind !== "bulb") { return { voltageVolts, currentAmps, powerWatts }; }
   const rated = part.ratedPowerWatts ?? 2;
   return { voltageVolts, currentAmps, powerWatts, brightness: Math.min(1, powerWatts / rated) };
@@ -737,7 +726,7 @@ function readAll(
     const currentUncertainty = ohms === null
       ? 0
       : ROUNDING_GUARD * currentDrop.scale / ohms;
-    const reading = readPart(part, drop.value, currentDrop.value, switchStates);
+    const reading = readPart(part, drop, currentDrop, switchStates);
     const voltageUncertainty = ROUNDING_GUARD * drop.scale;
     const currentAmps = tidy(reading.currentAmps, currentUncertainty);
     setRecordValue(parts, part.id, {
@@ -759,7 +748,12 @@ function readAll(
   for (const wire of document.wires) {
     const drop = difference(index.get(key(wire.from))!, index.get(key(wire.to))!);
     const currentUncertainty = ROUNDING_GUARD * drop.scale / IDEAL_OHMS;
-    setRecordValue(wireCurrents, wire.id, tidy(drop.value / IDEAL_OHMS, currentUncertainty));
+    const current = exactDifferenceQuotient(drop, IDEAL_OHMS);
+    setRecordValue(
+      wireCurrents,
+      wire.id,
+      tidy(current ? exactRationalToNumber(current) : drop.value / IDEAL_OHMS, currentUncertainty),
+    );
   }
   return { parts, wireCurrents };
 }

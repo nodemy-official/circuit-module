@@ -483,16 +483,16 @@ describe("learning quantities", () => {
   it.each([
     { kind: "capacitor" as const, frequencyHz: 1e-308, values: { capacitanceFarads: 1e-308 } },
     { kind: "inductor" as const, frequencyHz: 1e308, values: { inductanceHenries: 1e308 } },
-  ])("keeps zero-admittance AC $kind branches open in status, meter, and potential references", ({
+  ])("keeps exact nonzero AC $kind branches connected in status, meter, and potential references", ({
     kind,
     frequencyHz,
     values,
   }) => {
     const document: CircuitDocument = {
-      title: "範囲外リアクタンスで分離する交流回路",
+      title: "範囲外リアクタンスでつながる交流回路",
       parts: [
         { id: "source", kind: "ac-source", label: "交流電源", x: 0, y: 0, voltageVolts: 5, frequencyHz },
-        { id: "loop-reactive", kind, label: "開放リアクタンス", x: 1, y: 0, ...values },
+        { id: "loop-reactive", kind, label: "高インピーダンスリアクタンス", x: 1, y: 0, ...values },
         { id: "load", kind: "resistor", label: "抵抗", x: 2, y: 0, resistanceOhms: 100 },
         { id: "floating-reactive", kind, label: "浮いたリアクタンス", x: 3, y: 0, ...values },
         { id: "meter", kind: "voltmeter", label: "電圧計", x: 4, y: 0 },
@@ -520,20 +520,25 @@ describe("learning quantities", () => {
     const mismatchedFrequencyAnalysis = analyzeCircuit(mismatchedDocument, {}, { mode: "ac", frequencyHz });
     const mismatchedFrequencyNodes = circuitNodes(mismatchedDocument, mismatchedFrequencyAnalysis);
 
-    expect(analysis.status, analysis.message).toBe("open");
-    expect(analysis.parts.meter.meterStatus).toBe("floating");
+    expect(analysis.status, analysis.message).toBe("closed");
+    expect(analysis.parts.meter.meterStatus).toBe("connected");
     expect(nodeAt(nodes, "floating-reactive", "a").referenceGroup)
-      .not.toBe(nodeAt(nodes, "floating-reactive", "b").referenceGroup);
+      .toBe(nodeAt(nodes, "floating-reactive", "b").referenceGroup);
     expect(circuitPotential(
       nodeAt(nodes, "floating-reactive", "a"),
       nodeAt(nodes, "floating-reactive", "b"),
       true,
-    )).toBeNull();
+    )?.volts).toBe(0);
     expect(idleAnalysis.status, idleAnalysis.message).toBe("idle");
     expect(mismatchedFrequencyAnalysis.status, mismatchedFrequencyAnalysis.message).toBe("idle");
-    expect(mismatchedFrequencyAnalysis.parts.meter.meterStatus).toBe("floating");
+    expect(mismatchedFrequencyAnalysis.parts.meter.meterStatus).toBe("connected");
     expect(nodeAt(mismatchedFrequencyNodes, "floating-reactive", "a").referenceGroup)
-      .not.toBe(nodeAt(mismatchedFrequencyNodes, "floating-reactive", "b").referenceGroup);
+      .toBe(nodeAt(mismatchedFrequencyNodes, "floating-reactive", "b").referenceGroup);
+    expect(circuitPotential(
+      nodeAt(mismatchedFrequencyNodes, "floating-reactive", "a"),
+      nodeAt(mismatchedFrequencyNodes, "floating-reactive", "b"),
+      true,
+    )?.volts).toBe(0);
   });
 
   it.each([

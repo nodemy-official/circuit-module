@@ -218,7 +218,7 @@ describe("CircuitEditorLayout meter readouts", () => {
     expect(forwardValue).toBe("9 V（実効値）");
     expect(reversedValue).toBe(forwardValue);
     expect(meterTitle(forward.container, "voltmeter")).toContain("電圧位相 0°");
-    expect(meterTitle(reversed.container, "voltmeter")).toMatch(/電圧位相 [−-]?180°/);
+    expect(meterTitle(reversed.container, "voltmeter")).toMatch(/電圧位相 [+−-]?180°/);
   });
 
   it("explains unconnected meters and short-circuit analysis failures", () => {

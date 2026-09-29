@@ -1,5 +1,10 @@
-import { solveAnalogStep } from "./analog-solver.js";
-import { exactComponentSum, scaledProduct } from "./analog-math.js";
+import { solveAnalogStep, type TransientCompanionConstraint } from "./analog-solver.js";
+import { exactComponentSum, exactProductQuotient, scaledProduct } from "./analog-math.js";
+import { exactComplexValue } from "./exact-numeric-state.js";
+import {
+  numberToExactRational,
+  type ExactRational,
+} from "./exact-linear-algebra.js";
 import type { MeterStatus } from "./meter-status.js";
 import {
   circuitPartCatalog,
@@ -56,7 +61,9 @@ export interface TransientAnalysisOptions {
 
 interface StoredState {
   capacitorVoltages: Map<string, number>;
+  exactCapacitorVoltages: Map<string, ExactRational>;
   inductorCurrents: Map<string, number>;
+  exactInductorCurrents: Map<string, ExactRational>;
 }
 
 interface CapacitorMember {
@@ -77,6 +84,7 @@ interface CapacitorGroup {
 interface TransformedStep {
   document: CircuitDocument;
   voltageOverrides: Record<string, number>;
+  companionConstraints: Map<string, TransientCompanionConstraint>;
 }
 
 const TWO_PI = 2 * Math.PI;
@@ -567,34 +575,76 @@ function initialDocument(
   };
 }
 
+function capacitorStepPart(
+  part: CircuitPart,
+  state: StoredState,
+  dt: number,
+  voltageOverrides: Record<string, number>,
+  companionConstraints: Map<string, TransientCompanionConstraint>,
+): CircuitPart {
+  if (part.kind !== "capacitor") { return part; }
+  const capacitance = part.capacitanceFarads ?? DEFAULT_CAPACITANCE;
+  const previousVoltage = state.capacitorVoltages.get(part.id) ??
+    part.initialVoltageVolts ?? DEFAULT_INITIAL_VOLTAGE;
+  const exactPreviousVoltage = state.exactCapacitorVoltages.get(part.id) ??
+    numberToExactRational(previousVoltage);
+  const resistance = dt / capacitance;
+  if (!Number.isFinite(resistance) || resistance <= 0 || !Number.isFinite(previousVoltage) ||
+      !exactPreviousVoltage) { return part; }
+
+  // The Thevenin companion keeps the capacitor branch current as an MNA
+  // unknown. A Norton conductance plus history source loses small physical
+  // currents when two very large currents nearly cancel.
+  voltageOverrides[part.id] = previousVoltage;
+  companionConstraints.set(part.id, {
+    kind: "capacitor",
+    numerator: dt,
+    denominator: capacitance,
+    historyValue: previousVoltage,
+    exactHistoryValue: exactPreviousVoltage,
+  });
+  return { ...part, kind: "battery", voltageVolts: 1, internalResistanceOhms: resistance };
+}
+
+function inductorStepPart(
+  part: CircuitPart,
+  state: StoredState,
+  dt: number,
+  voltageOverrides: Record<string, number>,
+  companionConstraints: Map<string, TransientCompanionConstraint>,
+): CircuitPart {
+  if (part.kind !== "inductor") { return part; }
+  const inductance = part.inductanceHenries ?? DEFAULT_INDUCTANCE;
+  const previousCurrent = state.inductorCurrents.get(part.id) ??
+    part.initialCurrentAmps ?? DEFAULT_INITIAL_CURRENT;
+  const exactPreviousCurrent = state.exactInductorCurrents.get(part.id) ??
+    numberToExactRational(previousCurrent);
+  const resistance = inductance / dt;
+  const sourceVoltage = exactPreviousCurrent
+    ? -exactProductQuotient([inductance, exactPreviousCurrent], dt)
+    : Number.NaN;
+  if (!Number.isFinite(resistance) || resistance <= 0 || !Number.isFinite(sourceVoltage) ||
+      !exactPreviousCurrent) { return part; }
+  voltageOverrides[part.id] = sourceVoltage;
+  companionConstraints.set(part.id, {
+    kind: "inductor",
+    numerator: inductance,
+    denominator: dt,
+    historyValue: previousCurrent,
+    exactHistoryValue: exactPreviousCurrent,
+  });
+  return { ...part, kind: "battery", voltageVolts: 1, internalResistanceOhms: resistance };
+}
+
 function makeStepDocument(document: CircuitDocument, state: StoredState, dt: number): TransformedStep | null {
   const voltageOverrides = Object.create(null) as Record<string, number>;
+  const companionConstraints = new Map<string, TransientCompanionConstraint>();
   const parts = document.parts.map((part): CircuitPart => {
     if (part.kind === "capacitor") {
-      const capacitance = part.capacitanceFarads ?? DEFAULT_CAPACITANCE;
-      const previousVoltage = state.capacitorVoltages.get(part.id) ?? part.initialVoltageVolts ?? DEFAULT_INITIAL_VOLTAGE;
-      const resistance = dt / capacitance;
-      if (!Number.isFinite(resistance) || resistance <= 0 || !Number.isFinite(previousVoltage)) { return part; }
-
-      // The Thevenin companion keeps the capacitor branch current as an MNA
-      // unknown. A Norton conductance plus history source loses small physical
-      // currents when two very large currents nearly cancel.
-      voltageOverrides[part.id] = previousVoltage;
-      return {
-        ...part,
-        kind: "battery",
-        voltageVolts: 1,
-        internalResistanceOhms: resistance,
-      };
+      return capacitorStepPart(part, state, dt, voltageOverrides, companionConstraints);
     }
     if (part.kind === "inductor") {
-      const inductance = part.inductanceHenries ?? DEFAULT_INDUCTANCE;
-      const previousCurrent = state.inductorCurrents.get(part.id) ?? part.initialCurrentAmps ?? DEFAULT_INITIAL_CURRENT;
-      const resistance = inductance / dt;
-      const sourceVoltage = -resistance * previousCurrent;
-      if (!Number.isFinite(resistance) || resistance <= 0 || !Number.isFinite(sourceVoltage)) { return part; }
-      voltageOverrides[part.id] = sourceVoltage;
-      return { ...part, kind: "battery", voltageVolts: 1, internalResistanceOhms: resistance };
+      return inductorStepPart(part, state, dt, voltageOverrides, companionConstraints);
     }
     return part;
   });
@@ -603,6 +653,7 @@ function makeStepDocument(document: CircuitDocument, state: StoredState, dt: num
   return {
     document: { ...document, parts, wires: document.wires },
     voltageOverrides,
+    companionConstraints,
   };
 }
 
@@ -612,7 +663,13 @@ function readingFinite(reading: { voltage: { real: number }; current: { real: nu
 }
 
 type PartSampleResult =
-  | { reading: TransientPartReading; capacitorVoltage?: number; inductorCurrent?: number }
+  | {
+      reading: TransientPartReading;
+      capacitorVoltage?: number;
+      exactCapacitorVoltage?: ExactRational;
+      inductorCurrent?: number;
+      exactInductorCurrent?: ExactRational;
+    }
   | { reason: string };
 
 function samplePart(
@@ -624,10 +681,10 @@ function samplePart(
   }
   const voltageVolts = reading.voltage.real;
   const currentAmps = reading.current.real;
-  const powerWatts = part.kind === "capacitor" || part.kind === "inductor"
-    ? voltageVolts * currentAmps
-    : reading.power.real;
-  if (!Number.isFinite(currentAmps) || !Number.isFinite(powerWatts)) {
+  const exactVoltage = exactComplexValue(reading.voltage)?.real ?? numberToExactRational(voltageVolts);
+  const exactCurrent = exactComplexValue(reading.current)?.real ?? numberToExactRational(currentAmps);
+  const powerWatts = reading.power.real;
+  if (!Number.isFinite(currentAmps) || !Number.isFinite(powerWatts) || !exactVoltage || !exactCurrent) {
     return { reason: `${part.label || part.id}の過渡値が数値範囲を超えました。` };
   }
   return {
@@ -640,8 +697,12 @@ function samplePart(
         ? { a: currentAmps, b: -currentAmps }
         : Object.fromEntries(Object.entries(reading.terminalCurrents).map(([terminal, value]) => [terminal, value.real])),
     },
-    ...(part.kind === "capacitor" ? { capacitorVoltage: voltageVolts } : {}),
-    ...(part.kind === "inductor" ? { inductorCurrent: currentAmps } : {}),
+    ...(part.kind === "capacitor"
+      ? { capacitorVoltage: voltageVolts, exactCapacitorVoltage: exactVoltage }
+      : {}),
+    ...(part.kind === "inductor"
+      ? { inductorCurrent: currentAmps, exactInductorCurrent: exactCurrent }
+      : {}),
   };
 }
 
@@ -652,18 +713,22 @@ function createSample(
 ): { sample?: TransientSample; state?: StoredState; reason?: string } {
   const parts = Object.create(null) as Record<string, TransientPartReading>;
   const capacitorVoltages = new Map<string, number>();
+  const exactCapacitorVoltages = new Map<string, ExactRational>();
   const inductorCurrents = new Map<string, number>();
+  const exactInductorCurrents = new Map<string, ExactRational>();
   for (const part of document.parts) {
     const result = samplePart(part, analysis.parts[part.id]);
     if ("reason" in result) { return { reason: result.reason }; }
     if (part.kind === "switch") { result.reading.switchClosed = isSwitchClosed(part, switchStates); }
     parts[part.id] = result.reading;
     if (result.capacitorVoltage !== undefined) { capacitorVoltages.set(part.id, result.capacitorVoltage); }
+    if (result.exactCapacitorVoltage) { exactCapacitorVoltages.set(part.id, result.exactCapacitorVoltage); }
     if (result.inductorCurrent !== undefined) { inductorCurrents.set(part.id, result.inductorCurrent); }
+    if (result.exactInductorCurrent) { exactInductorCurrents.set(part.id, result.exactInductorCurrent); }
   }
   return {
     sample: { timeSeconds: 0, parts },
-    state: { capacitorVoltages, inductorCurrents },
+    state: { capacitorVoltages, exactCapacitorVoltages, inductorCurrents, exactInductorCurrents },
   };
 }
 
@@ -737,7 +802,7 @@ function distributeInitialCapacitorCurrents(sample: TransientSample, groups: rea
     for (const member of group.members) {
       const reading = sample.parts[member.partId];
       if (!reading) { continue; }
-      reading.currentAmps = scaledRatioProduct(
+      reading.currentAmps = exactProductQuotient(
         [canonicalCurrent * member.orientation, member.capacitanceFarads],
         group.totalCapacitanceFarads,
       );
@@ -745,27 +810,6 @@ function distributeInitialCapacitorCurrents(sample: TransientSample, groups: rea
       reading.powerWatts = reading.voltageVolts * reading.currentAmps;
     }
   }
-}
-
-/** Computes a scaled product quotient without rounding its denominator ratio to zero first. */
-function scaledRatioProduct(numerators: readonly number[], denominator: number) {
-  const exponent = Math.max(-1074, Math.min(1023, Math.floor(Math.log2(denominator))));
-  let mantissa = denominator / 2 ** exponent;
-  let adjustedExponent = exponent;
-  if (mantissa >= 2) {
-    mantissa /= 2;
-    adjustedExponent += 1;
-  } else if (mantissa < 1) {
-    mantissa *= 2;
-    adjustedExponent -= 1;
-  }
-  const firstExponent = Math.floor(adjustedExponent / 2);
-  return scaledProduct([
-    ...numerators,
-    1 / mantissa,
-    2 ** -firstExponent,
-    2 ** -(adjustedExponent - firstExponent),
-  ]);
 }
 
 interface InitialIdealBranch {
@@ -971,7 +1015,7 @@ function solveNextStep(
     mode: "dc",
     switchStates: options.switchStates,
     voltageOverrides: { ...acOverrides, ...transformed.voltageOverrides },
-  });
+  }, transformed.companionConstraints);
   if (analysis.status !== "valid") {
     return { analysis, reason: `t=${timeSeconds} s の解析に失敗しました。${analysis.message}` };
   }

@@ -10,15 +10,42 @@ import {
   complex,
   complexAdd,
   complexConjugate,
+  complexDivide,
   complexMagnitude,
   complexMultiply,
   complexPhaseDegrees,
+  complexSubtract,
   exactComponentSum,
+  exactDotProductRational,
+  exactProductSumRatio,
   solveComplexLinearSystem,
   solveRealLinearSystem,
   type ComplexValue,
 } from "./analog-math.js";
-import { acAnalysisFrequency, acReactiveAdmittance, acReactiveReactance, frequencyMatches } from "./ac-reactive.js";
+import {
+  addExactRational,
+  divideExactRational,
+  exactRationalProductToNumber,
+  exactRationalToNumber,
+  multiplyExactRational,
+  numberToExactRational,
+  subtractExactRational,
+  sumExactRationals,
+  type ExactRational,
+} from "./exact-linear-algebra.js";
+import {
+  addRealStateValue,
+  addScaledRealState,
+  clearRealStateRange,
+  cloneRealState,
+  complexFromExact,
+  exactComplexValue,
+  exactRealStateValue,
+  realStateFromExact,
+  setRealStateValue,
+} from "./exact-numeric-state.js";
+import { solveRealLinearSystemWithExactInverseCache } from "./exact-linear-cache.js";
+import { acAnalysisFrequency, acReactiveAdmittance, acReactiveImpedance, acReactiveReactance, frequencyMatches } from "./ac-reactive.js";
 import { meterStatuses, type MeterStatus } from "./meter-status.js";
 import { circuitDocumentShapeIssue, isSimulationRecord, simulationRecordField } from "./simulation-input.js";
 
@@ -27,6 +54,15 @@ export type { ComplexValue } from "./analog-math.js";
 export type AnalogAnalysisMode = "dc" | "ac";
 export type AnalogAnalysisStatus = "empty" | "valid" | "invalid";
 export type AnalogIssueSeverity = "error" | "warning" | "info";
+
+/** Backward-Euler constraint retained with its original numerator and denominator. */
+export interface TransientCompanionConstraint {
+  kind: "capacitor" | "inductor";
+  numerator: number;
+  denominator: number;
+  historyValue: number;
+  exactHistoryValue?: ExactRational;
+}
 
 export interface AnalogCircuitIssue {
   severity: AnalogIssueSeverity;
@@ -92,7 +128,6 @@ const GMIN_SIEMENS = 1e-12;
 // unchanged, and rescale only after another binary64 precision interval (53
 // bits, 1 / EPSILON) beyond it, where branch-current units can lose meaningful
 // voltage components when multiplied back by extreme impedances.
-const AC_BRANCH_CURRENT_SCALE_THRESHOLD_OHMS = 1e16 / Number.EPSILON;
 const MAX_NEWTON_ITERATIONS = 100;
 const NEWTON_CURRENT_TOLERANCE_AMPS = Number.MIN_VALUE;
 const NEWTON_VOLTAGE_TOLERANCE_VOLTS = 1e-12;
@@ -119,14 +154,15 @@ interface Branch {
   negativeNode: number;
   seriesResistanceOhms: number;
   seriesReactanceOhms?: number;
+  exactSeriesReactance?: ExactRational;
   sourceVoltage: ComplexValue;
+  /** Exact backward-Euler companion coefficients for transient DC steps. */
+  transientCompanion?: TransientCompanionConstraint;
   /** Componentwise allowance for rounding while deriving this source phasor. */
   sourceVoltageUncertainty?: ComplexValue;
   unknownIndex: number;
   /** Redundant compatible ideal voltage constraint; its current is fixed to zero. */
   redundantIdealSource?: boolean;
-  /** AC MNA stores branch current multiplied by this scale to retain tiny voltage drops. */
-  acCurrentScale?: number;
   /** Outer terminal tied to the wiper by an ideal internal potentiometer segment. */
   internalPotentiometerTerminal?: "a" | "b";
 }
@@ -160,10 +196,12 @@ interface NonlinearModel {
 interface DcAssembly {
   matrix: Float64Array;
   residual: Float64Array;
+  exactResidual: ExactRational[] | null;
 }
 
 /** Keep each KCL contribution until cancellation is complete, then round once. */
-type ResidualTerms = number[][];
+type ResidualTerms = (number | ExactRational)[][];
+type ResidualTerm = number | ExactRational;
 
 const endpointKey = (partId: string, terminal: CircuitTerminal) => `${partId}:${terminal}`;
 const positive = (value: number | undefined) =>
@@ -674,7 +712,9 @@ interface BranchSpec {
   negativeNode: number;
   seriesResistanceOhms: number;
   seriesReactanceOhms?: number;
+  exactSeriesReactance?: ExactRational;
   sourceVoltage: ComplexValue;
+  transientCompanion?: TransientCompanionConstraint;
   sourceVoltageUncertainty?: ComplexValue;
 }
 
@@ -705,6 +745,16 @@ function acSourceBranchSpec(
   };
 }
 
+function transientCompanionForPart(
+  part: CircuitPart,
+  mode: AnalogAnalysisMode,
+  transientCompanions?: ReadonlyMap<string, TransientCompanionConstraint>,
+) {
+  return part.kind === "battery" && mode === "dc"
+    ? transientCompanions?.get(part.id)
+    : undefined;
+}
+
 function branchSpecForPart(
   part: CircuitPart,
   topology: Topology,
@@ -713,6 +763,7 @@ function branchSpecForPart(
   voltageOverrides: Record<string, number>,
   switchStates: Record<string, boolean>,
   initialInductorCurrents: boolean,
+  transientCompanions?: ReadonlyMap<string, TransientCompanionConstraint>,
 ): BranchSpec | null {
   const positiveNode = nodeForTerminal(topology, part, "a");
   const negativeNode = nodeForTerminal(topology, part, "b");
@@ -726,7 +777,8 @@ function branchSpecForPart(
     };
   }
   if (mode === "ac" && (part.kind === "capacitor" || part.kind === "inductor")) {
-    const reactance = acReactiveReactance(part, frequencyHz ?? 0);
+    const impedance = acReactiveImpedance(part, frequencyHz ?? 0);
+    const reactance = impedance.imaginary;
     // An impedance beyond floating-point range is an open branch at this
     // analysis frequency. Its voltage still follows from the adjacent nodes.
     if (!Number.isFinite(reactance)) { return null; }
@@ -736,16 +788,19 @@ function branchSpecForPart(
       negativeNode,
       seriesResistanceOhms: 0,
       seriesReactanceOhms: reactance,
+      exactSeriesReactance: exactComplexValue(impedance)?.imaginary,
       sourceVoltage: complex(),
     };
   }
   if (part.kind === "battery") {
+    const transientCompanion = transientCompanionForPart(part, mode, transientCompanions);
     return {
       part,
       positiveNode,
       negativeNode,
       seriesResistanceOhms: part.internalResistanceOhms ?? 0,
       sourceVoltage: complex(mode === "dc" ? sourceVoltageForDc(part, voltageOverrides) : 0),
+      ...(transientCompanion ? { transientCompanion } : {}),
     };
   }
   if (part.kind === "ac-source") {
@@ -772,8 +827,9 @@ function unboundedReactiveAdmittanceForPart(
     return;
   }
   const admittance = acReactiveAdmittance(part, frequencyHz ?? 0);
+  const exact = exactComplexValue(admittance);
   return Number.isFinite(admittance.real) && Number.isFinite(admittance.imaginary) &&
-    (admittance.real !== 0 || admittance.imaginary !== 0)
+    exact !== null && (exact.real.numerator !== 0n || exact.imaginary.numerator !== 0n)
     ? admittance
     : undefined;
 }
@@ -832,7 +888,9 @@ function addMnaBranch(
 ): AnalogCircuitIssue | undefined {
   const { part, positiveNode, negativeNode, seriesResistanceOhms, sourceVoltage } = spec;
   const seriesReactanceOhms = spec.seriesReactanceOhms ?? 0;
-  if (positiveNode === negativeNode && seriesResistanceOhms === 0 && seriesReactanceOhms === 0) {
+  if (positiveNode === negativeNode && seriesResistanceOhms === 0 && seriesReactanceOhms === 0 &&
+      (spec.exactSeriesReactance?.numerator ?? 0n) === 0n &&
+      !spec.transientCompanion) {
     if (sourceVoltage.real === 0 && sourceVoltage.imaginary === 0) { return undefined; }
     return {
       severity: "error",
@@ -847,7 +905,9 @@ function addMnaBranch(
     negativeNode,
     seriesResistanceOhms,
     seriesReactanceOhms,
+    exactSeriesReactance: spec.exactSeriesReactance,
     sourceVoltage,
+    ...(spec.transientCompanion ? { transientCompanion: spec.transientCompanion } : {}),
     sourceVoltageUncertainty: spec.sourceVoltageUncertainty ?? complex(),
     unknownIndex: topology.nodeUnknownCount + branches.length,
   };
@@ -886,7 +946,9 @@ interface IdealVoltageConstraintPath {
 }
 
 function isIdealVoltageConstraint(branch: Branch) {
-  return branch.seriesResistanceOhms === 0 && (branch.seriesReactanceOhms ?? 0) === 0;
+  return !branch.transientCompanion &&
+    branch.seriesResistanceOhms === 0 && (branch.seriesReactanceOhms ?? 0) === 0 &&
+    (branch.exactSeriesReactance?.numerator ?? 0n) === 0n;
 }
 
 function idealVoltageConstraintPath(
@@ -949,7 +1011,7 @@ function addIdealVoltageConstraint(
   adjacency[branch.negativeNode]?.push({
     node: branch.positiveNode,
     partId: branch.partId,
-    voltageDifference: complex(-branch.sourceVoltage.real, -branch.sourceVoltage.imaginary),
+    voltageDifference: complexSubtract(complex(), branch.sourceVoltage),
     voltageUncertainty: branch.sourceVoltageUncertainty ?? complex(),
   });
 }
@@ -1050,49 +1112,6 @@ function addPotentiometerBranches(
   }
 }
 
-function assignAcBranchCurrentScales(
-  document: CircuitDocument,
-  topology: Topology,
-  branches: Branch[],
-) {
-  const parent = Array.from({ length: topology.nodeCount }, (_, node) => node);
-  for (const part of document.parts) {
-    const nodes = terminalsOf(part.kind).map((terminal) => nodeForTerminal(topology, part, terminal));
-    const firstNode = nodes[0];
-    if (firstNode === undefined) { continue; }
-    for (const node of nodes.slice(1)) { unionNodes(parent, firstNode, node); }
-  }
-
-  const impedanceScaleByComponent = new Map<number, number>();
-  for (const branch of branches) {
-    const component = findRoot(parent, branch.positiveNode);
-    const impedanceScale = Math.max(
-      Math.abs(branch.seriesResistanceOhms),
-      Math.abs(branch.seriesReactanceOhms ?? 0),
-    );
-    impedanceScaleByComponent.set(
-      component,
-      Math.max(impedanceScaleByComponent.get(component) ?? 0, impedanceScale),
-    );
-  }
-
-  for (const branch of branches) {
-    const component = findRoot(parent, branch.positiveNode);
-    const componentScale = impedanceScaleByComponent.get(component) ?? 0;
-    const impedanceScale = Math.max(
-      1,
-      Math.abs(branch.seriesResistanceOhms),
-      Math.abs(branch.seriesReactanceOhms ?? 0),
-    );
-    // Keep current units coordinated throughout an extreme component. Scaling
-    // only its largest-impedance branch can underflow smaller branch currents
-    // in KCL before their own representable voltage drops are reconstructed.
-    branch.acCurrentScale = componentScale >= AC_BRANCH_CURRENT_SCALE_THRESHOLD_OHMS
-      ? impedanceScale
-      : 1;
-  }
-}
-
 function buildLayout(
   document: CircuitDocument,
   topology: Topology,
@@ -1101,6 +1120,7 @@ function buildLayout(
   voltageOverrides: Record<string, number>,
   switchStates: Record<string, boolean>,
   initialInductorCurrents = false,
+  transientCompanions?: ReadonlyMap<string, TransientCompanionConstraint>,
 ): { layout?: MnaLayout; issue?: AnalogCircuitIssue } {
   const branches: Branch[] = [];
   const branchByPartId = new Map<string, Branch>();
@@ -1108,7 +1128,16 @@ function buildLayout(
   const internalBranches: Branch[] = [];
   const internalBranchesByPartId = new Map<string, Branch[]>();
   for (const part of document.parts) {
-    const spec = branchSpecForPart(part, topology, mode, frequencyHz, voltageOverrides, switchStates, initialInductorCurrents);
+    const spec = branchSpecForPart(
+      part,
+      topology,
+      mode,
+      frequencyHz,
+      voltageOverrides,
+      switchStates,
+      initialInductorCurrents,
+      transientCompanions,
+    );
     if (spec) {
       const issue = addMnaBranch(spec, topology, branches, branchByPartId);
       if (issue) { return { issue }; }
@@ -1129,10 +1158,6 @@ function buildLayout(
     document, [...branches, ...internalBranches], topology.nodeCount,
   );
   if (idealVoltageCycleIssue) { return { issue: idealVoltageCycleIssue }; }
-
-  if (mode === "ac") {
-    assignAcBranchCurrentScales(document, topology, [...branches, ...internalBranches]);
-  }
 
   const size = topology.nodeUnknownCount + branches.length + internalBranches.length;
   if (size > MAX_ANALOG_ANALYSIS_UNKNOWNS) {
@@ -1367,6 +1392,16 @@ function nonlinearModel(part: CircuitPart, voltages: number[]): NonlinearModel |
   return null;
 }
 
+function isNonlinearPart(part: CircuitPart) {
+  return part.kind === "diode" || part.kind === "led" || part.kind === "npn-transistor" ||
+    part.kind === "pnp-transistor" || part.kind === "nmos" || part.kind === "pmos" ||
+    part.kind === "op-amp";
+}
+
+function hasNonlinearParts(document: CircuitDocument) {
+  return document.parts.some(isNonlinearPart);
+}
+
 function mosChannelConductingByPartId(
   document: CircuitDocument,
   biasLayout: MnaLayout,
@@ -1390,22 +1425,86 @@ function nodeRealValue(layout: MnaLayout, node: number, state: Float64Array) {
   return unknown < 0 ? 0 : (state[unknown] ?? 0);
 }
 
-function terminalRealValues(part: CircuitPart, layout: MnaLayout, state: Float64Array) {
-  return terminalsOf(part.kind).map((terminal) => {
-    const node = layout.topology.terminalNodes.get(endpointKey(part.id, terminal));
-    return node === undefined ? 0 : nodeRealValue(layout, node, state);
-  });
-}
-
 function addMatrix(matrix: Float64Array, size: number, row: number, column: number, value: number) {
   if (row < 0 || column < 0 || row >= size || column >= size) { return; }
   const index = row * size + column;
-  matrix[index] = (matrix[index] ?? 0) + value;
+  addRealStateValue(matrix, index, value);
 }
 
-function addResidual(residual: ResidualTerms, row: number, value: number) {
+function addExactMatrixValue(
+  matrix: Float64Array,
+  size: number,
+  row: number,
+  column: number,
+  value: ExactRational,
+) {
+  if (row < 0 || column < 0 || row >= size || column >= size) { return; }
+  addRealStateValue(matrix, row * size + column, value);
+}
+
+function exactNumberSum(values: readonly number[]) {
+  let sum = numberToExactRational(0);
+  if (!sum) { return null; }
+  for (const value of values) {
+    const exactValue = numberToExactRational(value);
+    if (!exactValue) { return null; }
+    sum = addExactRational(sum, exactValue);
+  }
+  return sum;
+}
+
+function negativeExact(value: ExactRational): ExactRational {
+  const zero = numberToExactRational(0);
+  return zero ? subtractExactRational(zero, value) : value;
+}
+
+function addResidual(residual: ResidualTerms, row: number, value: ResidualTerm) {
   if (row < 0 || row >= residual.length) { return; }
-  if (value !== 0) { residual[row]?.push(value); }
+  if (typeof value === "number" ? value !== 0 : value.numerator !== 0n) {
+    residual[row]?.push(value);
+  }
+}
+
+function exactResidualSum(terms: readonly ResidualTerm[]) {
+  const exactTerms: ExactRational[] = [];
+  for (const term of terms) {
+    const exactTerm = typeof term === "number" ? numberToExactRational(term) : term;
+    if (!exactTerm) { return null; }
+    exactTerms.push(exactTerm);
+  }
+  return sumExactRationals(exactTerms);
+}
+
+function negatedExactResidual(values: readonly ExactRational[]) {
+  return values.map(negativeExact);
+}
+
+function exactStateValue(state: Float64Array, index: number): number | ExactRational {
+  if (index < 0) { return numberToExactRational(0) ?? 0; }
+  return exactRealStateValue(state, index) ?? state[index] ?? 0;
+}
+
+function negatedResidualTerm(value: number | ExactRational): number | ExactRational {
+  return typeof value === "number" ? -value : negativeExact(value);
+}
+
+function exactRhsFromResidualTerms(residual: ResidualTerms) {
+  const exactValues = residual.map(exactResidualSum);
+  return exactValues.every((value): value is ExactRational => value !== null)
+    ? negatedExactResidual(exactValues)
+    : null;
+}
+
+function exactRealStateDifference(left: Float64Array, right: Float64Array) {
+  if (left.length !== right.length) { return null; }
+  const difference: ExactRational[] = [];
+  for (let index = 0; index < left.length; index += 1) {
+    const leftValue = exactRealStateValue(left, index);
+    const rightValue = exactRealStateValue(right, index);
+    if (!leftValue || !rightValue) { return null; }
+    difference.push(subtractExactRational(leftValue, rightValue));
+  }
+  return realStateFromExact(difference);
 }
 
 function stampConductance(
@@ -1419,10 +1518,18 @@ function stampConductance(
 ) {
   const positiveUnknown = layout.topology.nodeUnknowns[positiveNode] ?? -1;
   const negativeUnknown = layout.topology.nodeUnknowns[negativeNode] ?? -1;
-  const voltage = nodeRealValue(layout, positiveNode, state) - nodeRealValue(layout, negativeNode, state);
-  const current = conductance * voltage;
-  addResidual(residual, positiveUnknown, current);
-  addResidual(residual, negativeUnknown, -current);
+  const positiveVoltage = exactStateValue(state, positiveUnknown);
+  const negativeVoltage = exactStateValue(state, negativeUnknown);
+  const current = exactDotProductRational(
+    [conductance, -conductance],
+    [positiveVoltage, negativeVoltage],
+  );
+  const fallbackCurrent = conductance * (
+    nodeRealValue(layout, positiveNode, state) - nodeRealValue(layout, negativeNode, state)
+  );
+  const currentTerm = current ?? fallbackCurrent;
+  addResidual(residual, positiveUnknown, currentTerm);
+  addResidual(residual, negativeUnknown, negatedResidualTerm(currentTerm));
   addMatrix(matrix, layout.size, positiveUnknown, positiveUnknown, conductance);
   addMatrix(matrix, layout.size, positiveUnknown, negativeUnknown, -conductance);
   addMatrix(matrix, layout.size, negativeUnknown, positiveUnknown, -conductance);
@@ -1448,8 +1555,7 @@ function addVoltageBranch(
   branch: Branch,
 ) {
   if (branch.redundantIdealSource) {
-    const branchCurrent = state[branch.unknownIndex] ?? 0;
-    addResidual(residual, branch.unknownIndex, branchCurrent);
+    addResidual(residual, branch.unknownIndex, exactStateValue(state, branch.unknownIndex));
     addMatrix(matrix, layout.size, branch.unknownIndex, branch.unknownIndex, 1);
     return;
   }
@@ -1458,18 +1564,42 @@ function addVoltageBranch(
   const branchCurrent = state[branch.unknownIndex] ?? 0;
   const positiveVoltage = nodeRealValue(layout, branch.positiveNode, state);
   const negativeVoltage = nodeRealValue(layout, branch.negativeNode, state);
-  addResidual(residual, positiveUnknown, branchCurrent);
-  addResidual(residual, negativeUnknown, -branchCurrent);
+  const exactBranchCurrent = exactStateValue(state, branch.unknownIndex);
+  addResidual(residual, positiveUnknown, exactBranchCurrent);
+  addResidual(residual, negativeUnknown, negatedResidualTerm(exactBranchCurrent));
   addMatrix(matrix, layout.size, positiveUnknown, branch.unknownIndex, 1);
   addMatrix(matrix, layout.size, negativeUnknown, branch.unknownIndex, -1);
-  addResidual(
-    residual,
-    branch.unknownIndex,
-    positiveVoltage -
-      negativeVoltage -
-      branch.seriesResistanceOhms * branchCurrent -
-      branch.sourceVoltage.real,
+  if (branch.transientCompanion) {
+    const companion = branch.transientCompanion;
+    const coefficients = companion.kind === "capacitor"
+      ? [companion.denominator, -companion.denominator, -companion.numerator, -companion.denominator]
+      : [companion.denominator, -companion.denominator, -companion.numerator, companion.numerator];
+    const values = [
+      exactStateValue(state, positiveUnknown),
+      exactStateValue(state, negativeUnknown),
+      exactBranchCurrent,
+      companion.exactHistoryValue ?? companion.historyValue,
+    ];
+    const exactResidual = exactDotProductRational(coefficients, values);
+    if (exactResidual) { addResidual(residual, branch.unknownIndex, exactResidual); }
+    addMatrix(matrix, layout.size, branch.unknownIndex, positiveUnknown, companion.denominator);
+    addMatrix(matrix, layout.size, branch.unknownIndex, negativeUnknown, -companion.denominator);
+    addMatrix(matrix, layout.size, branch.unknownIndex, branch.unknownIndex, -companion.numerator);
+    return;
+  }
+  const exactSourceVoltage = exactComplexValue(branch.sourceVoltage)?.real ?? branch.sourceVoltage.real;
+  const branchEquation = exactDotProductRational(
+    [1, -1, -branch.seriesResistanceOhms, -1],
+    [
+      exactStateValue(state, positiveUnknown),
+      exactStateValue(state, negativeUnknown),
+      exactBranchCurrent,
+      exactSourceVoltage,
+    ],
   );
+  addResidual(residual, branch.unknownIndex, branchEquation ?? (
+    positiveVoltage - negativeVoltage - branch.seriesResistanceOhms * branchCurrent - branch.sourceVoltage.real
+  ));
   addMatrix(matrix, layout.size, branch.unknownIndex, positiveUnknown, 1);
   addMatrix(matrix, layout.size, branch.unknownIndex, negativeUnknown, -1);
   addMatrix(
@@ -1495,15 +1625,23 @@ function stampNonlinear(
   for (let row = 0; row < terminals.length; row += 1) {
     const rowUnknown = layout.topology.nodeUnknowns[nodes[row] ?? -1] ?? -1;
     addResidual(residual, rowUnknown, model.currents[row] ?? 0);
-    for (let column = 0; column < terminals.length; column += 1) {
+    const coefficients = model.jacobian[row] ?? [];
+    for (let column = 0; column < terminals.length - 1; column += 1) {
       const columnUnknown = layout.topology.nodeUnknowns[nodes[column] ?? -1] ?? -1;
       addMatrix(
         matrix,
         layout.size,
         rowUnknown,
         columnUnknown,
-        model.jacobian[row]?.[column] ?? 0,
+        coefficients[column] ?? 0,
       );
+    }
+    // The model's terminal voltages are expressed relative to its final
+    // terminal. Make that gauge relation exact in the stamped MNA row.
+    const referenceCoefficient = exactNumberSum(coefficients.slice(0, terminals.length - 1));
+    const referenceUnknown = layout.topology.nodeUnknowns[nodes.at(-1) ?? -1] ?? -1;
+    if (referenceCoefficient) {
+      addExactMatrixValue(matrix, layout.size, rowUnknown, referenceUnknown, negativeExact(referenceCoefficient));
     }
   }
 }
@@ -1513,10 +1651,22 @@ function nonlinearTerminalVoltages(
   layout: MnaLayout,
   state: Float64Array,
 ) {
-  const values = terminalRealValues(part, layout, state);
-  if (part.kind !== "op-amp") { return values; }
-  const reference = nodeRealValue(layout, layout.physicalReferenceNode, state);
-  return values.map((value) => value - reference);
+  const values = terminalsOf(part.kind).map((terminal) => {
+    const node = nodeForTerminal(layout.topology, part, terminal);
+    const unknown = layout.topology.nodeUnknowns[node] ?? -1;
+    return unknown < 0 ? complex() : complexFromRealState(state, unknown);
+  });
+  if (part.kind !== "op-amp") {
+    const reference = values.at(-1) ?? complex();
+    return values.map((value) => voltageDifference(value, reference).real);
+  }
+  const referenceUnknown = layout.topology.nodeUnknowns[layout.physicalReferenceNode] ?? -1;
+  const reference = referenceUnknown < 0 ? complex() : complexFromRealState(state, referenceUnknown);
+  return [
+    voltageDifference(values[0] ?? complex(), values[1] ?? complex()).real,
+    0,
+    voltageDifference(values[2] ?? complex(), reference).real,
+  ];
 }
 
 function stampDcOpAmp(
@@ -1531,14 +1681,18 @@ function stampDcOpAmp(
   const outputUnknown = layout.topology.nodeUnknowns[outputNode] ?? -1;
   const referenceUnknown = layout.topology.nodeUnknowns[layout.physicalReferenceNode] ?? -1;
   const outputCurrent = model.currents[2] ?? 0;
-  const referenceSlope = nonlinearReferenceDerivative(part, model, 2);
+  const outputCoefficients = model.jacobian[2] ?? [];
+  const referenceSlopeSum = exactNumberSum(outputCoefficients);
+  const referenceSlope = referenceSlopeSum ? negativeExact(referenceSlopeSum) : null;
 
   addResidual(residual, outputUnknown, outputCurrent);
   for (let column = 0; column < nodes.length; column += 1) {
     const columnUnknown = layout.topology.nodeUnknowns[nodes[column] ?? -1] ?? -1;
     addMatrix(matrix, layout.size, outputUnknown, columnUnknown, model.jacobian[2]?.[column] ?? 0);
   }
-  addMatrix(matrix, layout.size, outputUnknown, referenceUnknown, referenceSlope);
+  if (referenceSlope) {
+    addExactMatrixValue(matrix, layout.size, outputUnknown, referenceUnknown, referenceSlope);
+  }
 
   // The op-amp output stage returns its current to the physical reference node.
   addResidual(residual, referenceUnknown, -outputCurrent);
@@ -1546,7 +1700,9 @@ function stampDcOpAmp(
     const columnUnknown = layout.topology.nodeUnknowns[nodes[column] ?? -1] ?? -1;
     addMatrix(matrix, layout.size, referenceUnknown, columnUnknown, -(model.jacobian[2]?.[column] ?? 0));
   }
-  addMatrix(matrix, layout.size, referenceUnknown, referenceUnknown, -referenceSlope);
+  if (referenceSlope) {
+    addExactMatrixValue(matrix, layout.size, referenceUnknown, referenceUnknown, negativeExact(referenceSlope));
+  }
 }
 
 function resistorValue(part: CircuitPart) {
@@ -1915,11 +2071,11 @@ function stampDcReferences(
     if (unknown < 0) { continue; }
     // Replace a redundant KCL row with an exact reference. Adding a tiny
     // conductance here loses that reference next to low-resistance branches.
-    matrix.fill(0, unknown * layout.size, (unknown + 1) * layout.size);
+    clearRealStateRange(matrix, unknown * layout.size, (unknown + 1) * layout.size);
     residual[unknown] = [];
     if (derivatives.length === 0) {
-      matrix[unknown * layout.size + unknown] = 1;
-      addResidual(residual, unknown, state[unknown] ?? 0);
+      setRealStateValue(matrix, unknown * layout.size + unknown, 1);
+      addResidual(residual, unknown, exactStateValue(state, unknown));
       continue;
     }
     // Across an inductor cutset, the prescribed currents already satisfy KCL.
@@ -1931,8 +2087,15 @@ function stampDcReferences(
       const outside = layout.topology.nodeUnknowns[branch.outside] ?? -1;
       addMatrix(matrix, layout.size, unknown, inside, conductance);
       addMatrix(matrix, layout.size, unknown, outside, -conductance);
-      addResidual(residual, unknown,
-        conductance * (nodeRealValue(layout, branch.inside, state) - nodeRealValue(layout, branch.outside, state)));
+      const derivativeResidual = exactDotProductRational(
+        [conductance, -conductance],
+        [exactStateValue(state, inside), exactStateValue(state, outside)],
+      );
+      addResidual(residual, unknown, derivativeResidual ?? (
+        conductance * (
+          nodeRealValue(layout, branch.inside, state) - nodeRealValue(layout, branch.outside, state)
+        )
+      ));
     }
   }
 }
@@ -1959,26 +2122,176 @@ function assembleDc(
   if (includeReferences) {
     stampDcReferences(document, layout, state, matrix, residual, channelConductingForReferences);
   }
-  return { matrix, residual: Float64Array.from(residual, exactComponentSum) };
+  const exactResidualTerms = residual.map(exactResidualSum);
+  const exactResidual = exactResidualTerms.every((value): value is ExactRational => value !== null)
+    ? exactResidualTerms
+    : null;
+  return {
+    matrix,
+    residual: Float64Array.from(exactResidualTerms, (value) => value ? exactRationalToNumber(value) : Number.NaN),
+    exactResidual,
+  };
 }
 
-function rowRelativeEquationScale(
+function addCurrentSourceAbsoluteRhs(
+  rhs: ResidualTerms,
+  layout: MnaLayout,
+  positiveNode: number,
+  negativeNode: number,
+  current: number,
+) {
+  addResidual(rhs, layout.topology.nodeUnknowns[positiveNode] ?? -1, -current);
+  addResidual(rhs, layout.topology.nodeUnknowns[negativeNode] ?? -1, current);
+}
+
+function addBranchAbsoluteRhs(rhs: ResidualTerms, branch: Branch) {
+  if (branch.redundantIdealSource) { return true; }
+  if (branch.transientCompanion) {
+    const companion = branch.transientCompanion;
+    const history = companion.exactHistoryValue ?? companion.historyValue;
+    const coefficient = companion.kind === "capacitor" ? companion.denominator : companion.numerator;
+    const source = exactProductSumRatio([{
+      factors: [coefficient, history],
+      sign: companion.kind === "capacitor" ? 1 : -1,
+    }], 1);
+    if (!source) { return false; }
+    addResidual(rhs, branch.unknownIndex, source);
+    return true;
+  }
+  const source = exactComplexValue(branch.sourceVoltage)?.real ??
+    numberToExactRational(branch.sourceVoltage.real);
+  if (!source) { return false; }
+  addResidual(rhs, branch.unknownIndex, source);
+  return true;
+}
+
+function nonlinearAbsoluteRhs(
+  rhs: ResidualTerms,
+  layout: MnaLayout,
+  part: CircuitPart,
+  center: readonly number[],
+  model: NonlinearModel,
+) {
+  if (part.kind === "op-amp") {
+    const row = 2;
+    const coefficients = model.jacobian[row] ?? [];
+    const linearizedCurrent = exactDotProductRational(coefficients, center);
+    const current = numberToExactRational(model.currents[row] ?? 0);
+    if (!linearizedCurrent || !current) { return false; }
+    const offset = subtractExactRational(linearizedCurrent, current);
+    const outputNode = nodeForTerminal(layout.topology, part, "c");
+    const outputUnknown = layout.topology.nodeUnknowns[outputNode] ?? -1;
+    const referenceUnknown = layout.topology.nodeUnknowns[layout.physicalReferenceNode] ?? -1;
+    addResidual(rhs, outputUnknown, offset);
+    addResidual(rhs, referenceUnknown, negativeExact(offset));
+    return true;
+  }
+
+  const terminals = terminalsOf(part.kind);
+  for (let row = 0; row < terminals.length; row += 1) {
+    const coefficients = model.jacobian[row] ?? [];
+    const linearizedCurrent = exactDotProductRational(
+      coefficients.slice(0, terminals.length - 1),
+      center.slice(0, terminals.length - 1),
+    );
+    const current = numberToExactRational(model.currents[row] ?? 0);
+    if (!linearizedCurrent || !current) { return false; }
+    const offset = subtractExactRational(linearizedCurrent, current);
+    const node = nodeForTerminal(layout.topology, part, terminals[row] ?? terminals.at(-1)!);
+    addResidual(rhs, layout.topology.nodeUnknowns[node] ?? -1, offset);
+  }
+  return true;
+}
+
+function addPartAbsoluteRhs(
+  rhs: ResidualTerms,
+  layout: MnaLayout,
+  state: Float64Array,
+  part: CircuitPart,
+) {
+  const branch = layout.branchByPartId.get(part.id);
+  if (branch && !addBranchAbsoluteRhs(rhs, branch)) { return false; }
+  const positiveNode = nodeForTerminal(layout.topology, part, "a");
+  const negativeNode = nodeForTerminal(layout.topology, part, "b");
+  if (part.kind === "current-source") {
+    addCurrentSourceAbsoluteRhs(rhs, layout, positiveNode, negativeNode, part.currentAmps ?? 0);
+  } else if (part.kind === "inductor" && layout.initialInductorCurrents) {
+    addCurrentSourceAbsoluteRhs(rhs, layout, positiveNode, negativeNode, part.initialCurrentAmps ?? 0);
+  }
+  if (!isNonlinearPart(part)) { return true; }
+  const center = nonlinearTerminalVoltages(part, layout, state);
+  const model = nonlinearModel(part, center);
+  return !model || nonlinearAbsoluteRhs(rhs, layout, part, center, model);
+}
+
+function clearReferenceAbsoluteRhs(
+  rhs: ResidualTerms,
+  document: CircuitDocument,
+  layout: MnaLayout,
+  channelConductingForReferences: Readonly<Record<string, boolean>>,
+) {
+  for (const { node } of referenceConstraints(document, layout, "dc", channelConductingForReferences)) {
+    const unknown = layout.topology.nodeUnknowns[node] ?? -1;
+    if (unknown >= 0) { rhs[unknown] = []; }
+  }
+}
+
+function absoluteDcRhs(
+  document: CircuitDocument,
+  layout: MnaLayout,
+  state: Float64Array,
+  channelConductingForReferences: Readonly<Record<string, boolean>>,
+) {
+  const rhs: ResidualTerms = Array.from({ length: layout.size }, () => []);
+  for (const part of document.parts) {
+    if (!addPartAbsoluteRhs(rhs, layout, state, part)) { return null; }
+  }
+  for (const branch of layout.internalBranches) {
+    if (!addBranchAbsoluteRhs(rhs, branch)) { return null; }
+  }
+  clearReferenceAbsoluteRhs(rhs, document, layout, channelConductingForReferences);
+  const exactRhs = rhs.map(exactResidualSum);
+  return exactRhs.every((value): value is ExactRational => value !== null) ? exactRhs : null;
+}
+
+function absoluteExactRational(value: ExactRational): ExactRational {
+  return value.numerator < 0n ? negativeExact(value) : value;
+}
+
+function largerNonnegativeRational(left: ExactRational, right: ExactRational) {
+  return left.numerator * right.denominator >= right.numerator * left.denominator ? left : right;
+}
+
+function exactRowTolerance(
   layout: MnaLayout,
   assembly: DcAssembly,
   state: Float64Array,
   row: number,
-  relativeTolerance: number,
+  relative: ExactRational,
+  absoluteTolerance: number,
 ) {
-  let scale = 0;
+  const exactAbsoluteTolerance = numberToExactRational(absoluteTolerance);
+  const equationTerms: ExactRational[] = [];
+  const residual = assembly.exactResidual?.[row];
+  if (!exactAbsoluteTolerance || !residual) { return null; }
   for (let column = 0; column < layout.size; column += 1) {
-    const term = (assembly.matrix[row * layout.size + column] ?? 0) * (state[column] ?? 0);
-    if (!Number.isFinite(term)) { return null; }
-    // Scale each term before summing so finite equations near Number.MAX_VALUE
-    // do not overflow while computing a relative convergence tolerance.
-    scale += relativeTolerance * Math.abs(term);
-    if (!Number.isFinite(scale)) { return null; }
+    const matrixIndex = row * layout.size + column;
+    const coefficient = exactRealStateValue(assembly.matrix, matrixIndex);
+    const value = exactStateValue(state, column);
+    const exactCoefficient = coefficient ?? numberToExactRational(assembly.matrix[matrixIndex] ?? Number.NaN);
+    const exactValue = typeof value === "number" ? numberToExactRational(value) : value;
+    if (!exactCoefficient || !exactValue) { return null; }
+    if (exactCoefficient.numerator === 0n || exactValue.numerator === 0n) { continue; }
+    const term = multiplyExactRational(exactCoefficient, exactValue);
+    equationTerms.push(absoluteExactRational(term));
   }
-  return scale;
+  const equationScale = sumExactRationals(equationTerms);
+  const absoluteResidual = absoluteExactRational(residual);
+  const relativeEquationScale = multiplyExactRational(relative, equationScale);
+  const relativeResidualScale = multiplyExactRational(relative, absoluteResidual);
+  const dominantScale = largerNonnegativeRational(relativeEquationScale, relativeResidualScale);
+  const tolerance = addExactRational(exactAbsoluteTolerance, dominantScale);
+  return tolerance.numerator > 0n ? tolerance : null;
 }
 
 function residualTolerances(
@@ -1988,64 +2301,59 @@ function residualTolerances(
   currentTolerance = NEWTON_CURRENT_TOLERANCE_AMPS,
   voltageTolerance = NEWTON_VOLTAGE_TOLERANCE_VOLTS,
   relativeTolerance = NEWTON_RELATIVE_TOLERANCE,
-): number[] | null {
-  const tolerances: number[] = [];
+): ExactRational[] | null {
+  if (!assembly.exactResidual) { return null; }
+  const relative = numberToExactRational(relativeTolerance);
+  const tolerances: ExactRational[] = [];
+  if (!relative) { return null; }
   for (let row = 0; row < layout.size; row += 1) {
-    const relativeEquationScale = rowRelativeEquationScale(
-      layout,
-      assembly,
-      state,
-      row,
-      relativeTolerance,
-    );
-    if (relativeEquationScale === null) { return null; }
-    // Keep an initially zero state relative to the source current or voltage that drives it.
-    const residualScale = Math.abs(assembly.residual[row] ?? 0);
-    if (!Number.isFinite(residualScale)) { return null; }
-    const relativeResidualScale = relativeTolerance * residualScale;
-    if (!Number.isFinite(relativeResidualScale)) { return null; }
     const absoluteTolerance = row < layout.topology.nodeUnknownCount
       ? currentTolerance
       : voltageTolerance;
-    const tolerance = absoluteTolerance + Math.max(relativeEquationScale, relativeResidualScale);
-    if (!Number.isFinite(tolerance) || tolerance <= 0) { return null; }
+    const tolerance = exactRowTolerance(layout, assembly, state, row, relative, absoluteTolerance);
+    if (!tolerance) { return null; }
     tolerances.push(tolerance);
   }
   return tolerances;
 }
 
-function residualScore(layout: MnaLayout, assembly: DcAssembly, tolerances: number[] | null) {
-  if (!tolerances) { return Number.POSITIVE_INFINITY; }
+function residualScore(layout: MnaLayout, assembly: DcAssembly, tolerances: ExactRational[] | null) {
+  if (!tolerances || !assembly.exactResidual) { return Number.POSITIVE_INFINITY; }
   let score = 0;
   for (let row = 0; row < layout.size; row += 1) {
-    const residual = Math.abs(assembly.residual[row] ?? 0);
-    if (!Number.isFinite(residual)) { return Number.POSITIVE_INFINITY; }
-    score = Math.max(score, residual / (tolerances[row] ?? 0));
+    const residual = assembly.exactResidual[row];
+    const tolerance = tolerances[row];
+    if (!residual || !tolerance) { return Number.POSITIVE_INFINITY; }
+    const normalized = divideExactRational(absoluteExactRational(residual), tolerance);
+    if (!normalized) { return Number.POSITIVE_INFINITY; }
+    score = Math.max(score, exactRationalToNumber(normalized));
+    if (!Number.isFinite(score)) { return Number.POSITIVE_INFINITY; }
   }
   return score;
 }
 
 function currentBiasedDcSeed(document: CircuitDocument, layout: MnaLayout, state: Float64Array) {
   const biasedAssembly = assembleDc(document, layout, state);
-  const biasedRhs = Float64Array.from(biasedAssembly.residual, (value) => -value);
-  if (solveRealLinearSystem(layout.size, biasedAssembly.matrix, biasedRhs)) { return state; }
+  const biasedRhs = biasedAssembly.exactResidual
+    ? negatedExactResidual(biasedAssembly.exactResidual)
+    : null;
+  if (biasedRhs && solveRealLinearSystem(layout.size, biasedAssembly.matrix, biasedRhs)) { return state; }
 
   // Independent voltage biases can already turn a MOS channel on. Preserve
   // their device slopes before seeding a remaining current-driven zero row;
   // I/GMIN alone can push a responsive channel into flat saturation instead.
-  const { matrix, residual: assembledResidual } = assembleDc(document, layout, state, false);
-  const residual: ResidualTerms = Array.from(assembledResidual, (value) => [value]);
+  const unbiasedAssembly = assembleDc(document, layout, state, false);
+  const { matrix } = unbiasedAssembly;
+  const residual: ResidualTerms = (unbiasedAssembly.exactResidual ?? []).map((value) => [value]);
   for (let node = 0; node < layout.topology.nodeCount; node += 1) {
     if (node !== layout.topology.referenceNode) {
       stampConductance(matrix, residual, layout, state, node, layout.topology.referenceNode, GMIN_SIEMENS);
     }
   }
   stampDcReferences(document, layout, state, matrix, residual);
-  const rhs = Float64Array.from(residual, (terms) => -exactComponentSum(terms));
-  const correction = solveRealLinearSystem(layout.size, matrix, rhs);
-  return correction
-    ? Float64Array.from(state, (value, index) => value + (correction[index] ?? 0))
-    : state;
+  const rhs = exactRhsFromResidualTerms(residual);
+  const correction = rhs ? solveRealLinearSystem(layout.size, matrix, rhs) : null;
+  return correction ? addScaledRealState(state, correction, 1) : state;
 }
 
 function linearDcSeed(document: CircuitDocument, layout: MnaLayout) {
@@ -2066,8 +2374,8 @@ function linearDcSeed(document: CircuitDocument, layout: MnaLayout) {
     addVoltageBranch(matrix, residual, layout, state, branch);
   }
   stampDcReferences(document, layout, state, matrix, residual);
-  const rhs = Float64Array.from(residual, (terms) => -exactComponentSum(terms));
-  const voltageSeed = solveRealLinearSystem(layout.size, matrix, rhs);
+  const rhs = exactRhsFromResidualTerms(residual);
+  const voltageSeed = rhs ? solveRealLinearSystem(layout.size, matrix, rhs) : null;
   return voltageSeed ? currentBiasedDcSeed(document, layout, voltageSeed) : null;
 }
 
@@ -2076,7 +2384,7 @@ function solveDcNewtonStep(
   layout: MnaLayout,
   state: Float64Array,
   assembly: DcAssembly,
-  tolerances: number[] | null,
+  tolerances: ExactRational[] | null,
   score: number,
 ) {
   // Keep this iteration's floating-node constraints fixed while comparing
@@ -2084,16 +2392,21 @@ function solveDcNewtonStep(
   // its new bias point, so a cutoff MOS can turn on without its candidate KCL
   // residual being rejected against a different equation set.
   const channelConductingForReferences = mosChannelConductingByPartId(document, layout, state);
-  const rhs = Float64Array.from(assembly.residual, (value) => -value);
-  const delta = solveRealLinearSystem(layout.size, assembly.matrix, rhs);
-  if (!delta) { return { nextState: undefined, singular: true }; }
+  const rhs = absoluteDcRhs(document, layout, state, channelConductingForReferences);
+  const targetState = rhs ? solveRealLinearSystem(layout.size, assembly.matrix, rhs) : null;
+  if (!targetState) { return { nextState: undefined, singular: true }; }
 
   let step = 1;
-  let nextState: Float64Array<ArrayBuffer> | undefined;
+  let nextState: Float64Array | undefined;
+  let delta: Float64Array | null = null;
   for (let search = 0; search < 14; search += 1) {
-    const candidate = state.slice();
-    for (let index = 0; index < layout.size; index += 1) {
-      candidate[index] = (state[index] ?? 0) + step * (delta[index] ?? 0);
+    let candidate: Float64Array;
+    if (step === 1) {
+      candidate = cloneRealState(targetState);
+    } else {
+      delta ??= exactRealStateDifference(targetState, state);
+      if (!delta) { return { nextState: undefined, singular: true }; }
+      candidate = addScaledRealState(state, delta, step);
     }
     const candidateAssembly = assembleDc(
       document,
@@ -2114,46 +2427,193 @@ function solveDcNewtonStep(
   return { nextState, singular: false };
 }
 
+function hasNonzeroExactResidual(assembly: DcAssembly) {
+  return assembly.exactResidual?.some(({ numerator }) => numerator !== 0n) ?? true;
+}
+
+function exactZeroPhysicalSolution(
+  document: CircuitDocument,
+  layout: MnaLayout,
+  state: Float64Array,
+  assembly: DcAssembly,
+) {
+  return hasNonzeroExactResidual(assembly)
+    ? null
+    : validatePhysicalDcSolution(document, layout, state);
+}
+
+function solveLinearTargetState(
+  size: number,
+  matrix: Float64Array,
+  rhs: readonly ExactRational[],
+) {
+  const cached = solveRealLinearSystemWithExactInverseCache(size, matrix, rhs);
+  if (cached.status === "solved") { return cached.solution; }
+  if (cached.status === "singular") { return null; }
+  return solveRealLinearSystem(size, matrix, rhs);
+}
+
+function nonlinearCenters(document: CircuitDocument, layout: MnaLayout, state: Float64Array) {
+  const centers: number[][] = [];
+  for (const part of document.parts) {
+    if (isNonlinearPart(part)) {
+      centers.push(nonlinearTerminalVoltages(part, layout, state));
+    }
+  }
+  return centers;
+}
+
+function nonlinearCentersMatch(left: readonly number[][], right: readonly number[][]) {
+  return left.length === right.length && left.every((center, partIndex) => {
+    const other = right[partIndex];
+    return other !== undefined && center.length === other.length &&
+      center.every((value, index) => Object.is(value, other[index]));
+  });
+}
+
+function polishConvergedDcState(
+  document: CircuitDocument,
+  layout: MnaLayout,
+  state: Float64Array,
+  tolerances: ExactRational[],
+  score: number,
+) {
+  if (score === 0 || !hasNonlinearParts(document)) { return state; }
+  let polished = state;
+  let polishedScore = score;
+  for (let iteration = 0; iteration < 3; iteration += 1) {
+    const channelConducting = mosChannelConductingByPartId(document, layout, polished);
+    const assembly = assembleDc(document, layout, polished, true, channelConducting);
+    const rhs = absoluteDcRhs(document, layout, polished, channelConducting);
+    const target = rhs ? solveRealLinearSystem(layout.size, assembly.matrix, rhs) : null;
+    if (!target) { break; }
+    const candidateAssembly = assembleDc(document, layout, target, true, channelConducting);
+    const candidateScore = residualScore(layout, candidateAssembly, tolerances);
+    if (!(candidateScore < polishedScore)) { break; }
+    const centersUnchanged = nonlinearCentersMatch(
+      nonlinearCenters(document, layout, polished),
+      nonlinearCenters(document, layout, target),
+    );
+    polished = target;
+    polishedScore = candidateScore;
+    if (centersUnchanged) { break; }
+  }
+  return polished;
+}
+
+function initialDcState(document: CircuitDocument, layout: MnaLayout, initialState?: Float64Array) {
+  if (initialState) { return { state: cloneRealState(initialState), usedLinearSeed: true }; }
+  if (!hasNonlinearParts(document)) {
+    return { state: new Float64Array(layout.size), usedLinearSeed: false };
+  }
+  const seed = linearDcSeed(document, layout);
+  return seed
+    ? { state: cloneRealState(seed), usedLinearSeed: true }
+    : { state: new Float64Array(layout.size), usedLinearSeed: false };
+}
+
+function validatePolishedDcSolution(
+  document: CircuitDocument,
+  layout: MnaLayout,
+  state: Float64Array,
+  tolerances: ExactRational[] | null,
+  score: number,
+) {
+  const polished = tolerances
+    ? polishConvergedDcState(document, layout, state, tolerances, score)
+    : state;
+  return validatePhysicalDcSolution(document, layout, polished);
+}
+
+function solveLinearDcAtReference(
+  document: CircuitDocument,
+  layout: MnaLayout,
+  state: Float64Array,
+) {
+  const assembly = assembleDc(document, layout, state);
+  if (!assembly.exactResidual) { return { converged: false, singular: false }; }
+  const exactSolution = exactZeroPhysicalSolution(document, layout, state, assembly);
+  if (exactSolution) { return exactSolution; }
+  const rhs = absoluteDcRhs(document, layout, state, {});
+  if (!rhs) { return { converged: false, singular: false }; }
+  const targetState = solveLinearTargetState(layout.size, assembly.matrix, rhs);
+  return targetState
+    ? validatePhysicalDcSolution(document, layout, targetState)
+    : { converged: false, singular: true };
+}
+
+function linearSeedAfterFailedStep(
+  document: CircuitDocument,
+  layout: MnaLayout,
+  state: Float64Array,
+  usedLinearSeed: boolean,
+  singular: boolean,
+) {
+  if (!singular || usedLinearSeed) { return null; }
+  const seed = linearDcSeed(document, layout);
+  return seed?.some((value, index) => value !== (state[index] ?? 0))
+    ? cloneRealState(seed)
+    : null;
+}
+
+function finishDcAtReference(
+  document: CircuitDocument,
+  layout: MnaLayout,
+  state: Float64Array,
+  usedLinearSeed: boolean,
+): { state?: Float64Array; converged: boolean; singular: boolean; invalidPhysicalSolution?: boolean } {
+  const finalAssembly = assembleDc(document, layout, state);
+  const exactSolution = exactZeroPhysicalSolution(document, layout, state, finalAssembly);
+  if (exactSolution) { return exactSolution; }
+  const tolerances = residualTolerances(layout, finalAssembly, state);
+  const score = residualScore(layout, finalAssembly, tolerances);
+  if (score <= 1) {
+    return validatePolishedDcSolution(document, layout, state, tolerances, score);
+  }
+  // A nearly zero device slope can stall line search before an independent
+  // bias is reached. Retry once with those linear voltage biases established.
+  const seed = usedLinearSeed ? null : linearDcSeed(document, layout);
+  return seed
+    ? solveDcAtReference(document, layout, seed)
+    : { converged: false, singular: false };
+}
+
 function solveDcAtReference(
   document: CircuitDocument,
   layout: MnaLayout,
   initialState?: Float64Array,
 ): { state?: Float64Array; converged: boolean; singular: boolean; invalidPhysicalSolution?: boolean } {
-  let state = initialState ? new Float64Array(initialState) : new Float64Array(layout.size);
-  let usedLinearSeed = initialState !== undefined;
+  const initial = initialDcState(document, layout, initialState);
+  let state: Float64Array = initial.state;
+  let usedLinearSeed = initial.usedLinearSeed;
   if (layout.size === 0) { return { state, converged: true, singular: false }; }
+  if (!hasNonlinearParts(document)) { return solveLinearDcAtReference(document, layout, state); }
 
   for (let iteration = 0; iteration < MAX_NEWTON_ITERATIONS; iteration += 1) {
     const assembled = assembleDc(document, layout, state);
+    const exactSolution = exactZeroPhysicalSolution(document, layout, state, assembled);
+    if (exactSolution) { return exactSolution; }
     const tolerances = residualTolerances(layout, assembled, state);
     const score = residualScore(layout, assembled, tolerances);
-    const hasInitialResidual = iteration === 0 && assembled.residual.some((value) => value !== 0);
+    const hasInitialResidual = iteration === 0 && hasNonzeroExactResidual(assembled);
     if (score <= 1 && !hasInitialResidual) {
-      return validatePhysicalDcSolution(document, layout, state);
+      return validatePolishedDcSolution(document, layout, state, tolerances, score);
     }
     const step = solveDcNewtonStep(document, layout, state, assembled, tolerances, score);
     if (!step.nextState) {
-      if (step.singular && iteration === 0 && !usedLinearSeed) {
-        const seed = linearDcSeed(document, layout);
-        if (seed?.some((value, index) => value !== (state[index] ?? 0))) {
-          state.set(seed);
-          usedLinearSeed = true;
-          continue;
-        }
+      const seed = iteration === 0
+        ? linearSeedAfterFailedStep(document, layout, state, usedLinearSeed, step.singular)
+        : null;
+      if (seed) {
+        state = seed;
+        usedLinearSeed = true;
+        continue;
       }
       return { converged: false, singular: step.singular };
     }
     state = step.nextState;
   }
-  const finalAssembly = assembleDc(document, layout, state);
-  const finalTolerances = residualTolerances(layout, finalAssembly, state);
-  const finalScore = residualScore(layout, finalAssembly, finalTolerances);
-  if (finalScore <= 1) { return validatePhysicalDcSolution(document, layout, state); }
-  // A nearly zero device slope can stall line search before an independent
-  // bias is reached. Retry once with those linear voltage biases established.
-  const seed = usedLinearSeed ? null : linearDcSeed(document, layout);
-  if (seed) { return solveDcAtReference(document, layout, seed); }
-  return { converged: false, singular: false };
+  return finishDcAtReference(document, layout, state, usedLinearSeed);
 }
 
 function validatePhysicalDcSolution(
@@ -2162,6 +2622,9 @@ function validatePhysicalDcSolution(
   state: Float64Array,
 ): { state?: Float64Array; converged: boolean; singular: boolean; invalidPhysicalSolution?: boolean } {
   const physicalAssembly = assembleDc(document, layout, state, false);
+  if (!hasNonzeroExactResidual(physicalAssembly)) {
+    return { state, converged: true, singular: false };
+  }
   const physicalScore = residualScore(
     layout,
     physicalAssembly,
@@ -2195,19 +2658,27 @@ function nodeComplexValue(layout: MnaLayout, node: number, solution: ComplexValu
   return unknown < 0 ? complex() : (solution[unknown] ?? complex());
 }
 
+function complexFromRealState(state: Float64Array, index: number) {
+  const real = exactRealStateValue(state, index);
+  const imaginary = numberToExactRational(0);
+  return real && imaginary
+    ? complexFromExact({ real, imaginary })
+    : complex(state[index] ?? 0);
+}
+
 function addComplexMatrix(
   matrixReal: Float64Array,
   matrixImaginary: Float64Array,
   size: number,
   row: number,
   column: number,
-  valueReal: number,
-  valueImaginary: number,
+  valueReal: number | ExactRational,
+  valueImaginary: number | ExactRational,
 ) {
   if (row < 0 || column < 0 || row >= size || column >= size) { return; }
   const index = row * size + column;
-  matrixReal[index] = (matrixReal[index] ?? 0) + valueReal;
-  matrixImaginary[index] = (matrixImaginary[index] ?? 0) + valueImaginary;
+  addRealStateValue(matrixReal, index, valueReal);
+  addRealStateValue(matrixImaginary, index, valueImaginary);
 }
 
 function stampAcReferences(
@@ -2220,9 +2691,9 @@ function stampAcReferences(
   for (const { node } of referenceConstraints(document, layout, "ac", channelConducting)) {
     const unknown = layout.topology.nodeUnknowns[node] ?? -1;
     if (unknown < 0) { continue; }
-    matrixReal.fill(0, unknown * layout.size, (unknown + 1) * layout.size);
-    matrixImaginary.fill(0, unknown * layout.size, (unknown + 1) * layout.size);
-    matrixReal[unknown * layout.size + unknown] = 1;
+    clearRealStateRange(matrixReal, unknown * layout.size, (unknown + 1) * layout.size);
+    clearRealStateRange(matrixImaginary, unknown * layout.size, (unknown + 1) * layout.size);
+    setRealStateValue(matrixReal, unknown * layout.size + unknown, 1);
   }
 }
 
@@ -2241,32 +2712,13 @@ function stampAcVoltageBranch(
   const positiveUnknown = layout.topology.nodeUnknowns[branch.positiveNode] ?? -1;
   const negativeUnknown = layout.topology.nodeUnknowns[branch.negativeNode] ?? -1;
   const reactance = branch.seriesReactanceOhms ?? 0;
-  const currentScale = branch.acCurrentScale ?? 1;
-  if (currentScale === 1) {
-    // Keep the established stamping for ordinary circuit values.
-    const rowScale = Math.max(1, Math.abs(branch.seriesResistanceOhms), Math.abs(reactance));
-    addComplexMatrix(matrixReal, matrixImaginary, layout.size, positiveUnknown, branch.unknownIndex, 1, 0);
-    addComplexMatrix(matrixReal, matrixImaginary, layout.size, negativeUnknown, branch.unknownIndex, -1, 0);
-    addComplexMatrix(matrixReal, matrixImaginary, layout.size, branch.unknownIndex, positiveUnknown, 1 / rowScale, 0);
-    addComplexMatrix(matrixReal, matrixImaginary, layout.size, branch.unknownIndex, negativeUnknown, -1 / rowScale, 0);
-    addComplexMatrix(
-      matrixReal, matrixImaginary, layout.size, branch.unknownIndex, branch.unknownIndex,
-      -branch.seriesResistanceOhms / rowScale, -reactance / rowScale,
-    );
-    rhsReal[branch.unknownIndex] = branch.sourceVoltage.real / rowScale;
-    rhsImaginary[branch.unknownIndex] = branch.sourceVoltage.imaginary / rowScale;
-    return;
-  }
-  // Store J = Zscale × I. This keeps voltage drops representable even when a
-  // component of I itself is below binary64 range; KCL converts J back with
-  // 1/Zscale, while the branch equation uses the normalized impedance.
   addComplexMatrix(
     matrixReal, matrixImaginary, layout.size, positiveUnknown, branch.unknownIndex,
-    1 / currentScale, 0,
+    1, 0,
   );
   addComplexMatrix(
     matrixReal, matrixImaginary, layout.size, negativeUnknown, branch.unknownIndex,
-    -1 / currentScale, 0,
+    -1, 0,
   );
   addComplexMatrix(matrixReal, matrixImaginary, layout.size, branch.unknownIndex, positiveUnknown, 1, 0);
   addComplexMatrix(matrixReal, matrixImaginary, layout.size, branch.unknownIndex, negativeUnknown, -1, 0);
@@ -2276,11 +2728,12 @@ function stampAcVoltageBranch(
     layout.size,
     branch.unknownIndex,
     branch.unknownIndex,
-    -branch.seriesResistanceOhms / currentScale,
-    -reactance / currentScale,
+    -branch.seriesResistanceOhms,
+    branch.exactSeriesReactance ? negatedResidualTerm(branch.exactSeriesReactance) : -reactance,
   );
-  rhsReal[branch.unknownIndex] = branch.sourceVoltage.real;
-  rhsImaginary[branch.unknownIndex] = branch.sourceVoltage.imaginary;
+  const exactSource = exactComplexValue(branch.sourceVoltage);
+  setRealStateValue(rhsReal, branch.unknownIndex, exactSource?.real ?? branch.sourceVoltage.real);
+  setRealStateValue(rhsImaginary, branch.unknownIndex, exactSource?.imaginary ?? branch.sourceVoltage.imaginary);
 }
 
 function stampAcAdmittance(
@@ -2293,21 +2746,23 @@ function stampAcAdmittance(
 ) {
   const positiveUnknown = layout.topology.nodeUnknowns[positiveNode] ?? -1;
   const negativeUnknown = layout.topology.nodeUnknowns[negativeNode] ?? -1;
+  const exact = exactComplexValue(admittance);
+  const negative = exactComplexValue(complexSubtract(complex(), admittance));
   addComplexMatrix(
     matrixReal, matrixImaginary, layout.size, positiveUnknown, positiveUnknown,
-    admittance.real, admittance.imaginary,
+    exact?.real ?? admittance.real, exact?.imaginary ?? admittance.imaginary,
   );
   addComplexMatrix(
     matrixReal, matrixImaginary, layout.size, positiveUnknown, negativeUnknown,
-    -admittance.real, -admittance.imaginary,
+    negative?.real ?? -admittance.real, negative?.imaginary ?? -admittance.imaginary,
   );
   addComplexMatrix(
     matrixReal, matrixImaginary, layout.size, negativeUnknown, positiveUnknown,
-    -admittance.real, -admittance.imaginary,
+    negative?.real ?? -admittance.real, negative?.imaginary ?? -admittance.imaginary,
   );
   addComplexMatrix(
     matrixReal, matrixImaginary, layout.size, negativeUnknown, negativeUnknown,
-    admittance.real, admittance.imaginary,
+    exact?.real ?? admittance.real, exact?.imaginary ?? admittance.imaginary,
   );
 }
 
@@ -2374,7 +2829,9 @@ function stampAcSmallSignalPart(
   const nodes = terminals.map((terminal) => nodeForTerminal(layout.topology, part, terminal));
   for (let row = 0; row < terminals.length; row += 1) {
     const rowUnknown = layout.topology.nodeUnknowns[nodes[row] ?? -1] ?? -1;
-    for (let column = 0; column < terminals.length; column += 1) {
+    const coefficients = model.jacobian[row] ?? [];
+    const columnCount = part.kind === "op-amp" ? terminals.length : terminals.length - 1;
+    for (let column = 0; column < columnCount; column += 1) {
       const columnUnknown = layout.topology.nodeUnknowns[nodes[column] ?? -1] ?? -1;
       addComplexMatrix(
         matrixReal,
@@ -2382,7 +2839,20 @@ function stampAcSmallSignalPart(
         layout.size,
         rowUnknown,
         columnUnknown,
-        model.jacobian[row]?.[column] ?? 0,
+        coefficients[column] ?? 0,
+        0,
+      );
+    }
+    if (part.kind !== "op-amp") {
+      const sum = exactNumberSum(coefficients.slice(0, columnCount));
+      const referenceUnknown = layout.topology.nodeUnknowns[nodes.at(-1) ?? -1] ?? -1;
+      addComplexMatrix(
+        matrixReal,
+        matrixImaginary,
+        layout.size,
+        rowUnknown,
+        referenceUnknown,
+        sum ? negativeExact(sum) : Number.NaN,
         0,
       );
     }
@@ -2480,7 +2950,7 @@ function acReferenceCandidatesFromSources(layout: MnaLayout) {
   for (const branch of layout.branches) {
     if (branch.kind !== "ac-source" || branch.positiveNode === branch.negativeNode) { continue; }
     addSourceEdge(branch.negativeNode, branch.positiveNode, branch.sourceVoltage);
-    addSourceEdge(branch.positiveNode, branch.negativeNode, complex(-branch.sourceVoltage.real, -branch.sourceVoltage.imaginary));
+    addSourceEdge(branch.positiveNode, branch.negativeNode, complexSubtract(complex(), branch.sourceVoltage));
   }
 
   // Follow series AC sources away from the original reference. Accumulating
@@ -2688,7 +3158,7 @@ function rebasedAcSolutionForQuality(
         layout.topology.referenceNode,
         rebasedValues,
       );
-      const offset = complex(-originalReferenceVoltage.real, -originalReferenceVoltage.imaginary);
+      const offset = complexSubtract(complex(), originalReferenceVoltage);
       const component = acReferenceComponent(document, rebasedLayout, referenceNode, channelConducting);
       bestSolution = {
         layout: rebasedLayout,
@@ -2750,7 +3220,7 @@ function solveAc(
       layout.topology.referenceNode,
       rebasedValues,
     );
-    const offset = complex(-originalReferenceVoltage.real, -originalReferenceVoltage.imaginary);
+    const offset = complexSubtract(complex(), originalReferenceVoltage);
     const component = acReferenceComponent(document, rebasedLayout, candidate.node, channelConducting);
     return {
       layout: rebasedLayout,
@@ -2775,7 +3245,7 @@ function terminalComplexValues(
 }
 
 function voltageDifference(left: ComplexValue, right: ComplexValue) {
-  return complex(left.real - right.real, left.imaginary - right.imaginary);
+  return complexSubtract(left, right);
 }
 
 function currentsFromVoltageBranch(
@@ -2786,20 +3256,14 @@ function currentsFromVoltageBranch(
   const branch = layout.branchByPartId.get(part.id);
   if (!branch) { return null; }
   const value = branchCurrentValue(branch, solution);
-  if (value.real === 0 && value.imaginary === 0) { return [complex(), complex()]; }
-  return [value, complex(-value.real, -value.imaginary)];
+  return [value, complexSubtract(complex(), value)];
 }
 
 function branchCurrentValue(branch: Branch, solution: ComplexValue[]) {
-  const scaledCurrent = solution[branch.unknownIndex] ?? complex();
-  const scale = branch.acCurrentScale ?? 1;
-  return scale === 1
-    ? scaledCurrent
-    : complex(scaledCurrent.real / scale, scaledCurrent.imaginary / scale);
+  return solution[branch.unknownIndex] ?? complex();
 }
 
 function reactiveCurrent(part: CircuitPart, frequencyHz: number | undefined, voltage: ComplexValue) {
-  if (voltage.real === 0 && voltage.imaginary === 0) { return complex(); }
   return complexMultiply(acReactiveAdmittance(part, frequencyHz ?? 0), voltage);
 }
 
@@ -2816,8 +3280,8 @@ function passiveTerminalCurrents(
   const vdiff = voltageDifference(va, vb);
   const terminalCount = terminalsOf(part.kind).length;
   if (part.kind === "resistor" || part.kind === "bulb") {
-    const current = complex(vdiff.real / resistorValue(part), vdiff.imaginary / resistorValue(part));
-    return [current, complex(-current.real, -current.imaginary)];
+    const current = complexDivide(vdiff, complex(resistorValue(part)));
+    return [current, complexSubtract(complex(), current)];
   }
   if (part.kind === "potentiometer") {
     const vc = voltages[2] ?? complex();
@@ -2833,17 +3297,14 @@ function passiveTerminalCurrents(
       );
       if (branch) { return branchCurrentValue(branch, solution); }
       if (resistance === 0) { return complex(); }
-      return complex(
-        (outerVoltage.real - vc.real) / resistance,
-        (outerVoltage.imaginary - vc.imaginary) / resistance,
-      );
+      return complexDivide(voltageDifference(outerVoltage, vc), complex(resistance));
     };
     const currentA = currentForSegment("a", va, segments.ac);
     const currentB = currentForSegment("b", vb, segments.cb);
     return [
       currentA,
       currentB,
-      complex(-currentA.real - currentB.real, -currentA.imaginary - currentB.imaginary),
+      complexSubtract(complex(), complexAdd(currentA, currentB)),
     ];
   }
   if (part.kind === "current-source") {
@@ -2851,9 +3312,8 @@ function passiveTerminalCurrents(
     return [complex(current), complex(-current)];
   }
   if ((part.kind === "capacitor" || part.kind === "inductor") && mode === "ac") {
-    // A reactance outside the representable range is stamped as a Norton
-    // admittance when that admittance remains representable; only a zero or
-    // unrepresentable admittance is an open branch.
+    // A reactance beyond binary64 range uses exact Norton admittance, even
+    // when that admittance's displayed number rounds to zero.
     if (
       !layout.branchByPartId.has(part.id) &&
       !layout.unboundedReactiveAdmittances.has(part.id)
@@ -2861,7 +3321,7 @@ function passiveTerminalCurrents(
       return [complex(), complex()];
     }
     const current = reactiveCurrent(part, frequencyHz, vdiff);
-    return [current, complex(-current.real, -current.imaginary)];
+    return [current, complexSubtract(complex(), current)];
   }
   return Array.from({ length: terminalCount }, () => complex());
 }
@@ -2881,21 +3341,20 @@ function nonlinearTerminalCurrents(
 
   const phasors = terminalComplexValues(part, layout, solution);
   return terminals.map((_, row) => {
-    let real = 0;
-    let imaginary = 0;
-    for (let column = 0; column < terminals.length; column += 1) {
-      const delta = phasors[column] ?? complex();
+    let current = complex();
+    const columnCount = part.kind === "op-amp" ? terminals.length : terminals.length - 1;
+    const deviceReference = part.kind === "op-amp" ? complex() : phasors.at(-1) ?? complex();
+    for (let column = 0; column < columnCount; column += 1) {
+      const delta = complexSubtract(phasors[column] ?? complex(), deviceReference);
       const slope = model.jacobian[row]?.[column] ?? 0;
-      real += slope * delta.real;
-      imaginary += slope * delta.imaginary;
+      current = complexAdd(current, complexMultiply(complex(slope), delta));
     }
     const referenceSlope = nonlinearReferenceDerivative(part, model, row);
     if (referenceSlope !== 0) {
       const reference = nodeComplexValue(layout, layout.physicalReferenceNode, solution);
-      real += referenceSlope * reference.real;
-      imaginary += referenceSlope * reference.imaginary;
+      current = complexAdd(current, complexMultiply(complex(referenceSlope), reference));
     }
-    return complex(real, imaginary);
+    return current;
   });
 }
 
@@ -2941,7 +3400,7 @@ function acKclQuality(
     }
     if (part.kind === "op-amp") {
       const outputCurrent = currents[2] ?? complex();
-      currentsByNode[layout.physicalReferenceNode]?.push(complex(-outputCurrent.real, -outputCurrent.imaginary));
+      currentsByNode[layout.physicalReferenceNode]?.push(complexSubtract(complex(), outputCurrent));
     }
   }
 
@@ -2976,48 +3435,53 @@ interface DcSolution {
 }
 
 function dcKclQuality(document: CircuitDocument, layout: MnaLayout, state: Float64Array) {
-  const values = Array.from({ length: layout.size }, (_, index) => complex(state[index] ?? 0));
-  const currentsByNode = Array.from({ length: layout.topology.nodeCount }, () => [] as number[]);
+  const values = Array.from({ length: layout.size }, (_, index) => complexFromRealState(state, index));
+  const currentsByNode = Array.from({ length: layout.topology.nodeCount }, () => [] as ComplexValue[]);
   for (const part of document.parts) {
     const currents = terminalCurrentsForPart(part, layout, layout, values, "dc", undefined, state);
     const terminals = terminalsOf(part.kind);
     for (let index = 0; index < terminals.length; index += 1) {
       const node = nodeForTerminal(layout.topology, part, terminals[index] ?? "a");
-      currentsByNode[node]?.push(currents[index]?.real ?? 0);
+      currentsByNode[node]?.push(currents[index] ?? complex());
     }
     if (part.kind === "op-amp") {
-      currentsByNode[layout.physicalReferenceNode]?.push(-(currents[2]?.real ?? 0));
+      currentsByNode[layout.physicalReferenceNode]?.push(complexSubtract(complex(), currents[2] ?? complex()));
     }
   }
 
-  let quality = 0;
-  for (const currents of currentsByNode) {
-    const scale = Math.max(0, ...currents.map(Math.abs));
-    if (scale === 0) { continue; }
-    const normalized = currents.map((current) => current / scale);
-    const residual = Math.abs(exactComponentSum(normalized));
-    const equationScale = normalized.reduce((sum, current) => sum + Math.abs(current), 0);
-    if (equationScale > 0) { quality = Math.max(quality, residual / equationScale); }
+  return Math.max(0, ...currentsByNode.map(relativeRealResidual));
+}
+
+/** Measures conservation before public number rounding changes the terms. */
+function relativeRealResidual(terms: ComplexValue[]) {
+  const values: ExactRational[] = [];
+  for (const term of terms) {
+    const value = exactComplexValue(term)?.real;
+    if (!value) { return Number.POSITIVE_INFINITY; }
+    values.push(value);
   }
-  return quality;
+  const residual = sumExactRationals(values);
+  if (residual.numerator === 0n) { return 0; }
+  const scale = sumExactRationals(values.map(absoluteExactRational));
+  if (scale.numerator === 0n) { return 0; }
+  const ratio = divideExactRational(residual, scale);
+  return ratio ? Math.abs(exactRationalToNumber(ratio)) : Number.POSITIVE_INFINITY;
 }
 
 function dcBranchVoltageQuality(layout: MnaLayout, state: Float64Array) {
+  const values = Array.from({ length: layout.size }, (_, index) => complexFromRealState(state, index));
   let quality = 0;
   for (const branch of [...layout.branches, ...layout.internalBranches]) {
     if (branch.redundantIdealSource) { continue; }
-    const positiveVoltage = nodeRealValue(layout, branch.positiveNode, state);
-    const negativeVoltage = nodeRealValue(layout, branch.negativeNode, state);
-    const resistanceDrop = branch.seriesResistanceOhms * (state[branch.unknownIndex] ?? 0);
-    const sourceVoltage = branch.sourceVoltage.real;
-    const voltage = positiveVoltage - negativeVoltage;
-    const residual = exactComponentSum([voltage, -resistanceDrop, -sourceVoltage].filter((value) => value !== 0));
-    // Use the physical branch's voltage scale, not its arbitrary common-mode
-    // coordinates. KCL can be exact even when subtracting those coordinates
-    // corrupts a small source or load voltage by several percent.
-    const scale = Math.max(Math.abs(voltage), Math.abs(resistanceDrop), Math.abs(sourceVoltage));
-    if (!Number.isFinite(residual)) { return Number.POSITIVE_INFINITY; }
-    if (scale > 0) { quality = Math.max(quality, Math.abs(residual) / scale); }
+    const nodeVoltage = voltageDifference(
+      nodeComplexValue(layout, branch.positiveNode, values),
+      nodeComplexValue(layout, branch.negativeNode, values),
+    );
+    const expectedVoltage = voltageFromBranch(branch, values);
+    quality = Math.max(quality, relativeRealResidual([
+      nodeVoltage,
+      complexSubtract(complex(), expectedVoltage),
+    ]));
   }
   return quality;
 }
@@ -3050,9 +3514,10 @@ function dcReferenceOffsets(
   channelConducting: Readonly<Record<string, boolean>>,
 ) {
   const referenceNode = layout.physicalReferenceNode;
-  const offset = -nodeRealValue(layout, referenceNode, state);
+  const unknown = layout.topology.nodeUnknowns[referenceNode] ?? -1;
+  const offset = complexSubtract(complex(), unknown < 0 ? complex() : complexFromRealState(state, unknown));
   const component = referenceComponentNodes(document, layout, referenceNode, "dc", channelConducting);
-  return component.map((isReferenceComponent) => complex(isReferenceComponent ? offset : 0));
+  return component.map((isReferenceComponent) => isReferenceComponent ? offset : complex());
 }
 
 function restoreFloatingReferenceOffsets(
@@ -3072,17 +3537,14 @@ function restoreFloatingReferenceOffsets(
     if (root !== undefined && !firstNodeByRoot.has(root)) { firstNodeByRoot.set(root, node); }
   }
 
-  const offsets = Array.from({ length: layout.topology.nodeCount }, (_, node) => {
-    const offset = initialOffsets[node] ?? complex();
-    return complex(offset.real, offset.imaginary);
-  });
+  const offsets = Array.from({ length: layout.topology.nodeCount }, (_, node) => initialOffsets[node] ?? complex());
   for (const [root, anchor] of firstNodeByRoot) {
     if (root === physicalReferenceRoot) { continue; }
     const potential = nodeComplexValue(layout, anchor, solution);
-    const offset = complex(-potential.real, -potential.imaginary);
+    const offset = complexSubtract(complex(), potential);
     for (let node = 0; node < componentIds.length; node += 1) {
       if (componentIds[node] !== root) { continue; }
-      offsets[node] = complex(offset.real, offset.imaginary);
+      offsets[node] = offset;
     }
   }
   return offsets;
@@ -3102,6 +3564,9 @@ function solveDc(
     layout,
     nodeVoltageOffsets: Array.from({ length: layout.topology.nodeCount }, () => complex()),
   };
+  // An exact linear solution already satisfies its branch equations. A
+  // coordinate change cannot improve it, and has no Newton stopping scale.
+  if (baseline.converged && !hasNonlinearParts(document)) { return baselineResult; }
   if (!adjustReference || !canAdjustDcReference(document, layout, baselineChannelConducting)) { return baselineResult; }
   const baselineQuality = baseline.converged && baseline.state
     ? dcSolutionQuality(document, layout, baseline.state)
@@ -3167,50 +3632,126 @@ function componentPower(
     const relativeVoltage = part.kind === "op-amp"
       ? voltage
       : voltageDifference(voltage, reference);
-    power = {
-      real:
-        power.real +
-        complexMultiply(relativeVoltage, complexConjugate(currentValues[index] ?? complex())).real,
-      imaginary:
-        power.imaginary +
-        complexMultiply(relativeVoltage, complexConjugate(currentValues[index] ?? complex())).imaginary,
-    };
+    power = complexAdd(
+      power,
+      complexMultiply(relativeVoltage, complexConjugate(currentValues[index] ?? complex())),
+    );
   }
   return power;
 }
 
-function impedanceMeasurements(resistance: number, reactance: number, current: ComplexValue) {
-  const voltage = complexMultiply(complex(resistance, reactance), current);
-  const power = complexMultiply(voltage, complexConjugate(current));
+function exactImpedance(resistance: number, reactance: number, exactReactance?: ExactRational) {
+  const real = numberToExactRational(resistance);
+  return exactReactance && real
+    ? complexFromExact({ real, imaginary: exactReactance })
+    : complex(resistance, reactance);
+}
+
+function measuredPower(voltage: ComplexValue, current: ComplexValue) {
+  const exactVoltage = exactComplexValue(voltage);
+  const exactCurrent = exactComplexValue(current);
+  if (
+    exactVoltage?.imaginary.numerator === 0n &&
+    exactCurrent?.imaginary.numerator === 0n
+  ) {
+    return complex(exactRationalProductToNumber(exactVoltage.real, exactCurrent.real));
+  }
+  return complexMultiply(voltage, complexConjugate(current));
+}
+
+function impedanceMeasurements(
+  resistance: number,
+  reactance: number,
+  current: ComplexValue,
+  exactReactance?: ExactRational,
+  retainExactPower = false,
+) {
+  const voltage = complexMultiply(exactImpedance(resistance, reactance, exactReactance), current);
+  const power = retainExactPower
+    ? complexMultiply(voltage, complexConjugate(current))
+    : measuredPower(voltage, current);
   return {
     voltage,
-    power: complex(resistance === 0 ? 0 : power.real, reactance === 0 ? 0 : power.imaginary),
+    power: retainExactPower
+      ? power
+      : complex(resistance === 0 ? 0 : power.real,
+        reactance === 0 && (exactReactance?.numerator ?? 0n) === 0n ? 0 : power.imaginary),
+  };
+}
+
+function transientCompanionBranchVoltage(
+  branch: Branch,
+  current: number | ComplexValue,
+  exactCurrentValue?: ExactRational,
+) {
+  const companion = branch.transientCompanion;
+  if (!companion) { return { voltage: Number.NaN, exactVoltage: null }; }
+  const currentNumber = typeof current === "number" ? current : current.real;
+  const exactCurrent = exactCurrentValue ??
+    (typeof current === "number" ? null : exactComplexValue(current)?.real) ??
+    numberToExactRational(currentNumber);
+  const exactHistory = companion.exactHistoryValue ?? numberToExactRational(companion.historyValue);
+  if (!exactCurrent || !exactHistory) {
+    return { voltage: Number.NaN, exactVoltage: null };
+  }
+  if (companion.kind === "capacitor") {
+    const exactVoltage = exactProductSumRatio([
+      { factors: [exactHistory, companion.denominator] },
+      { factors: [companion.numerator, exactCurrent] },
+    ], companion.denominator);
+    return {
+      voltage: exactVoltage ? exactRationalToNumber(exactVoltage) : Number.NaN,
+      exactVoltage,
+    };
+  }
+  const exactVoltage = exactProductSumRatio([
+    { factors: [companion.numerator, exactCurrent] },
+    { factors: [companion.numerator, exactHistory], sign: -1 },
+  ], companion.denominator);
+  return {
+    voltage: exactVoltage ? exactRationalToNumber(exactVoltage) : Number.NaN,
+    exactVoltage,
   };
 }
 
 function voltageFromBranch(branch: Branch, solution: ComplexValue[]) {
   const current = solution[branch.unknownIndex] ?? complex();
-  const scale = branch.acCurrentScale ?? 1;
-  if (scale === 1) {
-    return complexAdd(
-      branch.sourceVoltage,
-      complexMultiply(complex(branch.seriesResistanceOhms, branch.seriesReactanceOhms ?? 0), current),
+  if (branch.transientCompanion) {
+    const exact = exactComplexValue(current);
+    const companionVoltage = transientCompanionBranchVoltage(
+      branch,
+      current,
+      exact?.real,
     );
+    const zero = numberToExactRational(0);
+    return companionVoltage.exactVoltage && zero
+      ? complexFromExact({ real: companionVoltage.exactVoltage, imaginary: zero })
+      : complex(companionVoltage.voltage);
   }
   return complexAdd(
     branch.sourceVoltage,
     complexMultiply(
-      complex(branch.seriesResistanceOhms / scale, (branch.seriesReactanceOhms ?? 0) / scale),
+      exactImpedance(branch.seriesResistanceOhms, branch.seriesReactanceOhms ?? 0, branch.exactSeriesReactance),
       current,
     ),
   );
 }
 
 function branchVoltageMeasurement(branch: Branch, layout: MnaLayout, solution: ComplexValue[]) {
+  if (branch.transientCompanion) {
+    // The solved node values retain their exact fractions, including hidden
+    // subnormal differences. Reconstructing the same voltage from history
+    // would repeat expensive cancellations as that history grows.
+    const voltage = voltageDifference(
+      nodeComplexValue(layout, branch.positiveNode, solution),
+      nodeComplexValue(layout, branch.negativeNode, solution),
+    );
+    return { voltage, roundingScale: 0, cancellation: false };
+  }
   let voltage = voltageFromBranch(branch, solution);
   const sourceScale = Math.max(Math.abs(branch.sourceVoltage.real), Math.abs(branch.sourceVoltage.imaginary));
   const voltageScale = Math.max(Math.abs(voltage.real), Math.abs(voltage.imaginary));
-  const ideal = branch.seriesResistanceOhms === 0 && (branch.seriesReactanceOhms ?? 0) === 0;
+  const ideal = isIdealVoltageConstraint(branch);
   let roundingScale = ideal ? 0 : Math.max(sourceScale, voltageScale);
   const cancellation = !ideal && sourceScale > 0 && voltageScale < sourceScale / 2;
   if (cancellation) {
@@ -3226,44 +3767,6 @@ function branchVoltageMeasurement(branch: Branch, layout: MnaLayout, solution: C
     }
   }
   return { voltage, roundingScale, cancellation };
-}
-
-function recoverResolvedBranchVoltageComponents(
-  branchVoltage: ComplexValue,
-  terminalVoltages: ComplexValue[],
-) {
-  const positiveNodeVoltage = terminalVoltages[0] ?? complex();
-  const negativeNodeVoltage = terminalVoltages[1] ?? complex();
-  const nodeVoltage = voltageDifference(positiveNodeVoltage, negativeNodeVoltage);
-  const resolvedComponent = (
-    branchValue: number,
-    nodeValue: number,
-    positiveValue: number,
-    negativeValue: number,
-  ) => {
-    if (branchValue !== 0 || nodeValue === 0) { return branchValue; }
-    // A node difference is useful only when it is clearly above the rounding
-    // interval of its own coordinates. This rescues orthogonal tiny drops that
-    // the scaled branch-current product can underflow, while retaining the
-    // branch equation when common-mode subtraction cannot resolve a voltage.
-    const coordinateScale = Math.max(Math.abs(positiveValue), Math.abs(negativeValue));
-    const roundingInterval = 2 * Number.EPSILON * coordinateScale;
-    return Math.abs(nodeValue) > roundingInterval ? nodeValue : branchValue;
-  };
-  return complex(
-    resolvedComponent(
-      branchVoltage.real,
-      nodeVoltage.real,
-      positiveNodeVoltage.real,
-      negativeNodeVoltage.real,
-    ),
-    resolvedComponent(
-      branchVoltage.imaginary,
-      nodeVoltage.imaginary,
-      positiveNodeVoltage.imaginary,
-      negativeNodeVoltage.imaginary,
-    ),
-  );
 }
 
 interface BranchVoltagePathEdge {
@@ -3293,7 +3796,7 @@ function branchVoltagePathContext(layout: MnaLayout): BranchVoltagePathContext {
     const highNode = Math.max(branch.positiveNode, branch.negativeNode);
     const pairKey = lowNode * layout.topology.nodeCount + highNode;
     const pair = directBranches.get(pairKey);
-    const isIdeal = branch.seriesResistanceOhms === 0 && (branch.seriesReactanceOhms ?? 0) === 0;
+    const isIdeal = isIdealVoltageConstraint(branch);
     if (!pair) {
       directBranches.set(pairKey, { branches: [branch], ...(isIdeal ? { ideal: branch } : {}) });
     } else {
@@ -3331,7 +3834,7 @@ function branchVoltageAdjacency(
     adjacency[branch.positiveNode]?.push({ node: branch.negativeNode, voltage, cost });
     adjacency[branch.negativeNode]?.push({
       node: branch.positiveNode,
-      voltage: complex(-voltage.real, -voltage.imaginary),
+      voltage: complexSubtract(complex(), voltage),
       cost,
     });
   }
@@ -3408,19 +3911,15 @@ function sumBranchVoltagePath(
   previousNodes: number[],
   previousVoltages: Array<ComplexValue | undefined>,
 ) {
-  const realParts: number[] = [];
-  const imaginaryParts: number[] = [];
+  let voltage = complex();
   for (let node = negativeNode; node !== positiveNode;) {
     const edgeVoltage = previousVoltages[node];
     const previous = previousNodes[node] ?? -1;
     if (edgeVoltage === undefined || previous < 0) { return null; }
-    realParts.push(edgeVoltage.real);
-    imaginaryParts.push(edgeVoltage.imaginary);
+    voltage = complexAdd(voltage, edgeVoltage);
     node = previous;
   }
-  // A path can contain individually finite source drops whose intermediate
-  // floating-point sum overflows, even though their final difference is small.
-  return complex(exactComponentSum(realParts), exactComponentSum(imaginaryParts));
+  return voltage;
 }
 
 function voltageFromBranchPath(
@@ -3459,7 +3958,7 @@ function voltageFromBranchPath(
   context.paths.set(pathKey, voltage);
   context.paths.set(
     negativeNode * layout.topology.nodeCount + positiveNode,
-    voltage ? complex(-voltage.real, -voltage.imaginary) : null,
+    voltage ? complexSubtract(complex(), voltage) : null,
   );
   return voltage;
 }
@@ -3478,7 +3977,7 @@ function bestDirectBranchVoltage(
       ...measurement,
       voltage: branch.positiveNode === positiveNode
         ? measurement.voltage
-        : complex(-measurement.voltage.real, -measurement.voltage.imaginary),
+        : complexSubtract(complex(), measurement.voltage),
     };
   }
   return best;
@@ -3504,11 +4003,11 @@ function resistiveMeasurements(part: CircuitPart, currents: ComplexValue[]) {
   }
   if (part.kind !== "potentiometer") { return null; }
   const segments = potentiometerSegments(part);
-  const ac = impedanceMeasurements(segments.ac, 0, currents[0] ?? complex());
-  const bc = impedanceMeasurements(segments.cb, 0, currents[1] ?? complex());
+  const ac = impedanceMeasurements(segments.ac, 0, currents[0] ?? complex(), undefined, true);
+  const bc = impedanceMeasurements(segments.cb, 0, currents[1] ?? complex(), undefined, true);
   return {
     voltage: voltageDifference(ac.voltage, bc.voltage),
-    power: complex(ac.power.real + bc.power.real),
+    power: complexAdd(ac.power, bc.power),
   };
 }
 
@@ -3546,13 +4045,13 @@ function componentMeasurements(
   const isReactivePart = part.kind === "capacitor" || part.kind === "inductor";
   const reactive = mode === "ac" && isReactivePart
     ? reactiveBranch
-      ? impedanceMeasurements(0, reactiveBranch.seriesReactanceOhms ?? 0, current)
+      ? impedanceMeasurements(0, reactiveBranch.seriesReactanceOhms ?? 0, current, reactiveBranch.exactSeriesReactance)
       : unboundedReactiveAdmittance
         ? (() => {
           // Norton currents are derived from these node voltages. Inverting a
           // rounded subnormal current loses the original voltage (even to zero).
           const voltage = primaryVoltage(part, terminalVoltages);
-          const power = complexMultiply(voltage, complexConjugate(current));
+          const power = measuredPower(voltage, current);
           return { voltage, power: complex(0, power.imaginary) };
         })()
         : null
@@ -3563,18 +4062,13 @@ function componentMeasurements(
   const opAmpVoltage = part.kind === "op-amp"
     ? voltageDifference(terminalVoltages[2] ?? complex(), physicalReferenceVoltage)
     : null;
-  const derivedVoltage = resistive?.voltage ?? reactive?.voltage ?? branchVoltage ??
+  const voltage = resistive?.voltage ?? reactive?.voltage ?? branchVoltage ??
     voltageFromBranchPath(part, layout, solution, branchVoltagePaths) ?? opAmpVoltage ?? primaryVoltage(part, terminalVoltages);
-  const scaledAcBranch = mode === "ac" && branch &&
-    (part.kind === "resistor" || part.kind === "bulb" || part.kind === "capacitor" || part.kind === "inductor");
-  const voltage = scaledAcBranch && branchVoltage
-    ? recoverResolvedBranchVoltageComponents(branchVoltage, terminalVoltages)
-    : derivedVoltage;
   const powerVoltages = part.kind === "op-amp"
     ? terminalVoltages.map((value) => voltageDifference(value, physicalReferenceVoltage))
     : terminalVoltages;
   const power = resistive?.power ?? reactive?.power ??
-    (branchVoltage ? complexMultiply(voltage, complexConjugate(current)) : componentPower(part, powerVoltages, terminalCurrents));
+    (branchVoltage ? measuredPower(voltage, current) : componentPower(part, powerVoltages, terminalCurrents));
   return { voltage, power };
 }
 
@@ -3758,6 +4252,7 @@ function dcResult(
   document: CircuitDocument,
   options: AnalogStepOptions,
   initialIssues: AnalogCircuitIssue[] = [],
+  transientCompanions?: ReadonlyMap<string, TransientCompanionConstraint>,
 ): AnalogCircuitAnalysis {
   const mode = options.mode;
   const switchStates = options.switchStates === undefined ? {} : options.switchStates;
@@ -3790,6 +4285,7 @@ function dcResult(
     voltageOverrides,
     switchStates,
     options.initialInductorCurrents ?? false,
+    transientCompanions,
   );
   if (!prepared.layout) {
     const message = prepared.issue?.message ?? "回路を計算できませんでした。接続を確認してください。";
@@ -3805,7 +4301,7 @@ function dcResult(
 
   const solvedLayout = solution.layout ?? prepared.layout;
   const values = Array.from({ length: prepared.layout.size }, (_, index) =>
-    complex(solution.state?.[index] ?? 0),
+    solution.state ? complexFromRealState(solution.state, index) : complex(),
   );
   const nodeVoltageOffsets = restoreFloatingReferenceOffsets(
     document,
@@ -3995,6 +4491,7 @@ function acResult(document: CircuitDocument, options: AnalogStepOptions): Analog
 export function solveAnalogStep(
   inputDocument: CircuitDocument,
   options: AnalogStepOptions,
+  transientCompanions?: ReadonlyMap<string, TransientCompanionConstraint>,
 ): AnalogCircuitAnalysis {
   let mode: AnalogAnalysisMode = "dc";
   try {
@@ -4004,7 +4501,7 @@ export function solveAnalogStep(
     return result("invalid", mode, message, { issues: [{ severity: "error", message }] });
   }
   try {
-    return solveAnalogStepFromInput(inputDocument, options, mode);
+    return solveAnalogStepFromInput(inputDocument, options, mode, transientCompanions);
   } catch {
     // A caller-owned Proxy can change behavior after shape validation. Keep
     // failures at the public API boundary, as in transient analysis.
@@ -4017,6 +4514,7 @@ function solveAnalogStepFromInput(
   inputDocument: CircuitDocument,
   options: AnalogStepOptions,
   mode: AnalogAnalysisMode,
+  transientCompanions?: ReadonlyMap<string, TransientCompanionConstraint>,
 ): AnalogCircuitAnalysis {
   const shapeIssue = circuitDocumentShapeIssue(inputDocument);
   if (shapeIssue) {
@@ -4046,7 +4544,9 @@ function solveAnalogStepFromInput(
     const message = "コイルの初期電流を使う設定は直流の初期状態解析でのみ真偽値として指定してください。";
     return result("invalid", validatedOptions.mode, message, { issues: [{ severity: "error", message }] });
   }
-  return validatedOptions.mode === "dc" ? dcResult(document, validatedOptions) : acResult(document, validatedOptions);
+  return validatedOptions.mode === "dc"
+    ? dcResult(document, validatedOptions, [], transientCompanions)
+    : acResult(document, validatedOptions);
 }
 
 function analogOptionsShapeIssue(options: unknown) {
