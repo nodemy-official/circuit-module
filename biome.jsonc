@@ -107,7 +107,7 @@
       }
     },
     {
-      "includes": ["src/ui/CircuitEditor.test.tsx"],
+      "includes": ["src/ui/__tests__/CircuitEditor.test.tsx"],
       "linter": {
         "rules": {
           "correctness": {

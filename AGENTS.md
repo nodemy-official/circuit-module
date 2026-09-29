@@ -2,7 +2,7 @@
 
 ## プロジェクト構成
 
-`src/` に headless の回路モデル、編集・解析ロジック、任意利用の React UI（`src/ui/`）があります。テストはコードの隣に `*.test.ts` または `*.test.tsx` として置きます。Storybook の例は `stories/`、設定は `.storybook/`、設計・解析資料は `docs/` にあります。`dist/` は生成物なので直接編集しません。
+`src/` に headless の回路モデル、編集・解析ロジック、任意利用の React UI（`src/ui/`）があります。テストは `src/__tests__/` または `src/ui/__tests__/` に置き、`*.test.ts` をロジック用、`*.test.tsx` を React UI 用として使います。Storybook の例は `stories/`、設定は `.storybook/`、設計・解析資料は `docs/` にあります。`dist/` は生成物なので直接編集しません。
 
 ## ビルド・テスト・開発コマンド
 
@@ -14,7 +14,7 @@ Node.js 22 以降を使います。Bun の lockfile があり、CI は `bun ci` 
 
 ## テスト
 
-Vitest を使います。ロジックのテストは `*.test.ts`、React UI のテストは `*.test.tsx` とし、`npm test` で全件を実行します。`npm test -- --project headless` と `npm test -- --project ui` で各プロジェクトを個別に実行できます。`bun run check` にも全テストが含まれます。
+Vitest を使います。ロジックのテストは `src/__tests__/` または `src/ui/__tests__/` に `*.test.ts`、React UI のテストは `src/ui/__tests__/` に `*.test.tsx` として配置します。`npm test` で全件を実行し、`npm test -- --project headless` と `npm test -- --project ui` で各プロジェクトを個別に実行できます。`bun run check` にも全テストが含まれます。
 
 ## コミットとプルリクエスト
 

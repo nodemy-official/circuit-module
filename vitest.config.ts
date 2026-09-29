@@ -8,7 +8,7 @@ export default defineConfig({
         extends: true,
         test: {
           name: "headless",
-          include: ["src/**/*.test.ts"],
+          include: ["src/**/__tests__/**/*.test.ts"],
           isolate: false,
         },
       },
@@ -16,7 +16,7 @@ export default defineConfig({
         extends: true,
         test: {
           name: "ui",
-          include: ["src/**/*.test.tsx"],
+          include: ["src/**/__tests__/**/*.test.tsx"],
           isolate: true,
         },
       },

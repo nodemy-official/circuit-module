@@ -353,6 +353,6 @@ npm pack --dry-run
 
 `npm run build-storybook` は Docs を含む Storybook の静的ビルドで、CI でも検証します。操作確認用のアセットを速く生成する場合は `npm run build-storybook:test` を使えます。この test build は Docs を省略して `storybook-static/test` に出力しますが、自動ブラウザテストは実行しません。詳しくは[Storybook の build 設定](https://storybook.js.org/docs/api/main-config/main-config-build)と[telemetry 設定](https://storybook.js.org/docs/configure/telemetry)を参照してください。
 
-テストは `npm test` で全件、`npm test -- --project headless` でヘッドレス処理、`npm test -- --project ui` で React UI を実行できます。Vitest はスレッドで並列実行し、`src/**/*.test.ts` はワーカー内でモジュールを再利用します。このため、ヘッドレスのテストでは共有モジュールやグローバル変数への変更を残さないでください。`src/**/*.test.tsx` はファイルごとに分離し、操作テストの jsdom とサーバーレンダリングテストの Node 環境を使い分けます。
+テストは `npm test` で全件、`npm test -- --project headless` でヘッドレス処理、`npm test -- --project ui` で React UI を実行できます。Vitest はスレッドで並列実行し、`src/**/__tests__/**/*.test.ts` はワーカー内でモジュールを再利用します。このため、ヘッドレスのテストでは共有モジュールやグローバル変数への変更を残さないでください。`src/**/__tests__/**/*.test.tsx` はファイルごとに分離し、操作テストの jsdom とサーバーレンダリングテストの Node 環境を使い分けます。
 
 配布先は `https://npm.pkg.github.com` に限定しています。GitHub Release を公開すると、Actions がテスト・ビルドを確認してから `GITHUB_TOKEN` で公開パッケージを発行します。Release の前に `package.json` の version と tag を一致させてください。ライセンス表記は抽出元に合わせて `UNLICENSED` です。
