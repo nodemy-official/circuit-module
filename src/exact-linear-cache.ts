@@ -2,6 +2,7 @@ import {
   addExactRational,
   deferExactRationalReduction,
   exactRationalToNumber,
+  isExactRealLinearSolution,
   multiplyExactRational,
   numberToExactRational,
   solveExactRealLinearSystem,
@@ -103,6 +104,12 @@ export function solveRealLinearSystemWithExactInverseCache(
     ? deferExactRationalReduction(value)
     : value);
   const exactSolution = exactMatrixVectorProduct(size, inverse, deferredRhs);
+  // Verify cache hits too: the cache is an optimization, not an authority on
+  // the current matrix. A failed certificate falls back to the checked solve.
+  if (!isExactRealLinearSolution(size, exactRealStateInput(matrix), deferredRhs, exactSolution)) {
+    inverseCache.delete(key);
+    return { status: "not-applicable" };
+  }
   if (!exactSolution.every((value) => Number.isFinite(exactRationalToNumber(value)))) {
     return { status: "singular" };
   }

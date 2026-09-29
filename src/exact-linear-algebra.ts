@@ -960,8 +960,7 @@ function backSubstituteIntegerRows(rows: IntegerRow[], size: number) {
   return solution;
 }
 
-/** Solves an exact real system and returns each answer as a rational. */
-export function solveExactRealLinearSystem(
+function solveExactRealLinearSystemUnchecked(
   size: number,
   matrix: ExactRealArray,
   rhs: ExactRealArray,
@@ -995,6 +994,49 @@ export function solveExactRealLinearSystem(
   if (!scaledSolution) { return null; }
   if (rhsScale === 1n) { return scaledSolution; }
   return scaledSolution.map((value) => rational(value.numerator, value.denominator * rhsScale));
+}
+
+function exactEquationHolds(terms: readonly ExactRational[], rhs: ExactRational) {
+  const sum = sumExactRationals(terms);
+  return sum.numerator * rhs.denominator === rhs.numerator * sum.denominator;
+}
+
+/**
+ * Checks the original equations without a tolerance or binary64 rounding.
+ * This is separate from elimination so a solver optimization cannot silently
+ * return an answer to a different system. Pass exact sidecar values here when
+ * the matrix or solution was assembled through exact-numeric-state.
+ */
+export function isExactRealLinearSolution(
+  size: number,
+  matrix: ExactRealArray,
+  rhs: ExactRealArray,
+  solution: readonly ExactRational[],
+): boolean {
+  if (!validExactRealInput(size, matrix, rhs) || !validExactRealArray(size, solution)) { return false; }
+  for (let row = 0; row < size; row += 1) {
+    const terms: ExactRational[] = [];
+    for (let column = 0; column < size; column += 1) {
+      const coefficient = exactRealValueAt(matrix, row * size + column, 0);
+      const value = solution[column];
+      if (!coefficient || !value) { return false; }
+      if (coefficient.numerator === 0n || value.numerator === 0n) { continue; }
+      terms.push(multiplyExactRational(coefficient, value));
+    }
+    const expected = exactRightHandSideAt(rhs, row);
+    if (!expected || !exactEquationHolds(terms, expected)) { return false; }
+  }
+  return true;
+}
+
+/** Solves and verifies an exact real system before exposing its rational answer. */
+export function solveExactRealLinearSystem(
+  size: number,
+  matrix: ExactRealArray,
+  rhs: ExactRealArray,
+): ExactRational[] | null {
+  const solution = solveExactRealLinearSystemUnchecked(size, matrix, rhs);
+  return solution && isExactRealLinearSolution(size, matrix, rhs, solution) ? solution : null;
 }
 
 /** Solves a real system and rounds each exact result once to binary64. */
@@ -1069,7 +1111,61 @@ function realifyExactComplexSystem(
   return { matrix, rhs };
 }
 
-/** Solves an exact complex system and returns exact rectangular components. */
+function exactComplexEquationHolds(
+  size: number,
+  row: number,
+  matrixReal: ExactRealArray,
+  matrixImaginary: ExactRealArray,
+  rhsReal: ExactRealArray,
+  rhsImaginary: ExactRealArray,
+  solution: readonly ExactComplexValue[],
+) {
+  const realTerms: ExactRational[] = [];
+  const imaginaryTerms: ExactRational[] = [];
+  for (let column = 0; column < size; column += 1) {
+    const real = exactRealValueAt(matrixReal, row * size + column, 0);
+    const imaginary = exactRealValueAt(matrixImaginary, row * size + column, 0);
+    const value = solution[column];
+    if (!real || !imaginary || !value) { return false; }
+    if (real.numerator !== 0n) {
+      realTerms.push(multiplyExactRational(real, value.real));
+      imaginaryTerms.push(multiplyExactRational(real, value.imaginary));
+    }
+    if (imaginary.numerator !== 0n) {
+      realTerms.push(negateExactRational(multiplyExactRational(imaginary, value.imaginary)));
+      imaginaryTerms.push(multiplyExactRational(imaginary, value.real));
+    }
+  }
+  const expectedReal = exactRightHandSideAt(rhsReal, row);
+  const expectedImaginary = exactRightHandSideAt(rhsImaginary, row);
+  return expectedReal !== null && expectedImaginary !== null &&
+    exactEquationHolds(realTerms, expectedReal) && exactEquationHolds(imaginaryTerms, expectedImaginary);
+}
+
+/** Verifies the complex equations directly, independently of their realification. */
+export function isExactComplexLinearSolution(
+  size: number,
+  matrixReal: ExactRealArray,
+  matrixImaginary: ExactRealArray,
+  rhsReal: ExactRealArray,
+  rhsImaginary: ExactRealArray,
+  solution: readonly ExactComplexValue[],
+): boolean {
+  if (!validExactRealInput(size, matrixReal, rhsReal) ||
+      !validExactRealInput(size, matrixImaginary, rhsImaginary) ||
+      solution.length !== size ||
+      !solution.every((value) => value && normalized(value.real) !== null && normalized(value.imaginary) !== null)) {
+    return false;
+  }
+  for (let row = 0; row < size; row += 1) {
+    if (!exactComplexEquationHolds(size, row, matrixReal, matrixImaginary, rhsReal, rhsImaginary, solution)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** Solves and verifies a complex system before exposing exact rectangular components. */
 export function solveExactComplexLinearSystem(
   size: number,
   matrixReal: ExactRealArray,
@@ -1095,12 +1191,15 @@ export function solveExactComplexLinearSystem(
       rhsImaginary as Float64Array,
     );
   if (!realSystem) { return null; }
-  const exact = solveExactRealLinearSystem(realSize, realSystem.matrix, realSystem.rhs);
+  const exact = solveExactRealLinearSystemUnchecked(realSize, realSystem.matrix, realSystem.rhs);
   if (!exact) { return null; }
-  return Array.from({ length: size }, (_, index) => ({
+  const solution = Array.from({ length: size }, (_, index) => ({
     real: exact[index] ?? ZERO,
     imaginary: exact[index + size] ?? ZERO,
   }));
+  return isExactComplexLinearSolution(size, matrixReal, matrixImaginary, rhsReal, rhsImaginary, solution)
+    ? solution
+    : null;
 }
 
 /** Solves a complex system and rounds each exact result once to binary64. */

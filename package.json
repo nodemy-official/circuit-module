@@ -68,7 +68,8 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json && cp src/ui/*.css dist/ui/",
-    "check": "biome lint . && tsc --noEmit && vitest run",
+    "check": "biome lint . && tsc --noEmit && node scripts/numeric-policy.mjs && vitest run",
+    "check:numerics": "node scripts/numeric-policy.mjs && vitest run --project headless numeric-contract numeric-policy",
     "lint": "biome lint .",
     "format": "biome format --write .",
     "storybook": "storybook dev -p 6006",
