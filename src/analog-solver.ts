@@ -28,6 +28,7 @@ import {
 } from "./analog-math.js";
 import {
   addExactRational,
+  deferExactRationalReduction,
   divideExactRational,
   exactRationalProductToNumber,
   exactRationalSquareRootToNumber,
@@ -35,6 +36,7 @@ import {
   isExactComplexLinearSolution,
   multiplyExactRational,
   numberToExactRational,
+  roundExactRationalSignificand,
   solveExactRealLinearSystem,
   subtractExactRational,
   sumExactRationals,
@@ -55,7 +57,7 @@ import {
 import { solveRealLinearSystemWithExactInverseCache } from "./exact-linear-cache.js";
 import { acAnalysisFrequency, acReactiveAdmittance, acReactiveImpedance, acReactiveReactance, frequencyMatches } from "./ac-reactive.js";
 import { meterStatuses, type MeterStatus } from "./meter-status.js";
-import { circuitDocumentShapeIssue, isSimulationRecord, simulationRecordField } from "./simulation-input.js";
+import { circuitDocumentShapeIssue, copySimulationDocument, isSimulationRecord, simulationRecordEntries, simulationRecordField } from "./simulation-input.js";
 import { acResponsePartGroups, type AcResponseEdge } from "./ac-response-groups.js";
 
 export type { ComplexValue } from "./analog-math.js";
@@ -438,7 +440,10 @@ function validateVoltageOverrides(
   voltageOverrides: Record<string, number>,
   partById: Map<string, CircuitPart>,
 ) {
-  for (const [partId, voltage] of Object.entries(voltageOverrides)) {
+  if (!isSimulationRecord(voltageOverrides, partById.keys())) {
+    return "電圧上書きは部品 ID ごとの数値オブジェクトにしてください。";
+  }
+  for (const [partId, voltage] of simulationRecordEntries(voltageOverrides)) {
     const part = partById.get(partId);
     if (!part || (part.kind !== "battery" && part.kind !== "ac-source")) {
       return `電圧上書きの対象「${partId}」は電圧源ではありません。`;
@@ -457,11 +462,12 @@ function validateSwitchStates(
     typeof switchStates !== "object" ||
     Array.isArray(switchStates) ||
     switchStates instanceof Map ||
-    switchStates instanceof Set
+    switchStates instanceof Set ||
+    !isSimulationRecord(switchStates, partById.keys())
   ) {
     return "スイッチ状態は部品 ID ごとの真偽値オブジェクトにしてください。";
   }
-  for (const [partId, state] of Object.entries(switchStates as Record<string, unknown>)) {
+  for (const [partId, state] of simulationRecordEntries(switchStates)) {
     const part = partById.get(partId);
     if (part?.kind !== "switch") {
       return `スイッチ状態の対象「${partId}」はスイッチ部品ではありません。`;
@@ -1568,15 +1574,29 @@ function mosChannelValues(
   };
 }
 
-function mosChannel(overdrive: number, vds: number, beta: number, lambda: number) {
-  if (overdrive <= 0) {
+function mosControlAtModelBoundary(value: ExactRational): ResidualTerm {
+  const projected = exactRationalToNumber(value);
+  // Subnormal controls can still produce normal currents after beta/lambda
+  // amplification. Bound their significands, not their exponent: 512 bits
+  // keeps relative rounding error below 2^-512 without recursive denominator
+  // growth through the square-law model and transient storage.
+  return Math.abs(projected) < 2 ** -1022
+    ? roundExactRationalSignificand(value, 512)
+    : projected;
+}
+
+function mosChannel(overdrive: ResidualTerm, vds: ResidualTerm, beta: number, lambda: number) {
+  const exactOverdrive = typeof overdrive === "number" ? numberToExactRational(overdrive) : overdrive;
+  const exactVds = typeof vds === "number" ? numberToExactRational(vds) : vds;
+  if (!exactOverdrive || !exactVds) { return mosChannelValues(null, null, null); }
+  if (exactOverdrive.numerator <= 0n) {
     const zero = numberToExactRational(0)!;
     return mosChannelValues(zero, zero, zero);
   }
   // Expand the square-law and channel modulation before evaluating products.
   // The unscaled square or modulation can overflow (or the base current can
   // underflow) even when the final current and its derivatives are finite.
-  if (vds < overdrive) {
+  if (subtractExactRational(exactVds, exactOverdrive).numerator < 0n) {
     return mosChannelValues(
       exactProductSumRatio([
         { factors: [beta, overdrive, vds] },
@@ -1685,13 +1705,12 @@ function mosfetModel(part: CircuitPart, voltages: readonly ResidualTerm[]): Nonl
   const normalizedVgs = exactProductSumRatio([
     { factors: [sign, gate] }, { factors: [sign, reverseChannel ? drain : source], sign: -1 },
   ], 1)!;
-  // The nonlinear iteration evaluates its model at binary64 control values.
-  // Round only after completing the local gate difference and threshold
-  // subtraction; rounding remote terminal potentials loses that control bias.
+  // Use the same bounded controls as the Newton linearization center. Local
+  // differences and the threshold must be completed before this boundary.
   const overdrive = subtractExactRational(normalizedVgs, numberToExactRational(threshold)!);
   const channel = mosChannel(
-    exactRationalToNumber(overdrive),
-    exactRationalToNumber(reverseChannel ? negativeExact(normalizedVds) : normalizedVds),
+    mosControlAtModelBoundary(overdrive),
+    mosControlAtModelBoundary(reverseChannel ? negativeExact(normalizedVds) : normalizedVds),
     beta,
     lambda,
   );
@@ -2199,9 +2218,9 @@ function mosLinearizationCenter(part: CircuitPart, voltages: readonly ResidualTe
     { factors: [sign, residualTermDifference(voltages[1] ?? 0, voltages[reverse ? 0 : 2] ?? 0)] },
     { factors: [threshold], sign: -1 },
   ], 1)!;
-  const drain = roundedResidualTerm(vds);
-  const control = roundedResidualTerm(overdrive);
-  if (!Number.isFinite(drain) || !Number.isFinite(control)) { return [...voltages]; }
+  const drain = mosControlAtModelBoundary(vds);
+  const control = mosControlAtModelBoundary(overdrive);
+  if (!Number.isFinite(roundedResidualTerm(drain)) || !Number.isFinite(roundedResidualTerm(control))) { return [...voltages]; }
   const gate = exactProductSumRatio([
     { factors: [reverse ? drain : 0] },
     { factors: [sign, control] }, { factors: [sign, threshold] },
@@ -2914,7 +2933,9 @@ function exactRowTolerance(
     if (!exactCoefficient || !exactValue) { return null; }
     if (exactCoefficient.numerator === 0n || exactValue.numerator === 0n) { continue; }
     const term = multiplyExactRational(exactCoefficient, exactValue);
-    equationTerms.push(absoluteExactRational(term));
+    // These positive terms are only used for a temporary tolerance. Keep
+    // their exact ratio without reducing the entire sum on every trial.
+    equationTerms.push(deferExactRationalReduction(absoluteExactRational(term)));
   }
   const equationScale = sumExactRationals(equationTerms);
   const absoluteResidual = absoluteExactRational(residual);
@@ -2955,7 +2976,12 @@ function residualScore(layout: MnaLayout, assembly: DcAssembly, tolerances: Exac
     const residual = assembly.exactResidual[row];
     const tolerance = tolerances[row];
     if (!residual || !tolerance) { return Number.POSITIVE_INFINITY; }
-    const normalized = divideExactRational(absoluteExactRational(residual), tolerance);
+    // Only the rounded score is needed; cross-cancelling large numerators
+    // wastes time here and cannot change its correctly rounded projection.
+    const normalized = divideExactRational(
+      deferExactRationalReduction(absoluteExactRational(residual)),
+      deferExactRationalReduction(tolerance),
+    );
     if (!normalized) { return Number.POSITIVE_INFINITY; }
     score = Math.max(score, exactRationalToNumber(normalized));
     if (!Number.isFinite(score)) { return Number.POSITIVE_INFINITY; }
@@ -2968,7 +2994,7 @@ function currentBiasedDcSeed(document: CircuitDocument, layout: MnaLayout, state
   const biasedRhs = biasedAssembly.exactResidual
     ? negatedExactResidual(biasedAssembly.exactResidual)
     : null;
-  if (biasedRhs && solveRealLinearSystem(layout.size, biasedAssembly.matrix, biasedRhs)) { return state; }
+  if (biasedRhs && solveLinearTargetState(layout.size, biasedAssembly.matrix, biasedRhs)) { return state; }
 
   // Independent voltage biases can already turn a MOS channel on. Preserve
   // their device slopes before seeding a remaining current-driven zero row;
@@ -2983,7 +3009,7 @@ function currentBiasedDcSeed(document: CircuitDocument, layout: MnaLayout, state
   }
   stampDcReferences(document, layout, state, matrix, residual);
   const rhs = exactRhsFromResidualTerms(residual);
-  const correction = rhs ? solveRealLinearSystem(layout.size, matrix, rhs) : null;
+  const correction = rhs ? solveLinearTargetState(layout.size, matrix, rhs) : null;
   return correction ? addScaledRealState(state, correction, 1) : state;
 }
 
@@ -3009,7 +3035,7 @@ function linearOpAmpSeed(document: CircuitDocument, layout: MnaLayout) {
   // currents through an input level-shift source and can force rail clipping.
   stampDcReferences(document, layout, state, seedMatrix, seedResidual);
   const rhs = exactRhsFromResidualTerms(seedResidual);
-  return rhs ? solveRealLinearSystem(layout.size, seedMatrix, rhs) : null;
+  return rhs ? solveLinearTargetState(layout.size, seedMatrix, rhs) : null;
 }
 
 function linearDcSeed(document: CircuitDocument, layout: MnaLayout) {
@@ -3033,7 +3059,7 @@ function linearDcSeed(document: CircuitDocument, layout: MnaLayout) {
   const feedbackSeed = linearOpAmpSeed(document, layout);
   if (feedbackSeed) { return currentBiasedDcSeed(document, layout, feedbackSeed); }
   const rhs = exactRhsFromResidualTerms(residual);
-  const voltageSeed = rhs ? solveRealLinearSystem(layout.size, matrix, rhs) : null;
+  const voltageSeed = rhs ? solveLinearTargetState(layout.size, matrix, rhs) : null;
   return voltageSeed ? currentBiasedDcSeed(document, layout, voltageSeed) : null;
 }
 
@@ -3051,7 +3077,7 @@ function solveDcNewtonStep(
   // residual being rejected against a different equation set.
   const channelConductingForReferences = mosChannelConductingByPartId(document, layout, state);
   const rhs = absoluteDcRhs(document, layout, state, channelConductingForReferences);
-  const targetState = rhs ? solveRealLinearSystem(layout.size, assembly.matrix, rhs) : null;
+  const targetState = rhs ? solveLinearTargetState(layout.size, assembly.matrix, rhs) : null;
   if (!targetState) { return { nextState: undefined, singular: true }; }
 
   let step = 1;
@@ -3145,7 +3171,7 @@ function polishConvergedDcState(
     const channelConducting = mosChannelConductingByPartId(document, layout, polished);
     const assembly = assembleDc(document, layout, polished, true, channelConducting);
     const rhs = absoluteDcRhs(document, layout, polished, channelConducting);
-    const target = rhs ? solveRealLinearSystem(layout.size, assembly.matrix, rhs) : null;
+    const target = rhs ? solveLinearTargetState(layout.size, assembly.matrix, rhs) : null;
     if (!target) { break; }
     const candidateAssembly = assembleDc(document, layout, target, true, channelConducting);
     const candidateScore = residualScore(layout, candidateAssembly, tolerances);
@@ -6075,7 +6101,7 @@ function solveAnalogStepFromInput(
     const message = "解析条件を読み取れません。";
     return result("invalid", mode, message, { issues: [{ severity: "error", message }] });
   }
-  const document = documentWithCatalogDefaults(inputDocument);
+  const document = documentWithCatalogDefaults(copySimulationDocument(inputDocument));
   if (validatedOptions.initialInductorCurrents !== undefined &&
       (typeof validatedOptions.initialInductorCurrents !== "boolean" ||
        (validatedOptions.initialInductorCurrents && validatedOptions.mode !== "dc"))) {

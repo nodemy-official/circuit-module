@@ -19,7 +19,7 @@ import {
   MAX_CIRCUIT_ANALYSIS_TERMINALS,
   type CircuitIssue,
 } from "./circuit-solver.js";
-import { isSimulationArray, isSimulationRecord } from "./simulation-input.js";
+import { copySimulationDocument, isSimulationArray, isSimulationRecord, simulationRecordEntries } from "./simulation-input.js";
 import { readingPrecision, terminalVoltageDifferences, type CircuitReadingPrecision, type CircuitTerminalVoltageDifference } from "./circuit-reading.js";
 import { createExactExpressionCapture, freezeCapturedExactExpressions, withExactExpressionCapture, type ExactExpressionNode } from "./exact-expression.js";
 
@@ -157,11 +157,11 @@ function validateOptions(options: unknown, document: CircuitDocument): string | 
     return "直流動作点から開始する設定は真偽値で指定してください。";
   }
   if (options.switchStates !== undefined) {
-    if (!isSimulationRecord(options.switchStates) || options.switchStates instanceof Map || options.switchStates instanceof Set) {
+    if (!isSimulationRecord(options.switchStates, document.parts.map(({ id }) => id))) {
       return "スイッチ状態は部品 ID ごとの真偽値で指定してください。";
     }
     const switchIds = new Set(document.parts.filter((part) => part.kind === "switch").map(({ id }) => id));
-    for (const [partId, state] of Object.entries(options.switchStates)) {
+    for (const [partId, state] of simulationRecordEntries(options.switchStates)) {
       if (!switchIds.has(partId)) {
         return `スイッチ状態の対象「${partId}」はスイッチ部品ではありません。`;
       }
@@ -1108,12 +1108,13 @@ export function simulateTransient(
 }
 
 function simulateTransientFromInput(
-  document: CircuitDocument,
+  inputDocument: CircuitDocument,
   options: TransientAnalysisOptions,
 ): TransientAnalysis {
   try {
-    const shapeIssue = validateDocumentShape(document);
+    const shapeIssue = validateDocumentShape(inputDocument);
     if (shapeIssue) { return invalid(shapeIssue); }
+    const document = copySimulationDocument(inputDocument);
     const reactiveIssue = validateReactiveValues(document);
     if (reactiveIssue) { return invalid(reactiveIssue); }
     const optionsIssue = validateOptions(options, document);

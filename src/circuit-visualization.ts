@@ -879,6 +879,10 @@ function precisePartPotential(
   return precisePathPotential(node, reference, context, cache);
 }
 
+function finitePotential(volts: number, phaseDegrees: number) {
+  return finite(volts) ? { volts, phaseDegrees } : null;
+}
+
 /** AC differences subtract complex phasors, never their RMS magnitudes. */
 export function circuitPotential(
   node: CircuitNode | undefined,
@@ -893,7 +897,7 @@ export function circuitPotential(
     if (!finite(node.voltageVolts) || !finite(reference.voltageVolts)) { return null; }
     const difference = complexSubtract((context && restoredReadingComplex(node.exactVoltage, node.voltageVolts, undefined, false, context.analysis.precisionExpressions)) || complex(node.voltageVolts),
       (context && restoredReadingComplex(reference.exactVoltage, reference.voltageVolts, undefined, false, context.analysis.precisionExpressions)) || complex(reference.voltageVolts));
-    return { volts: difference.real, phaseDegrees: 0 };
+    return finitePotential(difference.real, 0);
   }
   if (!finite(node.voltageVolts) || !finite(reference.voltageVolts)) { return null; }
   if (!finite(node.voltagePhaseDegrees) || !finite(reference.voltagePhaseDegrees)) { return null; }
@@ -901,7 +905,7 @@ export function circuitPotential(
   const second = (context && restoredReadingComplex(reference.exactVoltage, reference.voltageVolts, reference.voltagePhaseDegrees, true, context.analysis.precisionExpressions)) || phasor(reference.voltageVolts, reference.voltagePhaseDegrees);
   const value = complexSubtract(first, second);
   const volts = complexMagnitude(value);
-  return { volts, phaseDegrees: complexPhaseDegrees(value) };
+  return finitePotential(volts, complexPhaseDegrees(value));
 }
 
 export function circuitPotentialColor(volts: number, scale: number) {

@@ -22,6 +22,27 @@ const wire = (
 ) => ({ id, from: { partId: from, terminal: fromTerminal }, to: { partId: to, terminal: toTerminal } });
 
 describe("AC potential path accumulation beyond binary64 intermediate range", () => {
+  it.each(["dc", "ac"] as const)("returns null for an unrepresentable %s potential difference", (mode) => {
+    const document: CircuitDocument = {
+      title: "Finite nodes with an overflowing difference",
+      parts: [part("positive", "ac-source", { voltageVolts: mode === "ac" ? 1e308 : 0,
+        offsetVolts: 1e308, frequencyHz: 50, phaseDegrees: 0 }),
+      part("negative", "ac-source", { voltageVolts: mode === "ac" ? 1e308 : 0,
+        offsetVolts: -1e308, frequencyHz: 50, phaseDegrees: 180 }), part("ground", "ground")],
+      wires: [wire("p", "positive", "b", "ground", "a"), wire("n", "negative", "b", "ground", "a")],
+    };
+    const analysis = analyzeCircuit(document, {}, { mode });
+    expect(analysis.status, analysis.message).toBe("open");
+    const nodes = circuitNodes(document, analysis);
+    const positive = nodes.find((node) => node.endpoints.some(({ partId, terminal }) => partId === "positive" && terminal === "a"));
+    const negative = nodes.find((node) => node.endpoints.some(({ partId, terminal }) => partId === "negative" && terminal === "a"));
+    expect(positive!.referenceGroup).toBe(negative!.referenceGroup);
+    for (const context of [undefined, { document, analysis, nodes }]) {
+      expect(circuitPotential(positive, negative, mode === "ac", context)).toBeNull();
+      expect(circuitPotential(negative, positive, mode === "ac", context)).toBeNull();
+    }
+  });
+
   it("keeps a finite 12 V path difference after large source drops cancel", () => {
     const sourceVoltages = [1e308, 1e308, -1e308, -1e308, 12];
     const document: CircuitDocument = {

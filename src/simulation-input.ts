@@ -1,6 +1,14 @@
-import { circuitPartCatalog, type CircuitPartKind, type CircuitTerminal } from "./circuit-model.js";
+import { circuitPartCatalog, type CircuitDocument, type CircuitPartKind, type CircuitTerminal } from "./circuit-model.js";
 
-export function isSimulationRecord(value: unknown): value is Record<string, unknown> {
+const simulationRecordFields = new Set([
+  ...Object.values(circuitPartCatalog).flatMap(({ defaults }) => Object.keys(defaults)),
+  "id", "kind", "x", "y", "rotation", "title", "parts", "wires",
+  "from", "to", "waypoints", "partId", "terminal", "mode", "frequencyHz",
+  "switchStates", "voltageOverrides", "initialInductorCurrents", "durationSeconds",
+  "timeStepSeconds", "startFromOperatingPoint",
+]);
+
+export function isSimulationRecord(value: unknown, expectedFields: Iterable<string> = simulationRecordFields): value is Record<string, unknown> {
   if (typeof value !== "object" || value === null) { return false; }
   try {
     if (Array.isArray(value)) { return false; }
@@ -9,6 +17,12 @@ export function isSimulationRecord(value: unknown): value is Record<string, unkn
     // Simulation input is data, so reject accessors before later validators or
     // catalog defaulting read fields and invoke caller-provided code.
     const descriptors = Object.getOwnPropertyDescriptors(value);
+    // A Proxy's ownKeys can omit configurable fields while direct reads still
+    // see them. Reject that mismatch before a snapshot silently loses values
+    // or a hidden accessor runs during later shape/value validation.
+    for (const key of expectedFields) {
+      if (!Object.hasOwn(descriptors, key) && Object.getOwnPropertyDescriptor(value, key)) { return false; }
+    }
     for (const key of Reflect.ownKeys(descriptors)) {
       const descriptor = Reflect.get(descriptors, key) as PropertyDescriptor;
       if (descriptor.get || descriptor.set || Reflect.get(value, key) !== descriptor.value) { return false; }
@@ -40,6 +54,9 @@ function usesNativeArrayMethods(value: unknown[]) {
     if (!descriptor || !Object.hasOwn(descriptor, "value") || typeof descriptor.value !== "function") {
       continue;
     }
+    // ownKeys may hide a configurable method override or accessor. Inspect
+    // its descriptor before reading the method, so the accessor cannot run.
+    if (Object.getOwnPropertyDescriptor(value, key)) { return false; }
     if (Reflect.get(value, key) !== descriptor.value) { return false; }
   }
   return true;
@@ -86,6 +103,25 @@ export function isSimulationArray(value: unknown): value is unknown[] {
 export function simulationRecordField(record: object, key: string) {
   const descriptor = Object.getOwnPropertyDescriptor(record, key);
   return descriptor && Object.hasOwn(descriptor, "value") ? descriptor.value : undefined;
+}
+
+/** Includes non-enumerable own data fields in validation and snapshots. */
+export function simulationRecordEntries(record: object): [string, unknown][] {
+  return Object.getOwnPropertyNames(record).map((key) => [key, simulationRecordField(record, key)]);
+}
+
+function copySimulationRecord<T extends object>(record: T): T {
+  return Object.fromEntries(simulationRecordEntries(record)) as T;
+}
+
+/** Called after shape validation so later spreads keep every simulation field. */
+export function copySimulationDocument(document: CircuitDocument): CircuitDocument {
+  return {
+    ...copySimulationRecord(document),
+    parts: document.parts.map(copySimulationRecord),
+    wires: document.wires.map((wire) => ({ ...copySimulationRecord(wire),
+      from: copySimulationRecord(wire.from), to: copySimulationRecord(wire.to) })),
+  };
 }
 
 /** Checks the object shape used before the numeric validators run. */

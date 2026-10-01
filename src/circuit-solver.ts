@@ -18,7 +18,7 @@ import {
 } from "./exact-linear-algebra.js";
 import { addRealStateValue, complexFromExact, exactRealStateValue } from "./exact-numeric-state.js";
 import { meterStatuses, type MeterStatus } from "./meter-status.js";
-import { circuitDocumentShapeIssue, isSimulationRecord, simulationRecordField } from "./simulation-input.js";
+import { circuitDocumentShapeIssue, copySimulationDocument, isSimulationRecord, simulationRecordEntries, simulationRecordField } from "./simulation-input.js";
 import { readingPrecision, type CircuitReadingPrecision, type CircuitTerminalVoltageDifference } from "./circuit-reading.js";
 import type { ExactExpressionNode } from "./exact-expression.js";
 
@@ -206,10 +206,10 @@ function documentIssue(document: CircuitDocument, switchStates: Record<string, b
 }
 
 function switchStateIssue(value: unknown, kinds: Map<string, CircuitPart["kind"]>): string | null {
-  if (typeof value !== "object" || value === null || Array.isArray(value) || value instanceof Map || value instanceof Set) {
+  if (!isSimulationRecord(value, kinds.keys())) {
     return "スイッチ状態は部品 ID ごとの真偽値で指定してください。";
   }
-  for (const [partId, state] of Object.entries(value)) {
+  for (const [partId, state] of simulationRecordEntries(value)) {
     if (kinds.get(partId) !== "switch") { return `スイッチ状態の対象「${partId}」はスイッチ部品ではありません。`; }
     if (typeof state !== "boolean") { return "スイッチ状態は部品 ID ごとの真偽値で指定してください。"; }
   }
@@ -2332,7 +2332,7 @@ function analyzeCircuitFromInput(
 ): CircuitAnalysis {
   const inputIssue = circuitAnalysisInputIssue(document, switchStates, options);
   if (inputIssue) { return invalidInputResult(inputIssue); }
-  const normalizedDocument = documentWithCatalogDefaults(document);
+  const normalizedDocument = documentWithCatalogDefaults(copySimulationDocument(document));
   let normalizedOptions: CircuitAnalysisOptions;
   try {
     normalizedOptions = {

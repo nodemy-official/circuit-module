@@ -508,6 +508,25 @@ function floorLog2Ratio(numerator: bigint, denominator: bigint) {
   return exponent;
 }
 
+/** Rounds a significand while preserving its exponent beyond binary64's range. */
+export function roundExactRationalSignificand(value: ExactRational, significantBits: number): ExactRational {
+  if (!Number.isSafeInteger(significantBits) || significantBits < 2) {
+    throw new RangeError("Exact rational precision must be an integer of at least two bits.");
+  }
+  const input = normalized(value);
+  if (!input) { throw new RangeError("Exact rational denominator must not be zero."); }
+  if (input.numerator === 0n) { return ZERO; }
+  const magnitude = absolute(input.numerator);
+  const exponent = floorLog2Ratio(magnitude, input.denominator);
+  const shift = significantBits - 1 - exponent;
+  const numerator = shift >= 0 ? magnitude * 2n ** BigInt(shift) : magnitude;
+  const denominator = shift >= 0 ? input.denominator : input.denominator * 2n ** BigInt(-shift);
+  const significand = roundPositiveRatio(numerator, denominator) * (input.numerator < 0n ? -1n : 1n);
+  return shift >= 0
+    ? rational(significand, 2n ** BigInt(shift))
+    : rational(significand * 2n ** BigInt(-shift));
+}
+
 /** Rounds one exact rational to binary64 using round-to-nearest, ties-to-even. */
 export function exactRationalToNumber(value: ExactRational): number {
   if (reducedRationals.has(value) || deferredRationals.has(value)) {
