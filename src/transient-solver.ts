@@ -5,6 +5,7 @@ import {
   numberToExactRational,
   exactRationalToNumber,
   divideExactRational,
+  multiplyExactRational,
   type ExactRational,
 } from "./exact-linear-algebra.js";
 import type { MeterStatus } from "./meter-status.js";
@@ -21,7 +22,8 @@ import {
 } from "./circuit-solver.js";
 import { copySimulationDocument, isSimulationArray, isSimulationRecord, simulationRecordEntries } from "./simulation-input.js";
 import { readingPrecision, terminalVoltageDifferences, type CircuitReadingPrecision, type CircuitTerminalVoltageDifference } from "./circuit-reading.js";
-import { createExactExpressionCapture, freezeCapturedExactExpressions, withExactExpressionCapture, type ExactExpressionNode } from "./exact-expression.js";
+import { createExactExpressionCapture, freezeCapturedExactExpressions, snapshotExactExpressions, withExactExpressionCapture, type ExactExpressionNode } from "./exact-expression.js";
+import { createTransientEnergyCollector, type TransientEnergyReadings } from "./transient-energy.js";
 
 export const MAX_TRANSIENT_STEPS = 2000;
 /** Maximum estimated dense MNA scalar operations across every sample. */
@@ -58,6 +60,9 @@ export interface TransientAnalysis {
   samples: TransientSample[];
   /** Shared immutable expressions for exact readings. Preserved by JSON and structuredClone. */
   precisionExpressions?: readonly ExactExpressionNode[];
+  /** Precomputed exact-state energy projections, guarded by sampled input snapshots. */
+  energyReadings?: TransientEnergyReadings;
+  energyPrecisionExpressions?: readonly ExactExpressionNode[];
 }
 
 export interface TransientAnalysisOptions {
@@ -73,6 +78,7 @@ interface StoredState {
   exactCapacitorVoltages: Map<string, ExactRational>;
   inductorCurrents: Map<string, number>;
   exactInductorCurrents: Map<string, ExactRational>;
+  exactResistivePowers: Map<string, ExactRational>;
 }
 
 interface CapacitorMember {
@@ -844,6 +850,7 @@ function createSample(
   const inductorCurrents = new Map<string, number>();
   const exactInductorCurrents = new Map<string, ExactRational>();
   const acSourceVoltages = new Map<string, ExactRational>();
+  const exactResistivePowers = new Map<string, ExactRational>();
   for (const part of document.parts) {
     const result = samplePart(part, analysis.parts[part.id]);
     if ("reason" in result) { return { reason: result.reason }; }
@@ -854,10 +861,14 @@ function createSample(
     if (result.inductorCurrent !== undefined) { inductorCurrents.set(part.id, result.inductorCurrent); }
     if (result.exactInductorCurrent) { exactInductorCurrents.set(part.id, result.exactInductorCurrent); }
     if (part.kind === "ac-source") { acSourceVoltages.set(part.id, exactComplexValue(analysis.parts[part.id]!.voltage)!.real); }
+    if (part.kind === "resistor" || part.kind === "bulb") {
+      const reading = analysis.parts[part.id]!;
+      exactResistivePowers.set(part.id, multiplyExactRational(exactComplexValue(reading.voltage)!.real, exactComplexValue(reading.current)!.real));
+    }
   }
   return {
     sample: { timeSeconds: 0, parts },
-    state: { capacitorVoltages, exactCapacitorVoltages, inductorCurrents, exactInductorCurrents, acSourceVoltages },
+    state: { capacitorVoltages, exactCapacitorVoltages, inductorCurrents, exactInductorCurrents, acSourceVoltages, exactResistivePowers },
   };
 }
 
@@ -1077,6 +1088,8 @@ function runSteps(
   const issues = [...initial.issues];
   const samples: TransientSample[] = [{ timeSeconds: 0, parts: initial.sample.parts }];
   let state = initial.state;
+  const energy = createTransientEnergyCollector(document);
+  energy.append(samples[0]!, state.exactCapacitorVoltages, state.exactInductorCurrents, state.exactResistivePowers);
   let previousTime = 0;
   for (let index = 1; index <= steps; index += 1) {
     const timeSeconds = timeAtStep(index, steps, options);
@@ -1089,11 +1102,13 @@ function runSteps(
     if (result.reason || !result.sample || !result.state) {
       return invalid(result.reason ?? `t=${timeSeconds} s の波形を計算できませんでした。`, issues, samples);
     }
-    samples.push({ timeSeconds, parts: result.sample.parts });
+    const sample = { timeSeconds, parts: result.sample.parts };
+    samples.push(sample);
     state = result.state;
+    energy.append(sample, state.exactCapacitorVoltages, state.exactInductorCurrents, state.exactResistivePowers);
     previousTime = timeSeconds;
   }
-  return valid(`過渡解析が完了しました（${steps}ステップ）。`, issues, samples);
+  return { ...valid(`過渡解析が完了しました（${steps}ステップ）。`, issues, samples), energyReadings: energy.readings };
 }
 
 /** Simulates transient DC/time-domain behavior with backward Euler integration. */
@@ -1104,7 +1119,10 @@ export function simulateTransient(
   const capture = createExactExpressionCapture();
   const result = withExactExpressionCapture(capture, () => simulateTransientFromInput(document, options));
   if (capture.nodes.length === 0) { return result; }
-  return { ...result, precisionExpressions: freezeCapturedExactExpressions(capture) };
+  const precisionExpressions = freezeCapturedExactExpressions(capture);
+  return { ...result, precisionExpressions,
+    ...(result.energyReadings ? { energyPrecisionExpressions: snapshotExactExpressions(precisionExpressions) } : {}),
+  };
 }
 
 function simulateTransientFromInput(

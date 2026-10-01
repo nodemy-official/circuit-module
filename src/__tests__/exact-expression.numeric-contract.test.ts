@@ -1,6 +1,6 @@
 import { expect, it } from "vitest";
 import { retainedComplex, restoredComplex } from "../circuit-reading.js";
-import { createExactExpressionCapture, freezeCapturedExactExpressions, withExactExpressionCapture } from "../exact-expression.js";
+import { createExactExpressionCapture, freezeCapturedExactExpressions, matchingExactExpressions, snapshotExactExpressions, withExactExpressionCapture, type ExactExpressionNode } from "../exact-expression.js";
 import { solveExactComplexLinearSystem, solveExactRealLinearSystem } from "../exact-linear-algebra.js";
 import { complexFromExact, exactComplexValue } from "../exact-numeric-state.js";
 
@@ -31,4 +31,43 @@ it.each(["real", "complex"] as const)("preserves the exact %s solution's transpo
       expect(restored.imaginary.numerator * denominator).toBe(imaginaryNumerators[index]! * restored.imaginary.denominator);
     }
   }
+});
+
+it("invalidates restored expression values when a mutable dependency or operation changes", () => {
+  const table: ExactExpressionNode[] = [
+    { operation: "literal", numerator: "1", denominator: "3" },
+    { operation: "literal", numerator: "2", denominator: "1" },
+    { operation: "multiply", arguments: [0, 1] },
+  ];
+  const reading = { real: { expression: 2, sign: 1 as const }, imaginary: { numerator: "0", denominator: "1" } };
+  const assertValue = (numerator: bigint, denominator: bigint) => {
+    const exact = exactComplexValue(restoredComplex(reading, table)!)!.real;
+    expect(exact.numerator * denominator).toBe(numerator * exact.denominator);
+  };
+  assertValue(2n, 3n);
+  table[0] = { operation: "literal", numerator: "1", denominator: "5" };
+  assertValue(2n, 5n);
+  table[2] = { operation: "add", arguments: [0, 1] };
+  assertValue(11n, 5n);
+  table[2] = { operation: "multiply", arguments: [0, 0] };
+  assertValue(1n, 25n);
+});
+
+it.each(["node", "argument"])("rejects sparse expression tables after a %s is deleted", (field) => {
+  const table: ExactExpressionNode[] = [
+    { operation: "literal", numerator: "5", denominator: "9" },
+    { operation: "literal", numerator: "0", denominator: "1" },
+    { operation: "add", arguments: [0, 1] },
+  ];
+  const snapshot = snapshotExactExpressions(table);
+  const reading = { real: { expression: 2, sign: 1 as const }, imaginary: { numerator: "0", denominator: "1" } };
+  expect(restoredComplex(reading, table)).toBeDefined();
+  if (field === "node") { Reflect.deleteProperty(table, "0"); }
+  else {
+    const node = table[2]!;
+    if (node.operation === "literal") { throw new Error("Expected operation"); }
+    Reflect.deleteProperty(node.arguments, "0");
+  }
+  expect(matchingExactExpressions(table, snapshot)).toBe(false);
+  expect(restoredComplex(reading, table)).toBeUndefined();
 });

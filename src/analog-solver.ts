@@ -59,6 +59,7 @@ import { acAnalysisFrequency, acReactiveAdmittance, acReactiveImpedance, acReact
 import { meterStatuses, type MeterStatus } from "./meter-status.js";
 import { circuitDocumentShapeIssue, copySimulationDocument, isSimulationRecord, simulationRecordEntries, simulationRecordField } from "./simulation-input.js";
 import { acResponsePartGroups, type AcResponseEdge } from "./ac-response-groups.js";
+import { compatibleIdealAcVoltageCycle } from "./ac-voltage-constraints.js";
 
 export type { ComplexValue } from "./analog-math.js";
 
@@ -189,7 +190,6 @@ interface Branch {
   /** Exact backward-Euler companion coefficients for transient DC steps. */
   transientCompanion?: TransientCompanionConstraint;
   /** Componentwise allowance for rounding while deriving this source phasor. */
-  sourceVoltageUncertainty?: ComplexValue;
   unknownIndex: number;
   /** Redundant compatible ideal voltage constraint; its current is fixed to zero. */
   redundantIdealSource?: boolean;
@@ -783,7 +783,6 @@ interface BranchSpec {
   exactSeriesReactance?: ExactRational;
   sourceVoltage: ComplexValue;
   transientCompanion?: TransientCompanionConstraint;
-  sourceVoltageUncertainty?: ComplexValue;
 }
 
 function nodeForTerminal(topology: Topology, part: CircuitPart, terminal: CircuitTerminal) {
@@ -810,9 +809,6 @@ function acSourceBranchSpec(
     // correction is applied to the independent response after solving.
     sourceVoltage: mode === "ac" && exactComplexValue(sourceVoltage)
       ? complexFromExact(exactComplexValue(sourceVoltage)!) : sourceVoltage,
-    sourceVoltageUncertainty: mode === "ac"
-      ? acSourcePhasorUncertainty(part, frequencyHz, sourceVoltage)
-      : complex(),
   };
 }
 
@@ -912,16 +908,6 @@ function acSourcePhasor(part: CircuitPart, frequencyHz: number | undefined) {
   return complexFromPolar(part.voltageVolts ?? 0, part.phaseDegrees ?? 0);
 }
 
-function acSourcePhasorUncertainty(part: CircuitPart, frequencyHz: number | undefined, phasor: ComplexValue) {
-  if (frequencyHz === undefined || !frequencyMatches(part.frequencyHz ?? 0, frequencyHz)) { return complex(); }
-  const phaseDegrees = (part.phaseDegrees ?? 0) % 360;
-  if ([0, 90, -90, 180, -180, 270, -270].includes(phaseDegrees)) { return complex(); }
-  const roundoffScale = 64 * Number.EPSILON;
-  const exact = exactComplexValue(phasor)!;
-  const absolute = (value: ExactRational) => value.numerator < 0n ? { ...value, numerator: -value.numerator } : value;
-  return complexMultiply(complex(roundoffScale), complexFromExact({ real: absolute(exact.real), imaginary: absolute(exact.imaginary) }));
-}
-
 function addMnaBranch(
   spec: BranchSpec,
   topology: Topology,
@@ -951,7 +937,6 @@ function addMnaBranch(
     exactSeriesReactance: spec.exactSeriesReactance,
     sourceVoltage,
     ...(spec.transientCompanion ? { transientCompanion: spec.transientCompanion } : {}),
-    sourceVoltageUncertainty: spec.sourceVoltageUncertainty ?? complex(),
     unknownIndex: topology.nodeUnknownCount + branches.length,
   };
   branches.push(branch);
@@ -959,21 +944,9 @@ function addMnaBranch(
   return undefined;
 }
 
-function compatibleIdealVoltageConstraint(
-  left: ComplexValue,
-  right: ComplexValue,
-  leftUncertainty: ComplexValue,
-  rightUncertainty: ComplexValue,
-) {
-  if (![left.real, left.imaginary, right.real, right.imaginary].every(Number.isFinite)) { return false; }
+function compatibleIdealVoltageConstraint(left: ComplexValue, right: ComplexValue) {
   const difference = exactComplexValue(complexSubtract(left, right));
-  const tolerance = exactComplexValue(complexAdd(leftUncertainty, rightUncertainty));
-  if (!difference || !tolerance) { return false; }
-  const componentsCompatible = (delta: ExactRational, exactTolerance: ExactRational) =>
-    exactTolerance.numerator >= 0n && absoluteExactRational(delta).numerator * exactTolerance.denominator <=
-      exactTolerance.numerator * delta.denominator;
-  return componentsCompatible(difference.real, tolerance.real) &&
-    componentsCompatible(difference.imaginary, tolerance.imaginary);
+  return difference?.real.numerator === 0n && difference.imaginary.numerator === 0n;
 }
 
 interface IdealVoltageConstraintNeighbor {
@@ -983,12 +956,10 @@ interface IdealVoltageConstraintNeighbor {
   orientation: 1 | -1;
   /** V(current node) − V(neighbor node). */
   voltageDifference: ComplexValue;
-  voltageUncertainty: ComplexValue;
 }
 
 interface IdealVoltageConstraintPath {
   voltageDifference: ComplexValue;
-  voltageUncertainty: ComplexValue;
   partIds: string[];
   edges: IdealVoltageConstraintNeighbor[];
 }
@@ -1023,20 +994,17 @@ function idealVoltageConstraintPath(
   if (parent[to] === -1) { return undefined; }
 
   let pathVoltage = complex();
-  let uncertainty = complex();
   const partIds: string[] = [];
   const edges: IdealVoltageConstraintNeighbor[] = [];
   for (let node = to; node !== from; node = parent[node] ?? -1) {
     const edge = parentEdge[node];
     if (!edge) { return undefined; }
     pathVoltage = complexAdd(pathVoltage, edge.voltageDifference);
-    uncertainty = complexAdd(uncertainty, edge.voltageUncertainty);
     partIds.push(edge.partId);
     edges.push(edge);
   }
   return {
     voltageDifference: pathVoltage,
-    voltageUncertainty: uncertainty,
     partIds,
     edges,
   };
@@ -1052,7 +1020,6 @@ function addIdealVoltageConstraint(
     branch,
     orientation: 1,
     voltageDifference: branch.sourceVoltage,
-    voltageUncertainty: branch.sourceVoltageUncertainty ?? complex(),
   });
   adjacency[branch.negativeNode]?.push({
     node: branch.positiveNode,
@@ -1060,7 +1027,6 @@ function addIdealVoltageConstraint(
     branch,
     orientation: -1,
     voltageDifference: complexSubtract(complex(), branch.sourceVoltage),
-    voltageUncertainty: branch.sourceVoltageUncertainty ?? complex(),
   });
 }
 
@@ -1111,6 +1077,7 @@ function markRedundantIdealVoltageCycles(
   document: CircuitDocument,
   branches: Branch[],
   nodeCount: number,
+  mode: AnalogAnalysisMode,
 ): AnalogCircuitIssue | undefined {
   const partById = new Map(document.parts.map((part) => [part.id, part]));
   const adjacency = Array.from(
@@ -1132,12 +1099,13 @@ function markRedundantIdealVoltageCycles(
       continue;
     }
 
-    if (!compatibleIdealVoltageConstraint(
-      path.voltageDifference,
-      branch.sourceVoltage,
-      path.voltageUncertainty,
-      branch.sourceVoltageUncertainty ?? complex(),
-    )) {
+    const compatible = mode === "ac"
+      ? compatibleIdealAcVoltageCycle([
+        ...path.edges.map((edge) => ({ part: partById.get(edge.partId)!, voltage: edge.branch.sourceVoltage, orientation: edge.orientation })),
+        { part: partById.get(branch.partId)!, voltage: branch.sourceVoltage, orientation: -1 },
+      ])
+      : compatibleIdealVoltageConstraint(path.voltageDifference, branch.sourceVoltage);
+    if (!compatible) {
       return idealVoltageConstraintIssue(branch, path, partById);
     }
 
@@ -1265,7 +1233,7 @@ function buildLayout(
     branch.initialVoltageDerivative = initialConstraint?.voltageDerivative;
   }
   const idealVoltageCycleIssue = markRedundantIdealVoltageCycles(
-    document, [...branches, ...internalBranches], topology.nodeCount,
+    document, [...branches, ...internalBranches], topology.nodeCount, mode,
   );
   if (idealVoltageCycleIssue) { return { issue: idealVoltageCycleIssue }; }
 

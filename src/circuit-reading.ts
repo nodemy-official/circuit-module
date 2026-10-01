@@ -60,16 +60,25 @@ export function retainedComplex(value: ComplexValue): CircuitExactComplex | unde
       : onImaginaryAxis ? Math.abs(value.imaginary) : complexMagnitude(value), phaseDegrees } };
 }
 
+const LARGE_REPLAY_VALUE = 2n ** 4096n;
+
+function replayOperand(value: ExactRational): ExactRational {
+  return value.denominator >= LARGE_REPLAY_VALUE || value.numerator >= LARGE_REPLAY_VALUE || value.numerator <= -LARGE_REPLAY_VALUE
+    ? deferExactRationalReduction(value) : value;
+}
+
 const expressionOperations = {
   // Keep fixed coefficients canonical, as in the solver. Marking every
   // coefficient deferred prevents cross-cancellation during long replay.
   literal: (value: ExactRational) => value.denominator < 2n ** 4096n && value.numerator < 2n ** 4096n && value.numerator > -(2n ** 4096n)
     ? addExactRational(value, numberToExactRational(0)!) : deferExactRationalReduction(value),
-  add: addExactRational,
-  subtract: subtractExactRational,
-  multiply: multiplyExactRational,
-  divide: divideExactRational,
-  sum: sumExactRationals,
+  // Growing histories retain their exact values without repeatedly reducing
+  // enormous numerators. Small fixed coefficients still cross-cancel normally.
+  add: (left: ExactRational, right: ExactRational) => addExactRational(replayOperand(left), replayOperand(right)),
+  subtract: (left: ExactRational, right: ExactRational) => subtractExactRational(replayOperand(left), replayOperand(right)),
+  multiply: (left: ExactRational, right: ExactRational) => multiplyExactRational(replayOperand(left), replayOperand(right)),
+  divide: (left: ExactRational, right: ExactRational) => divideExactRational(replayOperand(left), replayOperand(right)),
+  sum: (values: readonly ExactRational[]) => sumExactRationals(values.map(replayOperand)),
 };
 
 function restoredRational(component: unknown, expressions: readonly ExactExpressionNode[] | undefined) {
@@ -81,7 +90,7 @@ function restoredRational(component: unknown, expressions: readonly ExactExpress
         !/^-?(?:\d+|0x[\da-f]+)$/i.test(component.numerator) || !/^(?:\d+|0x[\da-f]+)$/i.test(component.denominator)) { return; }
       const denominator = BigInt(component.denominator);
       const numerator = component.numerator.startsWith("-") ? -BigInt(component.numerator.slice(1)) : BigInt(component.numerator);
-      return denominator > 0n ? { numerator, denominator } : undefined;
+      return denominator > 0n ? replayOperand({ numerator, denominator }) : undefined;
 }
 
 /** Ignore malformed optional metadata and let scalar-reading fallbacks apply. */

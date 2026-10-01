@@ -2,6 +2,7 @@ import { useId, useState } from "react";
 import type { CircuitAnalysis } from "../circuit-solver.js";
 import type { CircuitDocument, CircuitPart } from "../circuit-model.js";
 import { formatCircuitNumber } from "../number-format.js";
+import { copySimulationDocument } from "../simulation-input.js";
 
 type ComparisonMetric = "voltageVolts" | "currentAmps" | "powerWatts";
 interface Snapshot {
@@ -26,13 +27,11 @@ const metrics: Array<{ key: ComparisonMetric; label: string; unit: string }> = [
 const sourceKinds = new Set<CircuitPart["kind"]>(["battery", "ac-source", "current-source"]);
 
 function cloneDocument(document: CircuitDocument): CircuitDocument {
+  const copiedDocument = copySimulationDocument(document);
   return {
-    ...document,
-    parts: document.parts.map((part) => ({ ...part })),
-    wires: document.wires.map((wire) => ({
+    ...copiedDocument,
+    wires: copiedDocument.wires.map((wire) => ({
       ...wire,
-      from: { ...wire.from },
-      to: { ...wire.to },
       waypoints: wire.waypoints?.map((point) => ({ ...point })),
     })),
   };

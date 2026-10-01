@@ -1,10 +1,14 @@
-import { useMemo } from "react";
-import { scaledProduct } from "../analog-math.js";
+import { complexMagnitudeNormalization, scaledProduct } from "../analog-math.js";
 import type { CircuitDocument, CircuitPart } from "../circuit-model.js";
+import { restoredReadingComplex } from "../circuit-reading.js";
 import type { CircuitAnalysis } from "../circuit-solver.js";
+import { snapshotExactExpressions, type ExactExpressionNode } from "../exact-expression.js";
+import { addExactRational, exactRationalToNumber, multiplyExactRational, numberToExactRational, subtractExactRational, type ExactRational } from "../exact-linear-algebra.js";
+import { exactComplexValue } from "../exact-numeric-state.js";
 import { formatCircuitNumber } from "../number-format.js";
 import { formatCircuitQuantity, type CircuitTransientFrame } from "../circuit-visualization.js";
 import type { TransientPartReading, TransientSample } from "../transient-solver.js";
+import { matchingTransientEnergy, type TransientEnergySample } from "../transient-energy.js";
 
 const sourceKinds = new Set(["battery", "ac-source", "current-source"]);
 const reactiveKinds = new Set(["capacitor", "inductor"]);
@@ -18,58 +22,77 @@ function formatNumber(value: number): string {
   return formatCircuitNumber(value);
 }
 
-function storedEnergy(part: CircuitPart, voltageVolts: number, currentAmps: number): number | null {
-  if (part.kind === "capacitor") {
-    const capacitance = part.capacitanceFarads ?? 1e-6;
-    return finite(capacitance) && capacitance >= 0
-      ? scaledProduct([0.5, capacitance, voltageVolts, voltageVolts])
-      : null;
-  }
-  if (part.kind === "inductor") {
-    const inductance = part.inductanceHenries ?? 0.01;
-    return finite(inductance) && inductance >= 0
-      ? scaledProduct([0.5, inductance, currentAmps, currentAmps])
-      : null;
-  }
-  return null;
+function storedEnergy(
+  part: CircuitPart,
+  reading: CircuitAnalysis["parts"][string] | TransientPartReading,
+  ac: boolean,
+  expressions?: readonly ExactExpressionNode[],
+): number | null {
+  if (part.kind !== "capacitor" && part.kind !== "inductor") { return null; }
+  const capacitive = part.kind === "capacitor";
+  const coefficient = capacitive ? part.capacitanceFarads ?? 1e-6 : part.inductanceHenries ?? 0.01;
+  const scalar = capacitive ? reading.voltageVolts : reading.currentAmps;
+  if (!finite(coefficient) || coefficient < 0 || !finite(scalar)) { return null; }
+  const phase = capacitive ? "voltagePhaseDegrees" in reading ? reading.voltagePhaseDegrees : undefined
+    : "currentPhaseDegrees" in reading ? reading.currentPhaseDegrees : undefined;
+  const retained = restoredReadingComplex(capacitive ? reading.exactVoltage : reading.exactTerminalCurrents?.a, scalar, phase, ac, expressions);
+  const exact = retained && exactComplexValue(retained);
+  if (!retained || !exact) { return scaledProduct([0.5, coefficient, scalar, scalar]); }
+  const squaredMagnitude = multiplyExactRational(addExactRational(
+    multiplyExactRational(exact.real, exact.real), multiplyExactRational(exact.imaginary, exact.imaginary),
+  ), complexMagnitudeNormalization(retained));
+  return exactRationalToNumber(multiplyExactRational(
+    multiplyExactRational(numberToExactRational(0.5)!, numberToExactRational(coefficient)!), squaredMagnitude,
+  ));
 }
 
-function resistorEnergySeries(samples: readonly TransientSample[], partId: string): Array<number | null> {
+function resistivePower(reading: TransientPartReading, expressions?: readonly ExactExpressionNode[]): ExactRational {
+  const fallback = numberToExactRational(Math.max(0, reading.powerWatts))!;
+  if (!finite(reading.voltageVolts) || !finite(reading.currentAmps) || reading.powerWatts < 0) { return fallback; }
+  const voltage = restoredReadingComplex(reading.exactVoltage, reading.voltageVolts, undefined, false, expressions);
+  const current = restoredReadingComplex(reading.exactTerminalCurrents?.a, reading.currentAmps, undefined, false, expressions);
+  const power = multiplyExactRational(
+    voltage ? exactComplexValue(voltage)!.real : numberToExactRational(reading.voltageVolts)!,
+    current ? exactComplexValue(current)!.real : numberToExactRational(reading.currentAmps)!,
+  );
+  // Preserve the solver's unrounded V*I, including power below MIN_VALUE.
+  // A caller's independently replaced scalar power remains authoritative.
+  return power.numerator >= 0n && exactRationalToNumber(power) === reading.powerWatts ? power : fallback;
+}
+
+function resistorEnergySeries(samples: readonly TransientSample[], partId: string, expressions?: readonly ExactExpressionNode[]): Array<number | null> {
   const series: Array<number | null> = [0];
-  let accumulated: number | null = 0;
+  let accumulated: ExactRational | null = numberToExactRational(0)!;
+  const half = numberToExactRational(0.5)!;
   for (let index = 1; index < samples.length; index += 1) {
     const previous = samples[index - 1];
     const current = samples[index];
-    const previousPower = previous?.parts[partId]?.powerWatts;
-    const currentPower = current?.parts[partId]?.powerWatts;
-    if (accumulated === null || !previous || !current || !finite(previousPower) || !finite(currentPower)) {
+    const previousReading = previous?.parts[partId];
+    const currentReading = current?.parts[partId];
+    if (accumulated === null || !previous || !current || !previousReading || !currentReading ||
+      !finite(previousReading.powerWatts) || !finite(currentReading.powerWatts)) {
       accumulated = null;
       series.push(null);
       continue;
     }
-    const duration = current.timeSeconds - previous.timeSeconds;
-    if (!(duration > 0) || !Number.isFinite(duration)) {
+    const previousTime = numberToExactRational(previous.timeSeconds);
+    const currentTime = numberToExactRational(current.timeSeconds);
+    const duration = previousTime && currentTime && subtractExactRational(currentTime, previousTime);
+    if (!duration || duration.numerator <= 0n) {
       accumulated = null;
       series.push(null);
       continue;
     }
-    // Normalize the endpoints before averaging to avoid both overflow in the sum
-    // and underflow when halving the smallest positive power.
-    const positivePreviousPower = Math.max(0, previousPower);
-    const positiveCurrentPower = Math.max(0, currentPower);
-    const maximumPower = Math.max(positivePreviousPower, positiveCurrentPower);
-    const averageFactor = maximumPower === 0
-      ? 0
-      : (positivePreviousPower / maximumPower + positiveCurrentPower / maximumPower) * 0.5;
-    const intervalEnergy = scaledProduct([maximumPower, averageFactor, duration]);
-    const nextAccumulated: number = accumulated + intervalEnergy;
-    if (!Number.isFinite(nextAccumulated)) {
+    const powerSum = addExactRational(resistivePower(previousReading, expressions), resistivePower(currentReading, expressions));
+    const intervalEnergy = multiplyExactRational(multiplyExactRational(powerSum, half), duration);
+    accumulated = addExactRational(accumulated, intervalEnergy);
+    const displayed = exactRationalToNumber(accumulated);
+    if (!Number.isFinite(displayed)) {
       accumulated = null;
       series.push(null);
       continue;
     }
-    accumulated = nextAccumulated;
-    series.push(accumulated);
+    series.push(displayed);
   }
   return series;
 }
@@ -122,23 +145,28 @@ function energyEntries(
   analysis: CircuitAnalysis,
   sample: TransientSample | undefined,
   transient: boolean,
+  expressions?: readonly ExactExpressionNode[],
+  precomputed?: Map<string, readonly TransientEnergySample[]>,
+  sampleIndex = -1,
 ): EnergyEntry[] {
   return document.parts.flatMap((part) => {
     if (!reactiveKinds.has(part.kind)) { return []; }
     const reading = transient ? sample?.parts[part.id] : analysis.parts[part.id];
     if (!reading || !finite(reading.voltageVolts) || !finite(reading.currentAmps)) { return []; }
-    const joules = storedEnergy(part, reading.voltageVolts, reading.currentAmps);
+    const cached = precomputed?.get(part.id)?.[sampleIndex];
+    const joules = cached ? cached.storedJoules : storedEnergy(part, reading, analysis.mode === "ac" && !transient, expressions);
     return finite(joules) ? [{ part, joules }] : [];
   });
 }
 
-function maximumStoredEnergy(document: CircuitDocument, transient: CircuitTransientFrame["analysis"] | null): number {
+function maximumStoredEnergy(document: CircuitDocument, transient: CircuitTransientFrame["analysis"] | null, precomputed: Map<string, readonly TransientEnergySample[]>, expressions?: readonly ExactExpressionNode[]): number {
   if (!transient) { return 0; }
-  return Math.max(0, ...transient.samples.flatMap((sample) => document.parts.flatMap((part) => {
+  return Math.max(0, ...transient.samples.flatMap((sample, sampleIndex) => document.parts.flatMap((part) => {
     if (!reactiveKinds.has(part.kind)) { return []; }
     const reading = sample.parts[part.id];
     if (!reading || !finite(reading.voltageVolts) || !finite(reading.currentAmps)) { return []; }
-    const joules = storedEnergy(part, reading.voltageVolts, reading.currentAmps);
+    const cached = precomputed.get(part.id)?.[sampleIndex];
+    const joules = cached ? cached.storedJoules : storedEnergy(part, reading, false, expressions);
     return finite(joules) ? [joules] : [];
   })));
 }
@@ -240,6 +268,28 @@ function DissipationGroup({ entries, maximum }: { entries: DissipationEntry[]; m
   </div>;
 }
 
+function transientEnergy(document: CircuitDocument, transient: CircuitTransientFrame["analysis"] | null) {
+  return new Map(document.parts.flatMap((part) => {
+    const energy = transient && matchingTransientEnergy(part, transient.samples, transient.energyReadings,
+      transient.precisionExpressions, transient.energyPrecisionExpressions);
+    return energy ? [[part.id, energy] as const] : [];
+  }));
+}
+
+function energyExpressions(table: readonly ExactExpressionNode[] | undefined) {
+  if (!table) { return; }
+  try { return snapshotExactExpressions(table); }
+  catch { /* Malformed optional precision metadata uses scalar readouts. */ }
+}
+
+function dissipatedEnergy(parts: CircuitPart[], transient: CircuitTransientFrame["analysis"] | null,
+  precomputed: Map<string, readonly TransientEnergySample[]>, expressions?: readonly ExactExpressionNode[]) {
+  return transient
+    ? new Map(parts.map((part) => [part.id, precomputed.get(part.id)?.map((entry) => entry.dissipatedJoules ?? null)
+      ?? resistorEnergySeries(transient.samples, part.id, expressions)]))
+    : new Map<string, Array<number | null>>();
+}
+
 export interface CircuitEnergyPanelProps {
   document: CircuitDocument;
   analysis: CircuitAnalysis;
@@ -255,13 +305,14 @@ export function CircuitEnergyPanel({ document, analysis, frame }: CircuitEnergyP
     : -1;
   const sample = sampleIndex >= 0 ? transient?.samples[sampleIndex] : undefined;
   const usingTransient = Boolean(sample);
-  const canShowSteady = analysis.status !== "invalid" && analysis.status !== "empty" && analysis.status !== "short";
-  const maximumStoredJoules = useMemo(() => maximumStoredEnergy(document, transient), [document, transient]);
-  const resistiveParts = useMemo(() => document.parts.filter((part) => resistiveKinds.has(part.kind)), [document]);
-  const dissipatedByPart = useMemo(() => transient
-    ? new Map(resistiveParts.map((part) => [part.id, resistorEnergySeries(transient.samples, part.id)]))
-    : new Map<string, Array<number | null>>(), [resistiveParts, transient]);
-  const maximumDissipatedJoules = useMemo(() => maximumDissipation(dissipatedByPart), [dissipatedByPart]);
+  const canShowSteady = !["invalid", "empty", "short"].includes(analysis.status);
+  // Revalidate on every render: callers may edit samples or the document in place.
+  const precomputed = transientEnergy(document, transient);
+  const expressions = energyExpressions(transient?.precisionExpressions);
+  const maximumStoredJoules = maximumStoredEnergy(document, transient, precomputed, expressions);
+  const resistiveParts = document.parts.filter((part) => resistiveKinds.has(part.kind));
+  const dissipatedByPart = dissipatedEnergy(resistiveParts, transient, precomputed, expressions);
+  const maximumDissipatedJoules = maximumDissipation(dissipatedByPart);
 
   if ((!usingTransient && !canShowSteady) || (frame && !sample)) {
     const message = frame?.analysis.status === "valid"
@@ -278,7 +329,7 @@ export function CircuitEnergyPanel({ document, analysis, frame }: CircuitEnergyP
   const sources = powers.filter(({ part }) => isPowerSource(part, ac, usingTransient));
   const components = powers.filter(({ part }) => !isPowerSource(part, ac, usingTransient));
   const maximumPower = powerGroupMaximum(powers);
-  const energies = energyEntries(document, analysis, sample, usingTransient);
+  const energies = energyEntries(document, analysis, sample, usingTransient, transient ? expressions : analysis.precisionExpressions, precomputed, sampleIndex);
   const dissipation = usingTransient
     ? resistiveParts.map((part) => ({ part, joules: dissipatedByPart.get(part.id)?.[sampleIndex] ?? null }))
     : [];

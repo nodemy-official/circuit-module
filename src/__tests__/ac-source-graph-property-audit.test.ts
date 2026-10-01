@@ -125,7 +125,7 @@ function sourceEdges(nodeCount: number, axis: boolean, random: () => number) {
   return edges;
 }
 
-function makeDocument(nodePotentials: ComplexValue[], edges: Array<readonly [number, number]>, random: () => number) {
+function makeDocument(nodePotentials: ComplexValue[], edges: Array<readonly [number, number]>, random: () => number, commonPhase?: number) {
   const nodeCount = nodePotentials.length;
   const loadPositiveNode = Math.floor(random() * nodeCount);
   let loadNegativeNode = Math.floor(random() * nodeCount);
@@ -142,7 +142,10 @@ function makeDocument(nodePotentials: ComplexValue[], edges: Array<readonly [num
   const sourceParts = orientedEdges.map((edge) => {
     const sourceVoltage = subtract(nodePotentials[edge.positiveNode]!, nodePotentials[edge.negativeNode]!);
     return part(edge.id, "ac-source", {
-      ...polar(sourceVoltage),
+      ...(commonPhase === undefined ? polar(sourceVoltage) : {
+        voltageVolts: Math.abs(sourceVoltage.real),
+        phaseDegrees: commonPhase + (sourceVoltage.real < 0 ? 180 : 0),
+      }),
       frequencyHz,
     });
   });
@@ -203,7 +206,10 @@ function makeDocument(nodePotentials: ComplexValue[], edges: Array<readonly [num
 
   return {
     document: { title: "シード固定の交流電源グラフ", parts, wires },
-    oracle: subtract(nodePotentials[loadPositiveNode]!, nodePotentials[loadNegativeNode]!),
+    oracle: commonPhase === undefined ? subtract(nodePotentials[loadPositiveNode]!, nodePotentials[loadNegativeNode]!) : {
+      real: (nodePotentials[loadPositiveNode]!.real - nodePotentials[loadNegativeNode]!.real) * Math.cos(commonPhase * Math.PI / 180),
+      imaginary: (nodePotentials[loadPositiveNode]!.real - nodePotentials[loadNegativeNode]!.real) * Math.sin(commonPhase * Math.PI / 180),
+    },
     groundNode,
     representativeByNode,
     baseCycleResidual,
@@ -257,10 +263,16 @@ describe("seeded ideal AC source graph properties", () => {
     for (let sample = 0; sample < 12; sample += 1) {
       const nodeCount = 3 + Math.floor(random() * 6);
       const axis = sample % 3 === 0;
-      const potentials = axis
-        ? axisNodePotentials(nodeCount, random)
-        : arbitraryNodePotentials(nodeCount, random);
-      const edges = sourceEdges(nodeCount, axis, random);
+      const commonPhase = sample % 3 === 2 ? 37 : undefined;
+      const potentials = axis ? axisNodePotentials(nodeCount, random)
+        : commonPhase === undefined ? arbitraryNodePotentials(nodeCount, random)
+          : Array.from({ length: nodeCount }, (_, node) => ({ real: node * (1 + Math.floor(random() * 12)), imaginary: 0 }));
+      // Rounded hypot/atan2 values do not define exact redundant constraints.
+      // Arbitrary mixed phases exercise trees; redundant graphs instead use
+      // exact integer potential differences with one common phase coefficient.
+      const edges = commonPhase === undefined && !axis
+        ? Array.from({ length: nodeCount - 1 }, (_, node) => [node, node + 1] as const)
+        : sourceEdges(nodeCount, axis, random);
       const {
         document,
         oracle,
@@ -268,7 +280,7 @@ describe("seeded ideal AC source graph properties", () => {
         representativeByNode,
         baseCycleResidual,
         baseCycleScale,
-      } = makeDocument(potentials, edges, random);
+      } = makeDocument(potentials, edges, random, commonPhase);
       if (baseCycleResidual) {
         const roundoffTolerance = 64 * Number.EPSILON * baseCycleScale;
         expect(Math.abs(baseCycleResidual.real),

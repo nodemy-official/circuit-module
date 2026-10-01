@@ -3,6 +3,7 @@ import { frequencyMatches } from "../ac-reactive.js";
 import { circuitPartCatalog, type CircuitDocument, type CircuitPart } from "../circuit-model.js";
 import { analyzeCircuit, type CircuitAnalysis, type CircuitAnalysisOptions, type CircuitPartReading } from "../circuit-solver.js";
 import { formatCircuitNumber } from "../number-format.js";
+import { copySimulationDocument } from "../simulation-input.js";
 import { NumericInput } from "./NumericInput.js";
 
 const MIN_SWEEP_POINTS = 3;
@@ -106,12 +107,13 @@ function createFrequencySweep(
     const closed = analysis.parts[part.id]?.switchClosed;
     return part.kind === "switch" && closed !== undefined ? [[part.id, closed]] : [];
   }));
+  const copiedDocument = copySimulationDocument(document);
   const points: SweepPoint[] = [...frequencies].sort((first, second) => first - second).map((frequencyHz) => {
     // Keep the same excitation set as the displayed analysis. Sources at other
     // frequencies are out of band there, so they must stay out of the whole sweep.
     const sweptDocument: CircuitDocument = {
-      ...document,
-      parts: document.parts.map((part) => {
+      ...copiedDocument,
+      parts: copiedDocument.parts.map((part) => {
         if (part.kind !== "ac-source") { return part; }
         return frequencyMatches(acSourceFrequencyHz(part), centerFrequencyHz)
           ? { ...part, frequencyHz }

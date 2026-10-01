@@ -47,6 +47,44 @@ function panelProps(
 }
 
 describe("CircuitSimulationPanel learning feature visibility", () => {
+  it("retains non-enumerable circuit and switch fields while applying the analyzed switch state", () => {
+    const document: CircuitDocument = {
+      title: "非列挙スイッチの波形",
+      parts: [
+        { id: "source", kind: "battery", label: "電源", x: 0, y: 0, voltageVolts: 12 },
+        { id: "load", kind: "resistor", label: "抵抗", x: 0, y: 0, resistanceOhms: 100 },
+        { id: "switch", kind: "switch", label: "スイッチ", x: 0, y: 0, initiallyClosed: false },
+        { id: "ground", kind: "ground", label: "GND", x: 0, y: 0 },
+      ],
+      wires: [
+        { id: "a", from: { partId: "source", terminal: "a" }, to: { partId: "switch", terminal: "a" } },
+        { id: "b", from: { partId: "switch", terminal: "b" }, to: { partId: "load", terminal: "a" } },
+        { id: "c", from: { partId: "load", terminal: "b" }, to: { partId: "source", terminal: "b" } },
+        { id: "g", from: { partId: "source", terminal: "b" }, to: { partId: "ground", terminal: "a" } },
+      ],
+    };
+    const switchPart = document.parts[2]!;
+    Object.defineProperty(switchPart, "id", { value: switchPart.id, enumerable: false });
+    Object.defineProperty(document, "wires", { value: document.wires, enumerable: false });
+    const onFrameChange = vi.fn();
+    const props = panelProps(document, { mode: "dc" }, {
+      analysis: analyzeCircuit(document, { switch: true }), onFrameChange,
+    });
+    expect(props.analysis.status).toBe("closed");
+    const { container } = mount(<CircuitSimulationPanel {...props} />);
+    const button = [...container.querySelectorAll("button")].find((item) => item.textContent === "波形を計算");
+    expect(button).toBeDefined();
+    act(() => button!.click());
+
+    const frame = onFrameChange.mock.calls.at(-1)?.[0];
+    expect(frame?.analysis.status).toBe("valid");
+    expect(frame?.analysis.samples[0].parts.load.voltageVolts).toBe(12);
+    expect(frame?.analysis.samples[0].parts.switch.switchClosed).toBe(true);
+    expect(switchPart.initiallyClosed).toBe(false);
+    expect(Object.getOwnPropertyDescriptor(switchPart, "id")?.enumerable).toBe(false);
+    expect(Object.getOwnPropertyDescriptor(document, "wires")?.enumerable).toBe(false);
+  });
+
   it("uses the displayed switch state for transient calculation and clears stale frames", () => {
     const document: CircuitDocument = {
       title: "Switch override",

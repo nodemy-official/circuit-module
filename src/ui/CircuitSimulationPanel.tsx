@@ -2,6 +2,7 @@ import { useCallback, useId, useMemo, useState, type ComponentPropsWithoutRef } 
 import type { CircuitDocument } from "../circuit-model.js";
 import { analyzeCircuit, type CircuitAnalysis, type CircuitAnalysisOptions } from "../circuit-solver.js";
 import { analysisAtTransientFrame, type CircuitTransientFrame } from "../circuit-visualization.js";
+import { copySimulationDocument } from "../simulation-input.js";
 import { CircuitEnergyPanel } from "./CircuitEnergyPanel.js";
 import { CircuitAcPanel } from "./CircuitAcPanel.js";
 import { CircuitComparisonPanel } from "./CircuitComparisonPanel.js";
@@ -126,7 +127,8 @@ function analyzedSwitchOverrides(document: CircuitDocument, analysis: CircuitAna
 function documentWithSwitchOverrides(document: CircuitDocument, serializedOverrides: string): CircuitDocument {
   const overrides = new Map<string, boolean>(JSON.parse(serializedOverrides));
   if (overrides.size === 0) { return document; }
-  return { ...document, parts: document.parts.map((part) => overrides.has(part.id)
+  const copiedDocument = copySimulationDocument(document);
+  return { ...copiedDocument, parts: copiedDocument.parts.map((part) => overrides.has(part.id)
     ? { ...part, initiallyClosed: overrides.get(part.id) } : part) };
 }
 

@@ -73,6 +73,29 @@ function chooseMetric(container: ParentNode, metric: "voltageVolts" | "currentAm
 }
 
 describe("CircuitComparisonPanel", () => {
+  it.each(["id", "kind"] as const)("preserves a non-enumerable %s in a local comparison snapshot", (field) => {
+    const load = part("load", "resistor", "抵抗");
+    Object.defineProperty(load, field, { value: load[field], enumerable: false });
+    const circuit = documentOf([part("source", "battery", "電源"), load]);
+    circuit.wires = [
+      { id: "a", from: { partId: "source", terminal: "a" }, to: { partId: "load", terminal: "a" } },
+      { id: "b", from: { partId: "load", terminal: "b" }, to: { partId: "source", terminal: "b" } },
+    ];
+    Object.defineProperty(circuit, "wires", { value: circuit.wires, enumerable: false });
+    const result = analyzeCircuit(circuit);
+    expect(result.status).toBe("closed");
+    const { container } = mount({ document: circuit, analysis: result });
+    const button = [...container.querySelectorAll("button")].find((item) => item.textContent === "現在を比較の基準にする");
+    expect(button).toBeDefined();
+    act(() => button!.click());
+
+    const row = required(container, 'tr[data-part-id="load"]');
+    expect(row.getAttribute("data-row-status")).toBe("matched");
+    expect(row.textContent).not.toContain("差分対象外");
+    expect(row.textContent).not.toContain("部品の種類が変更");
+    expect(Object.getOwnPropertyDescriptor(load, field)?.enumerable).toBe(false);
+  });
+
   const beforeDocument = documentOf([
     part("source", "battery", "電池"),
     part("r1", "resistor", "R1"),

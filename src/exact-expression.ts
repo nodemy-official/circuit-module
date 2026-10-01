@@ -20,8 +20,10 @@ export interface ExactExpressionCapture {
 
 const expressions = new WeakMap<ExactRational, Expression>();
 const LARGE_VALUE = 2n ** 4096n;
+const COMPACT_LITERAL_VALUE = 2n ** 512n;
 let activeCapture: ExactExpressionCapture | undefined;
 const capturedSigns = new WeakMap<readonly ExactExpressionNode[], readonly (-1 | 0 | 1 | undefined)[]>();
+const immutableTables = new WeakSet<readonly ExactExpressionNode[]>();
 
 function sign(value: ExactRational): -1 | 0 | 1 { return value.numerator < 0n ? -1 : value.numerator > 0n ? 1 : 0; }
 
@@ -37,6 +39,7 @@ export function freezeCapturedExactExpressions(capture: ExactExpressionCapture):
     Object.freeze(node);
   }
   const table = Object.freeze(capture.nodes);
+  immutableTables.add(table);
   capturedSigns.set(table, Object.freeze(capture.signs));
   return table;
 }
@@ -115,8 +118,10 @@ function registerExpression(capture: ExactExpressionCapture, current: Expression
 
 export function capturedExactReference(value: ExactRational): ExactExpressionReference | undefined {
   const capture = activeCapture;
-  const root = expressions.get(value);
-  if (!capture || !root || !large(value)) { return; }
+  if (!capture || (value.denominator < COMPACT_LITERAL_VALUE && value.numerator < COMPACT_LITERAL_VALUE && value.numerator > -COMPACT_LITERAL_VALUE)) { return; }
+  // Medium-sized literals are shared too. Repeating their full hexadecimal
+  // components in input snapshots otherwise dominates saved result size.
+  const root = expressions.get(value) ?? { operation: "literal" as const, value };
   // Dependencies precede consumers. An explicit stack supports long histories.
   const pending: { expression: Expression; expanded: boolean }[] = [{ expression: root, expanded: false }];
   while (pending.length > 0) {
@@ -146,7 +151,36 @@ interface ExpressionOperations {
   sum: (values: readonly ExactRational[]) => ExactRational;
 }
 
-const restoredRoots = new WeakMap<readonly ExactExpressionNode[], Map<number, ExactRational>>();
+/** A separate immutable snapshot preserves evidence across editable result transports. */
+export function snapshotExactExpressions(table: readonly ExactExpressionNode[]): readonly ExactExpressionNode[] {
+  const snapshot = Object.freeze(table.map((node) => Object.freeze(node.operation === "literal"
+    ? { ...node } : { ...node, arguments: Object.freeze([...node.arguments]) })));
+  immutableTables.add(snapshot);
+  return snapshot;
+}
+
+export function matchingExactExpressions(first: readonly ExactExpressionNode[] | undefined, second: readonly ExactExpressionNode[] | undefined): boolean {
+  if (!first || !second) { return first === second; }
+  if (first.length !== second.length) { return false; }
+  try {
+    return Array.from({ length: first.length }, (_, index) => index).every((index) => {
+      const node = first[index];
+      const other = second[index];
+      if (!node || !other || node.operation !== other.operation) { return false; }
+      if (node.operation === "literal") {
+        return other.operation === "literal" && node.numerator === other.numerator && node.denominator === other.denominator;
+      }
+      return other.operation !== "literal" && node.arguments.length === other.arguments.length &&
+        Array.from({ length: node.arguments.length }, (_, argumentIndex) => argumentIndex).every((argumentIndex) =>
+          Number.isSafeInteger(node.arguments[argumentIndex]) && node.arguments[argumentIndex] === other.arguments[argumentIndex]);
+    });
+  } catch { return false; }
+}
+
+const restoredRoots = new WeakMap<readonly ExactExpressionNode[], {
+  snapshot: readonly ExactExpressionNode[];
+  roots: Map<number, ExactRational>;
+}>();
 
 function expressionDependencies(table: readonly ExactExpressionNode[], reference: number, cached: ReadonlyMap<number, ExactRational>) {
   const needed = new Set<number>();
@@ -212,14 +246,16 @@ function evaluateDependencies(table: readonly ExactExpressionNode[], reference: 
 
 export function restoreExactExpression(table: readonly ExactExpressionNode[] | undefined, reference: number, operations: ExpressionOperations): ExactRational | undefined {
   if (!table || !Number.isSafeInteger(reference) || reference < 0 || reference >= table.length) { return; }
-  const cached = restoredRoots.get(table);
-  const previous = cached?.get(reference);
-  if (previous) { return previous; }
   try {
-    const roots = cached ?? new Map<number, ExactRational>();
+    const previous = restoredRoots.get(table);
+    const immutable = immutableTables.has(table);
+    const cached = previous && (immutable || matchingExactExpressions(table, previous.snapshot)) ? previous : undefined;
+    const roots = cached?.roots ?? new Map<number, ExactRational>();
+    const known = roots.get(reference);
+    if (known) { return known; }
     const result = evaluateDependencies(table, reference, operations, roots);
     if (!result) { return; }
-    restoredRoots.set(table, roots);
+    restoredRoots.set(table, { roots, snapshot: cached?.snapshot ?? (immutable ? table : snapshotExactExpressions(table)) });
     return result;
   } catch {
     // Malformed optional result metadata falls back to scalar readings.

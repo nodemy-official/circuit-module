@@ -4,6 +4,8 @@ import type { CircuitDocument } from "../circuit-model.js";
 import { analyzeCircuit } from "../circuit-solver.js";
 import { analysisAtTransientFrame, circuitNodes, circuitPotential } from "../circuit-visualization.js";
 import { simulateTransient } from "../transient-solver.js";
+import { restoredComplex } from "../circuit-reading.js";
+import { exactComplexValue } from "../exact-numeric-state.js";
 
 function sourceCircuit(phaseDegrees: number): CircuitDocument {
   return {
@@ -88,12 +90,19 @@ describe("AC potential phase round trips", () => {
           expect(circuitPotential(end, start, mode === "ac", context)!.volts).toBe(mode === "ac" ? Number.MIN_VALUE : -Number.MIN_VALUE);
           if (mode === "ac") { expect(circuitPotential(start, end, true, context)!.phaseDegrees).toBe(0); }
           if (voltageVolts === 6) {
-            const retained = analysis.parts.first!.exactVoltage!.real;
+            const precision = analysis.parts.first!.exactVoltage!;
+            const originalReal = precision.real;
+            const restored = exactComplexValue(restoredComplex(precision, analysis.precisionExpressions)!)!.real;
+            const retained = "expression" in originalReal
+              ? { numerator: restored.numerator.toString(), denominator: restored.denominator.toString() }
+              : originalReal;
+            precision.real = retained;
             const originalNumerator = retained.numerator;
             retained.numerator = (2n * BigInt(originalNumerator)).toString();
             expect(circuitPotential(start, end, mode === "ac", context)!.volts).toBe(2 * Number.MIN_VALUE);
             retained.numerator = originalNumerator;
             expect(circuitPotential(start, end, mode === "ac", context)!.volts).toBe(Number.MIN_VALUE);
+            precision.real = originalReal;
           }
         }
       }

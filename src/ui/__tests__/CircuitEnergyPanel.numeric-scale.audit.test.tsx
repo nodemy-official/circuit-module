@@ -20,6 +20,57 @@ function panelMarkup(document: CircuitDocument, analysis: TransientAnalysis, sam
 }
 
 describe("energy numeric scale audit", () => {
+  it.each(["capacitor", "inductor"] as const)("uses the retained fractional %s state for stored energy", (kind) => {
+    const document: CircuitDocument = {
+      title: "厳密な分数の蓄積エネルギー",
+      parts: [
+        { id: "source", kind: "battery", label: "電源", x: 0, y: 0, voltageVolts: 1 },
+        { id: "upper", kind: "resistor", label: "上側抵抗", x: 0, y: 0, resistanceOhms: 2 },
+        { id: "lower", kind: "resistor", label: "下側抵抗", x: 0, y: 0, resistanceOhms: 1 },
+        { id: "reactive", kind, label: "蓄積部品", x: 0, y: 0,
+          ...(kind === "capacitor" ? { capacitanceFarads: 9 } : { inductanceHenries: 9 }) },
+        { id: "ground", kind: "ground", label: "GND", x: 0, y: 0 },
+      ],
+      wires: [
+        { id: "a", from: { partId: "source", terminal: "a" }, to: { partId: "upper", terminal: "a" } },
+        { id: "b", from: { partId: "upper", terminal: "b" }, to: { partId: "lower", terminal: "a" } },
+        { id: "c", from: { partId: "lower", terminal: "b" }, to: { partId: kind === "capacitor" ? "source" : "reactive", terminal: kind === "capacitor" ? "b" : "a" } },
+        { id: "d", from: { partId: "reactive", terminal: "a" }, to: { partId: "lower", terminal: kind === "capacitor" ? "a" : "b" } },
+        { id: "e", from: { partId: "reactive", terminal: "b" }, to: { partId: "source", terminal: "b" } },
+        { id: "g", from: { partId: "source", terminal: "b" }, to: { partId: "ground", terminal: "a" } },
+      ].filter((wire) => kind === "capacitor" || wire.id !== "d"),
+    };
+    const steady = analyzeCircuit(document);
+    expect(steady.status).toBe("closed");
+    // V_C=1/(2+1) V or I_L=1/(2+1) A, giving 9/2*(1/3)²=1/2 J.
+    const markup = renderToStaticMarkup(<CircuitEnergyPanel document={document} analysis={steady} />);
+    expect(rowValue(markup, "reactive", "data-energy-joules")).toBe(0.5);
+    const transient = simulateTransient(document, { durationSeconds: 1, timeStepSeconds: 1, startFromOperatingPoint: true });
+    expect(transient.status, transient.message).toBe("valid");
+    for (const analysis of [transient, JSON.parse(JSON.stringify(transient)) as TransientAnalysis, structuredClone(transient)]) {
+      expect(rowValue(panelMarkup(document, analysis, 1), "reactive", "data-energy-joules")).toBe(0.5);
+    }
+  });
+
+  it.each([0, 37, 45, 90])("keeps normalized AC stored energy independent of the source phase (%s degrees)", (phaseDegrees) => {
+    const document: CircuitDocument = {
+      title: "交流の周期平均エネルギー",
+      parts: [
+        { id: "source", kind: "ac-source", label: "電源", x: 0, y: 0, voltageVolts: 1, frequencyHz: 1, phaseDegrees },
+        { id: "capacitor", kind: "capacitor", label: "C", x: 0, y: 0, capacitanceFarads: 9 },
+      ],
+      wires: [
+        { id: "a", from: { partId: "source", terminal: "a" }, to: { partId: "capacitor", terminal: "a" } },
+        { id: "b", from: { partId: "capacitor", terminal: "b" }, to: { partId: "source", terminal: "b" } },
+      ],
+    };
+    const analysis = analyzeCircuit(document);
+    expect(analysis.status).toBe("closed");
+    const markup = renderToStaticMarkup(<CircuitEnergyPanel document={document} analysis={analysis} />);
+    // Average E=1/2*C*V_RMS², and ideal source V_RMS=1 at every phase.
+    expect(rowValue(markup, "capacitor", "data-energy-joules")).toBe(4.5);
+  });
+
   it.each([
     ["capacitor large", "capacitor", 1e-200, 1e200, 5e199],
     ["capacitor small", "capacitor", 1e200, 1e-200, 5e-201],
@@ -92,6 +143,33 @@ describe("energy numeric scale audit", () => {
     expect(solved.status, solved.message).toBe("valid");
     const markup = panelMarkup(document, analysis, 1);
     expect(rowValue(markup, "load", "data-dissipated-joules")).toBe(Number.MIN_VALUE);
+  });
+
+  it.each([
+    [2 ** -537, 1, Number.MIN_VALUE],
+    [2 ** -537, 2, 2 * Number.MIN_VALUE],
+    [2 ** -540, 64, Number.MIN_VALUE],
+  ])("accumulates unrepresentable power or interval energy (V=%s, t=%s)", (voltageVolts, durationSeconds, expected) => {
+    const document: CircuitDocument = {
+      title: "微小な消費エネルギーの累積",
+      parts: [
+        { id: "source", kind: "battery", label: "電源", x: 0, y: 0, voltageVolts },
+        { id: "load", kind: "resistor", label: "抵抗", x: 0, y: 0, resistanceOhms: 1 },
+        { id: "ground", kind: "ground", label: "GND", x: 0, y: 0 },
+      ],
+      wires: [
+        { id: "a", from: { partId: "source", terminal: "a" }, to: { partId: "load", terminal: "a" } },
+        { id: "b", from: { partId: "load", terminal: "b" }, to: { partId: "source", terminal: "b" } },
+        { id: "g", from: { partId: "source", terminal: "b" }, to: { partId: "ground", terminal: "a" } },
+      ],
+    };
+    const result = simulateTransient(document, { durationSeconds, timeStepSeconds: durationSeconds / 2 });
+    expect(result.status, result.message).toBe("valid");
+    expect(result.samples.every((sample) => sample.parts.load!.powerWatts === voltageVolts * voltageVolts)).toBe(true);
+    // Constant P=V²/R gives E=P*t. Either P or each interval's energy
+    // rounds to zero, while the full integral is representable.
+    const markup = panelMarkup(document, result, result.samples.length - 1);
+    expect(rowValue(markup, "load", "data-dissipated-joules")).toBe(expected);
   });
 
   it("rounds a subnormal stored-energy product to the nearest representable value", () => {

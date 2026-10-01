@@ -103,18 +103,7 @@ describe("consistent ideal AC source branch order audit", () => {
     { label: "near-subnormal source amplitudes", commonModeVolts: 1e-300, differentialVolts: 1e-300 },
     { label: "large common mode at adjacent float", commonModeVolts: 2 ** 53, differentialVolts: 2 },
     { label: "larger common mode at one ULP", commonModeVolts: 2 ** 500, differentialVolts: 2 ** 448 },
-    {
-      label: "millivolt quadrature drop over a 1e16 V common mode",
-      commonModeVolts: 1e16,
-      differentialVolts: (1e16 * (Math.PI / 180)) * 1e-18,
-      sourceBgVoltageVolts: 1e16,
-      sourceBgPhaseDegrees: 1e-18,
-      sourceAbPhaseDegrees: 270,
-      expectedLoadVoltage: {
-        real: 0,
-        imaginary: -((1e16 * (Math.PI / 180)) * 1e-18),
-      },
-    },
+
   ])("keeps the redundant-source count and load voltage across all source orders: $label", (testCase) => {
     const sourceIds = ["source-ag", "source-bg", "source-ab"];
     const expectedLoadVoltage = testCase.expectedLoadVoltage ?? { real: -testCase.differentialVolts, imaginary: 0 };
@@ -136,6 +125,24 @@ describe("consistent ideal AC source branch order audit", () => {
         real: scalar.parts.load!.voltageVolts * Math.cos(scalarPhase),
         imaginary: scalar.parts.load!.voltageVolts * Math.sin(scalarPhase),
       }, expectedLoadVoltage, `${testCase.label}, scalar order=${order.join(",")}`);
+    }
+  });
+
+  it("rejects a near-axis loop whose omitted cosine curvature contradicts its ideal source amplitudes", () => {
+    const testCase: SourceBranchOrderCase = {
+      label: "near-axis cosine curvature",
+      commonModeVolts: 1e16,
+      differentialVolts: (1e16 * (Math.PI / 180)) * 1e-18,
+      sourceBgVoltageVolts: 1e16,
+      sourceBgPhaseDegrees: 1e-18,
+      sourceAbPhaseDegrees: 270,
+    };
+    // cos(theta)<1 for this nonzero theta, while the third source has zero
+    // real part. The two equal RMS amplitudes therefore cannot obey KVL.
+    for (const order of permutations(["source-ag", "source-bg", "source-ab"])) {
+      const document = sourceOrderDocument(testCase, order);
+      expect(analyzeAnalogCircuit(document, { mode: "ac", frequencyHz }).status).toBe("invalid");
+      expect(analyzeCircuit(document, {}, { mode: "ac", frequencyHz }).status).toBe("invalid");
     }
   });
 });

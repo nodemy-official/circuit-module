@@ -51,6 +51,42 @@ function sweepFrequencies(container: HTMLElement) {
 }
 
 describe("CircuitAcPanel frequency sweep boundaries", () => {
+  it.each([false, true])("preserves non-enumerable source fields when sweeping (document fields: %s)", (hideDocumentFields) => {
+    const source: CircuitDocument["parts"][number] = {
+      id: "source", kind: "ac-source", label: "交流電源", x: 0, y: 0, frequencyHz: 1000,
+    };
+    Object.defineProperty(source, "voltageVolts", { value: 1, enumerable: false });
+    const document: CircuitDocument = {
+      title: "非列挙フィールドの掃引",
+      parts: [source, { id: "load", kind: "resistor", label: "負荷", x: 0, y: 0, resistanceOhms: 20 }],
+      wires: [
+        { id: "a", from: { partId: "source", terminal: "a" }, to: { partId: "load", terminal: "a" } },
+        { id: "b", from: { partId: "load", terminal: "b" }, to: { partId: "source", terminal: "b" } },
+      ],
+    };
+    if (hideDocumentFields) {
+      Object.defineProperty(document, "wires", { value: document.wires, enumerable: false });
+    }
+    const options = { mode: "ac" as const, frequencyHz: 1000 };
+    const analysis = analyzeCircuit(document, {}, options);
+    expect(analysis.status).toBe("closed");
+    expect(analysis.parts.source!.voltageVolts).toBe(1);
+    const container = globalThis.document.createElement("div");
+    globalThis.document.body.append(container);
+    const root = createRoot(container);
+    act(() => root.render(<CircuitAcPanel document={document} analysis={analysis} options={options} />));
+    mounted.push({ root, container });
+
+    sweepFrequencies(container);
+
+    const points = [...container.querySelectorAll(".circuit-ac__response-dot")];
+    expect(points).toHaveLength(41);
+    for (const point of points) { expect(Number(point.getAttribute("data-voltage-rms"))).toBe(1); }
+    expect(Object.getOwnPropertyDescriptor(source, "voltageVolts")?.enumerable).toBe(false);
+    expect(source.voltageVolts).toBe(1);
+    expect(source.frequencyHz).toBe(1000);
+  });
+
   it.each([Number.MIN_VALUE, 1e-10, 1e13, Number.MAX_VALUE])("keeps the analyzed center frequency in the sweep at %s Hz", (frequencyHz) => {
     const container = mountAtFrequency(frequencyHz);
     const frequencies = sweepFrequencies(container);
