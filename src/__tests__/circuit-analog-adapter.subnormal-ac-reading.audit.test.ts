@@ -62,7 +62,9 @@ describe("AC adapter subnormal readings", () => {
     expect(result.parts.source.voltagePhaseDegrees).toBe(currentPhase);
     expect(result.parts.load.voltageVolts).toBe(Number.MIN_VALUE);
     expect(result.parts.load.voltagePhaseDegrees).toBe(currentPhase);
-    expect(result.parts.load.currentAmps).toBe(Number.MIN_VALUE);
+    // Independent Ohm's law: MIN_VALUE / 2 is exactly the midpoint
+    // between 0 and MIN_VALUE, which rounds to even (0).
+    expect(result.parts.load.currentAmps).toBe(0);
     expect(result.parts.load.currentPhaseDegrees).toBe(currentPhase);
 
     expect(result.parts.load.terminalVoltages).toEqual({ a: 0, b: Number.MIN_VALUE });
@@ -71,8 +73,8 @@ describe("AC adapter subnormal readings", () => {
       b: normalizeDegrees(currentPhase - 180),
     });
     expect(result.parts.load.terminalCurrents).toEqual({
-      a: Number.MIN_VALUE,
-      b: Number.MIN_VALUE,
+      a: 0,
+      b: 0,
     });
     expect(result.parts.load.terminalCurrentPhasesDegrees).toEqual({
       a: currentPhase,

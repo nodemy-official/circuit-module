@@ -52,12 +52,39 @@ export function nextLabel(document: CircuitDocument, kind: CircuitPartKind) {
   return `${base}${number}`;
 }
 
+function validCoordinate(point: Point | undefined): boolean {
+  return !!point && Number.isFinite(point.x) && Number.isFinite(point.y) &&
+    Math.abs(point.x) <= MAX_WIRE_COORDINATE && Math.abs(point.y) <= MAX_WIRE_COORDINATE;
+}
+
+const coordinateError = `座標は±${MAX_WIRE_COORDINATE}セル以内の有限な値で指定してください。`;
+
+function waypointError(waypoints?: readonly Point[]): string | null {
+  if (waypoints && waypoints.length > MAX_CIRCUIT_WIRE_WAYPOINTS) {
+    return `導線の経由点は${MAX_CIRCUIT_WIRE_WAYPOINTS}個以下にしてください。`;
+  }
+  // Iteration visits sparse array slots, unlike some/every/map.
+  for (const point of waypoints ?? []) {
+    if (!validCoordinate(point)) { return `導線の経由点: ${coordinateError}`; }
+  }
+  return null;
+}
+
+function wireWaypointError(wires: readonly CircuitWire[]): string | null {
+  for (const wire of wires) {
+    const reason = waypointError(wire.waypoints);
+    if (reason) { return reason; }
+  }
+  return null;
+}
+
 /** Whether the candidates fit among the document's other parts. */
 export function canPlace(document: CircuitDocument, candidates: readonly CircuitPart[]) {
   const moving = new Set(candidates.map((part) => part.id));
   const others = document.parts.filter((part) => !moving.has(part.id));
   return candidates.every(
     (candidate, index) =>
+      validCoordinate(candidate) &&
       !others.some((other) => partsConflict(candidate, other)) &&
       !candidates.slice(index + 1).some((other) => partsConflict(candidate, other)),
   );
@@ -89,6 +116,7 @@ export function addPart(
   kind: CircuitPartKind,
   at: Point,
 ): EditResult<{ id: string }> {
+  if (!validCoordinate(at)) { return { ok: false, reason: coordinateError }; }
   const id = nextId(
     "part",
     document.parts.map((existingPart) => existingPart.id),
@@ -139,8 +167,14 @@ export function moveParts(
   dx: number,
   dy: number,
 ): EditResult {
+  if (!Number.isFinite(dx) || !Number.isFinite(dy)) { return { ok: false, reason: coordinateError }; }
+  const sourceIssue = wireWaypointError(document.wires);
+  if (sourceIssue) { return { ok: false, reason: sourceIssue }; }
   const next = shiftParts(document, ids, dx, dy);
   const moved = next.parts.filter((part) => ids.includes(part.id));
+  if (moved.some((part) => !validCoordinate(part))) { return { ok: false, reason: coordinateError }; }
+  const waypointIssue = wireWaypointError(next.wires);
+  if (waypointIssue) { return { ok: false, reason: waypointIssue }; }
   if (!canPlace(next, moved)) { return { ok: false, reason: "その位置にはほかの部品があります。" }; }
   return { ok: true, document: next };
 }
@@ -256,6 +290,9 @@ export function pasteFragment(
   fragment: CircuitFragment,
 ): EditResult<{ selection: CircuitSelection }> {
   if (fragment.parts.length === 0) { return { ok: false, reason: "コピーした部品がありません。" }; }
+  if (fragment.parts.some((part) => !validCoordinate(part))) { return { ok: false, reason: coordinateError }; }
+  const waypointIssue = wireWaypointError(fragment.wires);
+  if (waypointIssue) { return { ok: false, reason: waypointIssue }; }
   const sourceParts = new Map(fragment.parts.map((part) => [part.id, part]));
   if (sourceParts.size !== fragment.parts.length) { return { ok: false, reason: "コピーした部品の ID が重複しています。" }; }
   const validEndpoint = (endpoint: CircuitEndpoint) => {
@@ -267,6 +304,7 @@ export function pasteFragment(
   }
   for (let step = 1; step <= 12; step += 1) {
     const copy = renumber(document, fragment, step * 2, step * 2);
+    if (wireWaypointError(copy.wires)) { continue; }
     const next = {
       ...document,
       parts: [...document.parts, ...copy.parts],
@@ -426,16 +464,8 @@ export function setWireWaypoints(
 ): EditResult {
   const wire = document.wires.find((item) => item.id === wireId);
   if (!wire) { return { ok: false, reason: "導線が見つかりません。" }; }
-  if (waypoints && waypoints.length > MAX_CIRCUIT_WIRE_WAYPOINTS) {
-    return { ok: false, reason: `導線の経由点は${MAX_CIRCUIT_WIRE_WAYPOINTS}個以下にしてください。` };
-  }
-  if (waypoints?.some((point) =>
-    !point || !Number.isFinite(point.x) || !Number.isFinite(point.y) ||
-    Math.abs(point.x) > MAX_WIRE_COORDINATE ||
-    Math.abs(point.y) > MAX_WIRE_COORDINATE,
-  )) {
-    return { ok: false, reason: `導線の経由点は±${MAX_WIRE_COORDINATE}セル以内の有限な座標で指定してください。` };
-  }
+  const reason = waypointError(waypoints);
+  if (reason) { return { ok: false, reason }; }
   const nextPoints = waypoints && waypoints.length > 0 ? waypoints : undefined;
   const unchanged = (wire.waypoints?.length ?? 0) === (nextPoints?.length ?? 0) &&
     (wire.waypoints ?? []).every((point, index) =>

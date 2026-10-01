@@ -6,6 +6,53 @@ import { analyzeCircuit } from "../circuit-solver.js";
 import { simulateTransient } from "../transient-solver.js";
 
 describe("transient frame public analysis status", () => {
+  it.each([[Number.MIN_VALUE, "closed"], [0, "idle"]] as const)("uses retained discharge state after every displayed value rounds to zero (%s V)", (initialVoltageVolts, expected) => {
+    const document: CircuitDocument = {
+      title: "Unrepresentable RC discharge state",
+      parts: [
+        { id: "c", kind: "capacitor", label: "C", x: 0, y: 0, capacitanceFarads: 1e-308, initialVoltageVolts },
+        { id: "r", kind: "resistor", label: "R", x: 0, y: 0, resistanceOhms: 2 },
+      ],
+      wires: [
+        { id: "a", from: { partId: "c", terminal: "a" }, to: { partId: "r", terminal: "a" } },
+        { id: "b", from: { partId: "c", terminal: "b" }, to: { partId: "r", terminal: "b" } },
+      ],
+    };
+    const original = simulateTransient(document, { durationSeconds: 0.001, timeStepSeconds: 0.001 });
+    expect(original.status, original.message).toBe("valid");
+    for (const analysis of [original, JSON.parse(JSON.stringify(original)) as typeof original, structuredClone(original)]) {
+      const frame = analysisAtTransientFrame(document, { analysis, sampleIndex: 1 })!;
+      expect(frame.parts.c!.voltageVolts).toBe(0);
+      expect(Math.abs(frame.parts.c!.currentAmps)).toBe(0);
+      // Backward Euler V1=V0*RC/(RC+h) is strictly positive for V0>0,
+      // even though neither V1 nor V1/R can be displayed in binary64.
+      expect(frame.status).toBe(expected);
+    }
+  });
+
+  it("keeps a source-free discharge closed when displayed capacitor voltage underflows", () => {
+    const document: CircuitDocument = {
+      title: "Subnormal capacitor discharge",
+      parts: [
+        { id: "c", kind: "capacitor", label: "C", x: 0, y: 0, capacitanceFarads: 1, initialVoltageVolts: Number.MIN_VALUE },
+        { id: "r", kind: "resistor", label: "R", x: 0, y: 0, resistanceOhms: Number.MIN_VALUE },
+      ],
+      wires: [
+        { id: "a", from: { partId: "c", terminal: "a" }, to: { partId: "r", terminal: "a" } },
+        { id: "b", from: { partId: "c", terminal: "b" }, to: { partId: "r", terminal: "b" } },
+      ],
+    };
+    const analysis = simulateTransient(document, { durationSeconds: 2 * Number.MIN_VALUE, timeStepSeconds: Number.MIN_VALUE });
+    expect(analysis.status, analysis.message).toBe("valid");
+    for (const [sampleIndex, current] of [1, 0.5, 0.25].entries()) {
+      const frame = analysisAtTransientFrame(document, { analysis, sampleIndex });
+      // Backward Euler with h=RC halves the stored voltage each step.
+      expect(frame?.parts.r.currentAmps).toBe(current);
+      expect(frame?.status).toBe("closed");
+    }
+    expect(analysis.samples[1]!.parts.c!.voltageVolts).toBe(0);
+  });
+
   it("preserves an open-circuit state in a sampled frame", () => {
     const document: CircuitDocument = {
       title: "開スイッチを含む過渡回路",

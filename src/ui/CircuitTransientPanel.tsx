@@ -4,6 +4,7 @@ import { formatCircuitNumber } from "../number-format.js";
 import type { CircuitTransientFrame } from "../circuit-visualization.js";
 import { simulateTransient, type TransientAnalysis, type TransientSample } from "../transient-solver.js";
 import { measurementLabels } from "./measurement-labels.js";
+import { NumericInput } from "./NumericInput.js";
 
 const format = (value: number | undefined) => value === undefined ? "—" : formatCircuitNumber(value);
 const MAX_WAVEFORM_PARTS = 3;
@@ -438,9 +439,9 @@ export function CircuitTransientPanel({
   return <details {...props} open={openProp} className={`circuit-transient ${className}`}>
     <summary>時間波形・過渡解析</summary>
     <label htmlFor={`${id}-duration`}>解析時間 (s)</label>
-    <input id={`${id}-duration`} type="number" min="0" step="any" value={duration} onChange={(event) => numberChange(event.target.valueAsNumber, setDuration)} />
+    <NumericInput id={`${id}-duration`} min={0} exclusiveMin step="any" value={duration} onValueChange={(value) => numberChange(value, setDuration)} />
     <label htmlFor={`${id}-steps`}>時間分割数</label>
-    <input id={`${id}-steps`} type="number" min="1" max="2000" step="1" value={steps} onChange={(event) => numberChange(event.target.valueAsNumber, (value) => setSteps(Math.min(2000, Math.max(1, Math.round(value)))))} />
+    <NumericInput id={`${id}-steps`} min={1} max={2000} step="1" integer value={steps} onValueChange={(value) => numberChange(value, setSteps)} />
     <label className="circuit-transient__initial"><input type="checkbox" checked={startFromOperatingPoint} onChange={(event) => {
       setStartFromOperatingPoint(event.target.checked);
       setPlaying(false);

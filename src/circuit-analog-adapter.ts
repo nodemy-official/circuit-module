@@ -1,5 +1,6 @@
 import { analyzeAnalogCircuit, type ComplexValue, type AnalogCircuitPartReading } from "./analog-solver.js";
 import { complexMagnitude, complexPhaseDegrees } from "./analog-math.js";
+import { exactComplexValue } from "./exact-numeric-state.js";
 import { acAnalysisFrequency, frequencyMatches, isAcReactiveConductive } from "./ac-reactive.js";
 import { circuitPartCatalog, terminalsOf, type CircuitDocument, type CircuitPart, type CircuitTerminal } from "./circuit-model.js";
 import {
@@ -11,6 +12,7 @@ import {
 } from "./circuit-connectivity.js";
 import { circuitDocumentShapeIssue, isSimulationRecord, simulationRecordField } from "./simulation-input.js";
 import type { CircuitAnalysis, CircuitAnalysisOptions, CircuitPartReading } from "./circuit-solver.js";
+import { readingPrecision, terminalVoltageDifferences } from "./circuit-reading.js";
 
 const sourceKinds = new Set(["battery", "ac-source", "current-source"]);
 const directlyConductiveKinds = new Set<CircuitPart["kind"]>([
@@ -185,6 +187,7 @@ function analysisStatus(
   frequencyHz: number,
   switchStates: Record<string, boolean>,
   readings: Record<string, CircuitPartReading>,
+  analogReadings: Record<string, AnalogCircuitPartReading>,
 ): CircuitAnalysis["status"] {
   if (analogStatus !== "valid") { return analogStatus; }
   const hasOpAmpOutputLoop = document.parts.some((part) =>
@@ -195,7 +198,16 @@ function analysisStatus(
   const hasClosedSourceLoop = activeSources.some((source) =>
     hasSourceReturnPath(document, source, mode, frequencyHz, switchStates, readings),
   );
-  return hasClosedSourceLoop || hasOpAmpOutputLoop ? "closed" : "open";
+  // A transistor can drive a closed output loop while its input draws no
+  // current. The solved terminal currents satisfy KCL even when the input
+  // source has no conductive return path. Inspect before display rounding.
+  const hasControlledCurrent = mode === "ac" && document.parts.some((part) =>
+    smallSignalCurrentKinds.has(part.kind) && Object.values(analogReadings[part.id]?.terminalCurrents ?? {}).some((current) => {
+      const exact = exactComplexValue(current);
+      return exact !== null && (exact.real.numerator !== 0n || exact.imaginary.numerator !== 0n);
+    }),
+  );
+  return hasClosedSourceLoop || hasOpAmpOutputLoop || hasControlledCurrent ? "closed" : "open";
 }
 
 function adaptReading(
@@ -207,11 +219,14 @@ function adaptReading(
   const deliversPower = ac ? part.kind === "ac-source" : sourceKinds.has(part.kind);
   const powerWatts = part.kind === "capacitor" || part.kind === "inductor" ? 0
     : reading.power.real * (deliversPower ? -1 : 1);
+  const localDifferences = terminalVoltageDifferences(reading.terminalVoltages, ac, reading.terminalVoltageDifferences);
   const result: CircuitPartReading = {
     voltageVolts: ac ? magnitude(reading.voltage) : reading.voltage.real,
     currentAmps: ac ? magnitude(reading.current) : reading.current.real,
     powerWatts,
     terminalVoltages: terminalValues(reading.terminalVoltages, ac),
+    ...readingPrecision(reading),
+    ...(localDifferences ? { terminalVoltageDifferences: localDifferences } : {}),
     terminalCurrents: terminalValues(reading.terminalCurrents, ac),
     ...(reading.meterStatus ? { meterStatus: reading.meterStatus } : {}),
     ...(part.kind === "switch" ? { switchClosed: switchClosedState(part, switchStates) } : {}),
@@ -302,7 +317,7 @@ function analyzeExtendedCircuitFromInput(
     };
   }
   const sources = document.parts.filter((part) => sourceKinds.has(part.kind));
-  const status = analysisStatus(document, analog.status, sources, mode, frequencyHz, switchStates, parts);
+  const status = analysisStatus(document, analog.status, sources, mode, frequencyHz, switchStates, parts, analog.parts);
   const message = status === "open"
     ? "回路が開いているため電流は流れていません。導線とスイッチを確認してください。"
     : analog.message;

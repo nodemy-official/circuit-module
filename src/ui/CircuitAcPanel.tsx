@@ -1,8 +1,9 @@
-import { useId, useState, type ChangeEvent } from "react";
+import { useId, useState } from "react";
 import { frequencyMatches } from "../ac-reactive.js";
 import { circuitPartCatalog, type CircuitDocument, type CircuitPart } from "../circuit-model.js";
 import { analyzeCircuit, type CircuitAnalysis, type CircuitAnalysisOptions, type CircuitPartReading } from "../circuit-solver.js";
 import { formatCircuitNumber } from "../number-format.js";
+import { NumericInput } from "./NumericInput.js";
 
 const MIN_SWEEP_POINTS = 3;
 const MAX_SWEEP_POINTS = 81;
@@ -149,10 +150,6 @@ function emptyMessage(options: CircuitAnalysisOptions, analysis: CircuitAnalysis
   return analysis.status !== "closed"
     ? analysis.message || "有効な交流解析結果を待っています。"
     : "表示できる部品の交流計測値がありません。";
-}
-
-function boundedValue(value: number, minimum: number, maximum: number): number | null {
-  return Number.isFinite(value) && value >= minimum && value <= maximum ? value : null;
 }
 
 export interface CircuitAcPanelProps {
@@ -338,15 +335,6 @@ export function CircuitAcPanel({ document, analysis, options }: CircuitAcPanelPr
     }
   };
 
-  const changeDecades = (event: ChangeEvent<HTMLInputElement>) => {
-    const value = boundedValue(event.currentTarget.valueAsNumber, 0.5, 6);
-    if (value !== null) { setDecades(value); }
-  };
-  const changePointCount = (event: ChangeEvent<HTMLInputElement>) => {
-    const value = boundedValue(Math.round(event.currentTarget.valueAsNumber), MIN_SWEEP_POINTS, MAX_SWEEP_POINTS);
-    if (value !== null) { setPointCount(value); }
-  };
-
   if (!active || !selectedPart || !reading) {
     return <section className="circuit-panel circuit-ac" aria-label="交流の波形と周波数応答" data-state="empty">
       <div className="circuit-panel__heading"><h2>交流の波形と周波数応答</h2></div>
@@ -367,9 +355,9 @@ export function CircuitAcPanel({ document, analysis, options }: CircuitAcPanelPr
       <h3>周波数を変えて調べる</h3>
       <p>範囲を広げると、フィルタの境目や共振する周波数を見つけやすくなります。</p>
       <label htmlFor={`${id}-decades`}>範囲（全幅、桁）</label>
-      <input id={`${id}-decades`} type="number" min="0.5" max="6" step="0.5" value={decades} onChange={changeDecades} />
+      <NumericInput id={`${id}-decades`} min={0.5} max={6} step="0.5" value={decades} onValueChange={setDecades} />
       <label htmlFor={`${id}-points`}>解析点数（最大 {MAX_SWEEP_POINTS}）</label>
-      <input id={`${id}-points`} type="number" min={MIN_SWEEP_POINTS} max={MAX_SWEEP_POINTS} step="1" value={pointCount} onChange={changePointCount} />
+      <NumericInput id={`${id}-points`} min={MIN_SWEEP_POINTS} max={MAX_SWEEP_POINTS} step="1" integer value={pointCount} onValueChange={setPointCount} />
       <button type="button" className="circuit-button" onClick={runSweep} disabled={!active}>対数スイープを計算</button>
       <p className="circuit-ac__sweep-note">解析周波数に一致する交流電源を同時にスイープします。実効値と位相は保ち、異なる周波数の電源は解析対象外にします。</p>
     </div>

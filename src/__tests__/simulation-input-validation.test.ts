@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { analyzeExtendedCircuit } from "../circuit-analog-adapter.js";
 import { analyzeAnalogCircuit, solveAnalogStep } from "../analog-solver.js";
 import { analyzeCircuit } from "../circuit-solver.js";
-import { circuitPartCatalog, type CircuitDocument } from "../circuit-model.js";
+import { circuitPartCatalog, type CircuitDocument, type CircuitPart } from "../circuit-model.js";
 import { simulateTransient } from "../transient-solver.js";
 
 const validDocument: CircuitDocument = {
@@ -47,6 +47,98 @@ const publicAnalyzers: [string, (document: unknown) => { status: string }][] = [
 ];
 
 describe("simulation API runtime input validation", () => {
+  it.each(["nmos", "pmos"] as const)("validates explicit null %s channel modulation across DC, AC and transient APIs", (kind) => {
+    const sign = kind === "nmos" ? 1 : -1;
+    for (const value of [null, Number.NaN, undefined]) {
+      const document: CircuitDocument = {
+        title: "MOS channel modulation validation",
+        parts: [
+          { id: "mos", kind, label: "M", x: 0, y: 0, ...circuitPartCatalog[kind].defaults, channelLengthModulation: value } as unknown as CircuitPart,
+          { id: "g", kind: "ac-source", label: "G", x: 0, y: 0, voltageVolts: 0, frequencyHz: 1000, offsetVolts: sign * 4 },
+          { id: "d", kind: "ac-source", label: "D", x: 0, y: 0, voltageVolts: 1, frequencyHz: 1000, offsetVolts: sign * 5 },
+          { id: "ref", kind: "ground", label: "GND", x: 0, y: 0 },
+        ],
+        wires: [
+          { id: "gate", from: { partId: "g", terminal: "a" }, to: { partId: "mos", terminal: "b" } },
+          { id: "drain", from: { partId: "d", terminal: "a" }, to: { partId: "mos", terminal: "a" } },
+          ...["g", "d"].map((partId) => ({ id: partId, from: { partId, terminal: "b" as const }, to: { partId: "ref", terminal: "a" as const } })),
+          { id: "source", from: { partId: "mos", terminal: "c" }, to: { partId: "ref", terminal: "a" } },
+        ],
+      };
+      for (const mode of ["dc", "ac"] as const) {
+        const results = [analyzeAnalogCircuit(document, { mode }), solveAnalogStep(document, { mode }),
+          analyzeCircuit(document, {}, { mode }), analyzeExtendedCircuit(document, {}, { mode })];
+        for (const result of results) {
+          if (value === undefined) { expect(["closed", "valid"]).toContain(result.status); }
+          else { expect(result.status).toBe("invalid"); }
+        }
+        if (value === undefined) {
+          const result = analyzeAnalogCircuit(document, { mode });
+          // Independent square-law DC and output-conductance AC values.
+          const expected = mode === "dc" ? sign * 0.042 : 0.0004;
+          const actual = mode === "dc" ? result.parts.mos!.current.real : Math.hypot(result.parts.mos!.current.real, result.parts.mos!.current.imaginary);
+          expect(actual / expected).toBeCloseTo(1, 12);
+        }
+      }
+      const transient = simulateTransient(document, { durationSeconds: 1e-6, timeStepSeconds: 1e-6 });
+      expect(transient.status).toBe(value === undefined ? "valid" : "invalid");
+    }
+  });
+
+  it("validates initial inductor current before applying the omitted-value default", () => {
+    for (const value of [null, Number.NaN, undefined, 1]) {
+      const document: CircuitDocument = {
+        title: "Initial inductor current validation",
+        parts: [
+          { id: "l", kind: "inductor", label: "L", x: 0, y: 0, inductanceHenries: 1, initialCurrentAmps: value } as unknown as CircuitPart,
+          { id: "r", kind: "resistor", label: "R", x: 0, y: 0, resistanceOhms: 6 },
+        ],
+        wires: [
+          { id: "a", from: { partId: "l", terminal: "a" }, to: { partId: "r", terminal: "a" } },
+          { id: "b", from: { partId: "l", terminal: "b" }, to: { partId: "r", terminal: "b" } },
+        ],
+      };
+      for (const analyze of [solveAnalogStep, analyzeAnalogCircuit]) {
+        const result = analyze(document, { mode: "dc", initialInductorCurrents: true });
+        expect(result.status).toBe(value === null || Number.isNaN(value) ? "invalid" : "valid");
+        if (result.status === "valid") {
+          expect(result.parts.l!.current.real).toBe(value ?? 0);
+          expect(result.parts.r!.current.real).toBe(value === 1 ? -1 : 0);
+          expect(result.parts.r!.voltage.real).toBe(value === 1 ? -6 : 0);
+        }
+      }
+    }
+  });
+
+  it.each([
+    ["battery", "internalResistanceOhms"],
+    ["ac-source", "offsetVolts"],
+    ["ac-source", "phaseDegrees"],
+  ] as const)("distinguishes explicit null from an omitted %s.%s at every entry point", (kind, field) => {
+    for (const value of [null, Number.NaN, undefined]) {
+      const document = {
+        title: "Malformed numeric field with a valid load",
+        parts: [
+          { id: "s", kind, label: "S", x: 0, y: 0, ...circuitPartCatalog[kind].defaults, voltageVolts: 4, [field]: value },
+          { id: "r", kind: "resistor", label: "R", x: 0, y: 0, resistanceOhms: 8 },
+        ],
+        wires: [
+          { id: "a", from: { partId: "s", terminal: "a" }, to: { partId: "r", terminal: "a" } },
+          { id: "b", from: { partId: "s", terminal: "b" }, to: { partId: "r", terminal: "b" } },
+        ],
+      };
+      const analyzers = [...publicAnalyzers,
+        ["analog DC", (input: unknown) => analyzeAnalogCircuit(input as CircuitDocument, { mode: "dc" })] as const,
+        ["circuit DC", (input: unknown) => analyzeCircuit(input as CircuitDocument, {}, { mode: "dc" })] as const,
+      ];
+      for (const [name, analyze] of analyzers) {
+        const status = analyze(document).status;
+        if (value === undefined) { expect(status, name).not.toBe("invalid"); }
+        else { expect(status, name).toBe("invalid"); }
+      }
+    }
+  });
+
   it.each(publicAnalyzers)("returns invalid rather than throwing for malformed documents through %s", (_name, analyze) => {
     for (const [description, document] of malformedDocuments) {
       let result: { status: string } | undefined;

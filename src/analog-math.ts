@@ -5,6 +5,7 @@ import {
   divideExactComplex,
   exactRationalToNumber,
   exactRationalSquareRootToNumber,
+  floorExactRationalSquareRoot,
   multiplyExactComplex,
   multiplyExactRational,
   numberToExactRational,
@@ -29,6 +30,95 @@ export interface ComplexValue {
 }
 
 export const complex = (real = 0, imaginary = 0): ComplexValue => ({ real, imaginary });
+
+const ONE: ExactRational = { numerator: 1n, denominator: 1n };
+const magnitudeNormalizations = new WeakMap<ComplexValue, { squared: ExactRational; real: number; imaginary: number }>();
+
+/** A positive uniform amplitude correction; rectangular coefficients remain approximate. */
+export function complexMagnitudeNormalization(value: ComplexValue): ExactRational {
+  const stored = magnitudeNormalizations.get(value);
+  if (stored && Object.is(stored.real, value.real) && Object.is(stored.imaginary, value.imaginary)) { return stored.squared; }
+  magnitudeNormalizations.delete(value);
+  return ONE;
+}
+
+export function withComplexMagnitudeNormalization(value: ComplexValue, squared: ExactRational): ComplexValue {
+  if (squared.numerator <= 0n || squared.denominator <= 0n) { return complex(Number.NaN, Number.NaN); }
+  if (squared.numerator === squared.denominator && !magnitudeNormalizations.has(value)) { return value; }
+  const exact = exactComplexValue(value);
+  const result = exact ? complexFromExact(exact) : complex(value.real, value.imaginary);
+  if (squared.numerator !== squared.denominator) {
+    magnitudeNormalizations.set(result, { squared: addExactRational(squared, { numerator: 0n, denominator: 1n }), real: result.real, imaginary: result.imaginary });
+  }
+  return result;
+}
+
+function sumMagnitudeNormalization(left: ComplexValue, right: ComplexValue) {
+  const first = complexMagnitudeNormalization(left);
+  const second = complexMagnitudeNormalization(right);
+  if (first.numerator * second.denominator === second.numerator * first.denominator) { return first; }
+  const isZero = (value: ComplexValue) => {
+    const exact = exactComplexValue(value);
+    return exact && exact.real.numerator === 0n && exact.imaginary.numerator === 0n;
+  };
+  return isZero(left) ? second : isZero(right) ? first : ONE;
+}
+
+const normalizationScales = new WeakMap<ExactRational, ExactRational>();
+
+function componentsAtNormalization(value: ComplexValue, target: ExactRational) {
+  const exact = exactComplexValue(value);
+  const squared = complexMagnitudeNormalization(value);
+  if (!exact || squared.numerator * target.denominator === target.numerator * squared.denominator) { return exact; }
+  // Only mixed corrections need an irrational square-root boundary. A floor
+  // at 512 fractional bits has absolute coefficient error below 2^-512.
+  let scale = normalizationScales.get(squared);
+  if (!scale) {
+    scale = floorExactRationalSquareRoot(squared, 512) ?? undefined;
+    if (!scale) { return null; }
+    normalizationScales.set(squared, scale);
+  }
+  return { real: multiplyExactRational(exact.real, scale), imaginary: multiplyExactRational(exact.imaginary, scale) };
+}
+
+/** Expands a uniform amplitude correction at the documented 512-bit boundary. */
+export function complexRectangularValue(value: ComplexValue): ComplexValue {
+  const exact = componentsAtNormalization(value, ONE);
+  return exact ? complexFromExact(exact) : complex(value.real, value.imaginary);
+}
+
+// floor(sqrt(1/2) * 2^512): n^2 <= 2^1023 < (n+1)^2.
+// Equal diagonal coefficients preserve the exact phase; their absolute
+// approximation error is below 2^-512, without binary64 amplitude inflation.
+const DIAGONAL_DIRECTION: ExactRational = {
+  numerator: 0xb504f333f9de6484597d89b3754abe9f1d6f60ba893ba84ced17ac85833399154afc83043ab8a2c3a8b1fe6fdc83db390f74a85e439c7b4a780487363dfa2768n,
+  denominator: 2n ** 512n,
+};
+
+/** Trigonometric coefficients are binary64 approximations; amplitude products stay exact. */
+export function complexFromPolar(magnitude: number, degrees = 0): ComplexValue {
+  const wrappedDegrees = degrees % 360;
+  const quadrant = Math.round(wrappedDegrees / 90);
+  const offsetDegrees = wrappedDegrees - quadrant * 90;
+  const nearAxis = Math.abs(offsetDegrees) < 1e-7;
+  const diagonal = Math.abs(offsetDegrees) === 45;
+  const offsetRadians = nearAxis ? 0 : (offsetDegrees * Math.PI) / 180;
+  const acrossAxis = diagonal
+    ? offsetDegrees < 0 ? { ...DIAGONAL_DIRECTION, numerator: -DIAGONAL_DIRECTION.numerator } : DIAGONAL_DIRECTION
+    : nearAxis
+    ? exactProductSumRatio([{ factors: [offsetDegrees, Math.PI] }], 180)
+    : numberToExactRational(Math.sin(offsetRadians));
+  const alongAxis = diagonal ? DIAGONAL_DIRECTION : numberToExactRational(nearAxis ? 1 : Math.cos(offsetRadians));
+  if (!acrossAxis || !alongAxis) { return complex(Number.NaN, Number.NaN); }
+  // Near an axis, sin(epsilon)=epsilon and cos(epsilon)=1 have relative
+  // coefficient errors below epsilon^2/2 < 1.6e-18. Retain the rational
+  // radian offset itself, including offsets below the binary64 range.
+  const direction = complexFromExact({ real: alongAxis, imaginary: acrossAxis });
+  const rotation = [complex(1), complex(0, 1), complex(-1), complex(0, -1)][((quadrant % 4) + 4) % 4]!;
+  const squaredLength = addExactRational(multiplyExactRational(alongAxis, alongAxis), multiplyExactRational(acrossAxis, acrossAxis));
+  return withComplexMagnitudeNormalization(complexMultiply(complexMultiply(direction, rotation), complex(magnitude)),
+    divideExactRational(ONE, squaredLength)!);
+}
 
 /** Keeps the exact solution available to subsequent circuit calculations. */
 export function solveRealLinearSystem(...args: Parameters<typeof solveExactRealLinearSystem>) {
@@ -132,30 +222,35 @@ export function scaledProduct(values: readonly number[]): number {
 }
 
 export const complexAdd = (left: ComplexValue, right: ComplexValue): ComplexValue => {
-  const exactLeft = exactComplexValue(left);
-  const exactRight = exactComplexValue(right);
-  return exactLeft && exactRight
+  const normalization = sumMagnitudeNormalization(left, right);
+  const exactLeft = componentsAtNormalization(left, normalization);
+  const exactRight = componentsAtNormalization(right, normalization);
+  const result = exactLeft && exactRight
     ? complexFromExact(addExactComplex(exactLeft, exactRight))
     : complex(left.real + right.real, left.imaginary + right.imaginary);
+  return withComplexMagnitudeNormalization(result, normalization);
 };
 
 export const complexSubtract = (left: ComplexValue, right: ComplexValue): ComplexValue => {
-  const exactLeft = exactComplexValue(left);
-  const exactRight = exactComplexValue(right);
-  return exactLeft && exactRight
+  const normalization = sumMagnitudeNormalization(left, right);
+  const exactLeft = componentsAtNormalization(left, normalization);
+  const exactRight = componentsAtNormalization(right, normalization);
+  const result = exactLeft && exactRight
     ? complexFromExact(subtractExactComplex(exactLeft, exactRight))
     : complex(left.real - right.real, left.imaginary - right.imaginary);
+  return withComplexMagnitudeNormalization(result, normalization);
 };
 
 export const complexMultiply = (left: ComplexValue, right: ComplexValue): ComplexValue => {
   const exactLeft = exactComplexValue(left);
   const exactRight = exactComplexValue(right);
-  return exactLeft && exactRight
+  const result = exactLeft && exactRight
     ? complexFromExact(multiplyExactComplex(exactLeft, exactRight))
     : complex(
       left.real * right.real - left.imaginary * right.imaginary,
       left.real * right.imaginary + left.imaginary * right.real,
     );
+  return withComplexMagnitudeNormalization(result, multiplyExactRational(complexMagnitudeNormalization(left), complexMagnitudeNormalization(right)));
 };
 
 /** Divides finite complex inputs exactly before rounding the two output components. */
@@ -166,27 +261,32 @@ export const complexDivide = (left: ComplexValue, right: ComplexValue): ComplexV
     return complex(Number.NaN, Number.NaN);
   }
   const quotient = divideExactComplex(exactLeft, exactRight);
-  return quotient ? complexFromExact(quotient) : complex(Number.NaN, Number.NaN);
+  return quotient ? withComplexMagnitudeNormalization(complexFromExact(quotient), divideExactRational(complexMagnitudeNormalization(left), complexMagnitudeNormalization(right))!)
+    : complex(Number.NaN, Number.NaN);
 };
 
 export const complexConjugate = (value: ComplexValue): ComplexValue => {
   const exact = exactComplexValue(value);
-  return exact ? complexFromExact({
+  const result = exact ? complexFromExact({
     real: exact.real,
     imaginary: subtractExactRational({ numerator: 0n, denominator: 1n }, exact.imaginary),
   }) : complex(value.real, -value.imaginary);
+  return withComplexMagnitudeNormalization(result, complexMagnitudeNormalization(value));
 };
 
 export function complexMagnitude(value: ComplexValue) {
   const exact = exactComplexValue(value);
   if (!exact) { return Math.hypot(value.real, value.imaginary); }
-  if (exact.imaginary.numerator === 0n) { return Math.abs(exactRationalToNumber(exact.real)); }
-  if (exact.real.numerator === 0n) { return Math.abs(exactRationalToNumber(exact.imaginary)); }
+  const normalization = complexMagnitudeNormalization(value);
+  if (normalization.numerator === normalization.denominator) {
+    if (exact.imaginary.numerator === 0n) { return Math.abs(exactRationalToNumber(exact.real)); }
+    if (exact.real.numerator === 0n) { return Math.abs(exactRationalToNumber(exact.imaginary)); }
+  }
   const squaredMagnitude = addExactRational(
     multiplyExactRational(exact.real, exact.real),
     multiplyExactRational(exact.imaginary, exact.imaginary),
   );
-  return exactRationalSquareRootToNumber(squaredMagnitude);
+  return exactRationalSquareRootToNumber(multiplyExactRational(squaredMagnitude, normalization));
 }
 
 function phaseComponents(value: ComplexValue) {

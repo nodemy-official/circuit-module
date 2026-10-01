@@ -5,7 +5,8 @@ import { circuitSlot, type CircuitStyleProps } from "./style-props.js";
 import { CircuitIcon } from "./CircuitIcon.js";
 import { measurementLabels } from "./measurement-labels.js";
 import { CircuitMeterReadout, getMeterDisplay } from "./CircuitMeterReadout.js";
-import type { ComponentPropsWithoutRef, ReactNode } from "react";
+import { NumericInput } from "./NumericInput.js";
+import { useId, type ComponentPropsWithoutRef, type ReactNode } from "react";
 
 export type CircuitInspectorSlot =
   | "root"
@@ -213,28 +214,25 @@ function InspectorFields({
   slotProps?: CircuitInspectorProps["slotProps"];
 }) {
   const change = (patch: Partial<CircuitPart>) => onChange?.(part.id, patch);
+  const inputId = useId();
   const defaults = circuitPartCatalog[part.kind].defaults;
   const numericFields = circuitPartNumericFields(part.kind);
   const numeric = (key: CircuitPartNumericKey, label: string, unit: string, min?: number, max?: number, step?: number, exclusiveMin?: boolean) => {
     const value = part[key] ?? defaults[key] ?? 0;
     return (
-      <label {...circuitSlot("circuit-field", slotProps?.field)} key={key} data-field={key}>
+      <label {...circuitSlot("circuit-field", slotProps?.field)} key={key} data-field={key} htmlFor={`${inputId}-${key}`}>
         <span {...circuitSlot("circuit-field__label", slotProps?.fieldLabel)}>{label}</span>
         <span {...circuitSlot("circuit-field__input", slotProps?.numericInputContainer)}>
-          <input
+          <NumericInput
+            key={`${part.id}:${key}`}
+            id={`${inputId}-${key}`}
             {...circuitSlot(undefined, slotProps?.numericInput)}
-            type="number"
             step={step ?? "any"}
             min={min}
             max={max}
+            exclusiveMin={exclusiveMin}
             value={value}
-            onChange={(event) => {
-              const nextValue = event.currentTarget.valueAsNumber;
-              if (!Number.isFinite(nextValue)) { return; }
-              if (min !== undefined && (exclusiveMin ? nextValue <= min : nextValue < min)) { return; }
-              if (max !== undefined && nextValue > max) { return; }
-              change({ [key]: nextValue });
-            }}
+            onValueChange={(nextValue) => change({ [key]: nextValue })}
             disabled={!onChange}
             data-field={key}
           />

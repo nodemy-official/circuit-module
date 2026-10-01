@@ -17,6 +17,7 @@ import {
 } from "../circuit-edit.js";
 import { routeDocumentWires, routeEnd, routeWire, snapToGrid, terminalPoint } from "../circuit-geometry.js";
 import { createExampleCircuit, type CircuitDocument } from "../circuit-model.js";
+import { MAX_CIRCUIT_DOCUMENT_COORDINATE } from "../circuit-serialization.js";
 
 const empty: CircuitDocument = { title: "", parts: [], wires: [] };
 
@@ -48,6 +49,31 @@ describe("placing parts", () => {
     expect(placed.ok && placed.document.parts[0]).toMatchObject({ x: -4, y: -6 });
   });
 
+  it.each([
+    { name: "NaN x", at: { x: Number.NaN, y: 0 } },
+    { name: "infinite y", at: { x: 0, y: Number.POSITIVE_INFINITY } },
+    { name: "x beyond the save limit", at: { x: MAX_CIRCUIT_DOCUMENT_COORDINATE + 1, y: 0 } },
+    { name: "y beyond the save limit", at: { x: 0, y: -MAX_CIRCUIT_DOCUMENT_COORDINATE - 1 } },
+  ])("rejects unsaveable coordinates when adding a part ($name)", ({ at }) => {
+    const result = addPart(empty, "resistor", at);
+
+    expect(result.ok).toBe(false);
+    expect(empty).toEqual({ title: "", parts: [], wires: [] });
+  });
+
+  it("does not consider an unsaveable part position placeable", () => {
+    const invalidPart = {
+      id: "invalid",
+      kind: "resistor" as const,
+      x: Number.NaN,
+      y: 0,
+      label: "R",
+      resistanceOhms: 10,
+    };
+
+    expect(canPlace(empty, [invalidPart])).toBe(false);
+  });
+
   it("finds the nearest free spot", () => {
     const document = createExampleCircuit();
     const spot = findFreeSpot(document, "resistor", { x: 8, y: 5 });
@@ -72,6 +98,45 @@ describe("moving and rotating", () => {
     };
     const moved = moveParts(document, ["battery"], -5, -7);
     expect(moved.ok && moved.document.parts[0]).toMatchObject({ x: -4, y: -6 });
+  });
+
+  it.each([
+    { name: "crosses the save limit", dx: 1 },
+    { name: "uses a non-finite offset", dx: Number.NaN },
+    { name: "uses an infinite offset", dx: Number.POSITIVE_INFINITY },
+  ])("rejects a move that creates unsaveable coordinates ($name)", ({ dx }) => {
+    const document: CircuitDocument = {
+      title: "",
+      parts: [{ id: "edge", kind: "resistor", x: MAX_CIRCUIT_DOCUMENT_COORDINATE, y: 0, label: "R" }],
+      wires: [],
+    };
+
+    const result = moveParts(document, ["edge"], dx, 0);
+
+    expect(result.ok).toBe(false);
+    expect(document.parts[0]?.x).toBe(MAX_CIRCUIT_DOCUMENT_COORDINATE);
+  });
+
+  it("rejects moving an endpoint when its attached waypoints would exceed the save limit", () => {
+    const document: CircuitDocument = {
+      title: "",
+      parts: [
+        { id: "left", kind: "junction", x: MAX_CIRCUIT_DOCUMENT_COORDINATE - 2, y: 0, label: "L" },
+        { id: "right", kind: "junction", x: 0, y: 0, label: "R" },
+      ],
+      wires: [{
+        id: "wire",
+        from: { partId: "left", terminal: "a" },
+        to: { partId: "right", terminal: "a" },
+        waypoints: [{ x: MAX_CIRCUIT_DOCUMENT_COORDINATE, y: 0 }],
+      }],
+    };
+
+    const result = moveParts(document, ["left"], 2, 0);
+
+    expect(result.ok).toBe(false);
+    expect(document.parts[0]?.x).toBe(MAX_CIRCUIT_DOCUMENT_COORDINATE - 2);
+    expect(document.wires[0]?.waypoints?.[0]?.x).toBe(MAX_CIRCUIT_DOCUMENT_COORDINATE);
   });
 
   it("snaps pointer positions to negative grid cells", () => {
@@ -665,6 +730,48 @@ describe("clipboard", () => {
     expect(removed.parts).toHaveLength(4);
     expect(removed.wires).toHaveLength(4);
   });
+
+  it("rejects a paste whose offset would create an unsaveable part coordinate", () => {
+    const fragment = {
+      parts: [{
+        id: "edge",
+        kind: "resistor" as const,
+        x: MAX_CIRCUIT_DOCUMENT_COORDINATE,
+        y: 0,
+        label: "R",
+        resistanceOhms: 10,
+      }],
+      wires: [],
+    };
+
+    const pasted = pasteFragment(empty, fragment);
+
+    expect(pasted.ok).toBe(false);
+    expect(empty).toEqual({ title: "", parts: [], wires: [] });
+  });
+
+  it("rejects a paste containing sparse waypoint arrays", () => {
+    const waypoints: { x: number; y: number }[] = [];
+    waypoints[0] = { x: 3, y: 0 };
+    waypoints[2] = { x: 3, y: 5 };
+    const fragment = {
+      parts: [
+        { id: "left", kind: "junction" as const, x: 0, y: 0, label: "L" },
+        { id: "right", kind: "junction" as const, x: 10, y: 0, label: "R" },
+      ],
+      wires: [{
+        id: "wire",
+        from: { partId: "left", terminal: "a" as const },
+        to: { partId: "right", terminal: "a" as const },
+        waypoints,
+      }],
+    };
+
+    const pasted = pasteFragment(empty, fragment);
+
+    expect(pasted.ok).toBe(false);
+    expect(empty).toEqual({ title: "", parts: [], wires: [] });
+  });
 });
 
 describe("manual wire routing", () => {
@@ -697,6 +804,20 @@ describe("manual wire routing", () => {
     expect(reset.document.wires[0]).not.toHaveProperty("waypoints");
     expect(setWireWaypoints(document, "missing", points).ok).toBe(false);
     expect(setWireWaypoints(document, "wire-1", [{ x: Number.MAX_VALUE, y: 0 }]).ok).toBe(false);
+  });
+
+  it("rejects sparse waypoint arrays without changing the document", () => {
+    const document = documentWithManualWire();
+    const sparse: { x: number; y: number }[] = [];
+    sparse[0] = { x: 3, y: 0 };
+    sparse[2] = { x: 3, y: 5 };
+
+    const result = setWireWaypoints(document, "wire-1", sparse);
+
+    expect(result.ok).toBe(false);
+    expect(document.wires[0]?.waypoints).toEqual([
+      { x: 2, y: 0 }, { x: 2, y: 4 }, { x: 8, y: 4 }, { x: 8, y: 5 },
+    ]);
   });
 
   it("translates waypoints with moved endpoint parts", () => {

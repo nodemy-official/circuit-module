@@ -11,13 +11,33 @@ import {
   terminalPoint,
   type Point,
 } from "../circuit-geometry.js";
-import type { CircuitPart, CircuitPartKind, CircuitRotation } from "../circuit-model.js";
+import type { CircuitDocument, CircuitPart, CircuitPartKind, CircuitRotation } from "../circuit-model.js";
+import { parseCircuitDocument, serializeCircuitDocument } from "../circuit-serialization.js";
 
 function part(kind: CircuitPartKind, rotation: CircuitPart["rotation"] = 0): CircuitPart {
   return { id: kind, kind, x: 10, y: 10, label: kind, rotation };
 }
 
 describe("feedback routing", () => {
+  it.each([0, 90, 180, 270] as CircuitRotation[])("routes a two-terminal bypass outside its body at %s degrees", (rotation) => {
+    const resistor = part("resistor", rotation);
+    const route = routeDocumentWires({ title: "bypass", parts: [resistor], wires: [
+      { id: "bypass", from: { partId: resistor.id, terminal: "a" }, to: { partId: resistor.id, terminal: "b" } },
+    ] }).get("bypass");
+    if (!route) { throw new Error("Missing bypass route"); }
+    const bounds = footprint(resistor);
+    expect(route[0]).toEqual(terminalPoint(resistor, "a"));
+    expect(route.at(-1)).toEqual(terminalPoint(resistor, "b"));
+    expect(route.slice(1).some((to, index) => {
+      const from = route[index];
+      return from.y === to.y
+        ? from.y > bounds.minY && from.y < bounds.maxY &&
+          Math.max(from.x, to.x) > bounds.minX && Math.min(from.x, to.x) < bounds.maxX
+        : from.x > bounds.minX && from.x < bounds.maxX &&
+          Math.max(from.y, to.y) > bounds.minY && Math.min(from.y, to.y) < bounds.maxY;
+    })).toBe(false);
+  });
+
   it.each([0, 90, 180, 270] as CircuitRotation[])("routes an op-amp's tied pins outside its body at %s degrees", (rotation) => {
     const opamp = part("op-amp", rotation);
     const route = routeDocumentWires({ title: "feedback", parts: [opamp], wires: [
@@ -96,6 +116,68 @@ function hasInteriorCrossing(first: readonly Point[], second: readonly Point[], 
 }
 
 describe("routeWire", () => {
+  it("routes a valid billion-cell wire alongside another wire without expanding every cell", () => {
+    const document: CircuitDocument = { title: "large coordinates", parts: [
+      { id: "a", kind: "junction", x: 0, y: 0, label: "A" },
+      { id: "b", kind: "junction", x: 1e9, y: 0, label: "B" },
+      { id: "c", kind: "junction", x: 0, y: 10, label: "C" },
+      { id: "d", kind: "junction", x: 10, y: 10, label: "D" },
+    ], wires: [
+      { id: "long", from: { partId: "a", terminal: "a" }, to: { partId: "b", terminal: "a" } },
+      { id: "short", from: { partId: "c", terminal: "a" }, to: { partId: "d", terminal: "a" } },
+    ] };
+    expect(parseCircuitDocument(serializeCircuitDocument(document)).ok).toBe(true);
+    const routes = routeDocumentWires(document);
+    expect(routes.get("long")).toEqual([{ x: 0, y: 0 }, { x: 1e9, y: 0 }]);
+    expect(routes.get("short")).toEqual([{ x: 0, y: 10 }, { x: 10, y: 10 }]);
+  }, 1000);
+
+  it("finds a detour across a billion-cell occupied span with fixed endpoint coordinates", () => {
+    const existing = [{ x: 3, y: 0 }, { x: 1e9 - 3, y: 0 }];
+    const route = routeWire(
+      { point: { x: 0, y: 0 }, direction: null },
+      { point: { x: 1e9, y: 0 }, direction: null },
+      [existing],
+    );
+    expect(route[0]).toEqual({ x: 0, y: 0 });
+    expect(route.at(-1)).toEqual({ x: 1e9, y: 0 });
+    expect(segmentsOverlap(route, existing)).toBe(false);
+    expect(route.length).toBeLessThan(10);
+  }, 1000);
+
+  it.each([
+    [{ x: -2, y: 0 }, { x: 8, y: 0 }, { x: -1, y: 0 }],
+    [{ x: 2, y: 0 }, { x: -8, y: 0 }, { x: 1, y: 0 }],
+    [{ x: 0, y: -2 }, { x: 0, y: 8 }, { x: 0, y: -1 }],
+    [{ x: 0, y: 2 }, { x: 0, y: -8 }, { x: 0, y: 1 }],
+  ])("keeps outward leads without retracing them when the other terminal is behind (%j)", (start, end, direction) => {
+    const route = routeWire({ point: start, direction }, { point: end, direction });
+    const next = route[1];
+    const previous = route.at(-2);
+    if (!next || !previous) { throw new Error("Missing terminal leads"); }
+    expect((next.x - start.x) * direction.x + (next.y - start.y) * direction.y).toBeGreaterThan(0);
+    expect((previous.x - end.x) * direction.x + (previous.y - end.y) * direction.y).toBeGreaterThan(0);
+    expect(segmentsOverlap(route.slice(1), [start, { x: start.x + direction.x, y: start.y + direction.y }])).toBe(false);
+    expect(segmentsOverlap(route.slice(0, -1), [end, { x: end.x + direction.x, y: end.y + direction.y }])).toBe(false);
+  });
+
+  it.each([false, true])("avoids partial overlaps on fractional coordinates (vertical=%s)", (vertical) => {
+    const point = (along: number): Point => vertical ? { x: 0.1, y: along } : { x: along, y: 0.1 };
+    const existing = [point(0.1), point(10.1)];
+    const route = routeWire(
+      { point: point(0.3), direction: null },
+      { point: point(10.3), direction: null },
+      [existing],
+    );
+    expect(route[0]).toEqual(point(0.3));
+    expect(route.at(-1)).toEqual(point(10.3));
+    expect(segmentsOverlap(route, existing)).toBe(false);
+    expect(route.every((from, index) => {
+      const to = route[index + 1];
+      return !to || from.x === to.x || from.y === to.y;
+    })).toBe(true);
+  });
+
   it("avoids sharing a positive-length segment with an existing wire", () => {
     const existing = [{ x: 3, y: 0 }, { x: 7, y: 0 }];
     const route = routeWire(

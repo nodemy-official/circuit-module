@@ -1,5 +1,5 @@
 import { circuitPartCatalog, endpointName, terminalsOf, type CircuitDocument, type CircuitEndpoint, type CircuitPart, type CircuitTerminal } from "./circuit-model.js";
-import { complexMagnitude, complexPhaseDegrees, exactComponentSum } from "./analog-math.js";
+import { complex, complexAdd, complexFromPolar, complexMagnitude, complexMultiply, complexPhaseDegrees, complexSubtract } from "./analog-math.js";
 import {
   circuitEndpointsConnected,
   connectCircuitEndpoints,
@@ -10,6 +10,8 @@ import type { CircuitAnalysis, CircuitPartReading } from "./circuit-solver.js";
 import { acAnalysisFrequency, isAcReactiveConductive } from "./ac-reactive.js";
 import { formatCircuitNumber } from "./number-format.js";
 import type { TransientAnalysis } from "./transient-solver.js";
+import { retainedComplexIsNonzero, restoredReadingComplex, type CircuitExactComplex } from "./circuit-reading.js";
+import type { ExactExpressionNode } from "./exact-expression.js";
 
 export interface CircuitPotentialContext {
   document: CircuitDocument;
@@ -37,6 +39,7 @@ export interface CircuitNode {
   referenceGroup: string;
   voltageVolts?: number;
   voltagePhaseDegrees?: number;
+  exactVoltage?: CircuitExactComplex;
   currents: CircuitNodeCurrent[];
   /** Magnitude of the signed (DC) or phasor (AC) sum. Undefined for incomplete readings. */
   currentResidualAmps?: number;
@@ -61,7 +64,7 @@ function transientFrameParts(document: CircuitDocument, sample: TransientAnalysi
   return parts;
 }
 
-function transientSourceIsActive(part: CircuitPart, sample: TransientAnalysis["samples"][number]) {
+function transientSourceIsActive(part: CircuitPart, sample: TransientAnalysis["samples"][number], expressions?: readonly ExactExpressionNode[]) {
   if (part.kind === "battery") { return (part.voltageVolts ?? circuitPartCatalog.battery.defaults.voltageVolts ?? 0) !== 0; }
   if (part.kind === "ac-source") {
     return (part.voltageVolts ?? circuitPartCatalog["ac-source"].defaults.voltageVolts ?? 0) !== 0 ||
@@ -71,8 +74,12 @@ function transientSourceIsActive(part: CircuitPart, sample: TransientAnalysis["s
     return (part.currentAmps ?? circuitPartCatalog["current-source"].defaults.currentAmps ?? 0) !== 0;
   }
   const reading = sample.parts[part.id];
-  return part.kind === "capacitor" ? reading?.voltageVolts !== undefined && reading.voltageVolts !== 0
-    : part.kind === "inductor" && reading?.currentAmps !== undefined && reading.currentAmps !== 0;
+  // Displayed state values can underflow while the exact state still drives
+  // a representable current or voltage at the other reactive terminal value.
+  if (part.kind !== "capacitor" && part.kind !== "inductor") { return false; }
+  if ((finite(reading?.voltageVolts) && reading.voltageVolts !== 0) ||
+    (finite(reading?.currentAmps) && reading.currentAmps !== 0)) { return true; }
+  return [reading?.exactVoltage, reading?.exactTerminalCurrents?.a].some((retained) => retainedComplexIsNonzero(retained, expressions));
 }
 
 function transientConductiveTerminals(
@@ -160,8 +167,9 @@ function transientOpAmpOutputReturnPath(
 function transientAnalysisStatus(
   document: CircuitDocument,
   sample: TransientAnalysis["samples"][number],
+  expressions?: readonly ExactExpressionNode[],
 ): CircuitAnalysis["status"] {
-  const sources = document.parts.filter((part) => transientSourceIsActive(part, sample));
+  const sources = document.parts.filter((part) => transientSourceIsActive(part, sample, expressions));
   const hasOpAmpOutputLoop = document.parts.some((part) =>
     part.kind === "op-amp" && transientOpAmpOutputReturnPath(document, sample, part.id),
   );
@@ -181,9 +189,10 @@ export function analysisAtTransientFrame(document: CircuitDocument, frame: Circu
   const hasOpAmp = document.parts.some((part) => part.kind === "op-amp");
   const sourceCurrent = sources.length === 1 && !hasOpAmp ? parts[sources[0].id]?.currentAmps : undefined;
   return {
-    status: transientAnalysisStatus(document, sample), mode: "dc", timeSeconds: sample.timeSeconds, currentAmps: finite(sourceCurrent) ? Math.abs(sourceCurrent) : null,
+    status: transientAnalysisStatus(document, sample, frame.analysis.precisionExpressions), mode: "dc", timeSeconds: sample.timeSeconds, currentAmps: finite(sourceCurrent) ? Math.abs(sourceCurrent) : null,
     message: `過渡解析：${formatCircuitQuantity(sample.timeSeconds, "s")} の瞬時値`,
     parts, wireCurrents: {}, issues: frame.analysis.issues,
+    ...(frame.analysis.precisionExpressions ? { precisionExpressions: frame.analysis.precisionExpressions } : {}),
     bulbPowerWatts: Object.fromEntries(document.parts.filter((part) => part.kind === "bulb").map((part) => [part.id, parts[part.id]?.powerWatts ?? 0])),
   };
 }
@@ -203,21 +212,7 @@ function nodeGroups(keys: string[]) {
 }
 
 function phasor(value: number, degrees = 0) {
-  const wrappedDegrees = degrees % 360;
-  const quadrant = Math.round(wrappedDegrees / 90);
-  const offsetDegrees = wrappedDegrees - quadrant * 90;
-  const nearAxis = Math.abs(offsetDegrees) < 1e-7;
-  const offsetRadians = nearAxis ? 0 : (offsetDegrees * Math.PI) / 180;
-  const alongAxis = nearAxis ? value : value * Math.cos(offsetRadians);
-  const acrossAxis = nearAxis
-    ? (value * (Math.PI / 180)) * offsetDegrees
-    : value * Math.sin(offsetRadians);
-  switch (((quadrant % 4) + 4) % 4) {
-    case 0: return { real: alongAxis, imaginary: acrossAxis };
-    case 1: return { real: -acrossAxis, imaginary: alongAxis };
-    case 2: return { real: -alongAxis, imaginary: -acrossAxis };
-    default: return { real: acrossAxis, imaginary: -alongAxis };
-  }
+  return complexFromPolar(value, degrees);
 }
 
 function analysisFrequency(document: CircuitDocument, analysis: CircuitAnalysis) {
@@ -303,10 +298,10 @@ function potentialReferenceGroups(
 
 function nodeReading(endpoints: CircuitEndpoint[], document: CircuitDocument, analysis: CircuitAnalysis) {
   const currents: CircuitNodeCurrent[] = [];
-  const realCurrentComponents: number[] = [];
-  const imaginaryCurrentComponents: number[] = [];
+  let current = complex();
   let voltageVolts: number | undefined;
   let voltagePhaseDegrees: number | undefined;
+  let exactVoltage: CircuitExactComplex | undefined;
   let complete = true;
   for (const endpoint of endpoints) {
     const part = document.parts.find((item) => item.id === endpoint.partId)!;
@@ -315,23 +310,22 @@ function nodeReading(endpoints: CircuitEndpoint[], document: CircuitDocument, an
     if (voltageVolts === undefined && finite(voltage) && reading?.meterStatus !== "floating") {
       voltageVolts = voltage;
       voltagePhaseDegrees = reading?.terminalVoltagePhasesDegrees?.[endpoint.terminal];
+      exactVoltage = reading?.exactTerminalVoltages?.[endpoint.terminal];
     }
     if (part.kind === "junction" || part.kind === "ground") { continue; }
     const amps = reading?.terminalCurrents?.[endpoint.terminal];
     const phaseDegrees = reading?.terminalCurrentPhasesDegrees?.[endpoint.terminal];
     if (!finite(amps) || reading?.meterStatus === "floating" || (analysis.mode === "ac" && !finite(phaseDegrees))) { complete = false; continue; }
     currents.push({ endpoint, label: endpointName(part, endpoint.terminal), amps, phaseDegrees });
-    const value = phasor(amps, phaseDegrees);
-    realCurrentComponents.push(value.real);
-    imaginaryCurrentComponents.push(value.imaginary);
+    const value = restoredReadingComplex(reading?.exactTerminalCurrents?.[endpoint.terminal], amps, phaseDegrees, analysis.mode === "ac", analysis.precisionExpressions) ?? phasor(amps, phaseDegrees);
+    current = complexAdd(current, value);
   }
-  const realCurrent = exactComponentSum(realCurrentComponents);
-  const imaginaryCurrent = exactComponentSum(imaginaryCurrentComponents);
   return {
     voltageVolts,
     voltagePhaseDegrees,
+    ...(exactVoltage ? { exactVoltage } : {}),
     currents,
-    currentResidualAmps: complete && currents.length > 0 ? Math.hypot(realCurrent, imaginaryCurrent) : undefined,
+    currentResidualAmps: complete && currents.length > 0 ? complexMagnitude(current) : undefined,
   };
 }
 
@@ -388,11 +382,12 @@ export function defaultReferenceNode(document: CircuitDocument, nodes: CircuitNo
 }
 
 const preciseTwoTerminalVoltageKinds = new Set<CircuitPart["kind"]>([
-  "battery", "ac-source", "resistor", "bulb", "capacitor", "inductor", "ammeter", "diode", "led",
+  "battery", "ac-source", "current-source", "resistor", "bulb", "capacitor", "inductor", "ammeter", "diode", "led", "switch",
 ]);
 
+const preciseThreeTerminalVoltageKinds = new Set<CircuitPart["kind"]>(["npn-transistor", "pnp-transistor", "nmos", "pmos"]);
+
 function hasPreciseTwoTerminalVoltage(part: CircuitPart, reading: CircuitPartReading): boolean {
-  if (part.kind === "switch") { return reading.switchClosed === true; }
   if (part.kind === "voltmeter") { return reading.meterStatus === "connected"; }
   return preciseTwoTerminalVoltageKinds.has(part.kind);
 }
@@ -400,18 +395,12 @@ function hasPreciseTwoTerminalVoltage(part: CircuitPart, reading: CircuitPartRea
 function sharedPartTerminalPairs(
   node: CircuitNode,
   reference: CircuitNode,
-  potentiometers: ReadonlySet<string>,
 ): { partId: string; fromTerminal: CircuitTerminal; toTerminal: CircuitTerminal }[] {
   const pairs: { partId: string; fromTerminal: CircuitTerminal; toTerminal: CircuitTerminal }[] = [];
   for (const endpoint of node.endpoints) {
     for (const referenceEndpoint of reference.endpoints) {
       if (endpoint.partId !== referenceEndpoint.partId || endpoint.terminal === referenceEndpoint.terminal) { continue; }
-      const twoTerminalPair =
-        (endpoint.terminal === "a" && referenceEndpoint.terminal === "b") ||
-        (endpoint.terminal === "b" && referenceEndpoint.terminal === "a");
-      if (twoTerminalPair || potentiometers.has(endpoint.partId)) {
-        pairs.push({ partId: endpoint.partId, fromTerminal: endpoint.terminal, toTerminal: referenceEndpoint.terminal });
-      }
+      pairs.push({ partId: endpoint.partId, fromTerminal: endpoint.terminal, toTerminal: referenceEndpoint.terminal });
     }
   }
   return pairs;
@@ -446,20 +435,24 @@ function terminalBranchPhasor(
   terminal: CircuitTerminal,
   resistance: number,
   ac: boolean,
+  expressions?: readonly ExactExpressionNode[],
 ): ComplexPotential | undefined {
   const current = reading.terminalCurrents?.[terminal];
   const phaseDegrees = ac ? reading.terminalCurrentPhasesDegrees?.[terminal] : 0;
   if (!finite(current) || !finite(phaseDegrees) || !Number.isFinite(resistance)) { return; }
-  const voltage = phasor(current * resistance, phaseDegrees);
+  const value = restoredReadingComplex(reading.exactTerminalCurrents?.[terminal], current, phaseDegrees, ac, expressions) ?? phasor(current, phaseDegrees);
+  const voltage = complexMultiply(value, complex(resistance));
   return Number.isFinite(voltage.real) && Number.isFinite(voltage.imaginary) ? voltage : undefined;
 }
 
 function negativePotential(value: ComplexPotential): ComplexPotential {
-  return { real: -value.real, imaginary: -value.imaginary };
+  return complexMultiply(value, complex(-1));
 }
 
-function primaryReadingPhasor(reading: CircuitPartReading, reverse: boolean, ac: boolean): ComplexPotential | undefined {
+function primaryReadingPhasor(reading: CircuitPartReading, reverse: boolean, ac: boolean, expressions?: readonly ExactExpressionNode[]): ComplexPotential | undefined {
   if (!finite(reading.voltageVolts)) { return; }
+  const retained = restoredReadingComplex(reading.exactVoltage, reading.voltageVolts, reading.voltagePhaseDegrees, ac, expressions);
+  if (retained) { return reverse ? negativePotential(retained) : retained; }
   if (!ac) { return { real: reading.voltageVolts * (reverse ? -1 : 1), imaginary: 0 }; }
   if (!finite(reading.voltagePhaseDegrees)) { return; }
   const voltage = phasor(
@@ -487,15 +480,16 @@ function potentiometerBranchPhasor(
   reading: CircuitPartReading,
   pair: PreciseBranchPair,
   ac: boolean,
+  expressions?: readonly ExactExpressionNode[],
 ): ComplexPotential | undefined {
-  if (pair.fromTerminal === "a" && pair.toTerminal === "b") { return primaryReadingPhasor(reading, false, ac); }
-  if (pair.fromTerminal === "b" && pair.toTerminal === "a") { return primaryReadingPhasor(reading, true, ac); }
+  if (pair.fromTerminal === "a" && pair.toTerminal === "b") { return primaryReadingPhasor(reading, false, ac, expressions); }
+  if (pair.fromTerminal === "b" && pair.toTerminal === "a") { return primaryReadingPhasor(reading, true, ac, expressions); }
   const segment = potentiometerSegmentForPair(pair);
   if (!segment) { return; }
   const position = part.wiperPosition ?? 0.5;
   const totalResistance = part.resistanceOhms ?? 1000;
   const resistance = totalResistance * (segment.terminal === "a" ? position : 1 - position);
-  const voltage = terminalBranchPhasor(reading, segment.terminal, resistance, ac);
+  const voltage = terminalBranchPhasor(reading, segment.terminal, resistance, ac, expressions);
   if (!voltage) { return; }
   return segment.reverse ? negativePotential(voltage) : voltage;
 }
@@ -508,11 +502,33 @@ function preciseBranchPhasor(
   const reading = context.analysis.parts[pair.partId];
   if (!part || !reading) { return; }
   const ac = context.analysis.mode === "ac";
-  if (part.kind === "potentiometer") { return potentiometerBranchPhasor(part, reading, pair, ac); }
+  const expressions = context.analysis.precisionExpressions;
+  const local = localTerminalPhasor(reading, pair, ac, expressions);
+  if (local) { return local; }
+  if (part.kind === "potentiometer") { return potentiometerBranchPhasor(part, reading, pair, ac, expressions); }
+  if (preciseThreeTerminalVoltageKinds.has(part.kind)) {
+    const forward = pair.fromTerminal === "a" && pair.toTerminal === "c";
+    const reverse = pair.fromTerminal === "c" && pair.toTerminal === "a";
+    return forward || reverse ? primaryReadingPhasor(reading, reverse, ac, expressions) : undefined;
+  }
   if (!hasPreciseTwoTerminalVoltage(part, reading) ||
     !((pair.fromTerminal === "a" && pair.toTerminal === "b") ||
       (pair.fromTerminal === "b" && pair.toTerminal === "a"))) { return; }
-  return primaryReadingPhasor(reading, pair.fromTerminal === "b", ac);
+  return primaryReadingPhasor(reading, pair.fromTerminal === "b", ac, expressions);
+}
+
+function localTerminalPhasor(reading: CircuitPartReading, pair: PreciseBranchPair, ac: boolean, expressions?: readonly ExactExpressionNode[]) {
+  const difference = reading.terminalVoltageDifferences?.find((candidate) =>
+    (candidate.fromTerminal === pair.fromTerminal && candidate.toTerminal === pair.toTerminal) ||
+    (candidate.fromTerminal === pair.toTerminal && candidate.toTerminal === pair.fromTerminal));
+  if (!difference || !finite(difference.voltageVolts)) { return; }
+  const reverse = difference.fromTerminal === pair.toTerminal;
+  const retained = restoredReadingComplex(difference.exactVoltage, difference.voltageVolts, difference.voltagePhaseDegrees, ac, expressions);
+  if (retained) { return reverse ? negativePotential(retained) : retained; }
+  if (!ac) { return { real: reverse ? -difference.voltageVolts : difference.voltageVolts, imaginary: 0 }; }
+  if (!finite(difference.voltagePhaseDegrees)) { return; }
+  const value = phasor(difference.voltageVolts, difference.voltagePhaseDegrees);
+  return reverse ? negativePotential(value) : value;
 }
 
 interface PotentialPathEdge {
@@ -537,7 +553,6 @@ interface PotentialPathTree {
 
 interface PotentialContextCache {
   snapshot: unknown[];
-  potentiometerIds: Set<string>;
   trees: Map<string, PotentialPathTree>;
   graph?: PotentialPathGraph;
 }
@@ -560,6 +575,52 @@ function appendTerminalGroupsSnapshot(
   }
 }
 
+function appendTerminalDifferencesSnapshot(snapshot: unknown[], reading: CircuitPartReading | undefined) {
+  const differences = reading?.terminalVoltageDifferences;
+  snapshot.push(differences, differences?.length);
+  for (const difference of differences ?? []) {
+    snapshot.push(difference, difference.fromTerminal, difference.toTerminal, difference.voltageVolts, difference.voltagePhaseDegrees);
+    appendExactComplexSnapshot(snapshot, difference.exactVoltage);
+  }
+}
+
+function appendExactComponentSnapshot(snapshot: unknown[], value: unknown) {
+  snapshot.push(value);
+  if (typeof value === "object" && value !== null) {
+    snapshot.push("numerator" in value ? value.numerator : undefined,
+      "denominator" in value ? value.denominator : undefined,
+      "expression" in value ? value.expression : undefined,
+      "sign" in value ? value.sign : undefined);
+  }
+}
+
+function appendProjectionSnapshot(snapshot: unknown[], projection: unknown) {
+  snapshot.push(projection);
+  if (typeof projection === "object" && projection !== null) {
+    snapshot.push("real" in projection ? projection.real : undefined,
+      "magnitude" in projection ? projection.magnitude : undefined,
+      "phaseDegrees" in projection ? projection.phaseDegrees : undefined);
+  }
+}
+
+function appendExactComplexSnapshot(snapshot: unknown[], value: unknown) {
+  snapshot.push(value);
+  if (typeof value === "object" && value !== null) {
+    appendExactComponentSnapshot(snapshot, "real" in value ? value.real : undefined);
+    appendExactComponentSnapshot(snapshot, "imaginary" in value ? value.imaginary : undefined);
+    appendExactComponentSnapshot(snapshot, "magnitudeNormalizationSquared" in value ? value.magnitudeNormalizationSquared : undefined);
+    appendProjectionSnapshot(snapshot, "projection" in value ? value.projection : undefined);
+  }
+}
+
+function appendReadingPrecisionSnapshot(snapshot: unknown[], reading: CircuitPartReading | undefined) {
+  appendExactComplexSnapshot(snapshot, reading?.exactVoltage);
+  for (const values of [reading?.exactTerminalVoltages, reading?.exactTerminalCurrents]) {
+    snapshot.push(values);
+    if (values) { for (const terminal of ["a", "b", "c"] as const) { appendExactComplexSnapshot(snapshot, values[terminal]); } }
+  }
+}
+
 function potentialContextSnapshot(context: CircuitPotentialContext) {
   const { document, analysis } = context;
   const snapshot: unknown[] = [
@@ -568,6 +629,7 @@ function potentialContextSnapshot(context: CircuitPotentialContext) {
     document.wires,
     analysis,
     analysis.parts,
+    analysis.precisionExpressions,
     context.nodes,
     analysis.status,
     analysis.mode,
@@ -578,6 +640,7 @@ function potentialContextSnapshot(context: CircuitPotentialContext) {
 
   for (const part of document.parts) {
     const reading = analysis.parts[part.id];
+    appendReadingPrecisionSnapshot(snapshot, reading);
     snapshot.push(
       part,
       part.id,
@@ -597,6 +660,7 @@ function potentialContextSnapshot(context: CircuitPotentialContext) {
       reading?.voltagePhaseDegrees,
     );
     appendTerminalGroupsSnapshot(snapshot, reading?.acReferenceTerminalGroups);
+    appendTerminalDifferencesSnapshot(snapshot, reading);
     appendTerminalSnapshot(snapshot, reading?.terminalVoltages);
     appendTerminalSnapshot(snapshot, reading?.terminalCurrents);
     appendTerminalSnapshot(snapshot, reading?.terminalVoltagePhasesDegrees);
@@ -619,6 +683,7 @@ function potentialContextSnapshot(context: CircuitPotentialContext) {
   if (context.nodes) {
     snapshot.push(context.nodes.length);
     for (const node of context.nodes) {
+      appendExactComplexSnapshot(snapshot, node.exactVoltage);
       snapshot.push(
         node,
         node.id,
@@ -648,9 +713,6 @@ function potentialContextCache(context: CircuitPotentialContext) {
 
   const next: PotentialContextCache = {
     snapshot,
-    potentiometerIds: new Set(context.document.parts
-      .filter((part) => part.kind === "potentiometer")
-      .map((part) => part.id)),
     trees: new Map(),
   };
   potentialContextCaches.set(context, next);
@@ -702,13 +764,20 @@ function potentialPathGraph(
     adjacency.get(part.first.id)?.push({ nodeId: part.second.id, difference: part.voltage, cost });
     adjacency.get(part.second.id)?.push({
       nodeId: part.first.id,
-      difference: { real: -part.voltage.real, imaginary: -part.voltage.imaginary },
+      difference: negativePotential(part.voltage),
       cost,
     });
   }
   const graph = { nodeIds: nodes.map((node) => node.id), adjacency };
   cache.graph = graph;
   return graph;
+}
+
+function preciseReadingTerminalPairs(part: CircuitPart, reading: CircuitPartReading | undefined): [CircuitTerminal, CircuitTerminal][] {
+  const local = reading?.terminalVoltageDifferences;
+  if (local) { return local.map((difference) => [difference.fromTerminal, difference.toTerminal]); }
+  if (part.kind === "potentiometer") { return [["a", "c"], ["b", "c"]]; }
+  return preciseThreeTerminalVoltageKinds.has(part.kind) ? [["a", "c"]] : [["a", "b"]];
 }
 
 function precisePotentialParts(
@@ -722,9 +791,7 @@ function precisePotentialParts(
     magnitude: number;
   }[] = [];
   for (const part of context.document.parts) {
-    const terminalPairs: [CircuitTerminal, CircuitTerminal][] = part.kind === "potentiometer"
-      ? [["a", "c"], ["b", "c"]]
-      : [["a", "b"]];
+    const terminalPairs = preciseReadingTerminalPairs(part, context.analysis.parts[part.id]);
     for (const [fromTerminal, toTerminal] of terminalPairs) {
       const first = byEndpoint.get(circuitEndpointKey({ partId: part.id, terminal: fromTerminal }));
       const second = byEndpoint.get(circuitEndpointKey({ partId: part.id, terminal: toTerminal }));
@@ -781,22 +848,17 @@ function precisePathPotential(
     cache.trees.set(reference.id, tree);
   }
 
-  const realParts: number[] = [];
-  const imaginaryParts: number[] = [];
+  let value = complex();
   for (let currentId = node.id; currentId !== reference.id;) {
     const predecessor = tree.predecessors.get(currentId);
     if (!predecessor) { return undefined; }
     // The tree stores reference minus node along its traversal; this view shows node minus reference.
-    realParts.push(-predecessor.difference.real);
-    imaginaryParts.push(-predecessor.difference.imaginary);
+    value = complexSubtract(value, predecessor.difference);
     currentId = predecessor.nodeId;
   }
-  const real = exactComponentSum(realParts);
-  const imaginary = exactComponentSum(imaginaryParts);
   if (context.analysis.mode !== "ac") {
-    return Number.isFinite(real) ? { volts: real, phaseDegrees: 0 } : undefined;
+    return Number.isFinite(value.real) ? { volts: value.real, phaseDegrees: 0 } : undefined;
   }
-  const value = { real, imaginary };
   const volts = complexMagnitude(value);
   return Number.isFinite(volts)
     ? { volts, phaseDegrees: complexPhaseDegrees(value) }
@@ -810,7 +872,7 @@ function precisePartPotential(
 ): { volts: number; phaseDegrees: number } | undefined {
   if (!context || node.id === reference.id) { return undefined; }
   const cache = potentialContextCache(context);
-  for (const pair of sharedPartTerminalPairs(node, reference, cache.potentiometerIds)) {
+  for (const pair of sharedPartTerminalPairs(node, reference)) {
     const precise = preciseBranchVoltage(pair, context);
     if (precise) { return precise; }
   }
@@ -829,15 +891,15 @@ export function circuitPotential(
   if (precise) { return precise; }
   if (!ac) {
     if (!finite(node.voltageVolts) || !finite(reference.voltageVolts)) { return null; }
-    return { volts: node.voltageVolts - reference.voltageVolts, phaseDegrees: 0 };
+    const difference = complexSubtract((context && restoredReadingComplex(node.exactVoltage, node.voltageVolts, undefined, false, context.analysis.precisionExpressions)) || complex(node.voltageVolts),
+      (context && restoredReadingComplex(reference.exactVoltage, reference.voltageVolts, undefined, false, context.analysis.precisionExpressions)) || complex(reference.voltageVolts));
+    return { volts: difference.real, phaseDegrees: 0 };
   }
   if (!finite(node.voltageVolts) || !finite(reference.voltageVolts)) { return null; }
   if (!finite(node.voltagePhaseDegrees) || !finite(reference.voltagePhaseDegrees)) { return null; }
-  const first = phasor(node.voltageVolts, node.voltagePhaseDegrees);
-  const second = phasor(reference.voltageVolts, reference.voltagePhaseDegrees);
-  const real = first.real - second.real;
-  const imaginary = first.imaginary - second.imaginary;
-  const value = { real, imaginary };
+  const first = (context && restoredReadingComplex(node.exactVoltage, node.voltageVolts, node.voltagePhaseDegrees, true, context.analysis.precisionExpressions)) || phasor(node.voltageVolts, node.voltagePhaseDegrees);
+  const second = (context && restoredReadingComplex(reference.exactVoltage, reference.voltageVolts, reference.voltagePhaseDegrees, true, context.analysis.precisionExpressions)) || phasor(reference.voltageVolts, reference.voltagePhaseDegrees);
+  const value = complexSubtract(first, second);
   const volts = complexMagnitude(value);
   return { volts, phaseDegrees: complexPhaseDegrees(value) };
 }

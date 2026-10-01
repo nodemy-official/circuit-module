@@ -1,4 +1,5 @@
 import type { ComplexValue } from "./analog-math.js";
+import { combineExactExpressionHandles, exactExpressionCaptureIsActive, exactExpressionHandle, retainExactExpressionHandle, recordExactAlias, recordExactExpression, recordExactSum, type ExactExpressionHandle } from "./exact-expression.js";
 
 /** An exact rational with a positive denominator. */
 export interface ExactRational {
@@ -259,7 +260,7 @@ function normalized(value: ExactRational): ExactRational | null {
 export function deferExactRationalReduction(value: ExactRational): ExactRational {
   const normalizedValue = normalized(value);
   if (!normalizedValue) { throw new RangeError("Exact rational denominator must not be zero."); }
-  return withDeferredReduction(normalizedValue);
+  return recordExactAlias(value, withDeferredReduction(normalizedValue));
 }
 
 /** Converts a finite binary64 value to its exact binary rational. */
@@ -284,7 +285,11 @@ export function numberToExactRational(value: number): ExactRational | null {
 }
 
 /** Adds two exact rational values. */
-export function addExactRational(leftValue: ExactRational, rightValue: ExactRational): ExactRational {
+export function addExactRational(left: ExactRational, right: ExactRational): ExactRational {
+  return recordExactExpression("add", left, right, addRationalValue(left, right))!;
+}
+
+function addRationalValue(leftValue: ExactRational, rightValue: ExactRational): ExactRational {
   const left = normalized(leftValue);
   const right = normalized(rightValue);
   if (!left || !right) { throw new RangeError("Exact rational denominator must not be zero."); }
@@ -324,6 +329,10 @@ export function addExactRational(leftValue: ExactRational, rightValue: ExactRati
 
 /** Sums rationals exactly, reducing the final result only once. */
 export function sumExactRationals(values: readonly ExactRational[]): ExactRational {
+  return recordExactSum(values, sumRationalValues(values));
+}
+
+function sumRationalValues(values: readonly ExactRational[]): ExactRational {
   let numerator = 0n;
   let denominator = 1n;
   let hasNonzeroValue = false;
@@ -360,6 +369,10 @@ export function sumExactRationals(values: readonly ExactRational[]): ExactRation
 
 /** Subtracts two exact rational values. */
 export function subtractExactRational(left: ExactRational, right: ExactRational): ExactRational {
+  return recordExactExpression("subtract", left, right, subtractRationalValue(left, right))!;
+}
+
+function subtractRationalValue(left: ExactRational, right: ExactRational): ExactRational {
   const normalizedRight = normalized(right);
   if (!normalizedRight) { return addExactRational(left, right); }
   if (normalizedRight.numerator === 0n) { return addExactRational(left, ZERO); }
@@ -372,7 +385,11 @@ export function subtractExactRational(left: ExactRational, right: ExactRational)
 }
 
 /** Multiplies two exact rational values with cross-cancellation. */
-export function multiplyExactRational(leftValue: ExactRational, rightValue: ExactRational): ExactRational {
+export function multiplyExactRational(left: ExactRational, right: ExactRational): ExactRational {
+  return recordExactExpression("multiply", left, right, multiplyRationalValue(left, right))!;
+}
+
+function multiplyRationalValue(leftValue: ExactRational, rightValue: ExactRational): ExactRational {
   const left = normalized(leftValue);
   const right = normalized(rightValue);
   if (!left || !right) { throw new RangeError("Exact rational denominator must not be zero."); }
@@ -418,7 +435,11 @@ export function multiplyExactRational(leftValue: ExactRational, rightValue: Exac
 }
 
 /** Divides exact rational values, returning null when the divisor is zero. */
-export function divideExactRational(
+export function divideExactRational(left: ExactRational, right: ExactRational): ExactRational | null {
+  return recordExactExpression("divide", left, right, divideRationalValue(left, right));
+}
+
+function divideRationalValue(
   leftValue: ExactRational,
   rightValue: ExactRational,
 ): ExactRational | null {
@@ -623,6 +644,14 @@ function roundScaledSquareRoot(numerator: bigint, denominator: bigint, binarySca
     (twiceMidpointNumerator === twiceMidpointDenominator && floor % 2n === 1n)
     ? floor + 1n
     : floor;
+}
+
+/** Floors sqrt(value) to a binary rational at the requested fractional precision. */
+export function floorExactRationalSquareRoot(value: ExactRational, fractionalBits: number): ExactRational | null {
+  const normalizedValue = normalized(value);
+  if (!normalizedValue || normalizedValue.numerator < 0n || !Number.isSafeInteger(fractionalBits) || fractionalBits < 0) { return null; }
+  const scale = 2n ** BigInt(fractionalBits);
+  return rational(integerSquareRoot((normalizedValue.numerator * scale * scale) / normalizedValue.denominator), scale);
 }
 
 /** Rounds the square root of an exact nonnegative rational to binary64. */
@@ -835,6 +864,7 @@ function solveSparseRationalRows(rows: RationalRow[], size: number): ExactRation
 interface ScaledIntegerRows {
   rows: IntegerRow[];
   rhsScale: bigint;
+  rhsExpressions?: Map<IntegerRow, ExactExpressionHandle>;
 }
 
 interface IntegerizedRow {
@@ -864,7 +894,9 @@ function integerizeRow(coefficients: Map<number, ExactRational>, rhs: ExactRatio
   }
   return {
     coefficients: integerCoefficients,
-    scaledRhs: rational(rhs.numerator * rowDenominator, rhs.denominator * rowContent),
+    scaledRhs: exactExpressionCaptureIsActive()
+      ? multiplyExactRational(rhs, rational(rowDenominator, rowContent))
+      : rational(rhs.numerator * rowDenominator, rhs.denominator * rowContent),
   };
 }
 
@@ -879,12 +911,16 @@ function integerRowsFromInput(size: number, matrix: ExactRealArray, rhs: ExactRe
     integerizedRows.push(integerized);
     rhsScale = (rhsScale / gcd(rhsScale, integerized.scaledRhs.denominator)) * integerized.scaledRhs.denominator;
   }
+  const rhsExpressions = exactExpressionCaptureIsActive() ? new Map<IntegerRow, ExactExpressionHandle>() : undefined;
   const rows = integerizedRows.map(({ coefficients, scaledRhs }) => {
     const integerRhs = scaledRhs.numerator * (rhsScale / scaledRhs.denominator);
     if (integerRhs !== 0n) { coefficients.set(size, integerRhs); }
+    if (rhsExpressions) {
+      rhsExpressions.set(coefficients, exactExpressionHandle(scaledRhs));
+    }
     return coefficients;
   });
-  return { rows, rhsScale };
+  return { rows, rhsScale, rhsExpressions };
 }
 
 function findPivotRow(rows: IntegerRow[], column: number, size: number) {
@@ -910,9 +946,18 @@ function setIntegerCoefficient(row: IntegerRow, column: number, value: bigint) {
   else { row.set(column, value); }
 }
 
-function eliminateIntegerRow(row: IntegerRow, pivotEquation: IntegerRow, column: number, pivot: bigint, previousPivot: bigint) {
+function eliminateIntegerRow(row: IntegerRow, pivotEquation: IntegerRow, column: number, pivot: bigint, previousPivot: bigint, rhsExpressions?: Map<IntegerRow, ExactExpressionHandle>) {
   const leading = row.get(column) ?? 0n;
   if (leading === 0n && pivot === previousPivot) { return true; }
+  if (rhsExpressions) {
+    const current = rhsExpressions.get(row) ?? exactExpressionHandle(ZERO);
+    const pivotRhs = rhsExpressions.get(pivotEquation) ?? exactExpressionHandle(ZERO);
+    const left = combineExactExpressionHandles("multiply", exactExpressionHandle(rational(pivot)), current);
+    const right = combineExactExpressionHandles("multiply", exactExpressionHandle(rational(leading)), pivotRhs);
+    const numerator = combineExactExpressionHandles("subtract", left, right);
+    const next = combineExactExpressionHandles("divide", numerator, exactExpressionHandle(rational(previousPivot)));
+    rhsExpressions.set(row, next);
+  }
   const targetColumns = new Set<number>();
   for (const targetColumn of row.keys()) {
     if (targetColumn > column) { targetColumns.add(targetColumn); }
@@ -931,10 +976,10 @@ function eliminateIntegerRow(row: IntegerRow, pivotEquation: IntegerRow, column:
   return true;
 }
 
-function eliminateRowsBelow(rows: IntegerRow[], column: number, pivotEquation: IntegerRow, pivot: bigint, previousPivot: bigint, size: number) {
+function eliminateRowsBelow(rows: IntegerRow[], column: number, pivotEquation: IntegerRow, pivot: bigint, previousPivot: bigint, size: number, rhsExpressions?: Map<IntegerRow, ExactExpressionHandle>) {
   for (let rowIndex = column + 1; rowIndex < size; rowIndex += 1) {
     const row = rows[rowIndex];
-    if (!row || !eliminateIntegerRow(row, pivotEquation, column, pivot, previousPivot)) { return false; }
+    if (!row || !eliminateIntegerRow(row, pivotEquation, column, pivot, previousPivot, rhsExpressions)) { return false; }
   }
   return true;
 }
@@ -960,6 +1005,21 @@ function backSubstituteIntegerRows(rows: IntegerRow[], size: number) {
   return solution;
 }
 
+function integerSolutionExpressions(rows: IntegerRow[], size: number, rhsExpressions: ReadonlyMap<IntegerRow, ExactExpressionHandle>) {
+  const values: ExactExpressionHandle[] = Array.from({ length: size }, () => exactExpressionHandle(ZERO));
+  for (let rowIndex = size - 1; rowIndex >= 0; rowIndex -= 1) {
+    const row = rows[rowIndex]!;
+    let value = rhsExpressions.get(row) ?? exactExpressionHandle(ZERO);
+    for (const [column, coefficient] of row) {
+      if (column <= rowIndex || column >= size) { continue; }
+      const product = combineExactExpressionHandles("multiply", exactExpressionHandle(rational(coefficient)), values[column]!);
+      value = combineExactExpressionHandles("subtract", value, product);
+    }
+    values[rowIndex] = combineExactExpressionHandles("divide", value, exactExpressionHandle(rational(row.get(rowIndex)!)));
+  }
+  return values;
+}
+
 function solveExactRealLinearSystemUnchecked(
   size: number,
   matrix: ExactRealArray,
@@ -973,7 +1033,7 @@ function solveExactRealLinearSystemUnchecked(
   }
   const integerized = integerRowsFromInput(size, matrix, rhs);
   if (!integerized) { return null; }
-  const { rows, rhsScale } = integerized;
+  const { rows, rhsScale, rhsExpressions } = integerized;
 
   let previousPivot = 1n;
   for (let column = 0; column < size; column += 1) {
@@ -985,15 +1045,18 @@ function solveExactRealLinearSystemUnchecked(
     const pivot = rows[column]?.get(column);
     const pivotEquation = rows[column];
     if (pivot === undefined || pivot === 0n || !pivotEquation) { return null; }
-    if (column < size - 1 && !eliminateRowsBelow(rows, column, pivotEquation, pivot, previousPivot, size)) {
+    if (column < size - 1 && !eliminateRowsBelow(rows, column, pivotEquation, pivot, previousPivot, size, rhsExpressions)) {
       return null;
     }
     previousPivot = pivot;
   }
   const scaledSolution = backSubstituteIntegerRows(rows, size);
   if (!scaledSolution) { return null; }
-  if (rhsScale === 1n) { return scaledSolution; }
-  return scaledSolution.map((value) => rational(value.numerator, value.denominator * rhsScale));
+  const solution = rhsScale === 1n ? scaledSolution
+    : scaledSolution.map((value) => rational(value.numerator, value.denominator * rhsScale));
+  if (!rhsExpressions) { return solution; }
+  const solutionExpressions = integerSolutionExpressions(rows, size, rhsExpressions);
+  return solution.map((value, index) => retainExactExpressionHandle(value, solutionExpressions[index]!));
 }
 
 function exactEquationHolds(terms: readonly ExactRational[], rhs: ExactRational) {

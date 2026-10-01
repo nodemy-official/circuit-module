@@ -16,9 +16,14 @@ import {
   subtractExactRational,
   type ExactRational,
 } from "./exact-linear-algebra.js";
-import { addRealStateValue, exactRealStateValue } from "./exact-numeric-state.js";
+import { addRealStateValue, complexFromExact, exactRealStateValue } from "./exact-numeric-state.js";
 import { meterStatuses, type MeterStatus } from "./meter-status.js";
 import { circuitDocumentShapeIssue, isSimulationRecord, simulationRecordField } from "./simulation-input.js";
+import { readingPrecision, type CircuitReadingPrecision, type CircuitTerminalVoltageDifference } from "./circuit-reading.js";
+import type { ExactExpressionNode } from "./exact-expression.js";
+
+export type { CircuitExactComplex, CircuitExactRational, CircuitReadingPrecision, CircuitTerminalVoltageDifference } from "./circuit-reading.js";
+export type { ExactExpressionNode, ExactExpressionReference } from "./exact-expression.js";
 
 export type CircuitStatus = "empty" | "idle" | "open" | "closed" | "short" | "invalid";
 export type CircuitIssueSeverity = "error" | "warning" | "info";
@@ -32,7 +37,7 @@ export interface CircuitIssue {
   partId?: string;
 }
 
-export interface CircuitPartReading {
+export interface CircuitPartReading extends CircuitReadingPrecision {
   /** A−B voltage; BJT/MOS use A−C, op-amps use output−GND. AC values are RMS magnitudes. */
   voltageVolts: number;
   /** Current entering terminal A (op-amp: output C). Signed in DC; RMS magnitude in AC. */
@@ -51,6 +56,8 @@ export interface CircuitPartReading {
   reactivePowerVars?: number;
   /** Terminal potentials relative to the reference, and currents entering the device. */
   terminalVoltages?: Partial<Record<CircuitTerminal, number>>;
+  /** Local voltage differences for three-terminal parts, retained before display rounding. */
+  terminalVoltageDifferences?: readonly CircuitTerminalVoltageDifference[];
   terminalCurrents?: Partial<Record<CircuitTerminal, number>>;
   /** AC terminal phasor angles, paired with the RMS terminal magnitudes. */
   terminalVoltagePhasesDegrees?: Partial<Record<CircuitTerminal, number>>;
@@ -91,6 +98,8 @@ export interface CircuitAnalysis {
   frequencyHz?: number;
   /** Present when these readings represent a transient sample rather than steady state. */
   timeSeconds?: number;
+  /** Shared immutable expressions for exact transient readings; replace the whole table when editing. */
+  precisionExpressions?: readonly ExactExpressionNode[];
 }
 
 /** Resistance used for wires, closed switches and ammeters, which are ideal conductors. */
@@ -105,10 +114,12 @@ interface Conductance {
   b: number;
   g: number;
   resistanceOhms: number;
+  exactResistance?: ExactRational;
   /** Present for the battery's internal resistance so loop checks can omit that source. */
   batteryId?: string;
   /** Open-circuit A−B voltage of a battery branch. */
   voltage?: number;
+  exactVoltage?: ExactRational;
 }
 
 
@@ -154,8 +165,8 @@ function partValueIssue(part: CircuitPart): string | null {
   }
   if (part.kind === "battery") {
     if (!positive(part.voltageVolts)) { return `${part.label}の電圧は0より大きい数値にしてください。`; }
-    const internal = part.internalResistanceOhms ?? 0;
-    if (!Number.isFinite(internal) || internal < 0) {
+    const internal = part.internalResistanceOhms;
+    if (internal === undefined || !Number.isFinite(internal) || internal < 0) {
       return `${part.label}の内部抵抗は0以上の数値にしてください。`;
     }
   }
@@ -536,9 +547,9 @@ function stampConductanceBranch(
   unknownByNode: readonly number[],
   branch: Conductance,
 ) {
-  const resistance = exactInput(branch.resistanceOhms);
+  const resistance = branch.exactResistance ?? exactInput(branch.resistanceOhms);
   const conductance = resistance && divideExactRational(EXACT_ONE, resistance);
-  const sourceVoltage = exactInput(branch.voltage ?? 0);
+  const sourceVoltage = branch.exactVoltage ?? exactInput(branch.voltage ?? 0);
   if (!conductance || !sourceVoltage) { return false; }
 
   const a = unknownByNode[branch.a] ?? -1;
@@ -551,7 +562,7 @@ function stampConductanceBranch(
     addRealStateValue(matrix, b * count + a, offDiagonal);
   }
 
-  if (branch.voltage) {
+  if (sourceVoltage.numerator !== 0n) {
     const sourceTerm = multiplyExactRational(conductance, sourceVoltage);
     if (a >= 0) { addRealStateValue(rhs, a, sourceTerm); }
     if (b >= 0) { addRealStateValue(rhs, b, negateExact(sourceTerm)); }
@@ -617,13 +628,14 @@ function nodeVoltages(
   if (!voltages.every(Number.isFinite)) { return null; }
   return {
     voltages,
+    exactVoltages,
     difference: (from: number, to: number, offset = 0) =>
       exactNodeDifference(exactVoltages, from, to, offset),
   };
 }
 
 /** Equivalent resistance of the passive network between two terminals. */
-function externalResistance(
+function externalResistanceExact(
   nodes: readonly number[],
   conductances: readonly Conductance[],
   from: number,
@@ -633,7 +645,7 @@ function externalResistance(
   const localFrom = localIndex.get(from);
   const localTo = localIndex.get(to);
   if (localFrom === undefined || localTo === undefined) { return null; }
-  if (localFrom === localTo) { return 0; }
+  if (localFrom === localTo) { return EXACT_ZERO; }
   const localConductances: Conductance[] = [];
   for (const edge of conductances) {
     const a = localIndex.get(edge.a);
@@ -646,8 +658,15 @@ function externalResistance(
     amps: 1,
   });
   if (!solved) { return null; }
-  const resistance = solved.difference(localFrom, localTo).value;
-  return Number.isFinite(resistance) && resistance >= 0 ? resistance : null;
+  const resistance = exactDifferenceValue(solved.difference(localFrom, localTo));
+  return resistance && resistance.numerator >= 0n ? resistance : null;
+}
+
+function externalResistance(nodes: readonly number[], conductances: readonly Conductance[], from: number, to: number) {
+  const exact = externalResistanceExact(nodes, conductances, from, to);
+  if (!exact) { return null; }
+  const resistance = exactRationalToNumber(exact);
+  return Number.isFinite(resistance) ? resistance : null;
 }
 
 interface VoltageDifference {
@@ -710,6 +729,25 @@ function setRecordValue<T>(record: Record<string, T>, property: string, value: T
   });
 }
 
+function legacyReadingPrecision(
+  part: CircuitPart,
+  index: Map<string, number>,
+  exactVoltages: readonly ExactRational[],
+  drop: VoltageDifference,
+  currentDrop: VoltageDifference,
+  ohms: number | null,
+) {
+  const currentExact = ohms === null ? EXACT_ZERO : exactDifferenceQuotient(currentDrop, ohms) ?? EXACT_ZERO;
+  const realComplex = (value: ExactRational) => complexFromExact({ real: value, imaginary: EXACT_ZERO });
+  return readingPrecision({
+    voltage: realComplex(exactDifferenceValue(drop) ?? EXACT_ZERO),
+    terminalVoltages: Object.fromEntries(terminalsOf(part.kind).map((terminal) =>
+      [terminal, realComplex(exactVoltages[index.get(`${part.id}:${terminal}`)!] ?? EXACT_ZERO)])),
+    terminalCurrents: part.kind === "junction" ? { a: realComplex(EXACT_ZERO) }
+      : { a: realComplex(currentExact), b: realComplex(negateExact(currentExact)) },
+  });
+}
+
 function readAll(
   document: CircuitDocument,
   index: Map<string, number>,
@@ -731,10 +769,12 @@ function readAll(
       ? 0
       : ROUNDING_GUARD * currentDrop.scale / ohms;
     const reading = readPart(part, drop, currentDrop, switchStates);
+    const precision = legacyReadingPrecision(part, index, solved.exactVoltages, drop, currentDrop, ohms);
     const voltageUncertainty = ROUNDING_GUARD * drop.scale;
     const currentAmps = tidy(reading.currentAmps, currentUncertainty);
     setRecordValue(parts, part.id, {
       ...reading,
+      ...precision,
       terminalVoltages: Object.fromEntries(terminalsOf(part.kind).map((terminal) => [terminal, voltage(part.id, terminal)])),
       terminalCurrents: part.kind === "junction" ? { a: 0 } : { a: currentAmps, b: -currentAmps },
       ...(meterStatusByPart[part.id] ? { meterStatus: meterStatusByPart[part.id] } : {}),
@@ -802,14 +842,40 @@ function batteriesBySourceGroup(
   return groups;
 }
 
+interface ExactBatteryReading {
+  voltage: ExactRational;
+  current: ExactRational;
+}
+
+function exactBatteryReadings(
+  batteries: readonly CircuitPart[],
+  index: Map<string, number>,
+  solved: NonNullable<ReturnType<typeof nodeVoltages>>,
+) {
+  const readings = new Map<string, ExactBatteryReading>();
+  for (const battery of batteries) {
+    const a = index.get(`${battery.id}:a`);
+    const b = index.get(`${battery.id}:b`);
+    if (a === undefined || b === undefined) { continue; }
+    const voltage = exactDifferenceValue(solved.difference(a, b));
+    const current = exactDifferenceQuotient(
+      solved.difference(a, b, battery.voltageVolts), batteryOhms(battery),
+    );
+    if (voltage && current) { readings.set(battery.id, { voltage, current }); }
+  }
+  return readings;
+}
+
 function shortedBatteryByTerminalRatio(
   batteries: readonly CircuitPart[],
-  parts: Record<string, CircuitPartReading>,
+  readings: Map<string, ExactBatteryReading>,
   sourceTree: SourceConstraintTree,
   batteriesByGroup: Map<number, CircuitPart[]>,
   index: Map<string, number>,
   protectedBatteryIds: Set<string>,
 ) {
+  const threshold = exactInput(SHORT_OHMS);
+  if (!threshold) { return; }
   return batteries.find((battery) => {
     if (protectedBatteryIds.has(battery.id)) { return false; }
     const terminal = index.get(`${battery.id}:a`);
@@ -819,9 +885,12 @@ function shortedBatteryByTerminalRatio(
       !sourceTree.inconsistent.has(group)) {
       return false;
     }
-    const reading = parts[battery.id];
-    return Boolean(reading && reading.currentAmps !== 0 &&
-      Math.abs(reading.voltageVolts / reading.currentAmps) < SHORT_OHMS);
+    const reading = readings.get(battery.id);
+    if (!reading || reading.current.numerator === 0n) { return false; }
+    const voltage = reading.voltage.numerator < 0n ? negateExact(reading.voltage) : reading.voltage;
+    const current = reading.current.numerator < 0n ? negateExact(reading.current) : reading.current;
+    // Compare |V| < |I| R before rounding either reading for display.
+    return subtractExactRational(voltage, multiplyExactRational(current, threshold)).numerator < 0n;
   });
 }
 
@@ -896,6 +965,9 @@ interface PassiveBatteryEdge {
   toComponent: number;
   fromNode: number;
   toNode: number;
+  emf?: ExactRational;
+  seriesResistance?: number;
+  exactSeriesResistance?: ExactRational;
 }
 
 function batteryEdgesByPassiveComponent(
@@ -936,18 +1008,14 @@ interface BatteryBlockSearch {
 
 function recordBatteryCycle(search: BatteryBlockSearch, lastEdge: number) {
   const loop: PassiveBatteryEdge[] = [];
-  const degrees = new Map<number, number>();
   while (search.stack.length > 0) {
     const edgeIndex = search.stack.pop();
     const edge = edgeIndex === undefined ? undefined : search.edges[edgeIndex];
     if (!edge) { break; }
     loop.push(edge);
-    for (const component of [edge.fromComponent, edge.toComponent]) {
-      degrees.set(component, (degrees.get(component) ?? 0) + 1);
-    }
     if (edgeIndex === lastEdge) { break; }
   }
-  if (loop.length >= 2 && [...degrees.values()].every((degree) => degree === 2)) {
+  if (loop.length >= 2) {
     search.cycles.push(loop);
   }
 }
@@ -1012,7 +1080,7 @@ function seriesLoopExternalResistance(
     toTerminals.push(edge.toNode);
     terminalsByComponent.set(edge.toComponent, toTerminals);
   }
-  let totalResistance = 0;
+  let totalResistance = EXACT_ZERO;
   for (const [component, terminals] of terminalsByComponent) {
     if (terminals.length !== 2) { return null; }
     const nodes = nodesByComponent.get(component);
@@ -1020,16 +1088,753 @@ function seriesLoopExternalResistance(
     const from = terminals[0];
     const to = terminals[1];
     if (!nodes || from === undefined || to === undefined) { return null; }
-    const resistance = externalResistance(nodes, conductances, from, to);
+    const resistance = externalResistanceExact(nodes, conductances, from, to);
     if (resistance === null) { return null; }
-    totalResistance += resistance;
+    totalResistance = subtractExactRational(totalResistance, negateExact(resistance));
   }
   return totalResistance;
 }
 
+interface BatteryCycleNeighbor extends PassiveNeighbor {
+  batteryId?: string;
+  voltage?: number;
+  exactResistance?: ExactRational;
+}
+
+interface ParallelBatteryGroup {
+  edges: PassiveBatteryEdge[];
+  fromNodes: number[];
+  toNodes: number[];
+}
+
+function parallelBatteryGroups(block: readonly PassiveBatteryEdge[]) {
+  const first = block[0];
+  if (!first) { return null; }
+  const groups = new Map<string, ParallelBatteryGroup>();
+  for (const edge of block) {
+    const forward = edge.fromComponent === first.fromComponent && edge.toComponent === first.toComponent;
+    const reverse = edge.toComponent === first.fromComponent && edge.fromComponent === first.toComponent;
+    if (!forward && !reverse) { return null; }
+    const emf = edge.emf ?? exactInput(edge.battery.voltageVolts ?? 0)!;
+    const voltage = forward ? emf : negateExact(emf);
+    const voltageKey = `${voltage.numerator}/${voltage.denominator}`;
+    const group = groups.get(voltageKey) ?? { edges: [], fromNodes: [], toNodes: [] };
+    group.edges.push(edge);
+    group.fromNodes.push(forward ? edge.fromNode : edge.toNode);
+    group.toNodes.push(forward ? edge.toNode : edge.fromNode);
+    groups.set(voltageKey, group);
+  }
+  return { groups: [...groups.values()], fromComponent: first.fromComponent, toComponent: first.toComponent };
+}
+
+function batteryGroupExternalResistance(
+  size: number,
+  conductances: readonly Conductance[],
+  first: ParallelBatteryGroup,
+  second: ParallelBatteryGroup,
+) {
+  return batteryCycleExternalResistance(size, conductances, [first, second]);
+}
+
+function batteryCycleExternalResistance(
+  size: number,
+  conductances: readonly Conductance[],
+  groups: readonly ParallelBatteryGroup[],
+) {
+  const totalSize = size + groups.reduce((count, group) => count + group.edges.length, 0);
+  const parent = Array.from({ length: totalSize }, (_, node) => node);
+  const offsets = Array.from({ length: totalSize }, () => 0);
+  const branches = [...conductances];
+  let virtualNode = size;
+  for (const [groupIndex, group] of groups.entries()) {
+    for (const [position, edge] of group.edges.entries()) {
+      const from = group.fromNodes[position]!;
+      const to = group.toNodes[position]!;
+      const exactResistance = edge.exactSeriesResistance ?? EXACT_ZERO;
+      let positiveNode = from;
+      if (exactResistance.numerator > 0n) {
+        const resistanceOhms = exactRationalToNumber(exactResistance);
+        positiveNode = virtualNode++;
+        branches.push({ a: from, b: positiveNode, g: 1 / resistanceOhms, resistanceOhms, exactResistance });
+      }
+      // Keep each source's two ports paired. A unit EMF difference between
+      // groups becomes a fixed offset inside each contracted source branch.
+      parent[positiveNode] = to;
+      offsets[positiveNode] = groupIndex === 0 ? 1 : 0;
+    }
+  }
+  const collapsed = branches.map((edge) => ({
+    ...edge, a: findRoot(parent, edge.a), b: findRoot(parent, edge.b),
+    voltage: offsets[edge.b]! - offsets[edge.a]!,
+  }));
+  const power = passiveNetworkPower(totalSize, collapsed);
+  // For a unit drive, dissipated power is the group current, hence R=1/P.
+  return power && power.numerator > 0n ? divideExactRational(EXACT_ONE, power) : null;
+}
+
+function passiveNetworkPower(size: number, conductances: readonly Conductance[]) {
+  const solved = nodeVoltages(size, conductances);
+  if (!solved) { return null; }
+  let power = EXACT_ZERO;
+  for (const edge of conductances) {
+    const difference = exactDifferenceValue(solved.difference(edge.a, edge.b));
+    const sourceVoltage = edge.exactVoltage ?? exactInput(edge.voltage ?? 0);
+    const drop = difference && sourceVoltage && subtractExactRational(difference, sourceVoltage);
+    const resistance = edge.exactResistance ?? exactInput(edge.resistanceOhms);
+    const current = drop && resistance && divideExactRational(drop, resistance);
+    if (!drop || !current) { return null; }
+    power = subtractExactRational(power, negateExact(multiplyExactRational(drop, current)));
+  }
+  return power;
+}
+
+function shortedParallelBatteryGroup(
+  parallel: NonNullable<ReturnType<typeof parallelBatteryGroups>>,
+  readings: Map<string, ExactBatteryReading>,
+  size: number,
+  conductancesByComponent: Map<number, Conductance[]>,
+  physicalConductances?: readonly Conductance[],
+) {
+  for (const [position, first] of parallel.groups.entries()) {
+    for (const second of parallel.groups.slice(position + 1)) {
+      const flowing = [...first.edges, ...second.edges].find((edge) =>
+        (readings.get(edge.battery.id)?.current.numerator ?? 0n) !== 0n,
+      );
+      if (!flowing) { continue; }
+      const resistance = parallelGroupResistanceBound(size, [
+        ...conductancesByComponent.get(parallel.fromComponent) ?? [],
+        ...conductancesByComponent.get(parallel.toComponent) ?? [],
+      ], first, second, parallel.fromComponent, physicalConductances);
+      if (resistance !== null &&
+          subtractExactRational(exactInput(SHORT_OHMS)!, resistance).numerator > 0n) {
+        return flowing.battery;
+      }
+    }
+  }
+}
+
+function parallelGroupResistanceBound(size: number, conductances: readonly Conductance[], first: ParallelBatteryGroup, second: ParallelBatteryGroup, fromComponent: number, physical?: readonly Conductance[]) {
+  let resistance = batteryGroupExternalResistance(size, conductances, first, second);
+  if (!physical || [...first.edges, ...second.edges].some((edge) => (edge.exactSeriesResistance?.numerator ?? 0n) !== 0n)) { return resistance; }
+  const voltage = (group: ParallelBatteryGroup) => {
+    const edge = group.edges[0]!;
+    const emf = edge.emf ?? exactInput(edge.battery.voltageVolts ?? 0)!;
+    return edge.fromComponent === fromComponent ? emf : negateExact(emf);
+  };
+  // A common load on parallel cells must not erase their circulating short.
+  // Series/opposing-source groups retain their existing normalized group test.
+  if (voltage(first).numerator * voltage(second).numerator < 0n) { return resistance; }
+  for (const [drive, returned] of [[first, second], [second, first]]) {
+    const physicalResistance = batteryGroupExternalResistance(size, physical, drive!, returned!);
+    if (physicalResistance !== null && (resistance === null || subtractExactRational(physicalResistance, resistance).numerator < 0n)) {
+      resistance = physicalResistance;
+    }
+  }
+  return resistance;
+}
+
+function seriesBatteryPath(
+  edges: readonly PassiveBatteryEdge[],
+  incident: Map<number, number[]>,
+  startComponent: number,
+  firstEdge: number,
+  visited: Set<number>,
+  nodesByComponent: Map<number, number[]>,
+  conductancesByComponent: Map<number, Conductance[]>,
+) {
+  let component = startComponent;
+  let edgeIndex = firstEdge;
+  let emf = EXACT_ZERO;
+  let exactSeriesResistance = EXACT_ZERO;
+  const first = edges[firstEdge]!;
+  const fromNode = first.fromComponent === startComponent ? first.fromNode : first.toNode;
+  while (!visited.has(edgeIndex)) {
+    visited.add(edgeIndex);
+    const edge = edges[edgeIndex]!;
+    const forward = edge.fromComponent === component;
+    const leavingNode = forward ? edge.toNode : edge.fromNode;
+    emf = subtractExactRational(emf, exactInput((forward ? -1 : 1) * (edge.battery.voltageVolts ?? 0))!);
+    component = forward ? edge.toComponent : edge.fromComponent;
+    const neighbors = incident.get(component) ?? [];
+    if (neighbors.length !== 2) {
+      return { ...edges[firstEdge]!, fromComponent: startComponent, toComponent: component, fromNode, toNode: leavingNode, emf,
+        exactSeriesResistance, seriesResistance: exactRationalToNumber(exactSeriesResistance) };
+    }
+    const nextIndex = neighbors.find((candidate) => candidate !== edgeIndex)!;
+    const next = edges[nextIndex]!;
+    const nextNode = next.fromComponent === component ? next.fromNode : next.toNode;
+    const resistance = externalResistanceExact(nodesByComponent.get(component) ?? [], conductancesByComponent.get(component) ?? [], leavingNode, nextNode);
+    if (resistance === null) { return null; }
+    exactSeriesResistance = subtractExactRational(exactSeriesResistance, negateExact(resistance));
+    edgeIndex = nextIndex;
+  }
+  return null;
+}
+
+function reducedBatteryBlock(
+  edges: readonly PassiveBatteryEdge[],
+  nodesByComponent: Map<number, number[]>,
+  conductancesByComponent: Map<number, Conductance[]>,
+) {
+  const incident = new Map<number, number[]>();
+  for (const [index, edge] of edges.entries()) {
+    for (const component of [edge.fromComponent, edge.toComponent]) {
+      const neighbors = incident.get(component) ?? [];
+      neighbors.push(index);
+      incident.set(component, neighbors);
+    }
+  }
+  const reduced: PassiveBatteryEdge[] = [];
+  const visited = new Set<number>();
+  for (const [component, neighbors] of incident) {
+    if (neighbors.length <= 2) { continue; }
+    for (const index of neighbors) {
+      if (visited.has(index)) { continue; }
+      const path = seriesBatteryPath(edges, incident, component, index, visited, nodesByComponent, conductancesByComponent);
+      if (!path) { return []; }
+      reduced.push(path);
+    }
+  }
+  return reduced;
+}
+
+function batteryPortResistance(nodes: readonly number[], conductances: readonly Conductance[], from: number, to: number) {
+  const exactResistance = externalResistanceExact(nodes, conductances, from, to);
+  if (exactResistance === null) { return null; }
+  const resistance = exactRationalToNumber(exactResistance);
+  return Number.isFinite(resistance) ? { resistance, exactResistance } : null;
+}
+
+function batteryBlockAdjacency(
+  block: readonly PassiveBatteryEdge[],
+  size: number,
+  nodesByComponent: Map<number, number[]>,
+  conductancesByComponent: Map<number, Conductance[]>,
+) {
+  const adjacent = Array.from({ length: size }, () => [] as BatteryCycleNeighbor[]);
+  const terminalsByComponent = new Map<number, Set<number>>();
+  for (const { battery, fromNode, toNode, fromComponent, toComponent } of block) {
+    adjacent[fromNode]?.push({ node: toNode, resistance: 0, batteryId: battery.id, voltage: -(battery.voltageVolts ?? 0) });
+    adjacent[toNode]?.push({ node: fromNode, resistance: 0, batteryId: battery.id, voltage: battery.voltageVolts ?? 0 });
+    for (const [component, node] of [[fromComponent, fromNode], [toComponent, toNode]] as const) {
+      const terminals = terminalsByComponent.get(component) ?? new Set<number>();
+      terminals.add(node);
+      terminalsByComponent.set(component, terminals);
+    }
+  }
+  for (const [component, terminals] of terminalsByComponent) {
+    const nodes = nodesByComponent.get(component) ?? [];
+    const conductances = conductancesByComponent.get(component) ?? [];
+    const terminalNodes = [...terminals];
+    for (const [position, from] of terminalNodes.entries()) {
+      for (const to of terminalNodes.slice(position + 1)) {
+        const resistance = batteryPortResistance(nodes, conductances, from, to);
+        if (!resistance) { continue; }
+        adjacent[from]?.push({ node: to, ...resistance });
+        adjacent[to]?.push({ node: from, ...resistance });
+      }
+    }
+  }
+  return adjacent;
+}
+
+interface VoltagePath extends DistanceEntry {
+  voltage: ExactRational;
+  exactDistance: ExactRational;
+}
+
+function keepVoltagePath(labels: VoltagePath[], candidate: VoltagePath) {
+  const sameVoltage = labels.findIndex((label) => subtractExactRational(label.voltage, candidate.voltage).numerator === 0n);
+  if (sameVoltage >= 0) {
+    if (subtractExactRational(labels[sameVoltage]!.exactDistance, candidate.exactDistance).numerator <= 0n) { return false; }
+    labels.splice(sameVoltage, 1);
+  } else if (labels.length >= 2) {
+    const worst = subtractExactRational(labels[0]!.exactDistance, labels[1]!.exactDistance).numerator > 0n ? 0 : 1;
+    if (subtractExactRational(labels[worst]!.exactDistance, candidate.exactDistance).numerator <= 0n) { return false; }
+    labels.splice(worst, 1);
+  }
+  labels.push(candidate);
+  return true;
+}
+
+function drivenBatteryReturnPathIsShort(adjacent: readonly BatteryCycleNeighbor[][], edge: PassiveBatteryEdge) {
+  // Two shortest labels with distinct EMFs suffice: for any continuation,
+  // at most one label can cancel the tested source's voltage. This excludes
+  // zero-EMF loops driven only indirectly by a different, resistive loop.
+  const labels = Array.from({ length: adjacent.length }, () => [] as VoltagePath[]);
+  const start: VoltagePath = { node: edge.fromNode, distance: 0, voltage: EXACT_ZERO, exactDistance: EXACT_ZERO };
+  const states = [start];
+  const heap: DistanceEntry[] = [];
+  labels[start.node]?.push(start);
+  pushDistance(heap, { node: 0, distance: 0 });
+  const expected = exactInput(-(edge.battery.voltageVolts ?? 0))!;
+  while (heap.length > 0) {
+    const current = states[popDistance(heap)!.node]!;
+    if (!labels[current.node]!.includes(current)) { continue; }
+    if (subtractExactRational(current.exactDistance, exactInput(SHORT_OHMS)!).numerator >= 0n) { continue; }
+    if (current.node === edge.toNode && subtractExactRational(current.voltage, expected).numerator !== 0n) { return true; }
+    for (const neighbor of adjacent[current.node] ?? []) {
+      if (neighbor.batteryId === edge.battery.id) { continue; }
+      const exactDistance = subtractExactRational(current.exactDistance, negateExact(neighbor.exactResistance ?? exactInput(neighbor.resistance)!));
+      const next: VoltagePath = {
+        node: neighbor.node,
+        distance: exactRationalToNumber(exactDistance),
+        exactDistance,
+        voltage: subtractExactRational(current.voltage, exactInput(-(neighbor.voltage ?? 0))!),
+      };
+      if (!keepVoltagePath(labels[next.node]!, next)) { continue; }
+      pushDistance(heap, { node: states.length, distance: next.distance });
+      states.push(next);
+    }
+  }
+  return false;
+}
+
+function shortedBatteryInBlock(
+  block: readonly PassiveBatteryEdge[],
+  readings: Map<string, ExactBatteryReading>,
+  size: number,
+  nodesByComponent: Map<number, number[]>,
+  conductancesByComponent: Map<number, Conductance[]>,
+) {
+  // Shortest weighted return paths cover overlapping cycles without an
+  // exponential enumeration. Battery internal resistance is excluded, as
+  // for the ordinary and simple-series external-load tests.
+  const adjacent = batteryBlockAdjacency(block, size, nodesByComponent, conductancesByComponent);
+  return block.find((edge) => {
+    if ((readings.get(edge.battery.id)?.current.numerator ?? 0n) === 0n) { return false; }
+    return drivenBatteryReturnPathIsShort(adjacent, edge);
+  })?.battery;
+}
+
+function shortedBatteryInConductorGraph(
+  batteries: readonly CircuitPart[],
+  readings: Map<string, ExactBatteryReading>,
+  index: Map<string, number>,
+  passive: readonly Conductance[],
+  passiveComponents: number[],
+) {
+  const adjacent = Array.from({ length: index.size }, () => [] as BatteryCycleNeighbor[]);
+  for (const edge of passive) {
+    const resistance = edge.resistanceOhms;
+    const exactResistance = edge.exactResistance ?? exactInput(resistance)!;
+    adjacent[edge.a]!.push({ node: edge.b, resistance, exactResistance });
+    adjacent[edge.b]!.push({ node: edge.a, resistance, exactResistance });
+  }
+  const { edges } = batteryEdgesByPassiveComponent(batteries, index, passiveComponents);
+  for (const edge of edges) {
+    adjacent[edge.fromNode]!.push({ node: edge.toNode, resistance: 0, batteryId: edge.battery.id, voltage: -edge.battery.voltageVolts! });
+    adjacent[edge.toNode]!.push({ node: edge.fromNode, resistance: 0, batteryId: edge.battery.id, voltage: edge.battery.voltageVolts! });
+  }
+  // Weak passive links can merge all battery ports into one component. Walk
+  // the original conductors as well, retaining series wires and the exact
+  // nonzero EMF of opposing sources even when that EMF is extremely small.
+  return edges.find((edge) => (readings.get(edge.battery.id)?.current.numerator ?? 0n) !== 0n &&
+    drivenBatteryReturnPathIsShort(adjacent, edge))?.battery;
+}
+
+function parallelBatteryPairs(block: readonly PassiveBatteryEdge[]) {
+  const pairs = new Map<string, PassiveBatteryEdge[]>();
+  for (const edge of block) {
+    const pairKey = `${Math.min(edge.fromComponent, edge.toComponent)}:${Math.max(edge.fromComponent, edge.toComponent)}`;
+    const pair = pairs.get(pairKey) ?? [];
+    pair.push(edge);
+    pairs.set(pairKey, pair);
+  }
+  return [...pairs.values()].flatMap((pair) => {
+    const parallel = pair.length > 1 ? parallelBatteryGroups(pair) : null;
+    return parallel ? [parallel] : [];
+  });
+}
+
+function shortedParallelSubset(
+  blocks: readonly (readonly PassiveBatteryEdge[])[],
+  readings: Map<string, ExactBatteryReading>,
+  size: number,
+  conductancesByComponent: Map<number, Conductance[]>,
+  physicalConductances?: readonly Conductance[],
+) {
+  for (const parallel of blocks.flatMap(parallelBatteryPairs)) {
+    const shorted = shortedParallelBatteryGroup(parallel, readings, size, conductancesByComponent, physicalConductances);
+    if (shorted) { return shorted; }
+  }
+}
+
+interface ComponentBatteryGroup extends ParallelBatteryGroup {
+  fromComponent: number;
+  toComponent: number;
+  emf: ExactRational;
+}
+
+function componentBatteryGroups(block: readonly PassiveBatteryEdge[]) {
+  const pairs = new Map<string, PassiveBatteryEdge[]>();
+  for (const edge of block) {
+    const pairKey = `${Math.min(edge.fromComponent, edge.toComponent)}:${Math.max(edge.fromComponent, edge.toComponent)}`;
+    const pair = pairs.get(pairKey) ?? [];
+    pair.push(edge);
+    pairs.set(pairKey, pair);
+  }
+  return [...pairs.values()].flatMap((pair): ComponentBatteryGroup[] => {
+    const parallel = parallelBatteryGroups(pair)!;
+    return parallel.groups.map((group) => {
+      const edge = group.edges[0]!;
+      const emf = edge.emf ?? exactInput(edge.battery.voltageVolts ?? 0)!;
+      return { ...group, fromComponent: parallel.fromComponent, toComponent: parallel.toComponent,
+        emf: edge.fromComponent === parallel.fromComponent ? emf : negateExact(emf) };
+    });
+  });
+}
+
+function groupedNetworkShort(
+  cycle: readonly ComponentBatteryGroup[],
+  emf: ExactRational,
+  readings: Map<string, ExactBatteryReading>,
+  size: number,
+  conductancesByComponent: Map<number, Conductance[]>,
+  physicalConductances?: readonly Conductance[],
+) {
+  if (emf.numerator === 0n) { return; }
+  const flowing = cycle.flatMap((group) => group.edges).find((edge) =>
+    (readings.get(edge.battery.id)?.current.numerator ?? 0n) !== 0n,
+  );
+  if (!flowing) { return; }
+  const components = new Set(cycle.flatMap((group) => [group.fromComponent, group.toComponent]));
+  const conductances = [...components].flatMap((component) => conductancesByComponent.get(component) ?? []);
+  const resistance = batteryCycleExternalResistance(size, conductances, cycle);
+  if (resistance !== null && subtractExactRational(resistance, exactInput(SHORT_OHMS)!).numerator < 0n) { return flowing.battery; }
+  const drive = cycle[0]!;
+  const returnEmf = subtractExactRational(drive.emf, emf);
+  if (!physicalConductances || drive.emf.numerator * returnEmf.numerator < 0n ||
+    cycle.some((group) => group.edges.some((edge) => (edge.exactSeriesResistance?.numerator ?? 0n) !== 0n))) { return; }
+  const physicalResistance = batteryCycleExternalResistance(size, physicalConductances, cycle);
+  return physicalResistance !== null && subtractExactRational(physicalResistance, exactInput(SHORT_OHMS)!).numerator < 0n
+    ? flowing.battery : undefined;
+}
+
+interface GroupedCycleSearch {
+  groups: ComponentBatteryGroup[];
+  adjacent: Map<number, number[]>;
+  readings: Map<string, ExactBatteryReading>;
+  size: number;
+  conductancesByComponent: Map<number, Conductance[]>;
+  physicalConductances?: readonly Conductance[];
+  passiveLinks: Conductance[];
+}
+
+function visitConsistentGroup(
+  groups: readonly ComponentBatteryGroup[],
+  adjacent: Map<number, number[]>,
+  potentials: Map<number, ExactRational>,
+  start: number,
+) {
+  potentials.set(start, EXACT_ZERO);
+  const pending = [start];
+  while (pending.length > 0) {
+    const component = pending.pop()!;
+    for (const index of adjacent.get(component) ?? []) {
+      const group = groups[index]!;
+      const forward = group.fromComponent === component;
+      const next = forward ? group.toComponent : group.fromComponent;
+      const potential = subtractExactRational(potentials.get(component)!, forward ? group.emf : negateExact(group.emf));
+      const existing = potentials.get(next);
+      if (existing) {
+        if (subtractExactRational(existing, potential).numerator !== 0n) { return false; }
+      } else {
+        potentials.set(next, potential);
+        pending.push(next);
+      }
+    }
+  }
+  return true;
+}
+
+function groupedEmfsAreConsistent(groups: readonly ComponentBatteryGroup[], adjacent: Map<number, number[]>) {
+  const potentials = new Map<number, ExactRational>();
+  for (const start of adjacent.keys()) {
+    if (!potentials.has(start) && !visitConsistentGroup(groups, adjacent, potentials, start)) { return false; }
+  }
+  return true;
+}
+
+function groupedBatteryAdjacency(groups: readonly ComponentBatteryGroup[]) {
+  const adjacent = new Map<number, number[]>();
+  for (const [index, group] of groups.entries()) {
+    for (const component of [group.fromComponent, group.toComponent]) {
+      const neighbors = adjacent.get(component) ?? [];
+      neighbors.push(index);
+      adjacent.set(component, neighbors);
+    }
+  }
+  return adjacent;
+}
+
+function shortedConsistentBatteryReturns(search: GroupedCycleSearch) {
+  for (const [position, drive] of search.groups.entries()) {
+    const returns = search.groups.filter((_, index) => index !== position);
+    const adjacent = groupedBatteryAdjacency(returns);
+    const potentials = new Map<number, ExactRational>();
+    if (!visitConsistentGroup(returns, adjacent, potentials, drive.fromComponent)) { continue; }
+    const returnPotential = potentials.get(drive.toComponent);
+    if (!returnPotential) { continue; }
+    const emf = subtractExactRational(drive.emf, negateExact(returnPotential));
+    const connected = returns.filter((group) => potentials.has(group.fromComponent) && potentials.has(group.toComponent));
+    const shorted = groupedNetworkShort([drive, ...connected], emf, search.readings, search.size, search.conductancesByComponent, search.physicalConductances);
+    if (shorted) { return shorted; }
+  }
+}
+
+
+interface SeriesPortNeighbor {
+  node: number;
+  resistance: ExactRational;
+}
+
+function seriesPortResistance(
+  start: number,
+  adjacent: ReadonlyMap<number, SeriesPortNeighbor[]>,
+  terminals: ReadonlySet<number>,
+  drivenTerminals: ReadonlySet<number>,
+) {
+  let resistance = EXACT_ZERO;
+  let node = start;
+  let previous = -1;
+  const visited = new Set<number>();
+  while (!visited.has(node)) {
+    visited.add(node);
+    const neighbors = adjacent.get(node) ?? [];
+    if (neighbors.length !== (node === start ? 1 : 2)) { return resistance; }
+    const next = neighbors.find((edge) => edge.node !== previous);
+    if (!next) { return EXACT_ZERO; }
+    resistance = subtractExactRational(resistance, negateExact(next.resistance));
+    previous = node;
+    node = next.node;
+    if (terminals.has(node)) { return drivenTerminals.has(node) ? EXACT_ZERO : resistance; }
+  }
+  return EXACT_ZERO;
+}
+
+function groupedSeriesResistanceBounds(groups: readonly ComponentBatteryGroup[], conductancesByComponent: Map<number, Conductance[]>, physicalConductances?: readonly Conductance[]) {
+  const adjacent = new Map<number, SeriesPortNeighbor[]>();
+  const components = new Set(groups.flatMap((group) => [group.fromComponent, group.toComponent]));
+  for (const edge of physicalConductances ?? [...components].flatMap((component) => conductancesByComponent.get(component) ?? [])) {
+    for (const [from, to] of [[edge.a, edge.b], [edge.b, edge.a]]) {
+      const neighbors = adjacent.get(from!) ?? [];
+      neighbors.push({ node: to!, resistance: edge.exactResistance ?? exactInput(edge.resistanceOhms)! });
+      adjacent.set(from!, neighbors);
+    }
+  }
+  const terminals = new Set(groups.flatMap((group) => [...group.fromNodes, ...group.toNodes]));
+  pruneSeriesPortLeaves(adjacent, terminals);
+  return groups.map((group) => {
+    const driven = new Set([...group.fromNodes, ...group.toNodes]);
+    let conductance = EXACT_ZERO;
+    for (const edge of group.edges) {
+      const resistance = subtractExactRational(subtractExactRational(edge.exactSeriesResistance ?? EXACT_ZERO,
+        negateExact(seriesPortResistance(edge.fromNode, adjacent, terminals, driven))),
+      negateExact(seriesPortResistance(edge.toNode, adjacent, terminals, driven)));
+      if (resistance.numerator === 0n) { return EXACT_ZERO; }
+      conductance = subtractExactRational(conductance, negateExact(divideExactRational(EXACT_ONE, resistance)!));
+    }
+    return divideExactRational(EXACT_ONE, conductance)!;
+  });
+}
+
+function pruneSeriesPortLeaves(adjacent: Map<number, SeriesPortNeighbor[]>, terminals: ReadonlySet<number>) {
+  const pending = [...adjacent].filter(([node, neighbors]) => neighbors.length === 1 && !terminals.has(node)).map(([node]) => node);
+  while (pending.length > 0) {
+    const node = pending.pop()!;
+    const neighbors = adjacent.get(node);
+    if (neighbors?.length !== 1 || terminals.has(node)) { continue; }
+    const other = neighbors[0]!.node;
+    adjacent.delete(node);
+    const remaining = (adjacent.get(other) ?? []).filter((edge) => edge.node !== node);
+    adjacent.set(other, remaining);
+    if (remaining.length === 1 && !terminals.has(other)) { pending.push(other); }
+  }
+}
+
+function compatibleGroupPotentials(group: ComponentBatteryGroup, potentials: ReadonlyMap<number, ExactRational>) {
+  const from = potentials.get(group.fromComponent);
+  const to = potentials.get(group.toComponent);
+  return !from || !to || subtractExactRational(subtractExactRational(from, to), group.emf).numerator === 0n;
+}
+
+function groupReturnResistanceBound(groups: readonly ComponentBatteryGroup[], bounds: readonly ExactRational[], driveIndex: number, potentials: ReadonlyMap<number, ExactRational>, size: number, passiveLinks: readonly Conductance[]) {
+  const drive = groups[driveIndex]!;
+  const parent = Array.from({ length: size }, (_, node) => node);
+  const available = groups.map((group, index) => ({ group, index }))
+    .filter(({ group, index }) => index !== driveIndex && compatibleGroupPotentials(group, potentials));
+  for (const { group, index } of available) {
+    if (bounds[index]!.numerator === 0n) { parent[findRoot(parent, group.fromComponent)] = findRoot(parent, group.toComponent); }
+  }
+  const from = findRoot(parent, drive.fromComponent);
+  const to = findRoot(parent, drive.toComponent);
+  if (from === to) { return bounds[driveIndex]!; }
+  const branches = available.flatMap(({ group, index }): Conductance[] => {
+    const exactResistance = bounds[index]!;
+    const a = findRoot(parent, group.fromComponent);
+    const b = findRoot(parent, group.toComponent);
+    if (a === b || exactResistance.numerator === 0n) { return []; }
+    const resistanceOhms = exactRationalToNumber(exactResistance);
+    return [{ a, b, resistanceOhms, g: 1 / resistanceOhms, exactResistance }];
+  });
+  branches.push(...passiveLinks.map((edge) => ({ ...edge, a: findRoot(parent, edge.a), b: findRoot(parent, edge.b) })));
+  const nodes = [...new Set([from, to, ...branches.flatMap((edge) => [edge.a, edge.b])])];
+  const returned = externalResistanceExact(nodes, branches, from, to);
+  return returned === null ? null : subtractExactRational(bounds[driveIndex]!, negateExact(returned));
+}
+
+function groupPotentialStateKey(potentials: ReadonlyMap<number, ExactRational>) {
+  return [...potentials].sort(([first], [second]) => first - second)
+    .map(([node, value]) => `${node}:${value.numerator}/${value.denominator}`).join(";");
+}
+
+function shortedAssignedBatteryReturn(search: GroupedCycleSearch, driveIndex: number, potentials: ReadonlyMap<number, ExactRational>) {
+  const drive = search.groups[driveIndex]!;
+  const returned = potentials.get(drive.toComponent);
+  if (!returned) { return; }
+  const emf = subtractExactRational(drive.emf, negateExact(returned));
+  if (emf.numerator === 0n) { return; }
+  const returns = search.groups.filter((group, index) => index !== driveIndex &&
+    potentials.has(group.fromComponent) && potentials.has(group.toComponent) && compatibleGroupPotentials(group, potentials));
+  return groupedNetworkShort([drive, ...returns], emf, search.readings, search.size, search.conductancesByComponent, search.physicalConductances);
+}
+
+function extendGroupPotentialStates(search: GroupedCycleSearch, driveIndex: number, potentials: ReadonlyMap<number, ExactRational>, pending: Map<number, ExactRational>[]) {
+  for (const [index, group] of search.groups.entries()) {
+    if (index === driveIndex) { continue; }
+    const from = potentials.get(group.fromComponent);
+    const to = potentials.get(group.toComponent);
+    if (Boolean(from) === Boolean(to)) { continue; }
+    const next = new Map(potentials);
+    if (from) { next.set(group.toComponent, subtractExactRational(from, group.emf)); }
+    else { next.set(group.fromComponent, subtractExactRational(to!, negateExact(group.emf))); }
+    pending.push(next);
+  }
+}
+
+function shortedPotentialBatteryReturns(search: GroupedCycleSearch, bounds: readonly ExactRational[], driveIndex: number) {
+  const drive = search.groups[driveIndex]!;
+  const pending = [new Map([[drive.fromComponent, EXACT_ZERO]])];
+  const visited = new Set<string>();
+  while (pending.length > 0) {
+    const potentials = pending.pop()!;
+    const stateKey = groupPotentialStateKey(potentials);
+    if (visited.has(stateKey)) { continue; }
+    visited.add(stateKey);
+    const returned = potentials.get(drive.toComponent);
+    if (returned && subtractExactRational(drive.emf, negateExact(returned)).numerator === 0n) { continue; }
+    const bound = groupReturnResistanceBound(search.groups, bounds, driveIndex, potentials, search.size, search.passiveLinks);
+    if (bound === null || subtractExactRational(bound, exactInput(SHORT_OHMS)!).numerator >= 0n) { continue; }
+    const shorted = shortedAssignedBatteryReturn(search, driveIndex, potentials);
+    if (shorted) { return shorted; }
+    // Every connected consistent return network admits this construction.
+    // Memoized potential assignments merge different traversal orders; the
+    // resistance lower bound prunes networks that cannot reach the threshold.
+    extendGroupPotentialStates(search, driveIndex, potentials, pending);
+  }
+}
+
+function baselineGroupPotentials(groups: readonly ComponentBatteryGroup[], bounds: readonly ExactRational[], size: number) {
+  const parent = Array.from({ length: size }, (_, node) => node);
+  const ordered = groups.map((group, index) => ({ group, index })).sort((first, second) => {
+    const difference = subtractExactRational(bounds[first.index]!, bounds[second.index]!);
+    return difference.numerator < 0n ? -1 : difference.numerator > 0n ? 1 : 0;
+  });
+  const tree: ComponentBatteryGroup[] = [];
+  for (const { group } of ordered) {
+    const from = findRoot(parent, group.fromComponent);
+    const to = findRoot(parent, group.toComponent);
+    if (from === to) { continue; }
+    parent[from] = to;
+    tree.push(group);
+  }
+  const potentials = new Map<number, ExactRational>();
+  const adjacent = groupedBatteryAdjacency(tree);
+  for (const start of adjacent.keys()) {
+    if (!potentials.has(start)) { visitConsistentGroup(tree, adjacent, potentials, start); }
+  }
+  return potentials;
+}
+
+function residualGroupResistanceBound(groups: readonly ComponentBatteryGroup[], bounds: readonly ExactRational[], potentials: ReadonlyMap<number, ExactRational>, passiveLinks: readonly Conductance[]) {
+  let conductance = EXACT_ZERO;
+  for (const [index, group] of groups.entries()) {
+    if (compatibleGroupPotentials(group, potentials)) { continue; }
+    const resistance = bounds[index]!;
+    if (resistance.numerator === 0n) { return null; }
+    conductance = subtractExactRational(conductance, negateExact(divideExactRational(EXACT_ONE, resistance)!));
+  }
+  for (const edge of passiveLinks) {
+    const resistance = edge.exactResistance ?? exactInput(edge.resistanceOhms)!;
+    conductance = subtractExactRational(conductance, negateExact(divideExactRational(EXACT_ONE, resistance)!));
+  }
+  return conductance.numerator === 0n ? null : divideExactRational(EXACT_ONE, conductance);
+}
+
+function shortedGroupedBatteryCycles(
+  block: readonly PassiveBatteryEdge[],
+  readings: Map<string, ExactBatteryReading>,
+  size: number,
+  conductancesByComponent: Map<number, Conductance[]>,
+  physicalConductances?: readonly Conductance[],
+  passiveComponents?: readonly number[],
+) {
+  const groups = componentBatteryGroups(block);
+  if (groups.length < 3) { return; }
+  const adjacent = groupedBatteryAdjacency(groups);
+  if (groupedEmfsAreConsistent(groups, adjacent)) { return; }
+  const bounds = groupedSeriesResistanceBounds(groups, conductancesByComponent, physicalConductances);
+  const passiveLinks = physicalConductances && passiveComponents
+    ? physicalConductances.map((edge) => ({ ...edge, a: passiveComponents[edge.a]!, b: passiveComponents[edge.b]! })).filter((edge) => edge.a !== edge.b)
+    : [];
+  const search = { groups, adjacent, readings, size, conductancesByComponent, physicalConductances, passiveLinks };
+  const returnShort = shortedConsistentBatteryReturns(search);
+  if (returnShort) { return returnShort; }
+  const baseline = baselineGroupPotentials(groups, bounds, size);
+  const residualBound = residualGroupResistanceBound(groups, bounds, baseline, passiveLinks);
+  for (const position of groups.keys()) {
+    if (subtractExactRational(bounds[position]!, exactInput(SHORT_OHMS)!).numerator >= 0n) { continue; }
+    // A return with different EMF must cross a source group inconsistent
+    // with the baseline potential. Even putting all such groups in parallel
+    // cannot exceed their total conductance; this bound prunes dense networks
+    // whose only driving inconsistency lies behind a resistive branch.
+    if (residualBound && compatibleGroupPotentials(groups[position]!, baseline) &&
+      subtractExactRational(subtractExactRational(bounds[position]!, negateExact(residualBound)), exactInput(SHORT_OHMS)!).numerator >= 0n) { continue; }
+    const shorted = shortedPotentialBatteryReturns(search, bounds, position);
+    if (shorted) { return shorted; }
+  }
+}
+
+function shortedBatteryCycle(
+  loop: readonly PassiveBatteryEdge[],
+  readings: Map<string, ExactBatteryReading>,
+  size: number,
+  nodesByComponent: Map<number, number[]>,
+  conductancesByComponent: Map<number, Conductance[]>,
+  physicalConductances?: readonly Conductance[],
+  passiveComponents?: readonly number[],
+) {
+  const reduced = reducedBatteryBlock(loop, nodesByComponent, conductancesByComponent);
+  const parallel = parallelBatteryGroups(loop) ?? parallelBatteryGroups(reduced);
+  if (parallel) {
+    const shorted = shortedParallelBatteryGroup(parallel, readings, size, conductancesByComponent, physicalConductances);
+    if (shorted || !physicalConductances) { return shorted; }
+  }
+  // Further source branches must not hide a parallel group's combined return.
+  const subsetShort = shortedParallelSubset([loop, reduced], readings, size, conductancesByComponent, physicalConductances);
+  if (subsetShort) { return subsetShort; }
+  const groupedShort = shortedGroupedBatteryCycles(loop, readings, size, conductancesByComponent, physicalConductances, passiveComponents) ??
+    shortedGroupedBatteryCycles(reduced, readings, size, conductancesByComponent);
+  if (groupedShort) { return groupedShort; }
+  const resistance = seriesLoopExternalResistance(loop, nodesByComponent, conductancesByComponent);
+  if (resistance !== null && subtractExactRational(resistance, exactInput(SHORT_OHMS)!).numerator >= 0n) { return; }
+  return shortedBatteryInBlock(loop, readings, size, nodesByComponent, conductancesByComponent);
+}
+
 function shortedSeriesLoopBattery(
   batteries: readonly CircuitPart[],
-  parts: Record<string, CircuitPartReading>,
+  readings: Map<string, ExactBatteryReading>,
   index: Map<string, number>,
   passiveComponents: number[],
   nodesByComponent: Map<number, number[]>,
@@ -1038,12 +1843,9 @@ function shortedSeriesLoopBattery(
   const graph = batteryEdgesByPassiveComponent(batteries, index, passiveComponents);
   const protectedBatteryIds = new Set<string>();
   for (const loop of batteryCycleGroups(graph.edges, graph.incidentEdges)) {
-    const resistance = seriesLoopExternalResistance(loop, nodesByComponent, conductancesByComponent);
-    if (resistance === null) { continue; }
     for (const edge of loop) { protectedBatteryIds.add(edge.battery.id); }
-    if (resistance >= SHORT_OHMS) { continue; }
-    const flowingBattery = loop.find((edge) => parts[edge.battery.id]?.currentAmps !== 0);
-    if (flowingBattery) { return { protectedBatteryIds, shortedBattery: flowingBattery.battery }; }
+    const shortedCell = shortedBatteryCycle(loop, readings, index.size, nodesByComponent, conductancesByComponent);
+    if (shortedCell) { return { protectedBatteryIds, shortedBattery: shortedCell }; }
   }
   return { protectedBatteryIds, shortedBattery: undefined };
 }
@@ -1245,10 +2047,78 @@ function externalPairIsShort(
   return resistance !== null && resistance < SHORT_OHMS;
 }
 
+function exactSourcePotential(tree: SourceConstraintTree, node: number) {
+  let potential = EXACT_ZERO;
+  let current = node;
+  while (tree.parent[current] !== -1) {
+    potential = subtractExactRational(potential, negateExact(exactInput(tree.offset[current] ?? 0)!));
+    current = tree.parent[current]!;
+  }
+  return potential;
+}
+
+function sourceGroupVoltageSpan(tree: SourceConstraintTree, group: number) {
+  let low = EXACT_ZERO;
+  let high = EXACT_ZERO;
+  for (const [node, component] of tree.component.entries()) {
+    if (component !== group) { continue; }
+    const potential = exactSourcePotential(tree, node);
+    if (subtractExactRational(potential, low).numerator < 0n) { low = potential; }
+    if (subtractExactRational(potential, high).numerator > 0n) { high = potential; }
+  }
+  return subtractExactRational(high, low);
+}
+
+function sourceGroupExternalResistance(
+  group: number,
+  batteriesByGroup: Map<number, CircuitPart[]>,
+  index: Map<string, number>,
+  sourceTree: SourceConstraintTree,
+  passive: readonly Conductance[],
+) {
+  const span = sourceGroupVoltageSpan(sourceTree, group);
+  if (span.numerator === 0n) { return null; }
+  const parent = Array.from({ length: index.size }, (_, node) => node);
+  const offsets = Array.from({ length: index.size }, () => EXACT_ZERO);
+  // This test measures this source group's passive load. Other source groups
+  // are open here; zeroing their EMF would invent a driven source cycle.
+  // Genuine multi-group circulation is checked by the source-cycle search.
+  for (const battery of batteriesByGroup.get(group) ?? []) {
+    const from = index.get(`${battery.id}:a`)!;
+    const to = index.get(`${battery.id}:b`)!;
+    parent[from] = to;
+    offsets[from] = divideExactRational(exactInput(battery.voltageVolts!)!, span)!;
+  }
+  // Retain every conductor, including wires between series cells and weak
+  // loads that connect their intermediate terminals to the external network.
+  const branches = passive.map((edge) => ({
+    ...edge, a: findRoot(parent, edge.a), b: findRoot(parent, edge.b),
+    exactVoltage: subtractExactRational(offsets[edge.b]!, offsets[edge.a]!),
+  }));
+  const power = passiveNetworkPower(index.size, branches);
+  return power && power.numerator > 0n ? divideExactRational(EXACT_ONE, power) : null;
+}
+
+function multiSourceGroupShorts(
+  sourceGroups: Set<number>,
+  batteriesByGroup: Map<number, CircuitPart[]>,
+  index: Map<string, number>,
+  sourceTree: SourceConstraintTree,
+  passive: readonly Conductance[],
+) {
+  const results = new Map<number, boolean>();
+  for (const group of sourceGroups) {
+    if ((batteriesByGroup.get(group)?.length ?? 0) < 2 || sourceTree.inconsistent.has(group)) { continue; }
+    const resistance = sourceGroupExternalResistance(group, batteriesByGroup, index, sourceTree, passive);
+    results.set(group, resistance !== null && subtractExactRational(resistance, exactInput(SHORT_OHMS)!).numerator < 0n);
+  }
+  return results;
+}
+
 function shortedBatteryByExternalResistance(
   groups: Map<string, { sourceGroup: number; passiveGroup: number; nodes: number[] }>,
   batteriesByGroup: Map<number, CircuitPart[]>,
-  indexSize: number,
+  index: Map<string, number>,
   sourceTree: SourceConstraintTree,
   rails: number[],
   escapeConductance: number[],
@@ -1256,10 +2126,15 @@ function shortedBatteryByExternalResistance(
   nodesByComponent: Map<number, number[]>,
   conductancesByComponent: Map<number, Conductance[]>,
 ) {
-  const adjacent = passiveAdjacency(indexSize, passive);
+  const groupedResults = multiSourceGroupShorts(new Set([...groups.values()].map((group) => group.sourceGroup)),
+    batteriesByGroup, index, sourceTree, passive);
+  const shortedGroup = [...groupedResults].find(([, short]) => short)?.[0];
+  if (shortedGroup !== undefined) { return batteriesByGroup.get(shortedGroup)?.[0]; }
+  const remainingGroups = [...groups.values()].filter((group) => !groupedResults.has(group.sourceGroup));
+  const adjacent = passiveAdjacency(index.size, passive);
   const distancesByNode = new Map<number, number[]>();
   const resistanceIndexes = new Map<number, PassiveResistanceIndex>();
-  for (const { sourceGroup, passiveGroup, nodes } of groups.values()) {
+  for (const { sourceGroup, passiveGroup, nodes } of remainingGroups) {
     const battery = batteriesByGroup.get(sourceGroup)?.[0];
     const componentNodes = nodesByComponent.get(passiveGroup);
     const componentConductances = conductancesByComponent.get(passiveGroup) ?? [];
@@ -1270,11 +2145,10 @@ function shortedBatteryByExternalResistance(
       resistanceIndexes.set(passiveGroup, resistanceIndex);
     }
     for (let fromIndex = 0; fromIndex < nodes.length; fromIndex += 1) {
-      const from = nodes[fromIndex];
-      if (from === undefined) { continue; }
+      const from = nodes[fromIndex]!;
       for (let toIndex = fromIndex + 1; toIndex < nodes.length; toIndex += 1) {
-        const to = nodes[toIndex];
-        if (to !== undefined && externalPairIsShort(
+        const to = nodes[toIndex]!;
+        if (externalPairIsShort(
           from,
           to,
           sourceTree,
@@ -1294,29 +2168,34 @@ function shortedBatteryByExternalResistance(
 function shortedBattery(
   document: CircuitDocument,
   batteries: readonly CircuitPart[],
-  parts: Record<string, CircuitPartReading>,
+  solved: NonNullable<ReturnType<typeof nodeVoltages>>,
   index: Map<string, number>,
   conductances: readonly Conductance[],
   switchStates: Record<string, boolean>,
 ) {
+  const readings = exactBatteryReadings(batteries, index, solved);
   const passive = conductances.filter(({ batteryId }) => batteryId === undefined);
   const passiveNetwork = passiveComponentsByNode(index.size, passive);
   const seriesLoop = shortedSeriesLoopBattery(
     batteries,
-    parts,
+    readings,
     index,
     passiveNetwork.components,
     passiveNetwork.nodesByComponent,
     passiveNetwork.conductancesByComponent,
   );
   if (seriesLoop.shortedBattery) { return seriesLoop.shortedBattery; }
+  const drivenShort = shortedBatteryInConductorGraph(batteries, readings, index, passive, passiveNetwork.components);
+  if (drivenShort) { return drivenShort; }
+  const subnetworkShort = shortedBatterySubnetworks(batteries, readings, index, passive, passiveNetwork.components);
+  if (subnetworkShort) { return subnetworkShort; }
 
   const sourceEdges = sourceConstraintEdges(document, index, switchStates);
   const sourceTree = sourceConstraintTree(index.size, sourceEdges);
   const batteriesByGroup = batteriesBySourceGroup(batteries, sourceTree, index);
   const byTerminalRatio = shortedBatteryByTerminalRatio(
     batteries,
-    parts,
+    readings,
     sourceTree,
     batteriesByGroup,
     index,
@@ -1336,7 +2215,7 @@ function shortedBattery(
   return shortedBatteryByExternalResistance(
     groups,
     batteriesByGroup,
-    index.size,
+    index,
     sourceTree,
     rails,
     escapeConductance,
@@ -1344,6 +2223,43 @@ function shortedBattery(
     passiveNetwork.nodesByComponent,
     passiveNetwork.conductancesByComponent,
   );
+}
+
+function shortedBatterySubnetworks(
+  batteries: readonly CircuitPart[],
+  readings: Map<string, ExactBatteryReading>,
+  index: Map<string, number>,
+  passive: readonly Conductance[],
+  components: readonly number[],
+) {
+  if (batteries.length < 2 || !batteries.some((battery) => {
+    const from = index.get(`${battery.id}:a`);
+    const to = index.get(`${battery.id}:b`);
+    return from !== undefined && to !== undefined && components[from] === components[to];
+  })) { return; }
+  const resistanceOf = (edge: Conductance) => edge.exactResistance ?? exactInput(edge.resistanceOhms)!;
+  const levels = [...new Map(passive.map((edge) => {
+    const resistance = resistanceOf(edge);
+    return [`${resistance.numerator}/${resistance.denominator}`, resistance] as const;
+  })).values()].sort((first, second) => {
+    const difference = subtractExactRational(first, second).numerator;
+    return difference < 0n ? -1 : Number(difference > 0n);
+  });
+  // Adding a weak load must not remove a driven low-resistance source cycle.
+  // Check every distinct resistance level; individual parallel return branches
+  // can exceed SHORT_OHMS even when their combined resistance is below it.
+  for (const level of levels.slice(0, -1)) {
+    const subset = passive.filter((edge) => subtractExactRational(resistanceOf(edge), level).numerator <= 0n);
+    const network = passiveComponentsByNode(index.size, subset);
+    const graph = batteryEdgesByPassiveComponent(batteries, index, network.components);
+    for (const loop of batteryCycleGroups(graph.edges, graph.incidentEdges)) {
+      const parallel = parallelBatteryGroups(loop);
+      const shorted = parallel
+        ? shortedParallelBatteryGroup(parallel, readings, index.size, network.conductancesByComponent, passive)
+        : shortedBatteryCycle(loop, readings, index.size, network.nodesByComponent, network.conductancesByComponent, passive, network.components);
+      if (shorted) { return shorted; }
+    }
+  }
 }
 
 function connectedTerminals(document: CircuitDocument) {
@@ -1461,7 +2377,7 @@ function analyzeCircuitFromInput(
   const batteries = normalizedDocument.parts.filter((part) => part.kind === "battery");
   const readings = { parts, wireCurrents, issues };
   if (batteries.length === 0) { return result("idle", "電池を置くと電流を計算します。", readings); }
-  const shorted = shortedBattery(normalizedDocument, batteries, parts, index, conductances, switchStates);
+  const shorted = shortedBattery(normalizedDocument, batteries, solved, index, conductances, switchStates);
   if (shorted) {
     const message = `${shorted.label}が短絡しています。抵抗か電球を直列に入れてください。`;
     return result("short", message, {

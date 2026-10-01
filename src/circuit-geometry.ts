@@ -96,12 +96,17 @@ export function terminalDirection(part: CircuitPart, terminal: CircuitTerminal):
 }
 
 function boundsOfPoints(points: readonly Point[]): GridRect {
-  return {
-    minX: Math.min(...points.map(({ x }) => x)),
-    minY: Math.min(...points.map(({ y }) => y)),
-    maxX: Math.max(...points.map(({ x }) => x)),
-    maxY: Math.max(...points.map(({ y }) => y)),
+  const bounds = {
+    minX: Number.POSITIVE_INFINITY, minY: Number.POSITIVE_INFINITY,
+    maxX: Number.NEGATIVE_INFINITY, maxY: Number.NEGATIVE_INFINITY,
   };
+  for (const { x, y } of points) {
+    bounds.minX = Math.min(bounds.minX, x);
+    bounds.minY = Math.min(bounds.minY, y);
+    bounds.maxX = Math.max(bounds.maxX, x);
+    bounds.maxY = Math.max(bounds.maxY, y);
+  }
+  return bounds;
 }
 
 /** Cells a part occupies, including its terminals. */
@@ -177,19 +182,7 @@ function stub({ point, direction }: RouteEnd): Point {
 }
 
 function simplify(points: Point[]) {
-  const unique = points.filter(
-    (point, index) =>
-      index === 0 || point.x !== points[index - 1]?.x || point.y !== points[index - 1]?.y,
-  );
-  return unique.filter((point, index) => {
-    const before = unique[index - 1];
-    const after = unique[index + 1];
-    if (!before || !after) { return true; }
-    return !(
-      (before.x === point.x && point.x === after.x) ||
-      (before.y === point.y && point.y === after.y)
-    );
-  });
+  return simplifyManualRoute(points);
 }
 
 function leavesHorizontally(start: RouteEnd, end: RouteEnd) {
@@ -206,7 +199,10 @@ function leavesHorizontally(start: RouteEnd, end: RouteEnd) {
 export function routeWire(start: RouteEnd, end: RouteEnd, occupied: readonly (readonly Point[])[] = []): Point[] {
   const first = stub(start);
   const last = stub(end);
-  if (occupied.length > 0) { return routeAroundWires(start, end, first, last, occupied); }
+  return routeAroundWires(start, end, first, last, occupied);
+}
+
+function directWireRoute(start: RouteEnd, end: RouteEnd, first: Point, last: Point): Point[] {
   if (first.x === last.x || first.y === last.y) {
     return simplify([start.point, first, last, end.point]);
   }
@@ -287,47 +283,105 @@ export function moveWireSegment(
   return simplify(moved);
 }
 
-function edgeKey(a: Point, b: Point) {
-  return a.x < b.x || (a.x === b.x && a.y < b.y)
-    ? `${a.x},${a.y}:${b.x},${b.y}`
-    : `${b.x},${b.y}:${a.x},${a.y}`;
-}
-
 interface RouteNode {
   point: Point;
+  xIndex: number;
+  yIndex: number;
   direction: number;
   cost: number;
   score: number;
   previous?: RouteNode;
 }
 
-interface RouteBounds {
-  minX: number;
-  maxX: number;
-  minY: number;
-  maxY: number;
+interface RouteGrid {
+  x: number[];
+  y: number[];
+}
+
+interface RouteInterval {
+  min: number;
+  max: number;
+}
+
+interface RouteSpan extends RouteInterval {
+  horizontal: boolean;
+  lane: number;
+}
+
+interface UsedSegments {
+  horizontal: Map<number, RouteInterval[]>;
+  vertical: Map<number, RouteInterval[]>;
 }
 
 const ROUTE_DIRECTIONS = [{ x: 1, y: 0 }, { x: 0, y: 1 }, { x: -1, y: 0 }, { x: 0, y: -1}];
+/** Bound synchronous work independently of coordinate magnitude and compressed grid size. */
+const MAX_ROUTE_SEARCH_NODES = 20_000;
 
-function collectUsedEdges(occupied: readonly (readonly Point[])[]) {
-  const usedEdges = new Set<string>();
+function routeSpan(from: Point, to: Point): RouteSpan | undefined {
+  if (from.y === to.y && from.x !== to.x) {
+    return { horizontal: true, lane: from.y, min: Math.min(from.x, to.x), max: Math.max(from.x, to.x) };
+  }
+  if (from.x === to.x && from.y !== to.y) {
+    return { horizontal: false, lane: from.x, min: Math.min(from.y, to.y), max: Math.max(from.y, to.y) };
+  }
+  return undefined;
+}
+
+function mergeIntervals(lanes: Map<number, RouteInterval[]>) {
+  for (const [lane, intervals] of lanes) {
+    intervals.sort((a, b) => a.min - b.min);
+    const merged: RouteInterval[] = [];
+    for (const interval of intervals) {
+      const previous = merged.at(-1);
+      if (previous && interval.min <= previous.max) { previous.max = Math.max(previous.max, interval.max); }
+      else { merged.push({ ...interval }); }
+    }
+    lanes.set(lane, merged);
+  }
+}
+
+function collectUsedSegments(occupied: readonly (readonly Point[])[]): UsedSegments {
+  const used: UsedSegments = { horizontal: new Map(), vertical: new Map() };
   for (const route of occupied) {
     for (let index = 0; index < route.length - 1; index += 1) {
       const a = route[index];
       const b = route[index + 1];
       if (!a || !b) { continue; }
-      const dx = Math.sign(b.x - a.x);
-      const dy = Math.sign(b.y - a.y);
-      const length = Math.abs(b.x - a.x) + Math.abs(b.y - a.y);
-      for (let step = 0; step < length; step += 1) {
-        const here = { x: a.x + dx * step, y: a.y + dy * step };
-        const next = { x: here.x + dx, y: here.y + dy };
-        usedEdges.add(edgeKey(here, next));
-      }
+      const span = routeSpan(a, b);
+      if (!span) { continue; }
+      const lanes = span.horizontal ? used.horizontal : used.vertical;
+      const intervals = lanes.get(span.lane) ?? [];
+      intervals.push({ min: span.min, max: span.max });
+      lanes.set(span.lane, intervals);
     }
   }
-  return usedEdges;
+  mergeIntervals(used.horizontal);
+  mergeIntervals(used.vertical);
+  return used;
+}
+
+function intervalOverlaps(intervals: readonly RouteInterval[], interval: RouteInterval): boolean {
+  let low = 0;
+  let high = intervals.length;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if ((intervals[middle]?.max ?? Number.POSITIVE_INFINITY) <= interval.min) { low = middle + 1; }
+    else { high = middle; }
+  }
+  return (intervals[low]?.min ?? Number.POSITIVE_INFINITY) < interval.max;
+}
+
+function spansOverlap(first: RouteSpan | undefined, second: RouteSpan | undefined): boolean {
+  return !!first && !!second && first.horizontal === second.horizontal && first.lane === second.lane &&
+    Math.max(first.min, second.min) < Math.min(first.max, second.max);
+}
+
+function outsideInterval(interval: RouteInterval, excluded: RouteInterval): RouteInterval[] {
+  if (interval.max <= excluded.min || interval.min >= excluded.max) { return [interval]; }
+  const remaining: RouteInterval[] = [];
+  if (interval.min < excluded.min) { remaining.push({ min: interval.min, max: excluded.min }); }
+  if (interval.max > excluded.max) { remaining.push({ min: excluded.max, max: interval.max }); }
+  return remaining;
 }
 
 function edgeConflicts(
@@ -335,22 +389,24 @@ function edgeConflicts(
   end: RouteEnd,
   first: Point,
   last: Point,
-  usedEdges: ReadonlySet<string>,
+  used: UsedSegments,
   from: Point,
   to: Point,
 ) {
-  const dx = Math.sign(to.x - from.x);
-  const dy = Math.sign(to.y - from.y);
-  const length = Math.abs(to.x - from.x) + Math.abs(to.y - from.y);
-  for (let step = 0; step < length; step += 1) {
-    const here = { x: from.x + dx * step, y: from.y + dy * step };
-    const edge = edgeKey(here, { x: here.x + dx, y: here.y + dy });
-    const isTerminalStub =
-      (start.direction && edge === edgeKey(start.point, first)) ||
-      (end.direction && edge === edgeKey(last, end.point));
-    if (usedEdges.has(edge) && !isTerminalStub) { return true; }
+  const span = routeSpan(from, to);
+  if (!span) { return false; }
+  let intervals: RouteInterval[] = [span];
+  const stubs = [
+    start.direction ? routeSpan(start.point, first) : undefined,
+    end.direction ? routeSpan(last, end.point) : undefined,
+  ];
+  for (const lead of stubs) {
+    if (spansOverlap(span, lead) && lead) {
+      intervals = intervals.flatMap((interval) => outsideInterval(interval, lead));
+    }
   }
-  return false;
+  const occupied = (span.horizontal ? used.horizontal : used.vertical).get(span.lane) ?? [];
+  return intervals.some((interval) => intervalOverlaps(occupied, interval));
 }
 
 function routeHasConflict(
@@ -359,21 +415,49 @@ function routeHasConflict(
   end: RouteEnd,
   first: Point,
   last: Point,
-  usedEdges: ReadonlySet<string>,
+  used: UsedSegments,
 ) {
   return route.some((from, index) => {
     const to = route[index + 1];
-    return to ? edgeConflicts(start, end, first, last, usedEdges, from, to) : false;
+    return to ? edgeConflicts(start, end, first, last, used, from, to) : false;
   });
 }
 
-function routeBounds(points: readonly Point[]): RouteBounds {
-  return {
-    minX: Math.min(...points.map((point) => point.x)) - 6,
-    maxX: Math.max(...points.map((point) => point.x)) + 6,
-    minY: Math.min(...points.map((point) => point.y)) - 6,
-    maxY: Math.max(...points.map((point) => point.y)) + 6,
-  };
+function routeGrid(points: readonly Point[]): RouteGrid {
+  const x = new Set<number>();
+  const y = new Set<number>();
+  for (const point of points) {
+    for (const offset of [-1, 0, 1]) {
+      x.add(point.x + offset);
+      y.add(point.y + offset);
+    }
+  }
+  return { x: [...x].sort((a, b) => a - b), y: [...y].sort((a, b) => a - b) };
+}
+
+function pointOnSegment(point: Point, from: Point, to: Point) {
+  return from.x === to.x
+    ? point.x === from.x && point.y >= Math.min(from.y, to.y) && point.y <= Math.max(from.y, to.y)
+    : point.y === from.y && point.x >= Math.min(from.x, to.x) && point.x <= Math.max(from.x, to.x);
+}
+
+function terminalBlocksSegment(end: RouteEnd, from: Point, to: Point) {
+  return !!end.direction && (pointOnSegment(end.point, from, to) ||
+    spansOverlap(routeSpan(end.point, stub(end)), routeSpan(from, to)));
+}
+
+function outwardLead(end: RouteEnd, next: Point | undefined) {
+  return !end.direction || !!next &&
+    (next.x - end.point.x) * end.direction.x + (next.y - end.point.y) * end.direction.y > 0;
+}
+
+function routePreservesTerminals(route: readonly Point[], start: RouteEnd, end: RouteEnd) {
+  if (!outwardLead(start, route[1]) || !outwardLead(end, route.at(-2))) { return false; }
+  return route.every((from, index) => {
+    const to = route[index + 1];
+    return !to || (index === 0 || !terminalBlocksSegment(start, from, to)) &&
+      (index === route.length - 2 || !terminalBlocksSegment(end, from, to));
+  });
 }
 
 function pushRouteNode(heap: RouteNode[], node: RouteNode) {
@@ -418,20 +502,26 @@ function createNextRouteNode(
   direction: number,
   start: RouteEnd,
   end: RouteEnd,
-  bounds: RouteBounds,
-  usedEdges: ReadonlySet<string>,
+  grid: RouteGrid,
+  used: UsedSegments,
   best: Map<string, number>,
 ): RouteNode | undefined {
   const vector = ROUTE_DIRECTIONS[direction] as Point;
-  const point = { x: current.point.x + vector.x, y: current.point.y + vector.y };
-  if (point.x < bounds.minX || point.x > bounds.maxX || point.y < bounds.minY || point.y > bounds.maxY) { return undefined; }
-  if (point.x === start.point.x && point.y === start.point.y && start.direction) { return undefined; }
-  if (point.x === end.point.x && point.y === end.point.y && end.direction) { return undefined; }
-  const cost = current.cost + 10 + (current.direction >= 0 && current.direction !== direction ? 8 : 0)
-    + (usedEdges.has(edgeKey(current.point, point)) ? 10_000 : 0);
+  const xIndex = current.xIndex + vector.x;
+  const yIndex = current.yIndex + vector.y;
+  const x = grid.x[xIndex];
+  const y = grid.y[yIndex];
+  if (x === undefined || y === undefined) { return undefined; }
+  const point = { x, y };
+  if (terminalBlocksSegment(start, current.point, point) || terminalBlocksSegment(end, current.point, point)) { return undefined; }
+  const span = routeSpan(current.point, point);
+  const intervals = span ? (span.horizontal ? used.horizontal : used.vertical).get(span.lane) ?? [] : [];
+  const conflict = span && intervalOverlaps(intervals, span);
+  const cost = current.cost + heuristic(current.point, point) + (current.direction >= 0 && current.direction !== direction ? 8 : 0)
+    + (conflict ? 10_000 : 0);
   if (cost >= (best.get(routeKey(point, direction)) ?? Number.POSITIVE_INFINITY)) { return undefined; }
   best.set(routeKey(point, direction), cost);
-  return { point, direction, cost, score: cost + heuristic(point, end.point), previous: current };
+  return { point, xIndex, yIndex, direction, cost, score: cost + heuristic(point, stub(end)), previous: current };
 }
 
 function restoreRoute(current: RouteNode, start: RouteEnd, end: RouteEnd) {
@@ -446,23 +536,28 @@ function findDetour(
   end: RouteEnd,
   first: Point,
   last: Point,
-  bounds: RouteBounds,
-  usedEdges: ReadonlySet<string>,
+  grid: RouteGrid,
+  used: UsedSegments,
 ): Point[] | undefined {
   const heap: RouteNode[] = [];
   const best = new Map<string, number>();
   const initialDirection = start.direction
     ? ROUTE_DIRECTIONS.findIndex((direction) => direction.x === start.direction?.x && direction.y === start.direction?.y)
     : -1;
-  pushRouteNode(heap, { point: first, direction: initialDirection, cost: 0, score: heuristic(first, last) });
+  pushRouteNode(heap, {
+    point: first, xIndex: grid.x.indexOf(first.x), yIndex: grid.y.indexOf(first.y),
+    direction: initialDirection, cost: 0, score: heuristic(first, last),
+  });
 
-  while (heap.length) {
+  let expanded = 0;
+  while (heap.length && expanded < MAX_ROUTE_SEARCH_NODES) {
+    expanded += 1;
     const current = popRouteNode(heap);
     if (!current) { break; }
     if (current.cost > (best.get(routeKey(current.point, current.direction)) ?? Number.POSITIVE_INFINITY)) { continue; }
     if (current.point.x === last.x && current.point.y === last.y) { return restoreRoute(current, start, end); }
     for (let direction = 0; direction < ROUTE_DIRECTIONS.length; direction += 1) {
-      const next = createNextRouteNode(current, direction, start, end, bounds, usedEdges, best);
+      const next = createNextRouteNode(current, direction, start, end, grid, used, best);
       if (next) { pushRouteNode(heap, next); }
     }
   }
@@ -476,12 +571,21 @@ function routeAroundWires(
   last: Point,
   occupied: readonly (readonly Point[])[],
 ): Point[] {
-  const usedEdges = collectUsedEdges(occupied);
-  const direct = routeWire(start, end);
-  if (!routeHasConflict(direct, start, end, first, last, usedEdges)) { return direct; }
+  const used = collectUsedSegments(occupied);
+  const direct = directWireRoute(start, end, first, last);
+  if (routePreservesTerminals(direct, start, end) && !routeHasConflict(direct, start, end, first, last, used)) { return direct; }
 
-  const points = [start.point, end.point, ...occupied.flat()];
-  return findDetour(start, end, first, last, routeBounds(points), usedEdges) ?? direct;
+  const points = [start.point, end.point, first, last, ...direct];
+  for (const route of occupied) {
+    for (const point of route) { points.push(point); }
+  }
+  const detour = findDetour(start, end, first, last, routeGrid(points), used);
+  if (detour) { return detour; }
+  const bounds = boundsOfPoints(points);
+  return routeAroundBounds(start, end, {
+    minX: bounds.minX - 2, minY: bounds.minY - 2,
+    maxX: bounds.maxX + 2, maxY: bounds.maxY + 2,
+  }, used);
 }
 
 function perimeterDistance(point: Point, rect: GridRect) {
@@ -522,15 +626,18 @@ function routeTiedPins(part: CircuitPart, from: CircuitTerminal, to: CircuitTerm
   const rect = { minX: bounds.minX - 2, maxX: bounds.maxX + 2, minY: bounds.minY - 2, maxY: bounds.maxY + 2 };
   const start = routeEnd(part, from);
   const end = routeEnd(part, to);
+  return routeAroundBounds(start, end, rect, collectUsedSegments(occupied));
+}
+
+function routeAroundBounds(start: RouteEnd, end: RouteEnd, rect: GridRect, used: UsedSegments) {
   const first = outwardBoundary(start, rect);
   const last = outwardBoundary(end, rect);
-  const usedEdges = collectUsedEdges(occupied);
   const clockwise = clockwiseBoundary(first, last, rect);
   const counterclockwise = clockwiseBoundary(last, first, rect).reverse();
   const candidates = [clockwise, counterclockwise].map((middle) => simplify([start.point, ...middle, end.point]));
   const score = (points: Point[]) => points.slice(1).reduce((sum, point, index) =>
     sum + Math.abs(point.x - points[index].x) + Math.abs(point.y - points[index].y), 0)
-    + (routeHasConflict(points, start, end, stub(start), stub(end), usedEdges) ? 10_000 : 0);
+    + (routeHasConflict(points, start, end, stub(start), stub(end), used) ? 10_000 : 0);
   return score(candidates[0]) <= score(candidates[1]) ? candidates[0] : candidates[1];
 }
 
@@ -637,11 +744,16 @@ function routeThroughWaypoints(start: RouteEnd, end: RouteEnd, waypoints: readon
   if (!firstWaypoint || !lastWaypoint) { return routeWire(start, end); }
   const startContinuation = waypoints[1] ?? (end.direction ? stub(end) : end.point);
   const route = terminalLead(start, firstWaypoint, startContinuation);
+  const terminalLeads: Point[][] = [];
+  for (const terminal of [start, end]) {
+    if (terminal.direction) { terminalLeads.push([terminal.point, stub(terminal)]); }
+  }
   let current = firstWaypoint;
   for (const waypoint of waypoints.slice(1)) {
     appendRoute(route, routeWire(
       { point: current, direction: null },
       { point: waypoint, direction: null },
+      terminalLeads,
     ).slice(1));
     current = waypoint;
   }
@@ -653,6 +765,7 @@ function routeThroughWaypoints(start: RouteEnd, end: RouteEnd, waypoints: readon
     appendRoute(route, routeWire(
       { point: current, direction: null },
       end,
+      terminalLeads,
     ).slice(1));
   }
   return simplifyManualRoute(route);
@@ -670,7 +783,7 @@ export function routeDocumentWires(document: CircuitDocument): Map<string, Point
     const end = routeEnd(to, wire.to.terminal);
     const route = wire.waypoints?.length
       ? routeThroughWaypoints(start, end, wire.waypoints)
-      : from.id === to.id && terminalsOf(from.kind).length >= 3
+      : from.id === to.id && terminalsOf(from.kind).length >= 2
         ? routeTiedPins(from, wire.from.terminal, wire.to.terminal, [...routes.values()])
         : routeWire(start, end, [...routes.values()]);
     routes.set(wire.id, route);

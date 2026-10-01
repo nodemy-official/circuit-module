@@ -825,7 +825,7 @@ describe("analyzeCircuit", () => {
     expect(result.parts.battery.voltageVolts).toBeCloseTo(1e-8, 14);
   });
 
-  it("solves unequal parallel batteries and balances source and load power", () => {
+  it("detects the unequal parallel battery short while balancing source and load power", () => {
     const document: CircuitDocument = {
       title: "異なる電池の並列",
       parts: [
@@ -848,7 +848,9 @@ describe("analyzeCircuit", () => {
     const result = analyzeCircuit(document);
     const loadCurrent = 50 / 28;
 
-    expect(result.status).toBe("closed");
+    // The two sources drive a 5V circulating loop through four 1uOhm
+    // conductors. The 4-ohm load does not remove that external short.
+    expect(result.status).toBe("short");
     expect(result.currentAmps).toBeNull();
     expect(result.parts.load.currentAmps).toBeCloseTo(loadCurrent, 5);
     expect(result.parts.strong.currentAmps).toBeCloseTo(-20 / 7, 5);

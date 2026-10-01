@@ -8,6 +8,7 @@ import { CircuitComparisonPanel } from "./CircuitComparisonPanel.js";
 import { CircuitTransientPanel } from "./CircuitTransientPanel.js";
 import { resolveAcFeature, type CircuitLearningFeatures } from "./preview-features.js";
 import { Input, NativeSelect } from "./primitives.js";
+import { useNumericDraft } from "./NumericInput.js";
 
 export type { CircuitLearningFeatures } from "./preview-features.js";
 
@@ -43,6 +44,10 @@ function AnalysisSettings({
 }) {
   const id = useId();
   const acAnalysisSelected = analysis.mode === "ac" || options.mode === "ac";
+  const frequencyInput = useNumericDraft({
+    value: frequency, min: 0, exclusiveMin: true,
+    onValueChange: (value) => onChange({ ...options, mode: "ac", frequencyHz: value }),
+  });
   return <>
     <div className="circuit-panel__heading"><h2>解析の設定</h2></div>
     {acAvailable || !acAnalysisSelected ? <>
@@ -56,10 +61,8 @@ function AnalysisSettings({
     {analysis.mode === "ac" ? <>
       {acAvailable && <>
         <label htmlFor={`${id}-frequency`}>解析周波数 (Hz)</label>
-        <Input id={`${id}-frequency`} type="number" min="0" step="any" value={frequency} onValueChange={(nextValue) => {
-          const value = Number(nextValue);
-          if (Number.isFinite(value) && value > 0) { onChange({ ...options, mode: "ac", frequencyHz: value }); }
-        }} />
+        <Input id={`${id}-frequency`} type="number" min="0" step="any" value={frequencyInput.text}
+          onValueChange={frequencyInput.change} onBlur={frequencyInput.restore} onKeyDown={frequencyInput.keyDown} />
       </>}
       <p>{acAvailable
         ? "計測値は実効値と位相です。解析周波数と異なる交流電源は、この結果では0 Vとして扱います。別の周波数を確認するには解析周波数を変更してください。半導体は直流動作点まわりの小信号として計算します。"

@@ -1,0 +1,122 @@
+// @vitest-environment jsdom
+import { act, useState, type Dispatch, type SetStateAction } from "react";
+import { createRoot, type Root } from "react-dom/client";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { circuitPartCatalog, type CircuitPart, type CircuitPartNumericKey } from "../../circuit-model.js";
+import { CircuitInspector } from "../CircuitInspector.js";
+
+const mounted: Array<{ root: Root; container: HTMLElement }> = [];
+beforeEach(() => vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true));
+afterEach(() => {
+  for (const { root, container } of mounted.splice(0)) {
+    act(() => root.unmount());
+    container.remove();
+  }
+  vi.unstubAllGlobals();
+});
+
+function mount(kind: CircuitPart["kind"]) {
+  const initial: CircuitPart = { id: "part", kind, x: 0, y: 0, ...circuitPartCatalog[kind].defaults };
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  let latest = initial;
+  let replacePart: Dispatch<SetStateAction<CircuitPart>> | undefined;
+  function Harness() {
+    const [part, setPart] = useState(initial);
+    latest = part;
+    replacePart = setPart;
+    return <CircuitInspector part={part} onChange={(_id, patch) => setPart((current) => ({ ...current, ...patch }))} />;
+  }
+  act(() => root.render(<Harness />));
+  mounted.push({ root, container });
+  return {
+    get part() { return latest; },
+    field(key: CircuitPartNumericKey) {
+      const input = container.querySelector<HTMLInputElement>(`input[data-field="${key}"]`);
+      if (!input) { throw new Error(`Missing field ${key}`); }
+      act(() => input.focus());
+      return input;
+    },
+    replace(part: CircuitPart) {
+      const update = replacePart;
+      if (!update) { throw new Error("Missing state setter"); }
+      act(() => update(part));
+    },
+  };
+}
+
+function inputValue(input: HTMLInputElement, value: string) {
+  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+  if (!setter) { throw new Error("Missing input value setter"); }
+  act(() => {
+    setter.call(input, value);
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+}
+
+describe("Inspector numeric drafts", () => {
+  it.each([
+    ["ac-source", "offsetVolts"],
+    ["capacitor", "initialVoltageVolts"],
+    ["current-source", "currentAmps"],
+  ] as const)("keeps the native incomplete state before a negative %s.%s value", (kind, key) => {
+    const ui = mount(kind);
+    const input = ui.field(key);
+    const previous = ui.part[key];
+    // Native number inputs expose an empty value while '-' is being typed.
+    inputValue(input, "");
+    expect(input.value).toBe("");
+    expect(ui.part[key]).toBe(previous);
+    inputValue(input, "-7");
+    expect(input.value).toBe("-7");
+    expect(ui.part[key]).toBe(-7);
+  });
+
+  it("keeps an unfinished exponent and preserves its text until blur", () => {
+    const ui = mount("ac-source");
+    const input = ui.field("offsetVolts");
+    inputValue(input, "1");
+    inputValue(input, "");
+    expect(input.value).toBe("");
+    expect(ui.part.offsetVolts).toBe(1);
+    inputValue(input, "1e-3");
+    expect(input.value).toBe("1e-3");
+    expect(ui.part.offsetVolts).toBe(0.001);
+    act(() => input.blur());
+    expect(input.value).toBe("0.001");
+  });
+
+  it("allows a decimal prefix below the bound without committing an invalid resistance", () => {
+    const ui = mount("resistor");
+    const input = ui.field("resistanceOhms");
+    const previous = ui.part.resistanceOhms;
+    inputValue(input, "0");
+    expect(input.value).toBe("0");
+    expect(ui.part.resistanceOhms).toBe(previous);
+    inputValue(input, "0.1");
+    expect(ui.part.resistanceOhms).toBe(0.1);
+  });
+
+  it("restores an invalid draft on blur and keeps the committed value", () => {
+    const ui = mount("resistor");
+    const input = ui.field("resistanceOhms");
+    const previous = ui.part.resistanceOhms;
+    inputValue(input, "-7");
+    expect(input.value).toBe("-7");
+    expect(ui.part.resistanceOhms).toBe(previous);
+    act(() => input.blur());
+    expect(input.value).toBe(String(previous));
+  });
+
+  it("synchronizes external changes and resets drafts when another part is selected", () => {
+    const ui = mount("ac-source");
+    const input = ui.field("offsetVolts");
+    inputValue(input, "");
+    ui.replace({ ...ui.part, offsetVolts: 42 });
+    expect(input.value).toBe("42");
+    inputValue(input, "");
+    ui.replace({ ...ui.part, id: "other", offsetVolts: 42 });
+    expect(ui.field("offsetVolts").value).toBe("42");
+  });
+});
