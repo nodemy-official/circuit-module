@@ -977,7 +977,7 @@ describe("simulateTransient", () => {
     expect(sample?.parts.resistor?.currentAmps).toBeCloseTo(expectedCurrent, 12);
   });
 
-  it("rejects a time step when the capacitor companion resistance underflows to zero", () => {
+  it("keeps the exact capacitor companion when its resistance projection underflows to zero", () => {
     const document = rcCircuit();
     const capacitor = document.parts.find(({ kind }) => kind === "capacitor");
     if (capacitor?.kind !== "capacitor") { throw new Error("Missing capacitor"); }
@@ -987,8 +987,10 @@ describe("simulateTransient", () => {
       timeStepSeconds: Number.MIN_VALUE,
     });
 
-    expect(result.status).toBe("invalid");
-    expect(result.samples).toHaveLength(1);
+    expect(result.status, result.message).toBe("valid");
+    expect(result.samples).toHaveLength(2);
+    expect(result.samples[1]?.parts.capacitor?.voltageVolts).toBe(0);
+    expect(result.samples[1]?.parts.capacitor?.currentAmps).toBeGreaterThan(0);
   });
 
   it("counts both potentiometer segment currents when bounding solver work", () => {

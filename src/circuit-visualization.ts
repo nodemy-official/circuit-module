@@ -86,7 +86,10 @@ function transientSourceIsActive(part: CircuitPart, sample: TransientAnalysis["s
   if (part.kind !== "capacitor" && part.kind !== "inductor") { return false; }
   if ((finite(reading?.voltageVolts) && reading.voltageVolts !== 0) ||
     (finite(reading?.currentAmps) && reading.currentAmps !== 0)) { return true; }
-  return [reading?.exactVoltage, reading?.exactTerminalCurrents?.a].some((retained) => retainedComplexIsNonzero(retained, expressions));
+  return [
+    { retained: reading?.exactVoltage, scalar: reading?.voltageVolts },
+    { retained: reading?.exactTerminalCurrents?.a, scalar: reading?.terminalCurrents?.a ?? reading?.currentAmps },
+  ].some(({ retained, scalar }) => (!retained?.projection || retained.projection.real === scalar) && retainedComplexIsNonzero(retained, expressions));
 }
 
 function transientConductiveTerminals(
@@ -440,15 +443,15 @@ interface PreciseBranchPair {
 function terminalBranchPhasor(
   reading: CircuitPartReading,
   terminal: CircuitTerminal,
-  resistance: number,
+  resistance: ComplexPotential,
   ac: boolean,
   expressions?: readonly ExactExpressionNode[],
 ): ComplexPotential | undefined {
   const current = reading.terminalCurrents?.[terminal];
   const phaseDegrees = ac ? reading.terminalCurrentPhasesDegrees?.[terminal] : 0;
-  if (!finite(current) || !finite(phaseDegrees) || !Number.isFinite(resistance)) { return; }
+  if (!finite(current) || !finite(phaseDegrees) || !Number.isFinite(resistance.real) || !Number.isFinite(resistance.imaginary)) { return; }
   const value = restoredReadingComplex(reading.exactTerminalCurrents?.[terminal], current, phaseDegrees, ac, expressions) ?? phasor(current, phaseDegrees);
-  const voltage = complexMultiply(value, complex(resistance));
+  const voltage = complexMultiply(value, resistance);
   return Number.isFinite(voltage.real) && Number.isFinite(voltage.imaginary) ? voltage : undefined;
 }
 
@@ -495,7 +498,8 @@ function potentiometerBranchPhasor(
   if (!segment) { return; }
   const position = part.wiperPosition ?? 0.5;
   const totalResistance = part.resistanceOhms ?? 1000;
-  const resistance = totalResistance * (segment.terminal === "a" ? position : 1 - position);
+  const fraction = segment.terminal === "a" ? complex(position) : complexSubtract(complex(1), complex(position));
+  const resistance = complexMultiply(complex(totalResistance), fraction);
   const voltage = terminalBranchPhasor(reading, segment.terminal, resistance, ac, expressions);
   if (!voltage) { return; }
   return segment.reverse ? negativePotential(voltage) : voltage;

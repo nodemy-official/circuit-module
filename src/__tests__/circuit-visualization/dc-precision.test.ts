@@ -26,6 +26,34 @@ function highResistanceCircuit(potentiometer: boolean): CircuitDocument {
 }
 
 describe("DC potential display precision", () => {
+  it("keeps potentiometer segment voltages when segment resistance underflows", () => {
+    const document: CircuitDocument = {
+      title: "Potentiometer with unrepresentable segment resistance",
+      parts: [
+        { id: "v", kind: "battery", label: "V", x: 0, y: 0, voltageVolts: 2 * Number.MIN_VALUE, internalResistanceOhms: 0 },
+        { id: "p", kind: "potentiometer", label: "P", x: 0, y: 0, resistanceOhms: Number.MIN_VALUE, wiperPosition: 0.5 },
+      ],
+      wires: [
+        { id: "a", from: { partId: "v", terminal: "a" }, to: { partId: "p", terminal: "a" } },
+        { id: "b", from: { partId: "v", terminal: "b" }, to: { partId: "p", terminal: "b" } },
+      ],
+    };
+    const original = analyzeCircuit(document);
+    expect(original.status, original.message).toBe("closed");
+    for (const analysis of [original, JSON.parse(JSON.stringify(original)) as typeof original, structuredClone(original)]) {
+      // Exercise the terminal-current fallback used without local differences.
+      analysis.parts.p!.terminalVoltageDifferences = undefined;
+      const nodes = circuitNodes(document, analysis);
+      const node = (terminal: CircuitTerminal) => nodes.find((candidate) => candidate.endpoints.some((endpoint) => endpoint.partId === "p" && endpoint.terminal === terminal));
+      const context = { document, analysis, nodes };
+      // An unloaded midpoint divides the source voltage into equal halves.
+      expect(circuitPotential(node("a"), node("c"), false, context)?.volts).toBe(Number.MIN_VALUE);
+      expect(circuitPotential(node("c"), node("a"), false, context)?.volts).toBe(-Number.MIN_VALUE);
+      expect(circuitPotential(node("b"), node("c"), false, context)?.volts).toBe(-Number.MIN_VALUE);
+      expect(circuitPotential(node("c"), node("b"), false, context)?.volts).toBe(Number.MIN_VALUE);
+    }
+  });
+
   it.each(["dc", "ac"] as const)("subtracts nearly equal %s divider outputs using retained branch values", (mode) => {
     const document: CircuitDocument = {
       title: "Nearly equal divider outputs without a direct measurement branch",

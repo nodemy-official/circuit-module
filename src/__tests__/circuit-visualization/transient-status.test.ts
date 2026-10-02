@@ -6,6 +6,44 @@ import { analyzeCircuit } from "../../circuit-solver.js";
 import { simulateTransient } from "../../transient-solver.js";
 
 describe("transient frame public analysis status", () => {
+  it("ignores retained discharge state after scalar readings are edited to zero", () => {
+    const document: CircuitDocument = {
+      title: "Edited RC discharge readings",
+      parts: [
+        { id: "c", kind: "capacitor", label: "C", x: 0, y: 0, capacitanceFarads: 1, initialVoltageVolts: 1 },
+        { id: "r", kind: "resistor", label: "R", x: 0, y: 0, resistanceOhms: 1 },
+      ],
+      wires: [
+        { id: "a", from: { partId: "c", terminal: "a" }, to: { partId: "r", terminal: "a" } },
+        { id: "b", from: { partId: "c", terminal: "b" }, to: { partId: "r", terminal: "b" } },
+      ],
+    };
+    const original = simulateTransient(document, { durationSeconds: 2, timeStepSeconds: 2 });
+    expect(original.status, original.message).toBe("valid");
+    for (const analysis of [original, JSON.parse(JSON.stringify(original)) as typeof original, structuredClone(original)]) {
+      expect(analysisAtTransientFrame(document, { analysis, sampleIndex: 1 })?.status).toBe("closed");
+      const sample = analysis.samples[1]!;
+      const exactVoltage = sample.parts.c!.exactVoltage;
+      const exactTerminalCurrents = sample.parts.c!.exactTerminalCurrents;
+      expect(exactVoltage?.projection?.real).toBe(1 / 3);
+      expect(exactTerminalCurrents?.a?.projection?.real).toBe(-1 / 3);
+      for (const reading of Object.values(sample.parts)) {
+        reading.voltageVolts = 0;
+        reading.currentAmps = 0;
+        reading.powerWatts = 0;
+        for (const values of [reading.terminalVoltages, reading.terminalCurrents]) {
+          if (!values) { continue; }
+          for (const terminal of ["a", "b", "c"] as const) {
+            if (values[terminal] !== undefined) { values[terminal] = 0; }
+          }
+        }
+      }
+      expect(sample.parts.c!.exactVoltage).toBe(exactVoltage);
+      expect(sample.parts.c!.exactTerminalCurrents).toBe(exactTerminalCurrents);
+      expect(analysisAtTransientFrame(document, { analysis, sampleIndex: 1 })?.status).toBe("idle");
+    }
+  });
+
   it.each([[Number.MIN_VALUE, "closed"], [0, "idle"]] as const)("uses retained discharge state after every displayed value rounds to zero (%s V)", (initialVoltageVolts, expected) => {
     const document: CircuitDocument = {
       title: "Unrepresentable RC discharge state",

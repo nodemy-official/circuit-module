@@ -543,8 +543,53 @@ function finiteWaveformSettings(rms: number, frequency: number, phaseDegrees: nu
 }
 
 function waveformAnchorOffset(offsetDegrees: number): number | null {
-  if (Math.abs(offsetDegrees) < 1e-7) { return 0; }
-  return Math.abs(Math.abs(offsetDegrees) - 45) < 1e-7 ? Math.sign(offsetDegrees) * 45 : null;
+  // Choose the basis from the phase itself, including at t=0. At this
+  // radius the 12-order series remainder is below 1e-70 of the peak;
+  // looking ahead must not change the initial waveform representation.
+  if (Math.abs(offsetDegrees) < 1e-3) { return 0; }
+  return Math.abs(Math.abs(offsetDegrees) - 45) < 1e-3 ? Math.sign(offsetDegrees) * 45 : null;
+}
+
+interface WaveformAnchor { quadrant: number; offsetDegrees: number; }
+
+function sourceWaveformAnchor(part: CircuitPart, timeSeconds: number): WaveformAnchor | null {
+  const frequency = part.frequencyHz ?? DEFAULT_AC_FREQUENCY;
+  const phase = (part.phaseDegrees ?? DEFAULT_AC_PHASE) % 360;
+  const initial = exactTimeQuadrant(frequency, 0, phase);
+  // The initial phase selects the waveform model, independently of sampling.
+  // An ordinary phase uses its binary64 cosine/sine coefficients for the
+  // whole transient. Entering an axis/diagonal neighborhood cannot replace
+  // those coefficients with a differently normalized absolute phase model:
+  // the resulting coefficient error would be amplified by C/dt.
+  if (waveformAnchorOffset(initial.offsetDegrees) === null) { return null; }
+  const combined = timeSeconds === 0 ? initial : exactTimeQuadrant(frequency, timeSeconds, phase);
+  const offsetDegrees = waveformAnchorOffset(combined.offsetDegrees);
+  return offsetDegrees === null ? null : { quadrant: combined.quadrant, offsetDegrees };
+}
+
+function anchoredSourceVoltage(part: CircuitPart, timeSeconds: number, anchor: WaveformAnchor, orderLimit: number, phasePi: ExactRational, quadrantOffset = 0) {
+  const combined = exactTimeQuadrant(part.frequencyHz ?? DEFAULT_AC_FREQUENCY, timeSeconds, (part.phaseDegrees ?? DEFAULT_AC_PHASE) % 360);
+  const degrees = exactProductSumRatio([
+    { factors: [combined.exactOffsetDegrees] },
+    { factors: [90, combined.quadrant - anchor.quadrant] },
+    { factors: [anchor.offsetDegrees], sign: -1 },
+  ], 1)!;
+  const cycle = 360n * degrees.denominator;
+  const reduced = ((degrees.numerator + 180n * degrees.denominator) % cycle + cycle) % cycle - 180n * degrees.denominator;
+  const angle = exactProductSumRatio([{ factors: [{ numerator: reduced, denominator: degrees.denominator }, phasePi] }], 180)!;
+  const rms = part.voltageVolts ?? DEFAULT_AC_RMS;
+  const cosine = quadrantalPeakVoltage(rms, 90 * anchor.quadrant + anchor.offsetDegrees, quadrantOffset);
+  const sine = quadrantalPeakVoltage(rms, 90 * anchor.quadrant + anchor.offsetDegrees, (quadrantOffset + 3) % 4);
+  return exactProductSumRatio([
+    { factors: [part.offsetVolts ?? DEFAULT_AC_OFFSET] }, { factors: [cosine] },
+    { factors: [angleVoltageChange(cosine, sine, angle, orderLimit)] },
+  ], 1)!;
+}
+
+function followingWaveformAnchor(part: CircuitPart, timeSeconds: number, followingTimeSeconds: number | undefined): WaveformAnchor | null {
+  const frequency = part.frequencyHz ?? DEFAULT_AC_FREQUENCY;
+  if (followingTimeSeconds === undefined || Math.abs(frequency * (followingTimeSeconds - timeSeconds)) >= 1e-8) { return null; }
+  return sourceWaveformAnchor(part, followingTimeSeconds);
 }
 
 function sourceWaveformValue(part: CircuitPart, timeSeconds: number, orderLimit = 12, reducedOrder = 0, quadrantOffset = 0, phasePi = DEFAULT_PHASE_PI): ExactRational | null {
@@ -554,22 +599,13 @@ function sourceWaveformValue(part: CircuitPart, timeSeconds: number, orderLimit 
   const offset = part.offsetVolts ?? DEFAULT_AC_OFFSET;
   if (!finiteWaveformSettings(rms, frequency, phaseDegrees, offset, timeSeconds)) { return null; }
   if (rms === 0) { return numberToExactRational(offset); }
+  const anchor = sourceWaveformAnchor(part, timeSeconds);
+  if (anchor !== null) {
+    return anchoredSourceVoltage(part, timeSeconds, anchor, orderLimit, phasePi, quadrantOffset);
+  }
   const turns = frequency * timeSeconds;
   if (timeSeconds !== 0 && Math.abs(turns) < 1e-8) {
     return smallTurnVoltage(part, frequency, timeSeconds, offset, orderLimit, quadrantOffset, phasePi);
-  }
-  const combined = exactTimeQuadrant(frequency, timeSeconds, phaseDegrees);
-  const anchor = waveformAnchorOffset(combined.offsetDegrees);
-  if (anchor !== null) {
-    const cosine = quadrantalPeakVoltage(rms, 90 * combined.quadrant + anchor, quadrantOffset);
-    const sine = quadrantalPeakVoltage(rms, 90 * combined.quadrant + anchor, (quadrantOffset + 3) % 4);
-    const angle = exactProductSumRatio([
-      { factors: [combined.exactOffsetDegrees, phasePi] }, { factors: [anchor, phasePi], sign: -1 },
-    ], 180)!;
-    return exactProductSumRatio([
-      { factors: [offset] }, { factors: [cosine] },
-      { factors: [angleVoltageChange(cosine, sine, angle, orderLimit)] },
-    ], 1)!;
   }
   if (timeSeconds === 0) {
     return exactProductSumRatio([{ factors: [offset] }, {
@@ -603,35 +639,64 @@ function sourceWaveformValue(part: CircuitPart, timeSeconds: number, orderLimit 
   return voltage;
 }
 
-function timeVoltage(part: CircuitPart, timeSeconds: number, orderLimit = 12, reducedOrder = 0, phasePi = DEFAULT_PHASE_PI) {
-  const voltage = sourceWaveformValue(part, timeSeconds, orderLimit, reducedOrder, 0, phasePi);
+function finiteSourceVoltage(voltage: ExactRational | null) {
   return voltage && Number.isFinite(exactRationalToNumber(voltage)) ? voltage : null;
+}
+
+function timeVoltage(part: CircuitPart, timeSeconds: number, orderLimit = 12, reducedOrder = 0, phasePi = DEFAULT_PHASE_PI) {
+  return finiteSourceVoltage(sourceWaveformValue(part, timeSeconds, orderLimit, reducedOrder, 0, phasePi));
 }
 
 function steppedTimeVoltage(part: CircuitPart, timeSeconds: number, orderLimit: number, reducedOrder: number, phasePi: ExactRational, previous?: {
   timeSeconds: number; stepSeconds: number; voltages: ReadonlyMap<string, ExactRational>;
-}) {
-  const previousVoltage = previous?.voltages.get(part.id);
+}, followingTimeSeconds?: number) {
+  const followingAnchor = followingWaveformAnchor(part, timeSeconds, followingTimeSeconds);
   const frequency = part.frequencyHz ?? DEFAULT_AC_FREQUENCY;
+  const previousIsShort = previous && Math.abs(frequency * previous.stepSeconds) < 1e-8;
+  const followingIsShort = followingTimeSeconds !== undefined && Math.abs(frequency * (followingTimeSeconds - timeSeconds)) < 1e-8;
+  if (followingIsShort && !previousIsShort) {
+    // Evaluate both endpoints of a short interval in the same phase basis.
+    // Otherwise an ordinary trig error in the earlier stored voltage becomes
+    // a false C/dt current when the later endpoint returns to an exact axis.
+    if (followingAnchor) {
+      return finiteSourceVoltage(anchoredSourceVoltage(part, timeSeconds, followingAnchor, orderLimit, phasePi));
+    }
+    // Ordinary phases retain their initial coefficients. Only the short
+    // interval boundary needs a precise rotation; regular single-frequency
+    // steps still use the bounded binary64 trig model below.
+    return timeVoltage(part, timeSeconds, orderLimit, Math.max(40, reducedOrder), phasePi);
+  }
+  const previousVoltage = previous?.voltages.get(part.id);
   if (!previous || !previousVoltage || Math.abs(frequency * previous.stepSeconds) >= 1e-8) {
     return timeVoltage(part, timeSeconds, orderLimit, reducedOrder, phasePi);
   }
-  const phaseDegrees = (part.phaseDegrees ?? DEFAULT_AC_PHASE) % 360;
-  const combined = exactTimeQuadrant(frequency, timeSeconds, phaseDegrees);
-  if (waveformAnchorOffset(combined.offsetDegrees) !== null) {
+  const currentAnchor = sourceWaveformAnchor(part, timeSeconds);
+  if (currentAnchor) {
     // Absolute evaluation here retains the exact reduced phase and rational
     // corrections. Reanchor instead of carrying ordinary trig rounding or
     // an increment-series truncation residue into a canceled axis/diagonal.
-    return timeVoltage(part, timeSeconds, orderLimit, reducedOrder, phasePi);
+    const anchoredPrevious = anchoredSourceVoltage(part, previous.timeSeconds, currentAnchor, orderLimit, phasePi);
+    if (anchoredPrevious.numerator * previousVoltage.denominator === previousVoltage.numerator * anchoredPrevious.denominator) {
+      const voltage = anchoredSourceVoltage(part, timeSeconds, currentAnchor, orderLimit, phasePi);
+      return finiteSourceVoltage(voltage);
+    }
   }
   // Small final steps use a voltage increment, avoiding a discontinuity
   // between independently rounded absolute waveform evaluations.
-  const cosine = sourceWaveformValue({ ...part, offsetVolts: 0 }, previous.timeSeconds, orderLimit, reducedOrder, 0, phasePi);
-  const sine = sourceWaveformValue({ ...part, offsetVolts: 0 }, previous.timeSeconds, orderLimit, reducedOrder, 3, phasePi);
+  const anchor = currentAnchor ?? followingAnchor;
+  const withoutOffset = { ...part, offsetVolts: 0 };
+  // At a reduced angle of at most pi/4 the 40-order remainder is <1e-54
+  // of the peak. It does not contaminate a short interval's tiny curvature
+  // with another rounded trig evaluation of the initial phase coefficients.
+  const boundaryOrder = Math.max(40, reducedOrder);
+  const cosine = anchor ? anchoredSourceVoltage(withoutOffset, previous.timeSeconds, anchor, orderLimit, phasePi)
+    : sourceWaveformValue(withoutOffset, previous.timeSeconds, orderLimit, boundaryOrder, 0, phasePi);
+  const sine = anchor ? anchoredSourceVoltage(withoutOffset, previous.timeSeconds, anchor, orderLimit, phasePi, 3)
+    : sourceWaveformValue(withoutOffset, previous.timeSeconds, orderLimit, boundaryOrder, 3, phasePi);
   if (!cosine || !sine) { return null; }
   const change = smallAngleVoltageChange(cosine, sine, frequency, previous.stepSeconds, orderLimit, phasePi);
   const voltage = exactProductSumRatio([{ factors: [previousVoltage] }, { factors: [change] }], 1)!;
-  return Number.isFinite(exactRationalToNumber(voltage)) ? voltage : null;
+  return finiteSourceVoltage(voltage);
 }
 
 function sourceWaveformSettings(document: CircuitDocument) {
@@ -646,13 +711,13 @@ function sourceWaveformSettings(document: CircuitDocument) {
 
 function sourceOverrides(document: CircuitDocument, timeSeconds: number, previous?: {
   timeSeconds: number; stepSeconds: number; voltages: ReadonlyMap<string, ExactRational>;
-}): SourceOverrides | null {
+}, followingTimeSeconds?: number): SourceOverrides | null {
   const overrides = Object.create(null) as Record<string, number>;
   const constraints = new Map<string, InitialVoltageConstraint>();
   const { orderLimit, reducedOrder, phasePi } = sourceWaveformSettings(document);
   for (const part of document.parts) {
     if (part.kind !== "ac-source") { continue; }
-    const voltage = steppedTimeVoltage(part, timeSeconds, orderLimit, reducedOrder, phasePi, previous);
+    const voltage = steppedTimeVoltage(part, timeSeconds, orderLimit, reducedOrder, phasePi, previous, followingTimeSeconds);
     if (voltage === null) { return null; }
     overrides[part.id] = exactRationalToNumber(voltage);
     constraints.set(part.id, { voltageValue: voltage });
@@ -671,6 +736,108 @@ function initialOverrides(
     }
   }
   return overrides;
+}
+
+interface InitialSourceVoltageEdge {
+  node: string;
+  voltage: ExactRational;
+  acSource: boolean;
+}
+
+function initialSourceVoltageGraph(
+  document: CircuitDocument,
+  nodes: EndpointSet,
+  overrides: SourceOverrides,
+) {
+  const adjacency = new Map<string, InitialSourceVoltageEdge[]>();
+  const sourceNodes = new EndpointSet();
+  const dcNodes = new EndpointSet();
+  for (const part of document.parts) {
+    if ((part.kind !== "ac-source" && part.kind !== "battery") || (part.internalResistanceOhms ?? 0) !== 0) { continue; }
+    const voltage = overrides.voltageConstraints.get(part.id)?.voltageValue ??
+      numberToExactRational(part.voltageVolts ?? circuitPartCatalog.battery.defaults.voltageVolts!)!;
+    const a = nodes.find(endpointKey(part.id, "a"));
+    const b = nodes.find(endpointKey(part.id, "b"));
+    const acSource = part.kind === "ac-source" && (part.voltageVolts ?? DEFAULT_AC_RMS) !== 0;
+    if (!acSource) { dcNodes.union(a, b); }
+    // Match the solver's source forest in document order. Redundant source
+    // cycles must not select another independently rounded voltage basis.
+    if (sourceNodes.find(a) === sourceNodes.find(b)) { continue; }
+    sourceNodes.union(a, b);
+    const fromA = adjacency.get(a) ?? [];
+    fromA.push({ node: b, voltage: exactProductSumRatio([{ factors: [voltage], sign: -1 }], 1)!, acSource });
+    adjacency.set(a, fromA);
+    const fromB = adjacency.get(b) ?? [];
+    fromB.push({ node: a, voltage, acSource });
+    adjacency.set(b, fromB);
+  }
+  return { adjacency, dcNodes };
+}
+
+function initialSourceVoltagePotentials(adjacency: ReadonlyMap<string, readonly InitialSourceVoltageEdge[]>) {
+  const potentials = new Map<string, { component: string; voltage: ExactRational }>();
+  for (const root of adjacency.keys()) {
+    if (potentials.has(root)) { continue; }
+    potentials.set(root, { component: root, voltage: numberToExactRational(0)! });
+    const pending = [root];
+    for (const node of pending) {
+      for (const edge of adjacency.get(node) ?? []) {
+        if (potentials.has(edge.node)) { continue; }
+        const voltage = exactProductSumRatio([
+          { factors: [potentials.get(node)!.voltage] }, { factors: [edge.voltage] },
+        ], 1)!;
+        potentials.set(edge.node, { component: root, voltage });
+        pending.push(edge.node);
+      }
+    }
+  }
+  return potentials;
+}
+
+function pathHasAcSource(adjacency: ReadonlyMap<string, readonly InitialSourceVoltageEdge[]>, from: string, to: string) {
+  const visited = new Set([from]);
+  const pending = [{ node: from, acSource: false }];
+  for (const entry of pending) {
+    if (entry.node === to) { return entry.acSource; }
+    for (const edge of adjacency.get(entry.node) ?? []) {
+      if (visited.has(edge.node)) { continue; }
+      visited.add(edge.node);
+      pending.push({ node: edge.node, acSource: entry.acSource || edge.acSource });
+    }
+  }
+  return false;
+}
+
+function alignInitialAcCapacitorVoltages(
+  document: CircuitDocument,
+  switchStates: Record<string, boolean>,
+  overrides: SourceOverrides,
+  constraints: Map<string, InitialVoltageConstraint>,
+  operatingPointState?: StoredState,
+) {
+  // Operating-point histories already have exact values; they are not
+  // rounded user inputs and must retain the usual exact consistency check.
+  if (operatingPointState) { return; }
+  const nodes = createElectricalNodes(document, switchStates);
+  const { adjacency, dcNodes } = initialSourceVoltageGraph(document, nodes, overrides);
+  const potentials = initialSourceVoltagePotentials(adjacency);
+  for (const part of document.parts) {
+    if (part.kind !== "capacitor") { continue; }
+    const aNode = nodes.find(endpointKey(part.id, "a"));
+    const bNode = nodes.find(endpointKey(part.id, "b"));
+    const a = potentials.get(aNode);
+    const b = potentials.get(bNode);
+    if (!a || !b || a.component !== b.component || dcNodes.find(aNode) === dcNodes.find(bNode) ||
+        !pathHasAcSource(adjacency, aNode, bNode)) { continue; }
+    const voltageValue = exactProductSumRatio([{ factors: [a.voltage] }, { factors: [b.voltage], sign: -1 }], 1)!;
+    // The input is binary64, while a source constraint retains its rational
+    // waveform correction. Accept only the identical rounded input value,
+    // then preserve that source value as capacitor history (also for sums
+    // of series sources). A neighboring input remains inconsistent.
+    if (exactRationalToNumber(voltageValue) === (part.initialVoltageVolts ?? DEFAULT_INITIAL_VOLTAGE)) {
+      constraints.set(part.id, { ...constraints.get(part.id), voltageValue });
+    }
+  }
 }
 
 function initialDocument(
@@ -731,7 +898,7 @@ function capacitorStepPart(
   const exactPreviousVoltage = state.exactCapacitorVoltages.get(part.id) ??
     numberToExactRational(previousVoltage);
   const resistance = dt / capacitance;
-  if (!Number.isFinite(resistance) || resistance <= 0 || !Number.isFinite(previousVoltage) ||
+  if (!Number.isFinite(previousVoltage) ||
       !exactPreviousVoltage) { return part; }
 
   // The Thevenin companion keeps the capacitor branch current as an MNA
@@ -745,7 +912,10 @@ function capacitorStepPart(
     historyValue: previousVoltage,
     exactHistoryValue: exactPreviousVoltage,
   });
-  return { ...part, kind: "battery", voltageVolts: 1, internalResistanceOhms: resistance };
+  // The branch equation uses the exact dt and C coefficients above. This
+  // finite placeholder is only for the transformed part's numeric shape.
+  return { ...part, kind: "battery", voltageVolts: 1,
+    internalResistanceOhms: Number.isFinite(resistance) && resistance > 0 ? resistance : 1 };
 }
 
 function inductorStepPart(
@@ -762,7 +932,7 @@ function inductorStepPart(
   const exactPreviousCurrent = state.exactInductorCurrents.get(part.id) ??
     numberToExactRational(previousCurrent);
   const resistance = inductance / dt;
-  if (!Number.isFinite(resistance) || resistance <= 0 || !Number.isFinite(previousCurrent) ||
+  if (!Number.isFinite(previousCurrent) ||
       !exactPreviousCurrent) { return part; }
   // The companion stamps L*I_previous exactly. Its unused Thevenin voltage
   // can overflow even though all physical branch readings remain finite.
@@ -774,7 +944,8 @@ function inductorStepPart(
     historyValue: previousCurrent,
     exactHistoryValue: exactPreviousCurrent,
   });
-  return { ...part, kind: "battery", voltageVolts: 1, internalResistanceOhms: resistance };
+  return { ...part, kind: "battery", voltageVolts: 1,
+    internalResistanceOhms: Number.isFinite(resistance) && resistance > 0 ? resistance : 1 };
 }
 
 function makeStepDocument(document: CircuitDocument, state: StoredState, dt: number): TransformedStep | null {
@@ -1021,6 +1192,7 @@ function initializeTransient(
   for (const [partId, constraint] of overrides.voltageConstraints) {
     initialConstraints.set(partId, { ...initialConstraints.get(partId), ...constraint });
   }
+  alignInitialAcCapacitorVoltages(initialConditionDocument, options.switchStates ?? {}, overrides, initialConstraints, operatingPointState);
   const analysis = solveAnalogStep(initialDocument(initialConditionDocument), {
     mode: "dc",
     switchStates: options.switchStates,
@@ -1064,10 +1236,11 @@ function solveNextStep(
   timeSeconds: number,
   dt: number,
   previousTime: number,
+  followingTimeSeconds?: number,
 ): NextStepResult {
   const transformed = makeStepDocument(document, state, dt);
   if (!transformed) { return { reason: "部品の値が過渡解析で扱える数値範囲を超えています。" }; }
-  const acOverrides = sourceOverrides(document, timeSeconds, { timeSeconds: previousTime, stepSeconds: dt, voltages: state.acSourceVoltages });
+  const acOverrides = sourceOverrides(document, timeSeconds, { timeSeconds: previousTime, stepSeconds: dt, voltages: state.acSourceVoltages }, followingTimeSeconds);
   if (acOverrides === null) { return { reason: `t=${timeSeconds} s の交流電源値を有限な数値で計算できません。` }; }
   const analysis = solveAnalogStep(transformed.document, {
     mode: "dc",
@@ -1108,7 +1281,8 @@ function runSteps(
     if (!Number.isFinite(dt) || dt <= 0) {
       return invalid("時間刻みが数値精度の範囲を下回りました。", issues, samples);
     }
-    const result = solveNextStep(document, options, state, timeSeconds, dt, previousTime);
+    const result = solveNextStep(document, options, state, timeSeconds, dt, previousTime,
+      index < steps ? timeAtStep(index + 1, steps, options) : undefined);
     if (result.analysis) { appendIssues(issues, result.analysis.issues); }
     if (result.reason || !result.sample || !result.state) {
       return invalid(result.reason ?? `t=${timeSeconds} s の波形を計算できませんでした。`, issues, samples);

@@ -763,14 +763,8 @@ export function floorExactRationalSquareRootWithRelativeError(
   if (input.numerator === 0n) { return ZERO; }
   // A non-binary rational root must stay exact too: a floor can otherwise
   // move a later exact binary64 midpoint to the wrong side of its tie.
-  const reduced = canonicalized(input);
-  const numeratorRoot = integerSquareRoot(reduced.numerator);
-  if (numeratorRoot * numeratorRoot === reduced.numerator) {
-    const denominatorRoot = integerSquareRoot(reduced.denominator);
-    if (denominatorRoot * denominatorRoot === reduced.denominator) {
-      return reducedRational(numeratorRoot, denominatorRoot);
-    }
-  }
+  const exactRoot = exactRationalSquareRoot(input);
+  if (exactRoot) { return exactRoot; }
   const rootExponent = Math.floor(floorLog2Ratio(input.numerator, input.denominator) / 2);
   let fractionalBits = Math.max(0, relativeBits - rootExponent, -(absoluteErrorExponent ?? 0));
   const difference = absolute(input.numerator - input.denominator);
@@ -781,6 +775,18 @@ export function floorExactRationalSquareRootWithRelativeError(
     fractionalBits = Math.max(fractionalBits, relativeBits + Math.max(rootExponent, 0) + 2 - gapExponent);
   }
   return floorExactRationalSquareRoot(input, fractionalBits);
+}
+
+/** Returns the exact nonnegative rational root, or null for an irrational root. */
+export function exactRationalSquareRoot(value: ExactRational): ExactRational | null {
+  const input = normalized(value);
+  if (!input || input.numerator < 0n) { return null; }
+  const reduced = canonicalized(input);
+  const numerator = integerSquareRoot(reduced.numerator);
+  if (numerator * numerator !== reduced.numerator) { return null; }
+  const denominator = integerSquareRoot(reduced.denominator);
+  return denominator * denominator === reduced.denominator
+    ? reducedRational(numerator, denominator) : null;
 }
 
 /** Rounds the square root of an exact nonnegative rational to binary64. */

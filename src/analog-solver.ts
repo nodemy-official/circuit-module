@@ -16,7 +16,6 @@ import {
   complexMagnitudeNormalization,
   complexMultiply,
   complexPhaseDegrees,
-  complexRectangularValue,
   complexSubtract,
   exactComponentSum,
   exactDotProductRational,
@@ -32,12 +31,14 @@ import {
   deferExactRationalReduction,
   divideExactRational,
   exactRationalProductToNumber,
+  exactRationalSquareRoot,
   exactRationalSquareRootToNumber,
   exactRationalToNumber,
   isExactComplexLinearSolution,
   multiplyExactRational,
   numberToExactRational,
   roundExactRationalSignificand,
+  solveExactComplexLinearSystem,
   solveExactRealLinearSystem,
   subtractExactRational,
   sumExactRationals,
@@ -188,6 +189,8 @@ interface Branch {
   seriesReactanceOhms?: number;
   exactSeriesReactance?: ExactRational;
   sourceVoltage: ComplexValue;
+  /** Correction class solved separately before superposing a mixed AC response. */
+  acSourceNormalization?: ExactRational;
   /** Exact backward-Euler companion coefficients for transient DC steps. */
   transientCompanion?: TransientCompanionConstraint;
   /** Componentwise allowance for rounding while deriving this source phasor. */
@@ -236,6 +239,8 @@ interface NonlinearModel {
   smallSignalCurrentConnections?: readonly (readonly CircuitTerminal[])[];
   /** Preserve algebraic combinations after each device's approximation boundary. */
   exactCurrents?: readonly ExactRational[];
+  /** Independent device currents before terminal cancellation, for KCL error scaling. */
+  exactCurrentContributions?: readonly (readonly ExactRational[])[];
   exactJacobian?: readonly (readonly ExactRational[])[];
 }
 
@@ -251,6 +256,8 @@ interface DcAssembly {
   matrix: Float64Array;
   residual: Float64Array;
   exactResidual: ExactRational[] | null;
+  /** Absolute KCL contributions before either device or node cancellation. */
+  exactCurrentScales: (ExactRational | null)[];
 }
 
 /** Keep each KCL contribution until cancellation is complete, then round once. */
@@ -1387,22 +1394,20 @@ function diodeCurrentAndSlope(controlVoltage: ResidualTerm, saturationCurrent: n
   const rawExponent = subnormalScale ? (voltage / ideality) / THERMAL_VOLTAGE : voltage / scale;
   const exponential = Math.exp(Math.min(EXPONENT_MAX, rawExponent));
   const exponentialCurrent = saturationCurrent * exponential;
-  const scaledSaturation = subnormalScale
-    ? (saturationCurrent / ideality) / THERMAL_VOLTAGE
-    : saturationCurrent / scale;
-  const exponentialSlope = subnormalScale
-    ? (exponentialCurrent / ideality) / THERMAL_VOLTAGE
-    : exponentialCurrent / scale;
-  // Prefer a normal intermediate; if both are subnormal, use the larger one
-  // so division by a small thermal scale does not amplify avoidable rounding.
-  let slope = Number.isFinite(exponentialCurrent) &&
-    (exponentialCurrent >= 2 ** -1022 || !Number.isFinite(scaledSaturation) || exponentialCurrent >= scaledSaturation)
-    ? exponentialSlope
-    : scaledSaturation * exponential;
+  // exp is the binary64 approximation boundary. Complete Is*exp/(n*Vt)
+  // exactly after it: neither a rounded subnormal product nor Is/(n*Vt)
+  // may lose bits that a later base/load ratio or amplifier makes visible.
+  const exactExponentialSlope = divideExactRational(
+    multiplyExactRational(numberToExactRational(saturationCurrent)!, numberToExactRational(exponential)!),
+    exactScale,
+  )!;
+  let slope = exactRationalToNumber(exactExponentialSlope);
+  let exactSlope = slope > 0 && slope < 2 ** -1022 ? exactExponentialSlope : undefined;
   if (rawExponent < 0 && (exponential < 2 ** -1022 || !Number.isFinite(slope))) {
     // Reverse bias has no conductance floor. Evaluate the combined exponent
     // when exp(V/nVt) underflows before multiplication by Is or division by nVt.
     slope = Math.exp(Math.log(saturationCurrent) - Math.log(ideality) - Math.log(THERMAL_VOLTAGE) + rawExponent);
+    exactSlope = undefined;
   }
   if (rawExponent > EXPONENT_MAX) {
     return {
@@ -1412,12 +1417,13 @@ function diodeCurrentAndSlope(controlVoltage: ResidualTerm, saturationCurrent: n
         ? exponentialCurrent * (1 + rawExponent - EXPONENT_MAX) - saturationCurrent
         : slope * (voltage - scale * (EXPONENT_MAX - 1)) - saturationCurrent,
       slope,
+      ...(exactSlope ? { exactSlope } : {}),
     };
   }
-  return diodeExponentialValues(voltage, rawExponent, saturationCurrent, slope);
+  return diodeExponentialValues(voltage, rawExponent, saturationCurrent, slope, exactSlope);
 }
 
-function diodeExponentialValues(voltage: number, rawExponent: number, saturationCurrent: number, slope: number): DiodeValues {
+function diodeExponentialValues(voltage: number, rawExponent: number, saturationCurrent: number, slope: number, exactSlope?: ExactRational): DiodeValues {
   const currentFactor = Math.expm1(rawExponent);
   const current = voltage === 0 ? 0 : Math.abs(rawExponent) < 2 ** -1022
     ? slope * voltage : saturationCurrent * currentFactor;
@@ -1431,6 +1437,9 @@ function diodeExponentialValues(voltage: number, rawExponent: number, saturation
     current,
     slope,
     ...(exactCurrent ? { exactCurrent } : {}),
+    // Binary64 zero remains an open small-signal path; only a representable,
+    // nonzero subnormal slope carries its unrounded rational into the model.
+    ...(exactSlope ? { exactSlope } : {}),
   };
 }
 
@@ -1520,20 +1529,16 @@ function bjtModel(
 
   const exactSum = (terms: Parameters<typeof exactProductSumRatio>[0]) =>
     exactProductSumRatio(terms, 1);
-  const exactCurrents = [
-    exactSum([
-      { factors: [sign, exactForward] },
-      { factors: [sign, 2, exactReverse], sign: -1 },
-    ]),
-    exactSum([
-      { factors: [sign, exactForwardBase] },
-      { factors: [sign, exactReverse] },
-    ]),
-    exactSum([
-      { factors: [sign, exactForward], sign: -1 },
-      { factors: [sign, exactForwardBase], sign: -1 },
-      { factors: [sign, exactReverse] },
-    ]),
+  const signedForward = sign === 1 ? exactForward : negativeExact(exactForward);
+  const signedReverse = sign === 1 ? exactReverse : negativeExact(exactReverse);
+  const signedForwardBase = sign === 1 ? exactForwardBase : negativeExact(exactForwardBase);
+  // expm1 is an approximation boundary. A floating base balances If/beta
+  // against Ir, leaving a small rounding residual. Its error scale is the
+  // two independent currents, not their already-cancelled terminal sum.
+  const exactCurrentContributions = [
+    [signedForward, multiplyExactRational(numberToExactRational(-2)!, signedReverse)],
+    [signedForwardBase, signedReverse],
+    [negativeExact(signedForward), negativeExact(signedForwardBase), signedReverse],
   ];
   const exactJacobianEntries = [
     exactSum([{ factors: [2, exactReverseSlope] }]),
@@ -1567,9 +1572,9 @@ function bjtModel(
     }
     return resolved;
   };
-  const resolvedCurrents = exactValues(exactCurrents);
+  const resolvedCurrents = exactCurrentContributions.map(sumExactRationals);
   const resolvedJacobian = exactValues(exactJacobianEntries);
-  if (!resolvedCurrents || !resolvedJacobian) {
+  if (!resolvedJacobian) {
     return {
       currents: [Number.NaN, Number.NaN, Number.NaN],
       jacobian: Array.from({ length: 3 }, () => Array.from({ length: 3 }, () => Number.NaN)),
@@ -1596,6 +1601,7 @@ function bjtModel(
       jacobianExact,
     ),
     exactCurrents: resolvedCurrents,
+    exactCurrentContributions,
     exactJacobian: jacobianExact,
   };
 }
@@ -2178,6 +2184,10 @@ function nonlinearModelCurrent(model: NonlinearModel, row: number): ResidualTerm
   return model.exactCurrents?.[row] ?? model.currents[row] ?? 0;
 }
 
+function nonlinearModelCurrentContributions(model: NonlinearModel, row: number): readonly ResidualTerm[] {
+  return model.exactCurrentContributions?.[row] ?? [nonlinearModelCurrent(model, row)];
+}
+
 function nonlinearModelCoefficients(model: NonlinearModel, row: number): readonly ResidualTerm[] {
   return model.exactJacobian?.[row] ?? model.jacobian[row] ?? [];
 }
@@ -2188,6 +2198,7 @@ function stampNonlinear(
   layout: MnaLayout,
   part: CircuitPart,
   model: NonlinearModel,
+  independentCurrentRows: Set<number>,
 ) {
   const terminals = terminalsOf(part.kind);
   const nodes = terminals.map(
@@ -2195,7 +2206,10 @@ function stampNonlinear(
   );
   for (let row = 0; row < terminals.length; row += 1) {
     const rowUnknown = layout.topology.nodeUnknowns[nodes[row] ?? -1] ?? -1;
-    addResidual(residual, rowUnknown, nonlinearModelCurrent(model, row));
+    if (rowUnknown >= 0 && model.exactCurrentContributions) { independentCurrentRows.add(rowUnknown); }
+    for (const current of nonlinearModelCurrentContributions(model, row)) {
+      addResidual(residual, rowUnknown, current);
+    }
     const coefficients = nonlinearModelCoefficients(model, row);
     for (let column = 0; column < terminals.length - 1; column += 1) {
       const columnUnknown = layout.topology.nodeUnknowns[nodes[column] ?? -1] ?? -1;
@@ -2386,6 +2400,7 @@ function stampDcNonlinearPart(
   layout: MnaLayout,
   state: Float64Array,
   part: CircuitPart,
+  independentCurrentRows: Set<number>,
 ) {
   const model = nonlinearModel(part, nonlinearTerminalVoltages(part, layout, state));
   if (!model) { return; }
@@ -2393,7 +2408,7 @@ function stampDcNonlinearPart(
     stampDcOpAmp(matrix, residual, layout, part, model);
     return;
   }
-  stampNonlinear(matrix, residual, layout, part, model);
+  stampNonlinear(matrix, residual, layout, part, model, independentCurrentRows);
 }
 
 interface ReferenceConstraint {
@@ -2796,12 +2811,13 @@ function assembleDc(
 ): DcAssembly {
   const matrix = new Float64Array(layout.size * layout.size);
   const residual: ResidualTerms = Array.from({ length: layout.size }, () => []);
+  const independentCurrentRows = new Set<number>();
 
   for (const part of document.parts) {
     stampDcPassivePart(residual, layout, part);
     const branch = layout.branchByPartId.get(part.id);
     if (branch) { addVoltageBranch(matrix, residual, layout, state, branch); }
-    stampDcNonlinearPart(matrix, residual, layout, state, part);
+    stampDcNonlinearPart(matrix, residual, layout, state, part, independentCurrentRows);
   }
   for (const branch of layout.internalBranches) {
     addVoltageBranch(matrix, residual, layout, state, branch);
@@ -2813,10 +2829,27 @@ function assembleDc(
   const exactResidual = exactResidualTerms.every((value): value is ExactRational => value !== null)
     ? exactResidualTerms
     : null;
+  let exactCurrentScales: (ExactRational | null)[] | undefined;
   return {
     matrix,
     residual: Float64Array.from(exactResidualTerms, (value) => value ? exactRationalToNumber(value) : Number.NaN),
     exactResidual,
+    get exactCurrentScales() {
+      // Exact-zero and linear solves do not need relative KCL tolerances.
+      // Cache scales only when requested, keeping transient history deferred
+      // before taking absolute values as well as summing its contributions.
+      exactCurrentScales ??= residual.slice(0, layout.topology.nodeUnknownCount).map((terms, row) => {
+        // Only a device with independently approximated cancelling currents
+        // needs this additional scale. Other rows keep their existing exact
+        // linearized scale and avoid expanding long transient histories.
+        if (!independentCurrentRows.has(row)) { return null; }
+        const values = terms.map((value) => typeof value === "number" ? numberToExactRational(value) : value);
+        return values.every((value): value is ExactRational => value !== null)
+          ? sumExactRationals(values.map((value) => absoluteExactRational(deferExactRationalReduction(value))))
+          : null;
+      });
+      return exactCurrentScales;
+    },
   };
 }
 
@@ -2978,7 +3011,11 @@ function exactRowTolerance(
     // their exact ratio without reducing the entire sum on every trial.
     equationTerms.push(deferExactRationalReduction(absoluteExactRational(term)));
   }
-  const equationScale = sumExactRationals(equationTerms);
+  const linearizedScale = sumExactRationals(equationTerms);
+  const currentScale = assembly.exactCurrentScales[row];
+  const equationScale = currentScale
+    ? largerNonnegativeRational(linearizedScale, currentScale)
+    : linearizedScale;
   const absoluteResidual = absoluteExactRational(residual);
   const relativeEquationScale = multiplyExactRational(relative, equationScale);
   const relativeResidualScale = multiplyExactRational(relative, absoluteResidual);
@@ -3928,6 +3965,59 @@ function stampAcVoltageBranch(
   setRealStateValue(rhsImaginary, branch.unknownIndex, exactSource?.imaginary ?? branch.sourceVoltage.imaginary);
 }
 
+interface AcSourceResponse {
+  rhsReal: Float64Array;
+  rhsImaginary: Float64Array;
+  normalization: ExactRational;
+}
+
+function acSourceResponses(layout: MnaLayout, rhsReal: Float64Array, rhsImaginary: Float64Array): AcSourceResponse[] {
+  const mixedBranches = layout.branches.filter((branch) => branch.acSourceNormalization);
+  if (mixedBranches.length === 0) { return [{ rhsReal, rhsImaginary, normalization: numberToExactRational(1)! }]; }
+  const responses = [{
+    rhsReal: cloneRealState(rhsReal), rhsImaginary: cloneRealState(rhsImaginary), normalization: numberToExactRational(1)!,
+  }];
+  for (const branch of mixedBranches) {
+    setRealStateValue(responses[0]!.rhsReal, branch.unknownIndex, 0);
+    setRealStateValue(responses[0]!.rhsImaginary, branch.unknownIndex, 0);
+  }
+  for (const branch of mixedBranches) {
+    const normalization = branch.acSourceNormalization!;
+    // Rationally proportional roots belong to the same linear basis too.
+    // Keeping them together preserves compatible redundant voltage loops.
+    const equivalent = responses.map((candidate) => ({ response: candidate,
+      scale: exactRationalSquareRoot(divideExactRational(normalization, candidate.normalization)!),
+    })).find((item) => item.scale !== null);
+    let response = equivalent?.response;
+    if (!response) {
+      response = { rhsReal: new Float64Array(layout.size), rhsImaginary: new Float64Array(layout.size), normalization };
+      responses.push(response);
+    }
+    const scale = equivalent?.scale ?? numberToExactRational(1)!;
+    setRealStateValue(response.rhsReal, branch.unknownIndex, multiplyExactRational(exactRealStateValue(rhsReal, branch.unknownIndex)!, scale));
+    setRealStateValue(response.rhsImaginary, branch.unknownIndex, multiplyExactRational(exactRealStateValue(rhsImaginary, branch.unknownIndex)!, scale));
+  }
+  return responses;
+}
+
+function solveAcSourceResponse(
+  size: number,
+  matrixReal: Float64Array,
+  matrixImaginary: Float64Array,
+  response: AcSourceResponse,
+  mixed: boolean,
+) {
+  if (!mixed) {
+    return solveComplexLinearSystem(size, matrixReal, matrixImaginary, response.rhsReal, response.rhsImaginary);
+  }
+  // An individual contribution may exceed binary64 even when their sum is
+  // finite. Keep mixed-response coefficients exact until superposition.
+  return solveExactComplexLinearSystem(
+    size, exactRealStateInput(matrixReal), exactRealStateInput(matrixImaginary),
+    exactRealStateInput(response.rhsReal), exactRealStateInput(response.rhsImaginary),
+  )?.map(complexFromExact);
+}
+
 function stampAcAdmittance(
   matrixReal: Float64Array,
   matrixImaginary: Float64Array,
@@ -4098,14 +4188,10 @@ function solveAcForLayout(
     stampAcVoltageBranch(matrixReal, matrixImaginary, rhsReal, rhsImaginary, layout, branch);
   }
   const references = referenceConstraints(document, layout, "ac", channelConducting, smallSignalConnections);
-  if (references.length === 0) {
-    // The linear solver already certifies this unchanged physical system.
-    return solveComplexLinearSystem(layout.size, matrixReal, matrixImaginary, rhsReal, rhsImaginary);
-  }
   // A gauge reference replaces a KCL row. It must only remove a redundant
   // equation, never sink a controlled current into a floating island.
-  const physicalMatrixReal = cloneRealState(matrixReal);
-  const physicalMatrixImaginary = cloneRealState(matrixImaginary);
+  const physicalMatrixReal = references.length > 0 ? cloneRealState(matrixReal) : matrixReal;
+  const physicalMatrixImaginary = references.length > 0 ? cloneRealState(matrixImaginary) : matrixImaginary;
   stampAcReferences(
     matrixReal,
     matrixImaginary,
@@ -4115,24 +4201,29 @@ function solveAcForLayout(
     references,
   );
 
-  const solution = solveComplexLinearSystem(
-    layout.size,
-    matrixReal,
-    matrixImaginary,
-    rhsReal,
-    rhsImaginary,
-  );
-  if (!solution) { return null; }
-  const exactSolution = solution.map(exactComplexValue);
-  if (!exactSolution.every((value) => value !== null)) { return null; }
-  return isExactComplexLinearSolution(
-    layout.size,
-    exactRealStateInput(physicalMatrixReal),
-    exactRealStateInput(physicalMatrixImaginary),
-    exactRealStateInput(rhsReal),
-    exactRealStateInput(rhsImaginary),
-    exactSolution,
-  ) ? solution : null;
+  const responses = acSourceResponses(layout, rhsReal, rhsImaginary);
+  let combined = Array.from({ length: layout.size }, () => complex());
+  // Solve rational coefficients before restoring each correction. Combining
+  // expanded square roots in the RHS would erase exact source cancellation.
+  for (const response of responses) {
+    const solution = solveAcSourceResponse(layout.size, matrixReal, matrixImaginary, response, responses.length > 1);
+    if (!solution) { return null; }
+    if (references.length > 0) {
+      const exactSolution = solution.map(exactComplexValue);
+      if (!exactSolution.every((value) => value !== null) || !isExactComplexLinearSolution(
+        layout.size,
+        exactRealStateInput(physicalMatrixReal),
+        exactRealStateInput(physicalMatrixImaginary),
+        exactRealStateInput(response.rhsReal),
+        exactRealStateInput(response.rhsImaginary),
+        exactSolution,
+      )) { return null; }
+    }
+    if (responses.length === 1) { return solution; }
+    combined = combined.map((value, index) => complexAdd(value,
+      withComplexMagnitudeNormalization(solution[index]!, response.normalization)));
+  }
+  return combined;
 }
 
 interface AcReferenceCandidate {
@@ -4715,11 +4806,19 @@ function dcKclQuality(document: CircuitDocument, layout: MnaLayout, state: Float
   const values = Array.from({ length: layout.size }, (_, index) => complexFromRealState(state, index));
   const currentsByNode = Array.from({ length: layout.topology.nodeCount }, () => [] as ComplexValue[]);
   for (const part of document.parts) {
-    const currents = terminalCurrentsForPart(part, layout, layout, values, "dc", undefined, state);
+    const model = isNonlinearPart(part)
+      ? nonlinearModel(part, nonlinearTerminalVoltages(part, layout, state))
+      : null;
+    const currents = model
+      ? terminalsOf(part.kind).map((_, row) => complexFromScalar(nonlinearModelCurrent(model, row)))
+      : terminalCurrentsForPart(part, layout, layout, values, "dc", undefined, state);
     const terminals = terminalsOf(part.kind);
     for (let index = 0; index < terminals.length; index += 1) {
       const node = nodeForTerminal(layout.topology, part, terminals[index] ?? "a");
-      currentsByNode[node]?.push(currents[index] ?? complex());
+      const contributions = model ? nonlinearModelCurrentContributions(model, index) : null;
+      currentsByNode[node]?.push(...(contributions
+        ? contributions.map(complexFromScalar)
+        : [currents[index] ?? complex()]));
     }
     if (part.kind === "op-amp") {
       currentsByNode[layout.physicalReferenceNode]?.push(complexSubtract(complex(), currents[2] ?? complex()));
@@ -6032,7 +6131,11 @@ function prepareMixedAcSources(document: CircuitDocument, layout: MnaLayout, sta
   for (const part of document.parts) {
     if (part.kind !== "ac-source" || normalizations.get(part.id) !== undefined) { continue; }
     const branch = layout.branchByPartId.get(part.id);
-    if (branch) { branch.sourceVoltage = complexRectangularValue(acSourcePhasor(part, frequencyHz)); }
+    if (branch) {
+      const voltage = acSourcePhasor(part, frequencyHz);
+      branch.acSourceNormalization = complexMagnitudeNormalization(voltage);
+      branch.sourceVoltage = voltage;
+    }
   }
 }
 

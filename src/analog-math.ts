@@ -1,9 +1,11 @@
 import {
   addExactComplex,
   addExactRational,
+  deferExactRationalReduction,
   divideExactRational,
   divideExactComplex,
   exactRationalToNumber,
+  exactRationalSquareRoot,
   exactRationalSquareRootToNumber,
   exactRationalMagnitudeExponent,
   floorExactRationalSquareRootWithRelativeError,
@@ -16,6 +18,7 @@ import {
   subtractExactRational,
   sumExactRationals,
   type ExactRational,
+  type ExactComplexValue,
 } from "./exact-linear-algebra.js";
 import {
   complexFromExact,
@@ -33,7 +36,49 @@ export interface ComplexValue {
 export const complex = (real = 0, imaginary = 0): ComplexValue => ({ real, imaginary });
 
 const ONE: ExactRational = { numerator: 1n, denominator: 1n };
+const ZERO: ExactRational = { numerator: 0n, denominator: 1n };
 const magnitudeNormalizations = new WeakMap<ComplexValue, { squared: ExactRational; real: number; imaginary: number }>();
+interface NormalizedTerm {
+  coefficient: ExactComplexValue;
+  squared: ExactRational;
+}
+const normalizedSums = new WeakMap<ComplexValue, { terms: readonly NormalizedTerm[]; real: number; imaginary: number }>();
+interface NormalizedFraction {
+  numerator: readonly NormalizedTerm[];
+  denominator: readonly NormalizedTerm[];
+}
+const normalizedFractions = new WeakMap<ComplexValue, { fraction: NormalizedFraction; real: number; imaginary: number }>();
+
+function storedNormalizedFraction(value: ComplexValue) {
+  const stored = normalizedFractions.get(value);
+  if (stored && Object.is(stored.real, value.real) && Object.is(stored.imaginary, value.imaginary)) { return stored.fraction; }
+  normalizedFractions.delete(value);
+}
+
+function normalizedFraction(value: ComplexValue): NormalizedFraction | null {
+  const stored = storedNormalizedFraction(value);
+  if (stored) { return stored; }
+  const numerator = normalizedTerms(value);
+  return numerator ? { numerator, denominator: [{ coefficient: { real: ONE, imaginary: ZERO }, squared: ONE }] } : null;
+}
+
+function storedNormalizedTerms(value: ComplexValue) {
+  const stored = normalizedSums.get(value);
+  if (stored && Object.is(stored.real, value.real) && Object.is(stored.imaginary, value.imaginary)) { return stored.terms; }
+  normalizedSums.delete(value);
+}
+
+function retainNormalizedTerms(value: ComplexValue, terms: readonly NormalizedTerm[]) {
+  normalizedSums.set(value, { terms, real: value.real, imaginary: value.imaginary });
+  return value;
+}
+
+function normalizedTerms(value: ComplexValue): readonly NormalizedTerm[] | null {
+  const stored = storedNormalizedTerms(value);
+  if (stored) { return stored; }
+  const coefficient = exactComplexValue(value);
+  return coefficient ? [{ coefficient, squared: complexMagnitudeNormalization(value) }] : null;
+}
 
 /** A positive uniform amplitude correction; rectangular coefficients remain approximate. */
 export function complexMagnitudeNormalization(value: ComplexValue): ExactRational {
@@ -50,6 +95,18 @@ export function withComplexMagnitudeNormalization(value: ComplexValue, squared: 
   const result = exact ? complexFromExact(exact) : complex(value.real, value.imaginary);
   if (squared.numerator !== squared.denominator) {
     magnitudeNormalizations.set(result, { squared: addExactRational(squared, { numerator: 0n, denominator: 1n }), real: result.real, imaginary: result.imaginary });
+  }
+  const terms = storedNormalizedTerms(value);
+  if (terms) {
+    const ratio = divideExactRational(squared, complexMagnitudeNormalization(value))!;
+    retainNormalizedTerms(result, terms.map((term) => ({ ...term, squared: multiplyExactRational(term.squared, ratio) })));
+  }
+  const fraction = storedNormalizedFraction(value);
+  if (fraction) {
+    const ratio = divideExactRational(squared, complexMagnitudeNormalization(value))!;
+    normalizedFractions.set(result, { fraction: { ...fraction,
+      numerator: fraction.numerator.map((term) => ({ ...term, squared: multiplyExactRational(term.squared, ratio) })),
+    }, real: result.real, imaginary: result.imaginary });
   }
   return result;
 }
@@ -90,8 +147,275 @@ function componentsAtNormalization(value: ComplexValue, target: ExactRational, s
 
 /** Expands an amplitude correction while preserving its magnitude and departure from one. */
 export function complexRectangularValue(value: ComplexValue): ComplexValue {
+  const fraction = storedNormalizedFraction(value);
+  if (fraction) { return complexFromNormalizedFraction(fraction); }
+  const normalization = complexMagnitudeNormalization(value);
+  const terms = storedNormalizedTerms(value) ?? (normalization.numerator !== normalization.denominator
+    ? normalizedTerms(value) : null);
+  if (terms) { return complexFromNormalizedTerms(terms); }
   const exact = componentsAtNormalization(value, ONE);
   return exact ? complexFromExact(exact) : complex(value.real, value.imaginary);
+}
+
+function scaleExactComplex(value: ExactComplexValue, scale: ExactRational): ExactComplexValue {
+  return { real: multiplyExactRational(value.real, scale), imaginary: multiplyExactRational(value.imaginary, scale) };
+}
+
+/** Combine like radicals before any square-root boundary can erase an identity. */
+function compactNormalizedTerms(terms: readonly NormalizedTerm[]) {
+  const groups: NormalizedTerm[] = [];
+  for (const term of terms) {
+    if (term.coefficient.real.numerator === 0n && term.coefficient.imaginary.numerator === 0n) { continue; }
+    const rationalRoot = exactRationalSquareRoot(term.squared);
+    const next = rationalRoot ? { coefficient: scaleExactComplex(term.coefficient, rationalRoot), squared: ONE } : term;
+    let combined = false;
+    for (const group of groups) {
+      const ratio = divideExactRational(next.squared, group.squared)!;
+      const scale = ratio.numerator === ratio.denominator ? ONE : exactRationalSquareRoot(ratio);
+      if (!scale) { continue; }
+      group.coefficient = addExactComplex(group.coefficient, scaleExactComplex(next.coefficient, scale));
+      combined = true;
+      break;
+    }
+    if (!combined) { groups.push({ ...next }); }
+  }
+  return groups.filter(({ coefficient }) => coefficient.real.numerator !== 0n || coefficient.imaginary.numerator !== 0n);
+}
+
+function binaryRationalPower(exponent: number): ExactRational {
+  return exponent < 0 ? { numerator: 1n, denominator: 2n ** BigInt(-exponent) }
+    : { numerator: 2n ** BigInt(exponent), denominator: 1n };
+}
+
+function absoluteRational(value: ExactRational): ExactRational {
+  return value.numerator < 0n ? { numerator: -value.numerator, denominator: value.denominator } : value;
+}
+
+function componentExpansionAccurate(value: ExactRational, error: ExactRational) {
+  if (error.numerator === 0n) { return true; }
+  if (absoluteRational(value).numerator * error.denominator <= error.numerator * value.denominator * 2n ** 514n) {
+    return false;
+  }
+  // A relative bound alone cannot decide which side of a binary64 midpoint
+  // the exact algebraic value occupies. Refine until the entire enclosure
+  // rounds identically, including values arbitrarily close to a midpoint.
+  // These enclosure endpoints are temporary rounding witnesses. Their exact
+  // ratio is sufficient; reducing both large numerators adds no precision.
+  const retainedValue = deferExactRationalReduction(value);
+  const retainedError = deferExactRationalReduction(error);
+  return Object.is(exactRationalToNumber(subtractExactRational(retainedValue, retainedError)),
+    exactRationalToNumber(addExactRational(retainedValue, retainedError)));
+}
+
+function normalizedTermsErrorExponent(terms: readonly NormalizedTerm[]) {
+  const magnitudeExponents = terms.flatMap(({ coefficient, squared }) => [coefficient.real, coefficient.imaginary]
+    .map((value) => exactRationalMagnitudeExponent(multiplyExactRational(multiplyExactRational(value, value), squared)))
+    .filter((exponent): exponent is number => exponent !== null));
+  return Math.floor(Math.max(...magnitudeExponents) / 2) - 516 - Math.ceil(Math.log2(terms.length));
+}
+
+function normalizedTermsBounds(terms: readonly NormalizedTerm[], errorExponent: number) {
+  let real = ZERO;
+  let imaginary = ZERO;
+  let realError = ZERO;
+  let imaginaryError = ZERO;
+  for (const { coefficient, squared } of terms) {
+    const coefficientExponent = Math.max(exactRationalMagnitudeExponent(coefficient.real) ?? Number.NEGATIVE_INFINITY,
+      exactRationalMagnitudeExponent(coefficient.imaginary) ?? Number.NEGATIVE_INFINITY);
+    const rootErrorExponent = errorExponent - coefficientExponent - 2;
+    const root = floorExactRationalSquareRootWithRelativeError(squared, 512, rootErrorExponent)!;
+    const exact = multiplyExactRational(root, root);
+    const error = exact.numerator * squared.denominator === squared.numerator * exact.denominator
+      ? ZERO : binaryRationalPower(rootErrorExponent);
+    real = addExactRational(real, multiplyExactRational(coefficient.real, root));
+    imaginary = addExactRational(imaginary, multiplyExactRational(coefficient.imaginary, root));
+    realError = addExactRational(realError, multiplyExactRational(absoluteRational(coefficient.real), error));
+    imaginaryError = addExactRational(imaginaryError, multiplyExactRational(absoluteRational(coefficient.imaginary), error));
+  }
+  return { real, imaginary, realError, imaginaryError };
+}
+
+function expandNormalizedTerms(terms: readonly NormalizedTerm[]): ComplexValue {
+  let errorExponent = normalizedTermsErrorExponent(terms);
+  for (;;) {
+    const { real, imaginary, realError, imaginaryError } = normalizedTermsBounds(terms, errorExponent);
+    if (componentExpansionAccurate(real, realError) && componentExpansionAccurate(imaginary, imaginaryError)) {
+      return complexFromExact({ real, imaginary });
+    }
+    // Distinct rational square-root classes are linearly independent. Exact
+    // zero coefficients were combined first, so every remaining component
+    // with a nonzero error enclosure can be resolved by further refinement.
+    const resultExponent = Math.min(exactRationalMagnitudeExponent(real) ?? errorExponent,
+      exactRationalMagnitudeExponent(imaginary) ?? errorExponent);
+    errorExponent = Math.min(errorExponent - 64, resultExponent - 516);
+  }
+}
+
+function complexFromNormalizedTerms(input: readonly NormalizedTerm[], target = ONE): ComplexValue {
+  const terms = compactNormalizedTerms(input);
+  if (terms.length === 0) { return complex(); }
+  const first = terms[0]!;
+  if (terms.length === 1) {
+    const value = withComplexMagnitudeNormalization(complexFromExact(first.coefficient), first.squared);
+    const sameNormalization = first.squared.numerator * target.denominator === target.numerator * first.squared.denominator;
+    const exact = sameNormalization ? exactComplexValue(value)! : exactComplexValue(expandNormalizedTerms([
+      { ...first, squared: divideExactRational(first.squared, target)! },
+    ]))!;
+    const result = withComplexMagnitudeNormalization(complexFromExact(exact), target);
+    return sameNormalization ? result : retainNormalizedTerms(result, terms);
+  }
+  const coordinates = terms.map((term) => ({ ...term, squared: divideExactRational(term.squared, target)! }));
+  const expanded = expandNormalizedTerms(coordinates);
+  const result = withComplexMagnitudeNormalization(expanded, target);
+  return retainNormalizedTerms(result, terms);
+}
+
+function multiplyNormalizedTerms(left: readonly NormalizedTerm[], right: readonly NormalizedTerm[]) {
+  return compactNormalizedTerms(left.flatMap((a) => right.map((b) => ({
+    coefficient: multiplyExactComplex(a.coefficient, b.coefficient), squared: multiplyExactRational(a.squared, b.squared),
+  }))));
+}
+
+function conjugateNormalizedTerms(terms: readonly NormalizedTerm[]) {
+  return terms.map((term) => ({ ...term,
+    coefficient: { real: term.coefficient.real, imaginary: subtractExactRational(ZERO, term.coefficient.imaginary) },
+  }));
+}
+
+/** Detect zero and rational components before interval refinement, including exact midpoint ties. */
+function proportionalNormalizedComponent(numerator: readonly NormalizedTerm[], denominator: readonly NormalizedTerm[], component: keyof ExactComplexValue) {
+  const nonzero = numerator.filter((term) => term.coefficient[component].numerator !== 0n);
+  if (nonzero.length === 0) { return ZERO; }
+  if (nonzero.length !== denominator.length) { return null; }
+  const first = denominator[0]!;
+  let coefficient = ZERO;
+  for (const term of numerator) {
+    const scale = exactRationalSquareRoot(divideExactRational(term.squared, first.squared)!);
+    if (scale) { coefficient = addExactRational(coefficient, multiplyExactRational(term.coefficient[component], scale)); }
+  }
+  const ratio = divideExactRational(coefficient, first.coefficient.real)!;
+  return nonzero.every((term) => denominator.some((divisor) => {
+    const scale = exactRationalSquareRoot(divideExactRational(term.squared, divisor.squared)!);
+    return scale && compareExactRationals(multiplyExactRational(term.coefficient[component], scale),
+      multiplyExactRational(ratio, divisor.coefficient.real)) === 0;
+  })) ? ratio : null;
+}
+
+function proportionalNormalizedFraction(numerator: readonly NormalizedTerm[], denominator: readonly NormalizedTerm[]) {
+  if (numerator.length !== denominator.length) { return null; }
+  const first = denominator[0]!;
+  for (const term of numerator) {
+    const scale = exactRationalSquareRoot(divideExactRational(term.squared, first.squared)!);
+    if (!scale) { continue; }
+    const ratio = divideExactComplex(scaleExactComplex(term.coefficient, scale), first.coefficient)!;
+    return numerator.every((a) => denominator.some((b) => {
+      const factor = exactRationalSquareRoot(divideExactRational(a.squared, b.squared)!);
+      if (!factor) { return false; }
+      const difference = subtractExactComplex(scaleExactComplex(a.coefficient, factor), multiplyExactComplex(ratio, b.coefficient));
+      return difference.real.numerator === 0n && difference.imaginary.numerator === 0n;
+    })) ? ratio : null;
+  }
+  return null;
+}
+
+function compareExactRationals(left: ExactRational, right: ExactRational) {
+  const difference = left.numerator * right.denominator - right.numerator * left.denominator;
+  return difference < 0n ? -1 : difference > 0n ? 1 : 0;
+}
+
+function quotientComponentBounds(value: ExactRational, error: ExactRational, lowerDenominator: ExactRational, upperDenominator: ExactRational) {
+  const endpoints = [subtractExactRational(value, error), addExactRational(value, error)]
+    .flatMap((endpoint) => [lowerDenominator, upperDenominator].map((divisor) => divideExactRational(endpoint, divisor)!));
+  endpoints.sort(compareExactRationals);
+  const lower = endpoints[0]!;
+  const upper = endpoints[3]!;
+  return { value: divideExactRational(addExactRational(lower, upper), { numerator: 2n, denominator: 1n })!,
+    error: divideExactRational(subtractExactRational(upper, lower), { numerator: 2n, denominator: 1n })! };
+}
+
+function expandNormalizedFraction(fraction: NormalizedFraction, target: ExactRational) {
+  const coordinates = fraction.numerator.map((term) => ({ ...term, squared: divideExactRational(term.squared, target)! }));
+  const rationalReal = proportionalNormalizedComponent(coordinates, fraction.denominator, "real");
+  const rationalImaginary = proportionalNormalizedComponent(coordinates, fraction.denominator, "imaginary");
+  let errorExponent = Math.min(normalizedTermsErrorExponent(coordinates), normalizedTermsErrorExponent(fraction.denominator));
+  for (;;) {
+    const numerator = normalizedTermsBounds(coordinates, errorExponent);
+    const denominator = normalizedTermsBounds(fraction.denominator, errorExponent);
+    const lower = subtractExactRational(denominator.real, denominator.realError);
+    const upper = addExactRational(denominator.real, denominator.realError);
+    if (lower.numerator > 0n) {
+      const real = rationalReal ? { value: rationalReal, error: ZERO }
+        : quotientComponentBounds(numerator.real, numerator.realError, lower, upper);
+      const imaginary = rationalImaginary ? { value: rationalImaginary, error: ZERO }
+        : quotientComponentBounds(numerator.imaginary, numerator.imaginaryError, lower, upper);
+      if (componentExpansionAccurate(real.value, real.error) && componentExpansionAccurate(imaginary.value, imaginary.error)) {
+        return complexFromExact({ real: real.value, imaginary: imaginary.value });
+      }
+    }
+    // Nonproportional square-root sums cannot equal a rational midpoint.
+    // After exact cancellation, a positive denominator and unique binary64
+    // rounding are therefore certified by arbitrarily fine root enclosures.
+    errorExponent = Math.min(errorExponent - 64,
+      (exactRationalMagnitudeExponent(denominator.real) ?? errorExponent) - 516,
+      (exactRationalMagnitudeExponent(numerator.real) ?? errorExponent) - 516,
+      (exactRationalMagnitudeExponent(numerator.imaginary) ?? errorExponent) - 516);
+  }
+}
+
+function complexFromNormalizedFraction(input: NormalizedFraction, target = ONE): ComplexValue {
+  const numerator = compactNormalizedTerms(input.numerator);
+  const denominator = compactNormalizedTerms(input.denominator);
+  if (denominator.length === 0) { return complex(Number.NaN, Number.NaN); }
+  if (numerator.length === 0) { return complexFromNormalizedTerms([], target); }
+  if (denominator.length === 1) {
+    const divisor = denominator[0]!;
+    return complexFromNormalizedTerms(numerator.map((term) => ({
+      coefficient: divideExactComplex(term.coefficient, divisor.coefficient)!,
+      squared: divideExactRational(term.squared, divisor.squared)!,
+    })), target);
+  }
+  const proportional = proportionalNormalizedFraction(numerator, denominator);
+  if (proportional) { return complexFromNormalizedTerms([{ coefficient: proportional, squared: ONE }], target); }
+  // Keep the original compact fraction. Conjugation is only needed to certify
+  // its rectangular projection, without repeatedly squaring the stored term count.
+  const conjugate = conjugateNormalizedTerms(denominator);
+  const realFraction = { numerator: multiplyNormalizedTerms(numerator, conjugate),
+    denominator: multiplyNormalizedTerms(denominator, conjugate) };
+  const real = proportionalNormalizedComponent(realFraction.numerator, realFraction.denominator, "real");
+  const imaginary = proportionalNormalizedComponent(realFraction.numerator, realFraction.denominator, "imaginary");
+  if (real && imaginary) {
+    return complexFromNormalizedTerms([{ coefficient: { real, imaginary }, squared: ONE }], target);
+  }
+  const fraction = { numerator, denominator };
+  const result = withComplexMagnitudeNormalization(expandNormalizedFraction(realFraction, target), target);
+  normalizedFractions.set(result, { fraction, real: result.real, imaginary: result.imaginary });
+  return result;
+}
+
+function combineNormalizedFractions(left: ComplexValue, right: ComplexValue, subtract: boolean) {
+  if (!storedNormalizedFraction(left) && !storedNormalizedFraction(right)) { return null; }
+  const first = normalizedFraction(left);
+  const second = normalizedFraction(right);
+  if (!first || !second) { return null; }
+  const otherNumerator = multiplyNormalizedTerms(second.numerator, first.denominator);
+  return complexFromNormalizedFraction({
+    numerator: [...multiplyNormalizedTerms(first.numerator, second.denominator), ...otherNumerator.map((term) => subtract
+      ? { ...term, coefficient: scaleExactComplex(term.coefficient, { numerator: -1n, denominator: 1n }) } : term)],
+    denominator: multiplyNormalizedTerms(first.denominator, second.denominator),
+  }, sumMagnitudeNormalization(left, right));
+}
+
+function combineNormalizedTerms(left: ComplexValue, right: ComplexValue, subtract: boolean): ComplexValue | null {
+  if (!storedNormalizedTerms(left) && !storedNormalizedTerms(right)) {
+    const first = complexMagnitudeNormalization(left);
+    const second = complexMagnitudeNormalization(right);
+    if (first.numerator * second.denominator === second.numerator * first.denominator) { return null; }
+  }
+  const first = normalizedTerms(left);
+  const second = normalizedTerms(right);
+  return first && second ? complexFromNormalizedTerms([...first, ...second.map((term) => subtract
+    ? { ...term, coefficient: scaleExactComplex(term.coefficient, { numerator: -1n, denominator: 1n }) } : term)],
+    sumMagnitudeNormalization(left, right)) : null;
 }
 
 function componentSumMagnitudeBound(
@@ -266,33 +590,44 @@ export function scaledProduct(values: readonly number[]): number {
   return floatFromExactUnits(product, -1074 * values.length);
 }
 
-export const complexAdd = (left: ComplexValue, right: ComplexValue): ComplexValue => {
+function addExpandedComplexValues(left: ComplexValue, right: ComplexValue, subtract: boolean): ComplexValue {
   const normalization = sumMagnitudeNormalization(left, right);
-  const bounds = mixedNormalizationSumBounds(left, right, false);
+  const bounds = mixedNormalizationSumBounds(left, right, subtract);
   const exactLeft = componentsAtNormalization(left, normalization, bounds?.errorExponent);
   const exactRight = componentsAtNormalization(right, normalization, bounds?.errorExponent);
-  const sum = exactLeft && exactRight ? addExactComplex(exactLeft, exactRight) : null;
+  const sum = exactLeft && exactRight ? (subtract ? subtractExactComplex : addExactComplex)(exactLeft, exactRight) : null;
   const result = sum
     ? complexFromExact({ real: bounds?.real.zero ? { numerator: 0n, denominator: 1n } : sum.real,
       imaginary: bounds?.imaginary.zero ? { numerator: 0n, denominator: 1n } : sum.imaginary })
-    : complex(left.real + right.real, left.imaginary + right.imaginary);
+    : complex(left.real + (subtract ? -right.real : right.real), left.imaginary + (subtract ? -right.imaginary : right.imaginary));
   return withComplexMagnitudeNormalization(result, normalization);
-};
+}
 
-export const complexSubtract = (left: ComplexValue, right: ComplexValue): ComplexValue => {
-  const normalization = sumMagnitudeNormalization(left, right);
-  const bounds = mixedNormalizationSumBounds(left, right, true);
-  const exactLeft = componentsAtNormalization(left, normalization, bounds?.errorExponent);
-  const exactRight = componentsAtNormalization(right, normalization, bounds?.errorExponent);
-  const difference = exactLeft && exactRight ? subtractExactComplex(exactLeft, exactRight) : null;
-  const result = difference
-    ? complexFromExact({ real: bounds?.real.zero ? { numerator: 0n, denominator: 1n } : difference.real,
-      imaginary: bounds?.imaginary.zero ? { numerator: 0n, denominator: 1n } : difference.imaginary })
-    : complex(left.real - right.real, left.imaginary - right.imaginary);
-  return withComplexMagnitudeNormalization(result, normalization);
-};
+export const complexAdd = (left: ComplexValue, right: ComplexValue): ComplexValue =>
+  combineNormalizedFractions(left, right, false) ?? combineNormalizedTerms(left, right, false) ?? addExpandedComplexValues(left, right, false);
+
+export const complexSubtract = (left: ComplexValue, right: ComplexValue): ComplexValue =>
+  combineNormalizedFractions(left, right, true) ?? combineNormalizedTerms(left, right, true) ?? addExpandedComplexValues(left, right, true);
 
 export const complexMultiply = (left: ComplexValue, right: ComplexValue): ComplexValue => {
+  if (storedNormalizedFraction(left) || storedNormalizedFraction(right)) {
+    const first = normalizedFraction(left);
+    const second = normalizedFraction(right);
+    if (first && second) {
+      return complexFromNormalizedFraction({ numerator: multiplyNormalizedTerms(first.numerator, second.numerator),
+        denominator: multiplyNormalizedTerms(first.denominator, second.denominator),
+      }, multiplyExactRational(complexMagnitudeNormalization(left), complexMagnitudeNormalization(right)));
+    }
+  }
+  if (storedNormalizedTerms(left) || storedNormalizedTerms(right)) {
+    const first = normalizedTerms(left);
+    const second = normalizedTerms(right);
+    if (first && second) {
+      return complexFromNormalizedTerms(first.flatMap((a) => second.map((b) => ({
+        coefficient: multiplyExactComplex(a.coefficient, b.coefficient), squared: multiplyExactRational(a.squared, b.squared),
+      }))), multiplyExactRational(complexMagnitudeNormalization(left), complexMagnitudeNormalization(right)));
+    }
+  }
   const exactLeft = exactComplexValue(left);
   const exactRight = exactComplexValue(right);
   const result = exactLeft && exactRight
@@ -306,6 +641,28 @@ export const complexMultiply = (left: ComplexValue, right: ComplexValue): Comple
 
 /** Divides finite complex inputs exactly before rounding the two output components. */
 export const complexDivide = (left: ComplexValue, right: ComplexValue): ComplexValue => {
+  if (storedNormalizedFraction(left) || storedNormalizedFraction(right) || storedNormalizedTerms(right)) {
+    const first = normalizedFraction(left);
+    const second = normalizedFraction(right);
+    if (first && second) {
+      return complexFromNormalizedFraction({
+        numerator: multiplyNormalizedTerms(first.numerator, second.denominator),
+        denominator: multiplyNormalizedTerms(first.denominator, second.numerator),
+      }, divideExactRational(complexMagnitudeNormalization(left), complexMagnitudeNormalization(right))!);
+    }
+  }
+  const terms = storedNormalizedTerms(left);
+  if (terms && !storedNormalizedTerms(right)) {
+    const divisor = exactComplexValue(right);
+    const normalization = complexMagnitudeNormalization(right);
+    if (divisor) {
+      const divided = terms.map((term) => ({ coefficient: divideExactComplex(term.coefficient, divisor),
+        squared: divideExactRational(term.squared, normalization)! }));
+      if (divided.every((term): term is NormalizedTerm => term.coefficient !== null)) {
+        return complexFromNormalizedTerms(divided, divideExactRational(complexMagnitudeNormalization(left), normalization)!);
+      }
+    }
+  }
   const exactLeft = exactComplexValue(left);
   const exactRight = exactComplexValue(right);
   if (!exactLeft || !exactRight) {
@@ -317,6 +674,16 @@ export const complexDivide = (left: ComplexValue, right: ComplexValue): ComplexV
 };
 
 export const complexConjugate = (value: ComplexValue): ComplexValue => {
+  const fraction = storedNormalizedFraction(value);
+  if (fraction) {
+    return complexFromNormalizedFraction({ numerator: conjugateNormalizedTerms(fraction.numerator),
+      denominator: conjugateNormalizedTerms(fraction.denominator) },
+      complexMagnitudeNormalization(value));
+  }
+  const terms = storedNormalizedTerms(value);
+  if (terms) { return complexFromNormalizedTerms(terms.map((term) => ({ ...term,
+    coefficient: { real: term.coefficient.real, imaginary: subtractExactRational(ZERO, term.coefficient.imaginary) },
+  })), complexMagnitudeNormalization(value)); }
   const exact = exactComplexValue(value);
   const result = exact ? complexFromExact({
     real: exact.real,
@@ -325,7 +692,36 @@ export const complexConjugate = (value: ComplexValue): ComplexValue => {
   return withComplexMagnitudeNormalization(result, complexMagnitudeNormalization(value));
 };
 
+function normalizedFractionMagnitude(fraction: NormalizedFraction): number {
+  if (fraction.numerator.length === 0) { return 0; }
+  const numerator = multiplyNormalizedTerms(fraction.numerator, conjugateNormalizedTerms(fraction.numerator));
+  const denominator = multiplyNormalizedTerms(fraction.denominator, conjugateNormalizedTerms(fraction.denominator));
+  const rationalSquared = proportionalNormalizedComponent(numerator, denominator, "real");
+  if (rationalSquared) { return exactRationalSquareRootToNumber(rationalSquared); }
+  let errorExponent = Math.min(normalizedTermsErrorExponent(numerator), normalizedTermsErrorExponent(denominator));
+  for (;;) {
+    const top = normalizedTermsBounds(numerator, errorExponent);
+    const bottom = normalizedTermsBounds(denominator, errorExponent);
+    const lowerDenominator = subtractExactRational(bottom.real, bottom.realError);
+    if (lowerDenominator.numerator > 0n) {
+      const squared = quotientComponentBounds(top.real, top.realError, lowerDenominator,
+        addExactRational(bottom.real, bottom.realError));
+      const lower = subtractExactRational(squared.value, squared.error);
+      const upper = addExactRational(squared.value, squared.error);
+      const lowerMagnitude = exactRationalSquareRootToNumber(lower.numerator > 0n ? lower : ZERO);
+      const upperMagnitude = exactRationalSquareRootToNumber(upper);
+      if (Object.is(lowerMagnitude, upperMagnitude)) { return lowerMagnitude; }
+    }
+    // A rational midpoint squared was detected above. Every other positive
+    // algebraic magnitude has a unique rounded result after refinement.
+    errorExponent -= 64;
+  }
+}
+
 export function complexMagnitude(value: ComplexValue) {
+  if (storedNormalizedTerms(value) || storedNormalizedFraction(value)) {
+    return normalizedFractionMagnitude(normalizedFraction(value)!);
+  }
   const exact = exactComplexValue(value);
   if (!exact) { return Math.hypot(value.real, value.imaginary); }
   const normalization = complexMagnitudeNormalization(value);
