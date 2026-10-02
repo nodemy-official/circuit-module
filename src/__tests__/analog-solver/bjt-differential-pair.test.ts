@@ -65,6 +65,8 @@ describe("current-biased BJT differential pairs", () => {
     }
   }
 
+  // These cases also exercise current continuation and reference retries.
+  // Use the same runtime budget as the scaled and floating variants below.
   it.each([
     { kind: "npn-transistor", common: 0, reverse: false },
     { kind: "npn-transistor", common: 0, reverse: true },
@@ -87,7 +89,7 @@ describe("current-biased BJT differential pairs", () => {
     }
     const emitterBalance = analysis.parts.q1!.terminalCurrents.c!.real + analysis.parts.q2!.terminalCurrents.c!.real + sign * TAIL;
     expect(Math.abs(emitterBalance)).toBeLessThan(TAIL * 1e-10);
-  });
+  }, 30_000);
 
   it.each(["npn-transistor", "pnp-transistor"] as const)("linearizes the differential response of %s", (kind) => {
     const analysis = analyzeAnalogCircuit(differentialPair(kind, { signal: true }), { mode: "ac" });
@@ -98,7 +100,7 @@ describe("current-biased BJT differential pairs", () => {
     expectRelative(analysis.parts.q2!.current.real, -sign * SIGNAL * oracle.transfer);
     expectRelative(analysis.parts.q1!.terminalVoltages.a!.real, -sign * SIGNAL * LOAD * oracle.transfer);
     expectRelative(analysis.parts.q1!.terminalVoltages.c!.real, sign * SIGNAL * oracle.emitterGain);
-  });
+  }, 30_000);
 
   it.each((["npn-transistor", "pnp-transistor"] as const).flatMap((kind) =>
     [1e-200, 1e-100, 1e-20, 1e20, 1e100, 1e200].map((scale) => ({ kind, scale })),

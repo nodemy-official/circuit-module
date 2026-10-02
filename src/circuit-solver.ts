@@ -89,6 +89,7 @@ export interface CircuitAnalysis {
   /** Magnitude of current at the only independent source; null for multiple sources or unsolved circuits. */
   currentAmps: number | null;
   message: string;
+  /** Absorbed power for every solved bulb, including open, idle, and shorted circuits. */
   bulbPowerWatts: Record<string, number>;
   parts: Record<string, CircuitPartReading>;
   /** Signed current from → to. Only the legacy DC solver supplies wire-current estimates. */
@@ -3341,7 +3342,18 @@ function analyzeCircuitFromInput(
   }
   const issues = collectIssues(normalizedDocument, parts);
   const batteries = normalizedDocument.parts.filter((part) => part.kind === "battery");
-  const readings = { parts, wireCurrents, issues };
+  const only = batteries.length === 1 ? batteries[0] : undefined;
+  const readings = {
+    parts,
+    wireCurrents,
+    issues,
+    bulbPowerWatts: Object.fromEntries(
+      normalizedDocument.parts
+        .filter((part) => part.kind === "bulb")
+        .map((part) => [part.id, parts[part.id]?.powerWatts ?? 0]),
+    ),
+    currentAmps: only ? Math.abs(parts[only.id]?.currentAmps ?? 0) : null,
+  };
   if (batteries.length === 0) { return result("idle", "電池を置くと電流を計算します。", readings); }
   const shorted = shortedBattery(normalizedDocument, batteries, solved, index, conductances, switchStates);
   if (shorted) {
@@ -3366,17 +3378,7 @@ function analyzeCircuitFromInput(
       currentAmps: batteries.length === 1 ? 0 : null,
     });
   }
-  const bulbPowerWatts = Object.fromEntries(
-    normalizedDocument.parts
-      .filter((part) => part.kind === "bulb")
-      .map((part) => [part.id, parts[part.id]?.powerWatts ?? 0]),
-  );
-  const only = batteries.length === 1 ? batteries[0] : undefined;
-  return result("closed", closedMessage(batteries), {
-    ...readings,
-    bulbPowerWatts,
-    currentAmps: only ? Math.abs(parts[only.id]?.currentAmps ?? 0) : null,
-  });
+  return result("closed", closedMessage(batteries), readings);
 }
 
 function invalidInputResult(message: string): CircuitAnalysis {

@@ -330,7 +330,9 @@ function analyzeExtendedCircuitFromInput(
     ...(mode === "ac" ? { frequencyHz } : {}),
     currentAmps,
     parts,
-    bulbPowerWatts: Object.fromEntries(document.parts.filter((part) => part.kind === "bulb").map((part) => [part.id, parts[part.id]?.powerWatts ?? 0])),
+    bulbPowerWatts: Object.fromEntries(document.parts
+      .filter((part) => part.kind === "bulb" && Object.hasOwn(parts, part.id))
+      .map((part) => [part.id, parts[part.id]!.powerWatts])),
     // Ideal wires can form loops with indeterminate branch currents; do not invent flow directions.
     wireCurrents: {},
     issues: analog.issues,

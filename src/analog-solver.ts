@@ -256,7 +256,7 @@ interface DcAssembly {
   matrix: Float64Array;
   residual: Float64Array;
   exactResidual: ExactRational[] | null;
-  /** KCL magnitudes, canceling exact independent sources before taking absolute values. */
+  /** Nonlinear KCL magnitudes after exact linear-current cancellation. */
   exactCurrentScales: (ExactRational | null)[];
 }
 
@@ -2259,7 +2259,7 @@ function stampNonlinear(
   layout: MnaLayout,
   part: CircuitPart,
   model: NonlinearModel,
-  independentCurrentRows: Set<number>,
+  nonlinearCurrentRows: Set<number>,
 ) {
   const terminals = terminalsOf(part.kind);
   const nodes = terminals.map(
@@ -2267,7 +2267,7 @@ function stampNonlinear(
   );
   for (let row = 0; row < terminals.length; row += 1) {
     const rowUnknown = layout.topology.nodeUnknowns[nodes[row] ?? -1] ?? -1;
-    if (rowUnknown >= 0 && model.exactCurrentContributions) { independentCurrentRows.add(rowUnknown); }
+    if (rowUnknown >= 0) { nonlinearCurrentRows.add(rowUnknown); }
     for (const current of nonlinearModelCurrentContributions(model, row)) {
       addResidual(residual, rowUnknown, current);
     }
@@ -2476,15 +2476,17 @@ function stampDcNonlinearPart(
   layout: MnaLayout,
   state: Float64Array,
   part: CircuitPart,
-  independentCurrentRows: Set<number>,
+  nonlinearCurrentRows: Set<number>,
 ) {
   const model = nonlinearModel(part, nonlinearTerminalVoltages(part, layout, state));
   if (!model) { return; }
   if (part.kind === "op-amp") {
     stampDcOpAmp(matrix, residual, layout, part, model);
+    nonlinearCurrentRows.add(layout.topology.nodeUnknowns[nodeForTerminal(layout.topology, part, "c")] ?? -1);
+    nonlinearCurrentRows.add(layout.topology.nodeUnknowns[layout.physicalReferenceNode] ?? -1);
     return;
   }
-  stampNonlinear(matrix, residual, layout, part, model, independentCurrentRows);
+  stampNonlinear(matrix, residual, layout, part, model, nonlinearCurrentRows);
 }
 
 interface ReferenceConstraint {
@@ -2887,7 +2889,7 @@ function assembleDc(
 ): DcAssembly {
   const matrix = new Float64Array(layout.size * layout.size);
   const residual: ResidualTerms = Array.from({ length: layout.size }, () => []);
-  const independentCurrentRows = new Set<number>();
+  const nonlinearCurrentRows = new Set<number>();
 
   // Prescribed source values are exact. Their cancellation must not inflate
   // the tolerance for an independently approximated semiconductor current.
@@ -2898,10 +2900,20 @@ function assembleDc(
     if (part.kind !== "current-source") { stampDcPassivePart(residual, layout, part); }
     const branch = layout.branchByPartId.get(part.id);
     if (branch) { addVoltageBranch(matrix, residual, layout, state, branch); }
-    stampDcNonlinearPart(matrix, residual, layout, state, part, independentCurrentRows);
   }
   for (const branch of layout.internalBranches) {
     addVoltageBranch(matrix, residual, layout, state, branch);
+  }
+  const nonlinearParts = document.parts.filter(isNonlinearPart);
+  if (nonlinearParts.length > 0) {
+    // Linear branch and prescribed currents are exact. Their cancellation
+    // must not hide the remaining independently approximated device current.
+    for (let row = 0; row < layout.topology.nodeUnknownCount; row += 1) {
+      residual[row] = [exactResidualSum(residual[row]!) ?? Number.NaN];
+    }
+    for (const part of nonlinearParts) {
+      stampDcNonlinearPart(matrix, residual, layout, state, part, nonlinearCurrentRows);
+    }
   }
   if (includeReferences) {
     stampDcReferences(document, layout, state, matrix, residual, channelConductingForReferences);
@@ -2920,10 +2932,10 @@ function assembleDc(
       // Cache scales only when requested, keeping transient history deferred
       // before taking absolute values as well as summing its contributions.
       exactCurrentScales ??= residual.slice(0, layout.topology.nodeUnknownCount).map((terms, row) => {
-        // Only a device with independently approximated cancelling currents
-        // needs this additional scale. Other rows keep their existing exact
-        // linearized scale and avoid expanding long transient histories.
-        if (!independentCurrentRows.has(row)) { return null; }
+        // Semiconductor rows use physical currents, independent of the
+        // global voltage reference and large exactly cancelling linear flows.
+        // BJT junction contributions remain separate model approximations.
+        if (!nonlinearCurrentRows.has(row)) { return null; }
         const values = terms.map((value) => typeof value === "number" ? numberToExactRational(value) : value);
         return values.every((value): value is ExactRational => value !== null)
           ? sumExactRationals(values.map((value) => absoluteExactRational(deferExactRationalReduction(value))))
@@ -3094,9 +3106,7 @@ function exactRowTolerance(
   }
   const linearizedScale = sumExactRationals(equationTerms);
   const currentScale = assembly.exactCurrentScales[row];
-  const equationScale = currentScale
-    ? largerNonnegativeRational(linearizedScale, currentScale)
-    : linearizedScale;
+  const equationScale = currentScale ?? linearizedScale;
   const absoluteResidual = absoluteExactRational(residual);
   const relativeEquationScale = multiplyExactRational(relative, equationScale);
   const relativeResidualScale = multiplyExactRational(relative, absoluteResidual);
@@ -3292,6 +3302,22 @@ function exactZeroPhysicalSolution(
     : validatePhysicalDcSolution(document, layout, state);
 }
 
+function exactMosCutoffPhysicalSolution(
+  document: CircuitDocument,
+  layout: MnaLayout,
+  state: Float64Array,
+) {
+  if (!document.parts.some((part) => diodeConnectedMosNodes(part, layout))) { return null; }
+  // A nonzero current approaching cutoff retains a relative KCL error of one.
+  // Try the exact boundary before requiring Newton convergence, and accept it
+  // only when every original branch equation and node current is balanced.
+  const physical = assembleDc(document, layout, state, false);
+  const candidate = exactMosCutoffCandidate(document, layout, state, physical);
+  if (!candidate || !physicalDcQualityAcceptable(dcSolutionQuality(document, layout, candidate.state))) { return null; }
+  const solution = validatePhysicalDcSolution(document, layout, candidate.state);
+  return solution.converged ? solution : null;
+}
+
 function solveLinearTargetState(
   size: number,
   matrix: Float64Array,
@@ -3352,7 +3378,7 @@ function polishConvergedDcState(
     // coordinate-sensitive Jacobian scale. An unrelated high-common-mode
     // circuit must not hide a subnormal junction's remaining KCL error.
     const floorQuality = floorLimitedDcQuality(document, layout, polished);
-    if ((iteration >= 3 || polishedScore === 0) && floorQuality <= 1e-12) { break; }
+    if (iteration >= 3 && floorQuality <= 1e-12) { break; }
     const channelConducting = mosChannelConductingByPartId(document, layout, polished);
     const assembly = assembleDc(document, layout, polished, true, channelConducting);
     const rhs = absoluteDcRhs(document, layout, polished, channelConducting);
@@ -3360,7 +3386,10 @@ function polishConvergedDcState(
     if (!target) { break; }
     const candidateAssembly = assembleDc(document, layout, target, true, channelConducting);
     const candidateScore = residualScore(layout, candidateAssembly, tolerances);
-    const improves = candidateScore < polishedScore ||
+    // A normalized score may underflow to zero even though an exact residual
+    // remains. Prefer an exactly balanced target instead of preserving a
+    // spurious subnormal voltage amplified by a large circulating current.
+    const improves = !hasNonzeroExactResidual(candidateAssembly) || candidateScore < polishedScore ||
       (floorQuality > 1e-12 && candidateScore <= 1 && floorLimitedDcQuality(document, layout, target) < floorQuality);
     if (!improves) { break; }
     const centersUnchanged = nonlinearCentersMatch(
@@ -3443,7 +3472,8 @@ function finishDcAtReference(
   lineSearch: DcLineSearch,
 ): { state?: Float64Array; converged: boolean; singular: boolean; invalidPhysicalSolution?: boolean } {
   const finalAssembly = assembleDc(document, layout, state);
-  const exactSolution = exactZeroPhysicalSolution(document, layout, state, finalAssembly);
+  const exactSolution = exactZeroPhysicalSolution(document, layout, state, finalAssembly) ??
+    exactMosCutoffPhysicalSolution(document, layout, state);
   if (exactSolution) { return exactSolution; }
   const tolerances = residualTolerances(layout, finalAssembly, state);
   const score = residualScore(layout, finalAssembly, tolerances);
@@ -4913,13 +4943,20 @@ interface DcSolution {
   nodeVoltageOffsets?: ComplexValue[];
 }
 
+function dcCurrentContributions(model: NonlinearModel | null, currents: ComplexValue[], row: number) {
+  return model
+    ? nonlinearModelCurrentContributions(model, row).map(complexFromScalar)
+    : [currents[row] ?? complex()];
+}
+
 function dcKclContributions(document: CircuitDocument, layout: MnaLayout, state: Float64Array) {
   const values = Array.from({ length: layout.size }, (_, index) => complexFromRealState(state, index));
   const sources = independentSourceCurrents(document, layout);
-  const currentsByNode = Array.from({ length: layout.topology.nodeCount }, (_, node) => {
+  const linearCurrentsByNode = Array.from({ length: layout.topology.nodeCount }, (_, node) => {
     const current = sources.get(node);
     return current ? [complexFromScalar(current)] : [];
   });
+  const currentsByNode = Array.from({ length: layout.topology.nodeCount }, () => [] as ComplexValue[]);
   for (const part of document.parts) {
     if (part.kind === "current-source") { continue; }
     const model = isNonlinearPart(part)
@@ -4931,17 +4968,17 @@ function dcKclContributions(document: CircuitDocument, layout: MnaLayout, state:
     const terminals = terminalsOf(part.kind);
     for (let index = 0; index < terminals.length; index += 1) {
       const node = nodeForTerminal(layout.topology, part, terminals[index] ?? "a");
-      const contributions = model ? nonlinearModelCurrentContributions(model, index) : null;
-      currentsByNode[node]?.push(...(contributions
-        ? contributions.map(complexFromScalar)
-        : [currents[index] ?? complex()]));
+      (model ? currentsByNode : linearCurrentsByNode)[node]?.push(...dcCurrentContributions(model, currents, index));
     }
     if (part.kind === "op-amp") {
       currentsByNode[layout.physicalReferenceNode]?.push(complexSubtract(complex(), currents[2] ?? complex()));
     }
   }
 
-  return currentsByNode;
+  return currentsByNode.map((currents, node) => [
+    linearCurrentsByNode[node]!.reduce((sum, current) => complexAdd(sum, current), complex()),
+    ...currents,
+  ]);
 }
 
 function dcKclQuality(document: CircuitDocument, layout: MnaLayout, state: Float64Array) {
@@ -5299,7 +5336,77 @@ function solveDcWithReferences(
   return balancedDcResult(chosen, quality);
 }
 
+interface DcCurrentBounds { minimum: ExactRational | null; maximum: ExactRational | null; }
+
+function junctionCurrentBoundParents(document: CircuitDocument, layout: MnaLayout) {
+  const parent = Array.from({ length: layout.topology.nodeCount }, (_, node) => node);
+  // Currents through these branches are unconstrained for this necessary
+  // KCL check. In particular, transient capacitor companions can carry the
+  // imposed current even when a parallel diode cannot conduct in reverse.
+  for (const branch of [...layout.branches, ...layout.internalBranches]) {
+    joinConductiveNodes(parent, branch.positiveNode, branch.negativeNode);
+  }
+  for (const part of document.parts) {
+    if (isNonlinearPart(part) && part.kind !== "diode" && part.kind !== "led") {
+      unionPartConduction(part, layout.topology, parent, {}, layout.initialInductorCurrents, layout.physicalReferenceNode);
+    }
+  }
+  return parent;
+}
+
+function addFixedCurrentBound(bound: DcCurrentBounds, current: ExactRational) {
+  if (bound.minimum) { bound.minimum = addExactRational(bound.minimum, current); }
+  if (bound.maximum) { bound.maximum = addExactRational(bound.maximum, current); }
+}
+
+function addPartCurrentBounds(part: CircuitPart, layout: MnaLayout, anode: DcCurrentBounds, cathode: DcCurrentBounds) {
+  if (part.kind === "current-source" || (part.kind === "inductor" && layout.initialInductorCurrents)) {
+    const value = part.kind === "current-source" ? part.currentAmps ?? 0 : initialInductorCurrent(layout, part);
+    const current = typeof value === "number" ? numberToExactRational(value)! : value;
+    addFixedCurrentBound(anode, current);
+    addFixedCurrentBound(cathode, negativeExact(current));
+  } else if (part.kind === "diode" || part.kind === "led") {
+    const saturation = numberToExactRational(part.saturationCurrentAmps ?? (part.kind === "led" ? 1e-20 : 1e-12))!;
+    if (anode.minimum) { anode.minimum = subtractExactRational(anode.minimum, saturation); }
+    anode.maximum = null;
+    if (cathode.maximum) { cathode.maximum = addExactRational(cathode.maximum, saturation); }
+    cathode.minimum = null;
+  }
+}
+
+function violatesJunctionCurrentBounds(document: CircuitDocument, layout: MnaLayout) {
+  if (!document.parts.some((part) => part.kind === "diode" || part.kind === "led")) { return false; }
+  const parent = junctionCurrentBoundParents(document, layout);
+  const bounds = new Map<number, DcCurrentBounds>();
+  const boundAt = (node: number) => {
+    const root = findRoot(parent, node);
+    let bound = bounds.get(root);
+    if (!bound) {
+      bound = { minimum: numberToExactRational(0)!, maximum: numberToExactRational(0)! };
+      bounds.set(root, bound);
+    }
+    return bound;
+  };
+  for (const part of document.parts) {
+    const a = nodeForTerminal(layout.topology, part, "a");
+    const b = nodeForTerminal(layout.topology, part, "b");
+    if (findRoot(parent, a) === findRoot(parent, b)) { continue; }
+    addPartCurrentBounds(part, layout, boundAt(a), boundAt(b));
+  }
+  // Every component needs zero total outward current. Shockley junctions
+  // admit [-Is, +infinity) at their anodes and the negated interval at their
+  // cathodes. Keep the endpoint: binary64 expm1 can round to exactly -1.
+  // All comparisons remain exact, including subnormal limits and cancelling
+  // current sources. An interval containing zero only permits a normal solve;
+  // it does not establish that the nonlinear equations have a solution.
+  return [...bounds.values()].some(({ minimum, maximum }) =>
+    (minimum !== null && minimum.numerator > 0n) || (maximum !== null && maximum.numerator < 0n));
+}
+
 function solveDc(document: CircuitDocument, layout: MnaLayout, adjustReference = false): DcSolution {
+  if (violatesJunctionCurrentBounds(document, layout)) {
+    return { converged: false, singular: false, invalidPhysicalSolution: true };
+  }
   const initial = solveDcWithReferences(document, layout, adjustReference);
   // Exhaust the usual reference choices before the more expensive retry.
   // A separate feedback island can be solved by a better reference even

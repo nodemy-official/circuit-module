@@ -33,7 +33,8 @@ describe("legacy solver subnormal resistance audit", () => {
       const result = analyzeCircuit(document);
 
       expect(result.status, result.message).toBe("short");
-      expect(result.currentAmps).toBeNull();
+      expect(result.currentAmps).toBeCloseTo(3_000_000, 5);
+      expect(result.currentAmps).toBe(Math.abs(result.parts.source.currentAmps));
       expect(result.parts.load.currentAmps / 3_000_000).toBeCloseTo(1, 5);
       expect(result.parts.load.voltageVolts / resistanceOhms / 3_000_000).toBeCloseTo(1, 5);
       expect(Object.values(result.parts).every((reading) => [
@@ -72,7 +73,8 @@ describe("legacy solver subnormal resistance audit", () => {
     const result = analyzeCircuit(document);
 
     expect(result.status, result.message).toBe("short");
-    expect(result.currentAmps).toBeNull();
+    expect(result.currentAmps).toBeCloseTo(2_250_000, 5);
+    expect(result.currentAmps).toBe(Math.abs(result.parts.source.currentAmps));
     expect(result.parts.fast.currentAmps / result.parts.slow.currentAmps).toBeCloseTo(1, 5);
     expect((result.parts.fast.currentAmps + result.parts.slow.currentAmps) / 2_250_000)
       .toBeCloseTo(1, 5);
