@@ -293,7 +293,7 @@ function findRoot(parent: number[], node: number): number {
 }
 
 /** Finds the connected group for every terminal in the conductance graph. */
-function conductiveComponents(size: number, conductances: readonly Conductance[]) {
+function conductiveComponents(size: number, conductances: readonly Pick<Conductance, "a" | "b">[]) {
   const parent = Array.from({ length: size }, (_, index) => index);
   for (const { a, b } of conductances) { parent[findRoot(parent, a)] = findRoot(parent, b); }
   return parent.map((_, node) => findRoot(parent, node));
@@ -318,6 +318,7 @@ function sourceConstraintEdges(
   document: CircuitDocument,
   index: Map<string, number>,
   switchStates: Record<string, boolean>,
+  loopBatteryIds: ReadonlySet<string>,
 ): SourceConstraintEdge[] {
   const edges: SourceConstraintEdge[] = document.wires.map((wire) => ({
     from: index.get(key(wire.from)) ?? -1,
@@ -326,6 +327,7 @@ function sourceConstraintEdges(
   }));
   for (const part of document.parts) {
     if (part.kind === "battery") {
+      if (!loopBatteryIds.has(part.id)) { continue; }
       edges.push({
         from: index.get(`${part.id}:a`) ?? -1,
         to: index.get(`${part.id}:b`) ?? -1,
@@ -700,7 +702,7 @@ function readPart(
       ? exactRationalToNumber(currentExact)
       : currentDrop.value / ohms;
   const voltageExact = exactDifferenceValue(voltageDrop);
-  const absorbsPower = part.kind === "resistor" || part.kind === "bulb";
+  const absorbsPower = part.kind !== "battery" && ohms !== null;
   const deliversPower = part.kind === "battery";
   let powerWatts = 0;
   if ((absorbsPower || deliversPower) && voltageExact && currentExact) {
@@ -866,31 +868,33 @@ function exactBatteryReadings(
   return readings;
 }
 
-function shortedBatteryByTerminalRatio(
+function shortedBatteryByPassiveResistance(
   batteries: readonly CircuitPart[],
   readings: Map<string, ExactBatteryReading>,
-  sourceTree: SourceConstraintTree,
-  batteriesByGroup: Map<number, CircuitPart[]>,
   index: Map<string, number>,
   protectedBatteryIds: Set<string>,
+  passiveNetwork: ReturnType<typeof passiveComponentsByNode>,
+  checkedParallelBatteryIds: ReadonlySet<string>,
 ) {
   const threshold = exactInput(SHORT_OHMS);
   if (!threshold) { return; }
   return batteries.find((battery) => {
-    if (protectedBatteryIds.has(battery.id)) { return false; }
-    const terminal = index.get(`${battery.id}:a`);
-    const group = terminal === undefined ? undefined : sourceTree.component[terminal];
-    const groupBatteries = group === undefined ? undefined : batteriesByGroup.get(group);
-    if (group !== undefined && groupBatteries && groupBatteries.length > 1 &&
-      !sourceTree.inconsistent.has(group)) {
-      return false;
-    }
+    if (protectedBatteryIds.has(battery.id) || checkedParallelBatteryIds.has(battery.id)) { return false; }
     const reading = readings.get(battery.id);
     if (!reading || reading.current.numerator === 0n) { return false; }
-    const voltage = reading.voltage.numerator < 0n ? negateExact(reading.voltage) : reading.voltage;
-    const current = reading.current.numerator < 0n ? negateExact(reading.current) : reading.current;
-    // Compare |V| < |I| R before rounding either reading for display.
-    return subtractExactRational(voltage, multiplyExactRational(current, threshold)).numerator < 0n;
+    const from = index.get(`${battery.id}:a`)!;
+    const to = index.get(`${battery.id}:b`)!;
+    const component = passiveNetwork.components[from]!;
+    if (component !== passiveNetwork.components[to]) { return false; }
+    // Other batteries can cancel this cell's terminal voltage. Measure only
+    // its passive return; |Vterminal/Icell| is not a resistance in that case.
+    const resistance = externalResistanceExact(
+      passiveNetwork.nodesByComponent.get(component) ?? [],
+      passiveNetwork.conductancesByComponent.get(component) ?? [],
+      from,
+      to,
+    );
+    return resistance !== null && subtractExactRational(resistance, threshold).numerator < 0n;
   });
 }
 
@@ -968,6 +972,8 @@ interface PassiveBatteryEdge {
   emf?: ExactRational;
   seriesResistance?: number;
   exactSeriesResistance?: ExactRational;
+  /** Original paired cell ports of a reduced series branch. */
+  sourceEdges?: readonly PassiveBatteryEdge[];
 }
 
 function batteryEdgesByPassiveComponent(
@@ -1241,24 +1247,27 @@ function seriesBatteryPath(
   visited: Set<number>,
   nodesByComponent: Map<number, number[]>,
   conductancesByComponent: Map<number, Conductance[]>,
+  junctions?: ReadonlySet<number>,
 ) {
   let component = startComponent;
   let edgeIndex = firstEdge;
   let emf = EXACT_ZERO;
   let exactSeriesResistance = EXACT_ZERO;
+  const sourceEdges: PassiveBatteryEdge[] = [];
   const first = edges[firstEdge]!;
   const fromNode = first.fromComponent === startComponent ? first.fromNode : first.toNode;
   while (!visited.has(edgeIndex)) {
     visited.add(edgeIndex);
     const edge = edges[edgeIndex]!;
+    sourceEdges.push(...edge.sourceEdges ?? [edge]);
     const forward = edge.fromComponent === component;
     const leavingNode = forward ? edge.toNode : edge.fromNode;
     emf = subtractExactRational(emf, exactInput((forward ? -1 : 1) * (edge.battery.voltageVolts ?? 0))!);
     component = forward ? edge.toComponent : edge.fromComponent;
     const neighbors = incident.get(component) ?? [];
-    if (neighbors.length !== 2) {
+    if (neighbors.length !== 2 || junctions?.has(component)) {
       return { ...edges[firstEdge]!, fromComponent: startComponent, toComponent: component, fromNode, toNode: leavingNode, emf,
-        exactSeriesResistance, seriesResistance: exactRationalToNumber(exactSeriesResistance) };
+        exactSeriesResistance, seriesResistance: exactRationalToNumber(exactSeriesResistance), sourceEdges };
     }
     const nextIndex = neighbors.find((candidate) => candidate !== edgeIndex)!;
     const next = edges[nextIndex]!;
@@ -1275,6 +1284,7 @@ function reducedBatteryBlock(
   edges: readonly PassiveBatteryEdge[],
   nodesByComponent: Map<number, number[]>,
   conductancesByComponent: Map<number, Conductance[]>,
+  junctions?: ReadonlySet<number>,
 ) {
   const incident = new Map<number, number[]>();
   for (const [index, edge] of edges.entries()) {
@@ -1287,10 +1297,10 @@ function reducedBatteryBlock(
   const reduced: PassiveBatteryEdge[] = [];
   const visited = new Set<number>();
   for (const [component, neighbors] of incident) {
-    if (neighbors.length <= 2) { continue; }
+    if (neighbors.length <= 2 && !junctions?.has(component)) { continue; }
     for (const index of neighbors) {
       if (visited.has(index)) { continue; }
-      const path = seriesBatteryPath(edges, incident, component, index, visited, nodesByComponent, conductancesByComponent);
+      const path = seriesBatteryPath(edges, incident, component, index, visited, nodesByComponent, conductancesByComponent, junctions);
       if (!path) { return []; }
       reduced.push(path);
     }
@@ -1456,6 +1466,614 @@ function shortedParallelSubset(
 ) {
   for (const parallel of blocks.flatMap(parallelBatteryPairs)) {
     const shorted = shortedParallelBatteryGroup(parallel, readings, size, conductancesByComponent, physicalConductances);
+    if (shorted) { return shorted; }
+  }
+}
+
+interface SourceOutputMacro {
+  passive: Conductance[];
+  sources: PassiveBatteryEdge[];
+  from: boolean;
+  to: boolean;
+}
+
+interface CommonSourceOutput {
+  from: number;
+  to: number;
+  sources: SourceOutputMacro[];
+  load: Conductance[];
+  loadResistance?: ExactRational | null;
+  minimumSourceResistance?: ExactRational | null;
+  responses?: Map<string, { resistance: ExactRational; voltage: ExactRational } | null>;
+}
+
+function sourceOutputMacros(
+  size: number,
+  passive: readonly Conductance[],
+  sources: readonly PassiveBatteryEdge[],
+  from: number,
+  to: number,
+) {
+  const boundary = (node: number) => node === from || node === to;
+  const connections = [
+    ...passive,
+    ...sources.map((edge) => ({ a: edge.fromNode, b: edge.toNode })),
+  ];
+  const components = conductiveComponents(size, connections.filter((edge) => !boundary(edge.a) && !boundary(edge.b)));
+  const macros = new Map<number, SourceOutputMacro>();
+  let direct = size;
+  const macroFor = (a: number, b: number) => {
+    const component = !boundary(a) ? components[a]! : !boundary(b) ? components[b]! : direct++;
+    const macro = macros.get(component) ?? { passive: [], sources: [], from: false, to: false };
+    macro.from ||= a === from || b === from;
+    macro.to ||= a === to || b === to;
+    macros.set(component, macro);
+    return macro;
+  };
+  for (const edge of passive) { macroFor(edge.a, edge.b).passive.push(edge); }
+  for (const edge of sources) { macroFor(edge.fromNode, edge.toNode).sources.push(edge); }
+  return [...macros.values()].filter((macro) => macro.from && macro.to);
+}
+
+function sourceOutputCut(size: number, passive: readonly Conductance[], sources: readonly PassiveBatteryEdge[], from: number, to: number) {
+  const branches = sourceOutputMacros(size, passive, sources, from, to);
+  const sourceMacros = branches.filter((macro) => macro.sources.length > 0);
+  const load = branches.filter((macro) => macro.sources.length === 0).flatMap((macro) => macro.passive);
+  return sourceMacros.length > 0 && load.length > 0 ? { from, to, sources: sourceMacros, load } : null;
+}
+
+function sourceBoundaryBlock(edges: readonly { a: number; b: number }[], from: number, to: number) {
+  const incident = new Map<number, number[]>();
+  for (const [index, edge] of edges.entries()) {
+    for (const node of [edge.a, edge.b]) {
+      const neighbors = incident.get(node) ?? [];
+      neighbors.push(index);
+      incident.set(node, neighbors);
+    }
+  }
+  const discovered = new Map<number, number>();
+  const low = new Map<number, number>();
+  const stack: number[] = [];
+  let boundaryBlock: Set<number> | undefined;
+  const record = (last: number) => {
+    const block = new Set<number>();
+    let hasFrom = false;
+    let hasTo = false;
+    while (stack.length > 0) {
+      const index = stack.pop()!;
+      const edge = edges[index]!;
+      block.add(index);
+      hasFrom ||= edge.a === from || edge.b === from;
+      hasTo ||= edge.a === to || edge.b === to;
+      if (index === last) { break; }
+    }
+    if (hasFrom && hasTo) { boundaryBlock = block; }
+  };
+  const visit = (node: number, parent: number) => {
+    const order = discovered.size;
+    discovered.set(node, order);
+    low.set(node, order);
+    for (const index of incident.get(node) ?? []) {
+      if (index === parent) { continue; }
+      const edge = edges[index]!;
+      const next = edge.a === node ? edge.b : edge.a;
+      const nextOrder = discovered.get(next);
+      if (nextOrder === undefined) {
+        stack.push(index);
+        visit(next, index);
+        const nextLow = low.get(next)!;
+        low.set(node, Math.min(low.get(node)!, nextLow));
+        if (nextLow >= order) { record(index); }
+      } else if (nextOrder < order) {
+        stack.push(index);
+        low.set(node, Math.min(low.get(node)!, nextOrder));
+      }
+    }
+  };
+  visit(from, -1);
+  return boundaryBlock;
+}
+
+interface SourceBoundaryFlowEdge {
+  node: number;
+  reverse: number;
+  capacity: number;
+}
+
+function augmentSourceBoundaryPath(adjacent: SourceBoundaryFlowEdge[][], supply: number, sink: number) {
+  const parent = new Map<number, { node: number; edge: number }>();
+  const queue = [supply];
+  for (let head = 0; head < queue.length && !parent.has(sink); head += 1) {
+    const node = queue[head]!;
+    for (const [edge, next] of adjacent[node]!.entries()) {
+      if (next.capacity <= 0 || next.node === supply || parent.has(next.node)) { continue; }
+      parent.set(next.node, { node, edge });
+      queue.push(next.node);
+    }
+  }
+  if (!parent.has(sink)) { return false; }
+  for (let node = sink; node !== supply;) {
+    const previous = parent.get(node)!;
+    const edge = adjacent[previous.node]![previous.edge]!;
+    edge.capacity -= 1;
+    adjacent[node]![edge.reverse]!.capacity += 1;
+    node = previous.node;
+  }
+  return true;
+}
+
+function sourceBoundaryPaths(passive: readonly Conductance[], ports: ReadonlySet<number>, starts: readonly number[], target: number, other: number, occupied: ReadonlySet<number>) {
+  const allowed = (node: number) => node !== other && !occupied.has(node) && (node === target || starts.includes(node) || !ports.has(node));
+  if (starts.some((node) => !allowed(node))) { return null; }
+  const edges = passive.filter((edge) => allowed(edge.a) && allowed(edge.b));
+  const nodes = [...new Set([target, ...starts, ...edges.flatMap((edge) => [edge.a, edge.b])])];
+  const local = new Map(nodes.map((node, position) => [node, position]));
+  const supply = nodes.length * 2;
+  const sink = local.get(target)! * 2 + 1;
+  const adjacent = Array.from({ length: supply + 1 }, () => [] as SourceBoundaryFlowEdge[]);
+  const connect = (a: number, b: number, capacity: number) => {
+    adjacent[a]!.push({ node: b, reverse: adjacent[b]!.length, capacity });
+    adjacent[b]!.push({ node: a, reverse: adjacent[a]!.length - 1, capacity: 0 });
+  };
+  for (const [position, node] of nodes.entries()) { connect(position * 2, position * 2 + 1, node === target ? starts.length : 1); }
+  for (const edge of edges) {
+    const a = local.get(edge.a)! * 2;
+    const b = local.get(edge.b)! * 2;
+    if (a === b) { continue; }
+    connect(a + 1, b, starts.length);
+    connect(b + 1, a, starts.length);
+  }
+  for (const node of starts) { connect(supply, local.get(node)! * 2, 1); }
+  // Integer capacities count paths only; they never approximate resistance.
+  // Residual rerouting is essential for diamonds, where a greedy first path
+  // can consume the other driver's only outlet.
+  if (!starts.every(() => augmentSourceBoundaryPath(adjacent, supply, sink))) { return null; }
+  return new Set(nodes.filter((node, position) => node !== target && adjacent[position * 2]![0]!.capacity === 0));
+}
+
+function sourceBoundaryPairPaths(passive: readonly Conductance[], ports: ReadonlySet<number>, starts: readonly number[], returns: readonly number[], from: number, to: number) {
+  const outgoing = sourceBoundaryPaths(passive, ports, starts, from, to, new Set());
+  // The two return paths must also avoid the actual outgoing witnesses.
+  // Separate reachability on each side alone can reuse an internal hub on
+  // opposite sides and silently place both sources in one serial column.
+  return outgoing !== null && sourceBoundaryPaths(passive, ports, returns, to, from, outgoing) !== null;
+}
+
+function pairedSourceBoundaryPaths(output: CommonSourceOutput, passive: readonly Conductance[], ports: ReadonlySet<number>, sourceBranches: readonly PassiveBatteryEdge[]) {
+  const firstComponent = sourceBranches[0]!.fromComponent;
+  const ends = sourceBranches.map((branch) => branch.fromComponent === firstComponent
+    ? [branch.fromNode, branch.toNode] as const : [branch.toNode, branch.fromNode] as const);
+  // Two cells in the same series column are not two drivers. Require the
+  // same pair of original strings to reach each boundary independently,
+  // with consistent source orientation and no other selected cell ports.
+  // This also prevents an unequal bridge or a partial ballast from being
+  // substituted for the actual common load in the physical port response.
+  for (const [position, first] of ends.entries()) {
+    for (const second of ends.slice(position + 1)) {
+      for (const [from, to] of [[output.from, output.to], [output.to, output.from]]) {
+        const starts = [first[0], second[0]];
+        const returns = [first[1], second[1]];
+        if (sourceBoundaryPairPaths(passive, ports, starts, returns, from!, to!) ||
+          sourceBoundaryPairPaths(passive, ports, returns, starts, to!, from!)) { return true; }
+      }
+    }
+  }
+  return false;
+}
+
+function independentSourceOutputBoundary(output: CommonSourceOutput, selected: ReadonlySet<string>, sourceBranches: readonly PassiveBatteryEdge[]) {
+  if (sourceBranches.length < 2) { return false; }
+  const sources = output.sources.flatMap((macro) => macro.sources).filter((edge) => selected.has(edge.battery.id));
+  const passive = output.sources.flatMap((macro) => macro.passive);
+  const connections = [...passive, ...sources.map((edge) => ({ a: edge.fromNode, b: edge.toNode }))];
+  // Both outputs and every selected cell must belong to the same vertex
+  // block on the source side. A common return articulating a partial load
+  // cut fails this test; passive hubs and diamonds do not need to be opened.
+  const block = sourceBoundaryBlock(connections, output.from, output.to);
+  if (!block || sources.some((_, index) => !block.has(passive.length + index))) { return false; }
+  const ports = new Set(sources.flatMap((edge) => [edge.fromNode, edge.toNode]));
+  const covered = new Set<string>();
+  for (const branch of sourceBranches) {
+    for (const source of branch.sourceEdges ?? [branch]) { covered.add(source.battery.id); }
+    // Keep the original series string paired. Its two ends must lie on a
+    // simple output-to-output path without borrowing any other cell's ports
+    // or its own series midpoint. Adding a closing output edge makes exactly
+    // those paths a vertex block, including degree-two driver conductors.
+    const allowed = (node: number) => node === output.from || node === output.to ||
+      node === branch.fromNode || node === branch.toNode || !ports.has(node);
+    const path = passive.filter((edge) => allowed(edge.a) && allowed(edge.b));
+    const branchIndex = path.length;
+    const paired = [...path, { a: branch.fromNode, b: branch.toNode }, { a: output.from, b: output.to }];
+    if (!sourceBoundaryBlock(paired, output.from, output.to)?.has(branchIndex)) { return false; }
+  }
+  return [...selected].every((id) => covered.has(id)) && pairedSourceBoundaryPaths(output, passive, ports, sourceBranches);
+}
+
+function commonSourceOutputs(
+  batteries: readonly CircuitPart[],
+  index: Map<string, number>,
+  passive: readonly Conductance[],
+  components: number[],
+) {
+  const { edges } = batteryEdgesByPassiveComponent(batteries, index, components);
+  const degree = Array.from({ length: index.size }, () => 0);
+  for (const edge of passive) { degree[edge.a]! += 1; degree[edge.b]! += 1; }
+  for (const edge of edges) { degree[edge.fromNode]! += 1; degree[edge.toNode]! += 1; }
+  const junctions = degree.flatMap((count, node) => count >= 3 ? [node] : []);
+  const outputs: CommonSourceOutput[] = [];
+  // Degree-two nodes cannot separate independent source branches and a load.
+  // Only discovery uses this graph. Every physical wire, including shared
+  // 1 µΩ output leads, stays in the response measured at the actual cut nodes.
+  for (const [position, from] of junctions.entries()) {
+    for (const to of junctions.slice(position + 1)) {
+      const output = sourceOutputCut(index.size, passive, edges, from, to);
+      if (output) { outputs.push(output); }
+    }
+  }
+  return outputs;
+}
+
+function sourceOutputResponse(macro: SourceOutputMacro, selected: ReadonlySet<string>, from: number, to: number) {
+  const nodes = [...new Set([from, to, ...macro.passive.flatMap((edge) => [edge.a, edge.b]),
+    ...macro.sources.flatMap((edge) => [edge.fromNode, edge.toNode])])];
+  const local = new Map(nodes.map((node, position) => [node, position]));
+  const sourceEdges = macro.sources.filter((edge) => selected.has(edge.battery.id));
+  const tree = sourceConstraintTree(nodes.length, sourceEdges.map((edge) => ({
+    from: local.get(edge.fromNode)!, to: local.get(edge.toNode)!, voltage: -edge.battery.voltageVolts!,
+  })));
+  const offsets = nodes.map((_, node) => exactSourcePotential(tree, node));
+  const branches = macro.passive.map((edge) => {
+    const a = local.get(edge.a)!;
+    const b = local.get(edge.b)!;
+    return { ...edge, a: tree.component[a]!, b: tree.component[b]!,
+      exactVoltage: subtractExactRational(offsets[b]!, offsets[a]!) };
+  });
+  const a = local.get(from)!;
+  const b = local.get(to)!;
+  const rootA = tree.component[a]!;
+  const rootB = tree.component[b]!;
+  const network = reducedSourceResponseNetwork(branches, rootA, rootB);
+  const suppressed = network.branches.map((edge) => ({ ...edge, exactVoltage: EXACT_ZERO }));
+  const connected = conductiveComponents(network.size, suppressed);
+  if (connected[network.from] !== connected[network.to]) { return null; }
+  const resistance = externalResistanceExact(Array.from({ length: network.size }, (_, node) => node), suppressed, network.from, network.to);
+  const solved = nodeVoltages(network.size, network.branches);
+  const voltage = solved && exactDifferenceValue(solved.difference(network.from, network.to));
+  if (resistance === null || !voltage) { return null; }
+  return { resistance, voltage: subtractExactRational(voltage, subtractExactRational(offsets[b]!, offsets[a]!)) };
+}
+
+function sourceResponseSeriesBranch(first: Conductance, second: Conductance, node: number): Conductance {
+  const a = first.a === node ? first.b : first.a;
+  const b = second.a === node ? second.b : second.a;
+  const resistance = subtractExactRational(first.exactResistance ?? exactInput(first.resistanceOhms)!,
+    negateExact(second.exactResistance ?? exactInput(second.resistanceOhms)!));
+  const firstVoltage = first.exactVoltage ?? exactInput(first.voltage ?? 0)!;
+  const secondVoltage = second.exactVoltage ?? exactInput(second.voltage ?? 0)!;
+  const voltage = subtractExactRational(first.a === a ? firstVoltage : negateExact(firstVoltage),
+    negateExact(second.a === node ? secondVoltage : negateExact(secondVoltage)));
+  const resistanceOhms = exactRationalToNumber(resistance);
+  return { a, b, resistanceOhms, g: 1 / resistanceOhms, exactResistance: resistance, exactVoltage: voltage };
+}
+
+function reducedSourceResponseNetwork(branches: readonly Conductance[], from: number, to: number) {
+  const adjacent = new Map<number, Set<Conductance>>();
+  const pending: number[] = [];
+  const add = (edge: Conductance) => {
+    if (edge.a === edge.b) { return; }
+    for (const node of [edge.a, edge.b]) {
+      const neighbors = adjacent.get(node) ?? new Set<Conductance>();
+      neighbors.add(edge);
+      adjacent.set(node, neighbors);
+    }
+  };
+  const remove = (edge: Conductance) => {
+    for (const node of [edge.a, edge.b]) {
+      adjacent.get(node)!.delete(edge);
+      pending.push(node);
+    }
+  };
+  for (const edge of branches) { add(edge); }
+  pending.push(...adjacent.keys());
+  // This network is used only for the two output experiments. No current
+  // is injected at an interior node: KCL eliminates a leaf with zero branch
+  // current, or combines two series branches with exact R and oriented EMF.
+  // Self-loops (including suppressed private returns) have zero net nodal
+  // injection. Preserve both output nodes and every hub/parallel route.
+  for (const node of pending) {
+    if (node === from || node === to) { continue; }
+    const neighbors = [...adjacent.get(node) ?? []];
+    if (neighbors.length === 1) { remove(neighbors[0]!); }
+    if (neighbors.length !== 2) { continue; }
+    const first = neighbors[0]!;
+    const second = neighbors[1]!;
+    const combined = sourceResponseSeriesBranch(first, second, node);
+    remove(first);
+    remove(second);
+    add(combined);
+  }
+  const edges = [...new Set([...adjacent.values()].flatMap((neighbors) => [...neighbors]))];
+  const nodes = [...new Set([from, to, ...edges.flatMap((edge) => [edge.a, edge.b])])];
+  const local = new Map(nodes.map((node, position) => [node, position]));
+  return { size: nodes.length, from: local.get(from)!, to: local.get(to)!,
+    branches: edges.map((edge) => ({ ...edge, a: local.get(edge.a)!, b: local.get(edge.b)! })) };
+}
+
+function coveredUntappedBatteryReturns(output: CommonSourceOutput, driven: readonly SourceOutputMacro[], resistance: ExactRational, checkedBatteryIds: Set<string>) {
+  if (subtractExactRational(resistance, exactInput(SHORT_OHMS)!).numerator < 0n) { return; }
+  // Only untapped single-cell branches are covered by this lower resistance.
+  // A tapped macro can have a private passive return even at zero output EMF;
+  // its individual return must still be checked by the existing local guard.
+  for (const macro of driven) {
+    if (macro.sources.length !== 1) { continue; }
+    const passiveNodes = [...new Set([output.from, output.to, ...macro.passive.flatMap((edge) => [edge.a, edge.b])])];
+    const local = new Map(passiveNodes.map((node, position) => [node, position]));
+    const components = conductiveComponents(passiveNodes.length, macro.passive.map((edge) => ({ a: local.get(edge.a)!, b: local.get(edge.b)! })));
+    if (components[local.get(output.from)!] !== components[local.get(output.to)!]) {
+      checkedBatteryIds.add(macro.sources[0]!.battery.id);
+    }
+  }
+}
+
+function commonSourceOutputResistance(output: CommonSourceOutput, selected: ReadonlySet<string>, checkedBatteryIds: Set<string>, sourceBranches?: readonly PassiveBatteryEdge[]) {
+  const driven = output.sources.filter((macro) => macro.sources.some((edge) => selected.has(edge.battery.id)));
+  // Passive bridges can join multiple source branches into one component.
+  // Its paired-port response still measures the common output, including
+  // series strings, without treating private dissipation as load power.
+  if (selected.size < 2 || driven.length === 0) { return null; }
+  const present = new Set(driven.flatMap((macro) => macro.sources.map((edge) => edge.battery.id)));
+  if ([...selected].some((id) => !present.has(id))) { return null; }
+  if (driven.length === 1 && !independentSourceOutputBoundary(output, selected,
+    sourceBranches ?? driven[0]!.sources.filter((edge) => selected.has(edge.battery.id)))) { return null; }
+  const responseKey = JSON.stringify([...selected].sort());
+  const responses = output.responses ?? new Map();
+  output.responses = responses;
+  // The physical response depends on the selected cells, not their
+  // discovery partition. Keep the original paired boundary proof above
+  // outside this cache: a rejected pairing must never cover a valid one.
+  let combined = responses.get(responseKey);
+  if (combined === undefined) {
+    combined = combinedSourceOutputResponse(output, selected, driven);
+    responses.set(responseKey, combined);
+  }
+  if (!combined) { return null; }
+  const loadResistance = commonSourceLoadResistance(output);
+  if (loadResistance === null) { return null; }
+  const resistance = subtractExactRational(combined.resistance, negateExact(loadResistance));
+  coveredUntappedBatteryReturns(output, driven, resistance, checkedBatteryIds);
+  return { resistance, voltage: combined.voltage };
+}
+
+function commonSourceLoadResistance(output: CommonSourceOutput) {
+  if (output.loadResistance === undefined) {
+    const nodes = [...new Set([output.from, output.to, ...output.load.flatMap((edge) => [edge.a, edge.b])])];
+    output.loadResistance = externalResistanceExact(nodes, output.load, output.from, output.to);
+  }
+  return output.loadResistance;
+}
+
+function commonSourceOutputCanShort(output: CommonSourceOutput) {
+  const resistance = commonSourceLoadResistance(output);
+  // Suppressed ideal cells and passive source-side branches have Rout >= 0.
+  // Measure the entire parallel load before pruning: individual high-R
+  // paths can combine below the threshold. Local and circulating shorts
+  // remain separate checks and do not use this output-load bound.
+  if (resistance === null || subtractExactRational(resistance, exactInput(SHORT_OHMS)!).numerator >= 0n) { return false; }
+  const sourceResistance = minimumSourceOutputResistance(output);
+  return sourceResistance === null || subtractExactRational(
+    subtractExactRational(resistance, negateExact(sourceResistance)), exactInput(SHORT_OHMS)!,
+  ).numerator < 0n;
+}
+
+function minimumSourceOutputResistance(output: CommonSourceOutput) {
+  if (output.minimumSourceResistance !== undefined) { return output.minimumSourceResistance; }
+  const passive = output.sources.flatMap((macro) => macro.passive);
+  const sources = output.sources.flatMap((macro) => macro.sources);
+  const nodes = [...new Set([output.from, output.to, ...passive.flatMap((edge) => [edge.a, edge.b]),
+    ...sources.flatMap((edge) => [edge.fromNode, edge.toNode])])];
+  const local = new Map(nodes.map((node, position) => [node, position]));
+  // Shorting every ideal cell adds connections to any selected-cell Rout
+  // experiment, in which unselected cells are open. Rayleigh monotonicity
+  // therefore bounds every subset from below, without using its EMF,
+  // internal resistance, private dissipation or a discovery partition.
+  const components = conductiveComponents(nodes.length, sources.map((edge) => ({
+    a: local.get(edge.fromNode)!, b: local.get(edge.toNode)!,
+  })));
+  const branches = passive.map((edge) => ({ ...edge,
+    a: components[local.get(edge.a)!]!, b: components[local.get(edge.b)!]!, exactVoltage: EXACT_ZERO,
+  }));
+  const network = reducedSourceResponseNetwork(branches, components[local.get(output.from)!]!, components[local.get(output.to)!]!);
+  output.minimumSourceResistance = externalResistanceExact(Array.from({ length: network.size }, (_, node) => node),
+    network.branches, network.from, network.to);
+  return output.minimumSourceResistance;
+}
+
+function coveredHighResistanceOutputReturns(size: number, outputs: readonly CommonSourceOutput[], checkedBatteryIds: Set<string>) {
+  for (const output of outputs) {
+    const resistance = commonSourceLoadResistance(output);
+    if (resistance === null || subtractExactRational(resistance, exactInput(SHORT_OHMS)!).numerator < 0n) { continue; }
+    const passive = output.sources.flatMap((macro) => macro.passive);
+    const components = conductiveComponents(size, passive);
+    // With every cell open, a source-side passive return could bypass the
+    // load (including a private shunt or an unselected macro's conductors).
+    // Only when no such return exists does each untapped single-cell path
+    // necessarily include the full common load and inherit its lower bound.
+    if (components[output.from] === components[output.to]) { continue; }
+    coveredUntappedBatteryReturns(output, output.sources, resistance, checkedBatteryIds);
+  }
+}
+
+function combinedSourceOutputResponse(output: CommonSourceOutput, selected: ReadonlySet<string>, driven: readonly SourceOutputMacro[]) {
+  let conductance = EXACT_ZERO;
+  let current = EXACT_ZERO;
+  let idealVoltage: ExactRational | undefined;
+  for (const macro of output.sources) {
+    const response = sourceOutputResponse(macro, selected, output.from, output.to);
+    if (!response) {
+      if (driven.includes(macro)) { return null; }
+      continue; // Unselected cells are open; their real passive branches remain.
+    }
+    if (response.resistance.numerator === 0n) {
+      if (idealVoltage && subtractExactRational(idealVoltage, response.voltage).numerator !== 0n) { return null; }
+      idealVoltage = response.voltage;
+    } else {
+      const g = divideExactRational(EXACT_ONE, response.resistance)!;
+      conductance = subtractExactRational(conductance, negateExact(g));
+      current = subtractExactRational(current, negateExact(multiplyExactRational(g, response.voltage)));
+    }
+  }
+  const outputResistance = idealVoltage ? EXACT_ZERO : divideExactRational(EXACT_ONE, conductance);
+  const outputVoltage = idealVoltage ?? (outputResistance && multiplyExactRational(current, outputResistance));
+  if (!outputResistance || !outputVoltage) { return null; }
+  return { resistance: outputResistance, voltage: outputVoltage };
+}
+
+function pairedBatteryGroupSignature(group: ParallelBatteryGroup) {
+  const branches = group.edges.map((edge, position) => ({
+    from: group.fromNodes[position]!,
+    to: group.toNodes[position]!,
+    sources: (edge.sourceEdges ?? [edge]).map((source) => source.battery.id).sort(),
+  }));
+  const signature = (reversePorts: boolean) => JSON.stringify(branches.map((branch) => JSON.stringify([
+    reversePorts ? branch.to : branch.from,
+    reversePorts ? branch.from : branch.to,
+    branch.sources,
+  ])).sort());
+  const forward = signature(false);
+  const reverse = signature(true);
+  return forward < reverse ? forward : reverse;
+}
+
+function shortedParallelBatteryLoads(
+  block: readonly PassiveBatteryEdge[],
+  outputs: readonly CommonSourceOutput[],
+  testedGroups: Set<string>,
+  checkedBatteryIds: Set<string>,
+) {
+  for (const group of parallelBatteryPairs(block).flatMap((parallel) => parallel.groups)) {
+    const first = group.edges[0]!;
+    const emf = first.emf ?? exactInput(first.battery.voltageVolts ?? 0)!;
+    if (group.edges.length < 2 || emf.numerator === 0n) { continue; }
+    const selected = new Set(group.edges.flatMap((edge) => (edge.sourceEdges ?? [edge]).map((source) => source.battery.id)));
+    // Boundary rejection depends on the paired outer ports and original
+    // series membership, not just the selected cell IDs. A different split
+    // of the same source loop must still reach the strict boundary proof.
+    const signature = pairedBatteryGroupSignature(group);
+    if (testedGroups.has(signature)) { continue; }
+    testedGroups.add(signature);
+    for (const output of outputs) {
+      if (!commonSourceOutputCanShort(output)) { continue; }
+      const response = commonSourceOutputResistance(output, selected, checkedBatteryIds, group.edges);
+      // Local source/shunt dissipation and macro current distribution are
+      // absent from this metric: suppress paired sources for Rout, then add
+      // the common passive load. A zero open-circuit output cannot drive it.
+      if (response && response.voltage.numerator !== 0n &&
+        subtractExactRational(response.resistance, exactInput(SHORT_OHMS)!).numerator < 0n) {
+        return first.battery;
+      }
+    }
+  }
+}
+
+function shortedReducedSourceLoads(
+  loop: readonly PassiveBatteryEdge[],
+  network: ReturnType<typeof passiveComponentsByNode>,
+  outputs: readonly CommonSourceOutput[],
+  testedGroups: Set<string>,
+  testedOutputs: Map<CommonSourceOutput, Set<string>>,
+  checkedBatteryIds: Set<string>,
+  junctions?: readonly number[],
+) {
+  const reduced = reducedBatteryBlock(loop, network.nodesByComponent, network.conductancesByComponent,
+    subnetworkJunctionComponents(network.components, junctions));
+  const reducedShort = shortedParallelBatteryLoads(reduced, outputs, testedGroups, checkedBatteryIds);
+  if (reducedShort) { return reducedShort; }
+  // Raw parallel cell groups were already checked with these paired ports;
+  // only a loop containing series interiors needs alternative restoration.
+  if (new Set(loop.flatMap((edge) => [edge.fromComponent, edge.toComponent])).size < 3) { return; }
+  for (const output of outputs) {
+    if (!commonSourceOutputCanShort(output)) { continue; }
+    const [fromRoots, toRoots] = sourceOutputRootComponents(output, loop, network.components);
+    const tested = testedOutputs.get(output) ?? new Set<string>();
+    testedOutputs.set(output, tested);
+    for (const from of fromRoots) {
+      for (const to of toRoots) {
+        if (from === to) { continue; }
+        // Discovery cuts can isolate the actual outputs or mark a private
+        // series midpoint as a junction. Restore at physically reachable
+        // outer cell ports; the original paired strings must still pass the
+        // strict independent boundary proof on the full source-side network.
+        const strings = reducedBatteryBlock(loop, network.nodesByComponent, network.conductancesByComponent, new Set([from, to]));
+        const shorted = shortedParallelBatteryLoads(strings, [output], tested, checkedBatteryIds);
+        if (shorted) { return shorted; }
+      }
+    }
+  }
+}
+
+function sourceOutputRootComponents(output: CommonSourceOutput, loop: readonly PassiveBatteryEdge[], components: readonly number[]) {
+  const ports = new Set(loop.flatMap((edge) => (edge.sourceEdges ?? [edge]).flatMap((source) => [source.fromNode, source.toNode])));
+  const adjacent = new Map<number, number[]>();
+  // Use only the physical source side: traversing the common load would
+  // leak into the opposite output and turn interior cell ports into roots.
+  for (const edge of output.sources.flatMap((macro) => macro.passive)) {
+    for (const [from, to] of [[edge.a, edge.b], [edge.b, edge.a]] as const) {
+      const neighbors = adjacent.get(from) ?? [];
+      neighbors.push(to);
+      adjacent.set(from, neighbors);
+    }
+  }
+  const reachable = (start: number, other: number) => {
+    const roots = new Set<number>();
+    const visited = new Set([start]);
+    const queue = [start];
+    for (const node of queue) {
+      if (ports.has(node)) {
+        roots.add(components[node]!);
+        if (node !== start) { continue; }
+      }
+      for (const next of adjacent.get(node) ?? []) {
+        if (next === other || visited.has(next)) { continue; }
+        visited.add(next);
+        queue.push(next);
+      }
+    }
+    return roots;
+  };
+  // At most one root per selected port component on each side, followed by
+  // a bounded Cartesian product; no source-edge or passive-path enumeration.
+  return [reachable(output.from, output.to), reachable(output.to, output.from)] as const;
+}
+
+function shortedCommonRailBatteryLoads(
+  batteries: readonly CircuitPart[],
+  index: Map<string, number>,
+  passive: readonly Conductance[],
+  outputs: readonly CommonSourceOutput[],
+  testedGroups: Set<string>,
+  checkedBatteryIds: Set<string>,
+) {
+  const rails = conductiveComponents(index.size, passive.filter((edge) => edge.resistanceOhms === IDEAL_OHMS));
+  const portsByRail = new Map<number, number>();
+  for (const battery of batteries) {
+    for (const terminal of ["a", "b"] as const) {
+      const rail = rails[index.get(`${battery.id}:${terminal}`)!]!;
+      portsByRail.set(rail, (portsByRail.get(rail) ?? 0) + 1);
+    }
+  }
+  for (const [rail, ports] of portsByRail) {
+    if (ports < 2) { continue; }
+    // Removing a shared conductor rail prevents loads and taps from joining
+    // the two source sides. The other ports can then be grouped through their
+    // real ballasts regardless of how those values compare with the load.
+    const remaining = passive.filter((edge) => rails[edge.a] !== rail && rails[edge.b] !== rail);
+    const components = conductiveComponents(index.size, remaining);
+    for (const [node, component] of rails.entries()) {
+      if (component === rail) { components[node] = index.size; }
+    }
+    const graph = batteryEdgesByPassiveComponent(batteries, index, components);
+    const attached = graph.edges.filter((edge) => (edge.fromComponent === index.size) !== (edge.toComponent === index.size));
+    const shorted = shortedParallelBatteryLoads(attached, outputs, testedGroups, checkedBatteryIds);
     if (shorted) { return shorted; }
   }
 }
@@ -2075,7 +2693,23 @@ function sourceGroupExternalResistance(
   index: Map<string, number>,
   sourceTree: SourceConstraintTree,
   passive: readonly Conductance[],
+  outputs: readonly CommonSourceOutput[],
 ) {
+  const selected = new Set((batteriesByGroup.get(group) ?? []).map((battery) => battery.id));
+  let hasOutput = false;
+  let outputResistance: ExactRational | null = null;
+  for (const output of outputs) {
+    const response = commonSourceOutputResistance(output, selected, new Set());
+    if (!response) { continue; }
+    hasOutput = true;
+    if (response.voltage.numerator !== 0n && (outputResistance === null ||
+      subtractExactRational(response.resistance, outputResistance).numerator < 0n)) {
+      outputResistance = response.resistance;
+    }
+  }
+  // Wires can put tapped cells into the same ideal source-constraint group.
+  // That does not turn their private losses into common output load power.
+  if (hasOutput) { return outputResistance; }
   const span = sourceGroupVoltageSpan(sourceTree, group);
   if (span.numerator === 0n) { return null; }
   const parent = Array.from({ length: index.size }, (_, node) => node);
@@ -2105,11 +2739,12 @@ function multiSourceGroupShorts(
   index: Map<string, number>,
   sourceTree: SourceConstraintTree,
   passive: readonly Conductance[],
+  outputs: readonly CommonSourceOutput[],
 ) {
   const results = new Map<number, boolean>();
   for (const group of sourceGroups) {
     if ((batteriesByGroup.get(group)?.length ?? 0) < 2 || sourceTree.inconsistent.has(group)) { continue; }
-    const resistance = sourceGroupExternalResistance(group, batteriesByGroup, index, sourceTree, passive);
+    const resistance = sourceGroupExternalResistance(group, batteriesByGroup, index, sourceTree, passive, outputs);
     results.set(group, resistance !== null && subtractExactRational(resistance, exactInput(SHORT_OHMS)!).numerator < 0n);
   }
   return results;
@@ -2125,9 +2760,10 @@ function shortedBatteryByExternalResistance(
   passive: readonly Conductance[],
   nodesByComponent: Map<number, number[]>,
   conductancesByComponent: Map<number, Conductance[]>,
+  outputs: readonly CommonSourceOutput[],
 ) {
   const groupedResults = multiSourceGroupShorts(new Set([...groups.values()].map((group) => group.sourceGroup)),
-    batteriesByGroup, index, sourceTree, passive);
+    batteriesByGroup, index, sourceTree, passive, outputs);
   const shortedGroup = [...groupedResults].find(([, short]) => short)?.[0];
   if (shortedGroup !== undefined) { return batteriesByGroup.get(shortedGroup)?.[0]; }
   const remainingGroups = [...groups.values()].filter((group) => !groupedResults.has(group.sourceGroup));
@@ -2173,11 +2809,16 @@ function shortedBattery(
   conductances: readonly Conductance[],
   switchStates: Record<string, boolean>,
 ) {
-  const readings = exactBatteryReadings(batteries, index, solved);
+  // A bridge source carries no loop current. Its EMF must not enlarge the
+  // normalized voltage span or suppress a connected source's load check.
+  const loopBatteries = batteries.filter((battery) => hasExternalBatteryPath(
+    index.size, conductances, battery.id, index.get(`${battery.id}:a`)!, index.get(`${battery.id}:b`)!,
+  ));
+  const readings = exactBatteryReadings(loopBatteries, index, solved);
   const passive = conductances.filter(({ batteryId }) => batteryId === undefined);
   const passiveNetwork = passiveComponentsByNode(index.size, passive);
   const seriesLoop = shortedSeriesLoopBattery(
-    batteries,
+    loopBatteries,
     readings,
     index,
     passiveNetwork.components,
@@ -2185,23 +2826,23 @@ function shortedBattery(
     passiveNetwork.conductancesByComponent,
   );
   if (seriesLoop.shortedBattery) { return seriesLoop.shortedBattery; }
-  const drivenShort = shortedBatteryInConductorGraph(batteries, readings, index, passive, passiveNetwork.components);
+  const drivenShort = shortedBatteryInConductorGraph(loopBatteries, readings, index, passive, passiveNetwork.components);
   if (drivenShort) { return drivenShort; }
-  const subnetworkShort = shortedBatterySubnetworks(batteries, readings, index, passive, passiveNetwork.components);
-  if (subnetworkShort) { return subnetworkShort; }
+  const subnetworks = shortedBatterySubnetworks(loopBatteries, readings, index, passive, passiveNetwork.components);
+  if (subnetworks.shortedBattery) { return subnetworks.shortedBattery; }
 
-  const sourceEdges = sourceConstraintEdges(document, index, switchStates);
+  const sourceEdges = sourceConstraintEdges(document, index, switchStates, new Set(loopBatteries.map((battery) => battery.id)));
   const sourceTree = sourceConstraintTree(index.size, sourceEdges);
-  const batteriesByGroup = batteriesBySourceGroup(batteries, sourceTree, index);
-  const byTerminalRatio = shortedBatteryByTerminalRatio(
-    batteries,
+  const batteriesByGroup = batteriesBySourceGroup(loopBatteries, sourceTree, index);
+  const byPassiveResistance = shortedBatteryByPassiveResistance(
+    loopBatteries,
     readings,
-    sourceTree,
-    batteriesByGroup,
     index,
     seriesLoop.protectedBatteryIds,
+    passiveNetwork,
+    subnetworks.checkedBatteryIds,
   );
-  if (byTerminalRatio) { return byTerminalRatio; }
+  if (byPassiveResistance) { return byPassiveResistance; }
 
   const rails = zeroVoltageSourceRails(index.size, sourceEdges);
   const escapeConductance = passiveEscapeConductances(index.size, rails, passive);
@@ -2222,6 +2863,7 @@ function shortedBattery(
     passive,
     passiveNetwork.nodesByComponent,
     passiveNetwork.conductancesByComponent,
+    subnetworks.outputs,
   );
 }
 
@@ -2232,32 +2874,343 @@ function shortedBatterySubnetworks(
   passive: readonly Conductance[],
   components: readonly number[],
 ) {
-  if (batteries.length < 2 || !batteries.some((battery) => {
-    const from = index.get(`${battery.id}:a`);
-    const to = index.get(`${battery.id}:b`);
-    return from !== undefined && to !== undefined && components[from] === components[to];
-  })) { return; }
+  const checkedBatteryIds = new Set<string>();
+  if (batteries.length < 2) { return { checkedBatteryIds, outputs: [] }; }
+  const testedGroups = new Set<string>();
+  const testedOutputs = new Map<CommonSourceOutput, Set<string>>();
+  const outputs = commonSourceOutputs(batteries, index, passive, [...components]);
+  coveredHighResistanceOutputReturns(index.size, outputs, checkedBatteryIds);
+  const commonRailShort = shortedCommonRailBatteryLoads(batteries, index, passive, outputs, testedGroups, checkedBatteryIds) ??
+    shortedSourceOutputLoads(index, outputs, testedOutputs, checkedBatteryIds);
+  if (commonRailShort) { return { checkedBatteryIds, shortedBattery: commonRailShort }; }
+  const levels = passiveResistanceLevels(passive);
+  for (const { subset, checkCycles, junctions } of passiveBatterySubnetworks(batteries, index, passive, components, levels)) {
+    const network = passiveComponentsByNode(index.size, subset);
+    const graph = batteryEdgesByPassiveComponent(batteries, index, network.components);
+    for (const loop of batteryCycleGroups(graph.edges, graph.incidentEdges)) {
+      // A consistent (zero circulating EMF) cycle can still supply a real
+      // passive short. This load test has its own nonzero drive and therefore
+      // also applies to cells with exactly zero actual current. Protection of
+      // series cycles and the flowing-current guard remain in the cycle tests.
+      const loadShort = shortedParallelBatteryLoads(loop, outputs, testedGroups, checkedBatteryIds);
+      if (loadShort) { return { checkedBatteryIds, shortedBattery: loadShort }; }
+      const reducedLoadShort = shortedReducedSourceLoads(loop, network, outputs, testedGroups, testedOutputs, checkedBatteryIds, junctions);
+      if (reducedLoadShort) { return { checkedBatteryIds, shortedBattery: reducedLoadShort }; }
+      // A load cut can also expose unequal source groups. Their circulation
+      // still requires the original low-resistance cycle tests; using a load
+      // shunt to lower that return would misclassify a resistive charging path.
+      if (!checkCycles) { continue; }
+      const shorted = shortedBatterySubnetworkCycle(loop, readings, index.size, network, passive);
+      if (shorted) { return { checkedBatteryIds, shortedBattery: shorted }; }
+    }
+  }
+  return { checkedBatteryIds, outputs };
+}
+
+function shortedBatterySubnetworkCycle(
+  loop: readonly PassiveBatteryEdge[],
+  readings: Map<string, ExactBatteryReading>,
+  size: number,
+  network: ReturnType<typeof passiveComponentsByNode>,
+  passive: readonly Conductance[],
+) {
+  const parallel = parallelBatteryGroups(loop);
+  return parallel
+    ? shortedParallelBatteryGroup(parallel, readings, size, network.conductancesByComponent, passive)
+    : shortedBatteryCycle(loop, readings, size, network.nodesByComponent, network.conductancesByComponent, passive, network.components);
+}
+
+function passiveResistanceLevels(passive: readonly Conductance[]) {
   const resistanceOf = (edge: Conductance) => edge.exactResistance ?? exactInput(edge.resistanceOhms)!;
-  const levels = [...new Map(passive.map((edge) => {
+  return [...new Map(passive.map((edge) => {
     const resistance = resistanceOf(edge);
     return [`${resistance.numerator}/${resistance.denominator}`, resistance] as const;
   })).values()].sort((first, second) => {
     const difference = subtractExactRational(first, second).numerator;
     return difference < 0n ? -1 : Number(difference > 0n);
   });
-  // Adding a weak load must not remove a driven low-resistance source cycle.
-  // Check every distinct resistance level; individual parallel return branches
-  // can exceed SHORT_OHMS even when their combined resistance is below it.
-  for (const level of levels.slice(0, -1)) {
-    const subset = passive.filter((edge) => subtractExactRational(resistanceOf(edge), level).numerator <= 0n);
-    const network = passiveComponentsByNode(index.size, subset);
-    const graph = batteryEdgesByPassiveComponent(batteries, index, network.components);
-    for (const loop of batteryCycleGroups(graph.edges, graph.incidentEdges)) {
-      const parallel = parallelBatteryGroups(loop);
-      const shorted = parallel
-        ? shortedParallelBatteryGroup(parallel, readings, index.size, network.conductancesByComponent, passive)
-        : shortedBatteryCycle(loop, readings, index.size, network.nodesByComponent, network.conductancesByComponent, passive, network.components);
-      if (shorted) { return shorted; }
+}
+
+function shortedSourceOutputLoads(
+  index: Map<string, number>,
+  outputs: readonly CommonSourceOutput[],
+  testedOutputs: Map<CommonSourceOutput, Set<string>>,
+  checkedBatteryIds: Set<string>,
+) {
+  for (const output of outputs) {
+    if (!commonSourceOutputCanShort(output)) { continue; }
+    const passive = output.sources.flatMap((macro) => macro.passive);
+    const batteries = output.sources.flatMap((macro) => macro.sources.map((edge) => edge.battery));
+    const components = conductiveComponents(index.size, passive);
+    const tested = testedOutputs.get(output) ?? new Set<string>();
+    testedOutputs.set(output, tested);
+    // First remove the complete source-free output load, including paths
+    // with multiple resistance ranks. Otherwise a load between two ballast
+    // ranks and private cell shunts can hide every original series string.
+    // Subsequent cuts discover paired strings only; their boundary proof
+    // and response still use every physical source-side passive branch,
+    // including those attached to an unselected cell's open raw terminals.
+    for (const { subset, junctions } of passiveBatterySubnetworks(batteries, index, passive, components, passiveResistanceLevels(passive))) {
+      const network = passiveComponentsByNode(index.size, subset);
+      const graph = batteryEdgesByPassiveComponent(batteries, index, network.components);
+      for (const loop of batteryCycleGroups(graph.edges, graph.incidentEdges)) {
+        const shorted = shortedParallelBatteryLoads(loop, [output], tested, checkedBatteryIds) ??
+          shortedReducedSourceLoads(loop, network, [output], tested, testedOutputs, checkedBatteryIds, junctions);
+        if (shorted) { return shorted; }
+      }
+    }
+  }
+}
+
+function hasPassiveBatteryReturn(batteries: readonly CircuitPart[], index: Map<string, number>, components: readonly number[]) {
+  return batteries.length > 1 && batteries.some((battery) => {
+    const from = index.get(`${battery.id}:a`);
+    const to = index.get(`${battery.id}:b`);
+    return from !== undefined && to !== undefined && components[from] === components[to];
+  });
+}
+
+interface PassiveTopologyNeighbor {
+  node: number;
+  edge: number;
+}
+
+interface PassiveBatterySubnetwork {
+  subset: Conductance[];
+  checkCycles: boolean;
+  junctions?: number[];
+}
+
+interface PassiveTopologyPath {
+  from: number;
+  to: number;
+  edges: number[];
+}
+
+function subnetworkJunctionComponents(components: readonly number[], junctions?: readonly number[]) {
+  return junctions && new Set(junctions.map((node) => components[node]!));
+}
+
+function passiveTopologyPaths(
+  adjacent: ReadonlyMap<number, PassiveTopologyNeighbor[]>,
+  ports: ReadonlyMap<number, number>,
+) {
+  const visited = new Set<number>();
+  const paths: PassiveTopologyPath[] = [];
+  for (const [from, neighbors] of adjacent) {
+    if (neighbors.length === 2 && !ports.has(from)) { continue; }
+    for (const first of neighbors) {
+      if (visited.has(first.edge)) { continue; }
+      const edges = [first.edge];
+      visited.add(first.edge);
+      let node = first.node;
+      let previous = first.edge;
+      while (!ports.has(node) && adjacent.get(node)?.length === 2) {
+        const next = adjacent.get(node)!.find((edge) => edge.edge !== previous)!;
+        if (visited.has(next.edge)) { break; }
+        visited.add(next.edge);
+        edges.push(next.edge);
+        previous = next.edge;
+        node = next.node;
+      }
+      paths.push({ from, to: node, edges });
+    }
+  }
+  return paths;
+}
+
+function passiveTopologyAdjacency(passive: readonly Conductance[], rails: readonly number[]) {
+  const adjacent = new Map<number, PassiveTopologyNeighbor[]>();
+  for (const [edgeIndex, edge] of passive.entries()) {
+    const a = rails[edge.a]!;
+    const b = rails[edge.b]!;
+    if (a === b) { continue; }
+    for (const [from, to] of [[a, b], [b, a]] as const) {
+      const neighbors = adjacent.get(from) ?? [];
+      neighbors.push({ node: to, edge: edgeIndex });
+      adjacent.set(from, neighbors);
+    }
+  }
+  return adjacent;
+}
+
+function mergeTopologyPolarity(polarities: Map<number, number>, node: number, polarity: number) {
+  const previous = polarities.get(node);
+  polarities.set(node, previous === undefined || previous === polarity ? polarity : 0);
+}
+
+function* passivePolarityAssignments(
+  polarities: ReadonlyMap<number, number>,
+  adjacent: ReadonlyMap<number, PassiveTopologyNeighbor[]>,
+) {
+  yield polarities;
+  const ambiguous = [...adjacent].filter(([node, neighbors]) => !polarities.has(node) && neighbors.length >= 3)
+    .map(([node]) => node);
+  // If every cell has crossed taps, no source-port leaf can label the hubs.
+  // Try each ambiguous hub on one side and the remaining hubs on the other,
+  // in both orientations. This is linear in the number of hubs, not their
+  // power set. Conflicting source rails are never assigned a polarity.
+  // These are discovery cuts only: connected paired ports must subsequently
+  // prove a parallel group before its physical passive network is driven.
+  for (const singled of ambiguous) {
+    for (const polarity of [1, -1]) {
+      const assigned = new Map(polarities);
+      for (const node of ambiguous) { assigned.set(node, node === singled ? polarity : -polarity); }
+      yield assigned;
+    }
+  }
+}
+
+function passiveTopologyPolarities(
+  cells: readonly CircuitPart[],
+  index: Map<string, number>,
+  rails: readonly number[],
+  paths: readonly PassiveTopologyPath[],
+  adjacent: ReadonlyMap<number, PassiveTopologyNeighbor[]>,
+) {
+  const polarities = new Map<number, number>();
+  for (const battery of cells) {
+    mergeTopologyPolarity(polarities, rails[index.get(`${battery.id}:a`)!]!, 1);
+    mergeTopologyPolarity(polarities, rails[index.get(`${battery.id}:b`)!]!, -1);
+  }
+  const terminals = new Map(polarities);
+  // Only a source-port leaf can establish a neighboring hub's polarity.
+  // Do not flood through loads/taps or through shared opposite ports of
+  // series cells. Mixed polarity at a rail remains an explicit conflict.
+  for (const path of paths) {
+    for (const [from, to] of [[path.from, path.to], [path.to, path.from]] as const) {
+      const polarity = terminals.get(from);
+      if (polarity && adjacent.get(from)?.length === 1 && !terminals.has(to)) {
+        mergeTopologyPolarity(polarities, to, polarity);
+      }
+    }
+  }
+  return polarities;
+}
+
+function* passivePolarityCuts(
+  batteries: readonly CircuitPart[],
+  index: Map<string, number>,
+  rails: readonly number[],
+  paths: readonly PassiveTopologyPath[],
+  adjacent: ReadonlyMap<number, PassiveTopologyNeighbor[]>,
+) {
+  const groups = new Map<number, CircuitPart[]>();
+  for (const battery of batteries) {
+    const voltage = battery.voltageVolts!;
+    const cells = groups.get(voltage) ?? [];
+    cells.push(battery);
+    groups.set(voltage, cells);
+  }
+  for (const cells of groups.values()) {
+    if (cells.length < 2) { continue; }
+    const polarities = passiveTopologyPolarities(cells, index, rails, paths, adjacent);
+    for (const assigned of passivePolarityAssignments(polarities, adjacent)) {
+      const cut = paths.filter((path) => (assigned.get(path.from) ?? 0) * (assigned.get(path.to) ?? 0) < 0);
+      if (cut.length > 0) { yield new Set(cut.flatMap((path) => path.edges)); }
+    }
+  }
+}
+
+function* passiveTopologyCuts(polarityCuts: Iterable<Set<number>>, junctionCuts: Iterable<Set<number>>) {
+  yield* polarityCuts;
+  yield* junctionCuts;
+}
+
+function* passiveTopologySubnetworks(
+  batteries: readonly CircuitPart[],
+  index: Map<string, number>,
+  passive: readonly Conductance[],
+): Generator<PassiveBatterySubnetwork> {
+  const rails = conductiveComponents(index.size, passive.filter((edge) => edge.resistanceOhms === IDEAL_OHMS));
+  const ports = new Map<number, number>();
+  for (const battery of batteries) {
+    for (const terminal of ["a", "b"] as const) {
+      const rail = rails[index.get(`${battery.id}:${terminal}`)!]!;
+      ports.set(rail, (ports.get(rail) ?? 0) + 1);
+    }
+  }
+  const adjacent = passiveTopologyAdjacency(passive, rails);
+  const junction = (node: number) => (adjacent.get(node)?.length ?? 0) + (ports.get(node) ?? 0) >= 3;
+  const cuts = new Map<number, Set<number>>();
+  const paths = passiveTopologyPaths(adjacent, ports);
+  // Suppress only source-free degree-two paths. A split load or ballast is
+  // still one topological path, regardless of resistor values or segment count.
+  // At each junction cut all paths to other junctions together: parallel loads
+  // and upstream taps must not keep the source sides in one passive component.
+  // Source-port leaves retain their ballast paths. Battery edges never enter
+  // this search, so equal cell voltages alone cannot identify a parallel group.
+  for (const path of paths) {
+    if (path.from === path.to || !junction(path.from) || !junction(path.to)) { continue; }
+    for (const node of [path.from, path.to]) {
+      const cut = cuts.get(node) ?? new Set<number>();
+      for (const edge of path.edges) { cut.add(edge); }
+      cuts.set(node, cut);
+    }
+  }
+  const seen = new Set<string>();
+  // A bounded number of hub cuts per EMF group, not arbitrary edge subsets.
+  // Cuts identify paired ports only; the unit drive keeps the physical network.
+  // A pair of crossed upstream taps can make both cell ports junctions.
+  // Polarity established by the other source's leaf ports distinguishes
+  // the real same-side ballast from those taps even when every R is equal.
+  for (const cut of passiveTopologyCuts(passivePolarityCuts(batteries, index, rails, paths, adjacent), cuts.values())) {
+    const signature = [...cut].sort((a, b) => a - b).join(",");
+    if (seen.has(signature)) { continue; }
+    seen.add(signature);
+    // Remember the load's junctions even if the cut leaves just two source
+    // strings there. Otherwise a degree-two source cycle would be mistaken
+    // for one indivisible series ring instead of two parallel series paths.
+    yield { subset: passive.filter((_, edge) => !cut.has(edge)), checkCycles: false,
+      junctions: [...new Set(paths.filter((path) => path.edges.some((edge) => cut.has(edge)))
+        .flatMap((path) => [path.from, path.to]).filter(junction))] };
+  }
+}
+
+function* passiveBatterySubnetworks(batteries: readonly CircuitPart[], index: Map<string, number>, passive: readonly Conductance[], components: readonly number[], levels: readonly ExactRational[]): Generator<PassiveBatterySubnetwork> {
+  // A series string can have a passive return across its outer ports even
+  // when none of its individual cells has one. Discover those paired paths
+  // before applying the single-cell guard to the resistance-rank search.
+  yield* passiveTopologySubnetworks(batteries, index, passive);
+  if (hasPassiveBatteryReturn(batteries, index, components)) { yield* passiveResistanceSubnetworks(passive, levels); }
+}
+
+function* passiveResistanceSubnetworks(passive: readonly Conductance[], levels: readonly ExactRational[]) {
+  const resistanceKey = (value: ExactRational) => `${value.numerator}/${value.denominator}`;
+  const ranks = new Map(levels.map((value, rank) => [resistanceKey(value), rank]));
+  const ranked = passive.map((edge, index) => ({
+    edge, index, rank: ranks.get(resistanceKey(edge.exactResistance ?? exactInput(edge.resistanceOhms)!))!,
+  }));
+  const seen = new Set<string>();
+  const candidate = (entries: typeof ranked, checkCycles: boolean) => {
+    const signature = entries.map(({ index }) => index).join(",");
+    if (entries.length === passive.length || seen.has(signature)) { return null; }
+    seen.add(signature);
+    return { subset: entries.map(({ edge }) => edge), checkCycles };
+  };
+  for (let upper = 0; upper < levels.length - 1; upper += 1) {
+    const entries = ranked.filter(({ rank }) => rank <= upper);
+    const next = candidate(entries, true);
+    if (next) { yield next; }
+  }
+  // A shared load may sit between unequal ballast ranks on both source
+  // sides. Cutting its rank keeps those ballasts together even without a
+  // conductor-only common terminal rail or a contiguous resistor band.
+  for (let omitted = 0; omitted < levels.length; omitted += 1) {
+    const entries = ranked.filter(({ edge, rank }) => edge.resistanceOhms === IDEAL_OHMS || rank !== omitted);
+    const next = candidate(entries, false);
+    if (next) { yield next; }
+  }
+  // Keep conductors and each contiguous band of resistor values. Ballasts
+  // can lie above a common load and below a weak upstream tap, so neither a
+  // prefix nor a suffix alone separates the parallel source ports. The bands
+  // identify groups only; unit-drive solves retain the entire physical net.
+  // There are quadratically many bands, rather than arbitrary edge subsets.
+  for (let lower = 1; lower < levels.length; lower += 1) {
+    for (let upper = lower; upper < levels.length; upper += 1) {
+      const entries = ranked.filter(({ edge, rank }) => edge.resistanceOhms === IDEAL_OHMS || (rank >= lower && rank <= upper));
+      const next = candidate(entries, false);
+      if (next) { yield next; }
     }
   }
 }

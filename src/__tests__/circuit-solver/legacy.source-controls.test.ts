@@ -293,7 +293,11 @@ describe("legacy DC parallel circulation and short thresholds", () => {
     const leads = [0.0001, returned, returned];
     const document = parallelDocument(emfs, leads, load);
     const returnBranches = leads.slice(1).map((value) => plus(input(value), times(input(conductorOhms), fraction(3n))));
-    if (load !== undefined) {
+    // Opposing sources are evaluated as a circulating loop. Their common
+    // output load has a separate Thevenin resistance and must not be added
+    // to the loop's unit-drive power. Same-direction groups also retain the
+    // physical parallel return used by the legacy load definition.
+    if (load !== undefined && second > 0) {
       returnBranches.push(plus(input(load), times(input(conductorOhms), fraction(2n))));
     }
     const returnOhms = parallel(returnBranches);
@@ -313,6 +317,43 @@ describe("legacy DC parallel circulation and short thresholds", () => {
       expectConservation(variant, analysis);
     }
     expectOpenBranchInvariant(document, analyzeCircuit(document));
+  });
+
+  it.each([0.000_496_999_975, 0.000_497_000_025])(
+    "keeps zero-output opposing circulation separate from the common load at $0 ohms",
+    (leadOhms) => {
+      const emfs = [1, -1];
+      const leads = [leadOhms, leadOhms];
+      const document = parallelDocument(emfs, leads, 1000);
+      const loopResistance = times(plus(input(leadOhms), times(input(conductorOhms), fraction(3n))), fraction(2n));
+      const status = belowThreshold(loopResistance) ? "short" : "closed";
+      const oracle = parallelOracle(emfs, leads, 1000);
+      expect(oracle.voltage).toBe(0);
+      expect(oracle.loadCurrent).toBe(0);
+      for (const variant of [...variants(document), reverseBatteryPolarity(document)]) {
+        const analysis = analyzeCircuit(variant);
+        expect(analysis.status, analysis.message).toBe(status);
+        expect(analysis.parts.load.currentAmps).toBe(0);
+        expect(analysis.parts.load.powerWatts).toBe(0);
+        expectConservation(variant, analysis);
+      }
+    },
+  );
+
+  it("retains the weak physical return for same-direction unequal sources", () => {
+    const leadOhms = 0.000_497_000_025;
+    const document = parallelDocument([3, 1], [leadOhms, leadOhms], 1000);
+    const sourceLead = plus(input(leadOhms), times(input(conductorOhms), fraction(3n)));
+    const loopResistance = times(sourceLead, fraction(2n));
+    const loadResistance = plus(input(1000), times(input(conductorOhms), fraction(2n)));
+    const physicalReturn = plus(sourceLead, parallel([sourceLead, loadResistance]));
+    expect(belowThreshold(loopResistance)).toBe(false);
+    expect(belowThreshold(physicalReturn)).toBe(true);
+    for (const variant of [...variants(document), reverseBatteryPolarity(document)]) {
+      const analysis = analyzeCircuit(variant);
+      expect(analysis.status, analysis.message).toBe("short");
+      expectConservation(variant, analysis);
+    }
   });
 });
 

@@ -21,6 +21,7 @@ import {
   exactComponentSum,
   exactDotProductRational,
   exactProductSumRatio,
+  scaledProduct,
   solveComplexLinearSystem,
   solveRealLinearSystem,
   withComplexMagnitudeNormalization,
@@ -1073,11 +1074,50 @@ function initialCapacitorLoopEquation(branch: Branch, path: IdealVoltageConstrai
   return { terms, rhs: negativeExact(sumExactRationals(derivatives)) };
 }
 
+function hasTransientSourceVoltage(constraint?: InitialVoltageConstraint) {
+  return constraint?.voltageValue !== undefined || constraint?.voltageDerivative !== undefined;
+}
+
+function compatibleTransientSourceWaveforms(
+  branch: Branch,
+  path: IdealVoltageConstraintPath,
+  partById: ReadonlyMap<string, CircuitPart>,
+  constraints?: ReadonlyMap<string, InitialVoltageConstraint>,
+) {
+  const edges = [
+    { branch, orientation: -1 },
+    ...path.edges.map((edge) => ({ branch: edge.branch, orientation: edge.orientation })),
+  ];
+  const sources = edges.map((edge) => ({ ...edge, part: partById.get(edge.branch.partId)! }));
+  if (!sources.some((edge) => edge.part.kind === "ac-source" &&
+      hasTransientSourceVoltage(constraints?.get(edge.part.id)))) {
+    return;
+  }
+  const offsets = sources.map(({ part, branch: sourceBranch, orientation }) => {
+    const voltage = part.kind === "ac-source"
+      ? numberToExactRational(part.offsetVolts ?? 0)!
+      : exactComplexValue(sourceBranch.sourceVoltage)!.real;
+    return orientation === 1 ? voltage : negativeExact(voltage);
+  });
+  if (sumExactRationals(offsets).numerator !== 0n) { return false; }
+  const frequencies = new Set(sources.filter(({ part }) => part.kind === "ac-source" && part.voltageVolts !== 0)
+    .map(({ part }) => part.frequencyHz!));
+  // Sampled voltages and even their first derivatives can agree while the
+  // ideal waveforms differ between samples. Every frequency must satisfy KVL.
+  return [...frequencies].every((frequency) => compatibleIdealAcVoltageCycle(sources.map(({ part, orientation }) => ({
+    part,
+    orientation,
+    voltage: part.kind === "ac-source" && part.frequencyHz === frequency
+      ? complexFromPolar(part.voltageVolts ?? 0, part.phaseDegrees ?? 0) : complex(),
+  }))));
+}
+
 function markRedundantIdealVoltageCycles(
   document: CircuitDocument,
   branches: Branch[],
   nodeCount: number,
   mode: AnalogAnalysisMode,
+  initialVoltageConstraints?: ReadonlyMap<string, InitialVoltageConstraint>,
 ): AnalogCircuitIssue | undefined {
   const partById = new Map(document.parts.map((part) => [part.id, part]));
   const adjacency = Array.from(
@@ -1099,13 +1139,22 @@ function markRedundantIdealVoltageCycles(
       continue;
     }
 
-    const compatible = mode === "ac"
+    const waveformCompatible = mode === "dc" && branch.initialCapacitanceFarads === undefined
+      ? compatibleTransientSourceWaveforms(branch, path, partById, initialVoltageConstraints)
+      : undefined;
+    // Consistent continuous source constraints share a spanning-tree basis.
+    // Independently rounded trigonometric samples need not sum to exact zero.
+    const compatible = waveformCompatible ?? (mode === "ac"
       ? compatibleIdealAcVoltageCycle([
         ...path.edges.map((edge) => ({ part: partById.get(edge.partId)!, voltage: edge.branch.sourceVoltage, orientation: edge.orientation })),
         { part: partById.get(branch.partId)!, voltage: branch.sourceVoltage, orientation: -1 },
       ])
-      : compatibleIdealVoltageConstraint(path.voltageDifference, branch.sourceVoltage);
+      : compatibleIdealVoltageConstraint(path.voltageDifference, branch.sourceVoltage));
     if (!compatible) {
+      if (waveformCompatible !== undefined) {
+        return { ...idealVoltageConstraintIssue(branch, path, partById),
+          message: "理想電圧源のループで時間波形が一致しません。電源の振幅・周波数・位相・極性を確認してください。" };
+      }
       return idealVoltageConstraintIssue(branch, path, partById);
     }
 
@@ -1212,6 +1261,11 @@ function buildLayout(
       transientCompanions,
     ), initialVoltageConstraints?.get(part.id));
     if (spec) {
+      if (part.kind === "ac-source" && hasTransientSourceVoltage(initialVoltageConstraints?.get(part.id)) &&
+          part.voltageVolts !== 0 && spec.positiveNode === spec.negativeNode) {
+        return { issue: { severity: "error", partId: part.id,
+          message: `${part.label}の理想交流電源が短絡され、時間波形を保てません。導線と電源の接続を確認してください。` } };
+      }
       const issue = addMnaBranch(spec, topology, branches, branchByPartId);
       if (issue) { return { issue }; }
     } else {
@@ -1233,7 +1287,7 @@ function buildLayout(
     branch.initialVoltageDerivative = initialConstraint?.voltageDerivative;
   }
   const idealVoltageCycleIssue = markRedundantIdealVoltageCycles(
-    document, [...branches, ...internalBranches], topology.nodeCount, mode,
+    document, [...branches, ...internalBranches], topology.nodeCount, mode, initialVoltageConstraints,
   );
   if (idealVoltageCycleIssue) { return { issue: idealVoltageCycleIssue }; }
 
@@ -3006,7 +3060,7 @@ function linearOpAmpSeed(document: CircuitDocument, layout: MnaLayout) {
   return rhs ? solveLinearTargetState(layout.size, seedMatrix, rhs) : null;
 }
 
-function linearDcSeed(document: CircuitDocument, layout: MnaLayout) {
+function linearDcSeed(document: CircuitDocument, layout: MnaLayout, includeFeedback = true) {
   // Seed independent voltage biases before retrying a singular off-state nonlinear Jacobian.
   const state = new Float64Array(layout.size);
   const matrix = new Float64Array(layout.size * layout.size);
@@ -3024,7 +3078,7 @@ function linearDcSeed(document: CircuitDocument, layout: MnaLayout) {
     addVoltageBranch(matrix, residual, layout, state, branch);
   }
   stampDcReferences(document, layout, state, matrix, residual);
-  const feedbackSeed = linearOpAmpSeed(document, layout);
+  const feedbackSeed = includeFeedback ? linearOpAmpSeed(document, layout) : null;
   if (feedbackSeed) { return currentBiasedDcSeed(document, layout, feedbackSeed); }
   const rhs = exactRhsFromResidualTerms(residual);
   const voltageSeed = rhs ? solveLinearTargetState(layout.size, matrix, rhs) : null;
@@ -4791,12 +4845,61 @@ function balancedDcResult(solution: DcSolution, quality: ReturnType<typeof dcSol
   return solution;
 }
 
+function requiresOpAmpGainContinuation(document: CircuitDocument, layout: MnaLayout) {
+  if (!document.parts.some((part) => part.kind === "npn-transistor" || part.kind === "pnp-transistor") ||
+      !document.parts.some((part) => part.kind === "op-amp")) { return false; }
+  const seed = linearOpAmpSeed(document, layout);
+  // An independent current-driven transistor island can make the linear
+  // seed singular without changing the solvability of the feedback circuit.
+  if (!seed) { return true; }
+  return document.parts.some((part) => {
+    if (part.kind !== "op-amp") { return false; }
+    const output = nonlinearTerminalVoltages(part, layout, seed)[2] ?? 0;
+    return residualTermDifference(output, part.positiveRailVolts ?? 15).numerator > 0n ||
+      residualTermDifference(output, part.negativeRailVolts ?? -15).numerator < 0n;
+  });
+}
+
+function solveDcWithOpAmpGainContinuation(document: CircuitDocument, layout: MnaLayout) {
+  if (!requiresOpAmpGainContinuation(document, layout)) { return null; }
+  const maximumGain = Math.max(...document.parts.filter((part) => part.kind === "op-amp")
+    .map((part) => part.openLoopGain ?? 100_000));
+  let previousState: Float64Array | undefined;
+  // Resolve the nonlinear feedback at low gain before increasing it. Jumping
+  // directly to the final gain can clip both rails and lose the input slope.
+  // These intermediate models only supply initial states; the last solve
+  // uses the original document and the usual physical residual checks.
+  for (let gain = Math.min(1, maximumGain); ; gain = Math.min(maximumGain, scaledProduct([gain, 2]))) {
+    const gainDocument = gain === maximumGain ? document : {
+      ...document,
+      parts: document.parts.map((part) => part.kind === "op-amp"
+        ? { ...part, openLoopGain: Math.min(part.openLoopGain ?? 100_000, gain) } : part),
+    };
+    const solution = solveDcAtReference(gainDocument, layout, previousState);
+    if (!solution.converged || !solution.state) { return null; }
+    if (gain === maximumGain) { return solution; }
+    previousState = solution.state;
+  }
+}
+
+function solveDcWithAlternativeSeed(document: CircuitDocument, layout: MnaLayout) {
+  const continued = solveDcWithOpAmpGainContinuation(document, layout);
+  if (continued) { return continued; }
+  const initial = solveDcAtReference(document, layout);
+  if (initial.converged || !document.parts.some((part) => part.kind === "op-amp")) { return initial; }
+  // A feedback path through an initially open nonlinear device is absent
+  // from the linear amplifier seed. Its unbounded output can strand Newton
+  // in the exponential continuation. Retry from independent voltage biases.
+  const independentSeed = linearDcSeed(document, layout, false);
+  return independentSeed ? solveDcAtReference(document, layout, independentSeed) : initial;
+}
+
 function solveDc(
   document: CircuitDocument,
   layout: MnaLayout,
   adjustReference = false,
 ): DcSolution {
-  const baseline = solveDcAtReference(document, layout);
+  const baseline = solveDcWithAlternativeSeed(document, layout);
   const baselineChannelConducting = baseline.state
     ? mosChannelConductingByPartId(document, layout, baseline.state)
     : undefined;
@@ -4819,7 +4922,7 @@ function solveDc(
     // when the strongest candidate shares another badly conditioned branch.
   for (const referenceNode of preferredReferenceNodes(document, layout, "dc", baselineChannelConducting).slice(0, 8)) {
     const candidateLayout = layoutWithReferenceNode(layout, referenceNode);
-    const candidate = solveDcAtReference(document, candidateLayout);
+    const candidate = solveDcWithAlternativeSeed(document, candidateLayout);
     if (!candidate.converged || !candidate.state) { continue; }
     const candidateQuality = dcSolutionQuality(document, candidateLayout, candidate.state);
     if (improvesDcQuality(candidateQuality, bestQuality)) {

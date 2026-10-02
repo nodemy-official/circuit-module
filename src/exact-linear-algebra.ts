@@ -27,6 +27,8 @@ const MAX_PRODUCT_INTERVAL_SMALL_OPERAND = 2n ** 512n;
 const binary64View = new DataView(new ArrayBuffer(8));
 const exactRationalNumberCache = new WeakMap<ExactRational, number>();
 const MAX_SMALL_DEFERRED_OPERAND = 2n ** 2048n;
+const bitLengthThresholds = [2n ** 32n];
+const smallDivisorGcdCache = new Map<bigint, Map<bigint, bigint>>();
 
 function absolute(value: bigint) {
   return value < 0n ? -value : value;
@@ -58,21 +60,40 @@ function gcd(first: bigint, second: bigint) {
     // biome-ignore lint/suspicious/noBitwiseOperators: exact BigInt shift extracts high word
     const approximateRight = Number(right >> shiftAmount);
     if (approximateRight === 0) {
-      [left, right] = [right, left % right];
+      [left, right] = [right, positiveQuotientAndRemainder(left, right)[1]];
       continue;
     }
 
     const reduced = lehmerReduction(left, right, approximateLeft, approximateRight);
-    [left, right] = reduced ?? [right, left % right];
+    [left, right] = reduced ?? [right, positiveQuotientAndRemainder(left, right)[1]];
   }
   return left;
 }
 
 function nativeGcd(left: bigint, right: bigint) {
+  if (right === 0n) { return left; }
+  if (right === 1n) { return 1n; }
+  const cacheable = left >= MAX_SMALL_DEFERRED_OPERAND;
+  const cached = cacheable ? smallDivisorGcdCache.get(left) : undefined;
+  const known = cached?.get(right);
+  if (known !== undefined) { return known; }
   let dividend = left;
   let divisor = right;
   while (divisor !== 0n) {
+    if (divisor === 1n) { dividend = 1n; break; }
     [dividend, divisor] = [divisor, dividend % divisor];
+  }
+  if (cacheable) {
+    const factors = cached ?? new Map<bigint, bigint>();
+    // BigInt keys and answers are immutable. Bound both dimensions so that
+    // repeated exact coefficients reuse work without retaining a history.
+    if (factors.size < 16) { factors.set(right, dividend); }
+    if (!cached) {
+      if (smallDivisorGcdCache.size >= 32) {
+        smallDivisorGcdCache.delete(smallDivisorGcdCache.keys().next().value!);
+      }
+      smallDivisorGcdCache.set(left, factors);
+    }
   }
   return dividend;
 }
@@ -211,8 +232,8 @@ function multiplyDeferredRationals(
     const firstCancellation = gcd(left.numerator, right.denominator);
     const secondCancellation = gcd(right.numerator, left.denominator);
     return deferredRational(
-      (left.numerator / firstCancellation) * (right.numerator / secondCancellation),
-      (left.denominator / secondCancellation) * (right.denominator / firstCancellation),
+      integerQuotient(left.numerator, firstCancellation) * integerQuotient(right.numerator, secondCancellation),
+      integerQuotient(left.denominator, secondCancellation) * integerQuotient(right.denominator, firstCancellation),
     );
   }
   return deferredRational(left.numerator * right.numerator, left.denominator * right.denominator);
@@ -229,8 +250,8 @@ function divideDeferredRationals(
     const numeratorCancellation = gcd(left.numerator, right.numerator);
     const denominatorCancellation = gcd(right.denominator, left.denominator);
     return deferredRational(
-      (left.numerator / numeratorCancellation) * (right.denominator / denominatorCancellation),
-      (left.denominator / denominatorCancellation) * (right.numerator / numeratorCancellation),
+      integerQuotient(left.numerator, numeratorCancellation) * integerQuotient(right.denominator, denominatorCancellation),
+      integerQuotient(left.denominator, denominatorCancellation) * integerQuotient(right.numerator, numeratorCancellation),
     );
   }
   return deferredRational(left.numerator * right.denominator, left.denominator * right.numerator);
@@ -302,13 +323,13 @@ function addRationalValue(leftValue: ExactRational, rightValue: ExactRational): 
   }
   if (reducedRationals.has(left) && reducedRationals.has(right)) {
     const commonDenominator = gcd(left.denominator, right.denominator);
-    const numerator = left.numerator * (right.denominator / commonDenominator) +
-      right.numerator * (left.denominator / commonDenominator);
+    const numerator = left.numerator * integerQuotient(right.denominator, commonDenominator) +
+      right.numerator * integerQuotient(left.denominator, commonDenominator);
     if (numerator === 0n) { return ZERO; }
     const sharedFactor = gcd(numerator, commonDenominator);
     return reducedRational(
       numerator / sharedFactor,
-      (left.denominator / commonDenominator) * (right.denominator / sharedFactor),
+      integerQuotient(left.denominator, commonDenominator) * (right.denominator / sharedFactor),
     );
   }
   if (left.denominator === right.denominator) {
@@ -318,8 +339,8 @@ function addRationalValue(leftValue: ExactRational, rightValue: ExactRational): 
       : rational(numerator, left.denominator);
   }
   const common = gcd(left.denominator, right.denominator);
-  const leftScale = right.denominator / common;
-  const rightScale = left.denominator / common;
+  const leftScale = integerQuotient(right.denominator, common);
+  const rightScale = integerQuotient(left.denominator, common);
   const numerator = left.numerator * leftScale + right.numerator * rightScale;
   const denominator = left.denominator * leftScale;
   return hasDeferredOperand
@@ -351,9 +372,9 @@ function sumRationalValues(values: readonly ExactRational[]): ExactRational {
       continue;
     }
     const commonDenominator = gcd(denominator, normalizedValue.denominator);
-    numerator = numerator * (normalizedValue.denominator / commonDenominator) +
-      normalizedValue.numerator * (denominator / commonDenominator);
-    denominator = (denominator / commonDenominator) * normalizedValue.denominator;
+    numerator = numerator * integerQuotient(normalizedValue.denominator, commonDenominator) +
+      normalizedValue.numerator * integerQuotient(denominator, commonDenominator);
+    denominator = integerQuotient(denominator, commonDenominator) * normalizedValue.denominator;
   }
   if (!hasNonzeroValue || numerator === 0n) { return ZERO; }
   if (firstNonzeroValue && numerator === firstNonzeroValue.numerator &&
@@ -421,7 +442,7 @@ function multiplyRationalValue(leftValue: ExactRational, rightValue: ExactRation
     // opposite residual denominator can contribute a cross-cancellation.
     const firstCancellation = gcd(left.numerator, rightResidualDenominator);
     const secondCancellation = gcd(right.numerator, leftResidualDenominator);
-    const numerator = (left.numerator / firstCancellation) * (right.numerator / secondCancellation);
+    const numerator = integerQuotient(left.numerator, firstCancellation) * integerQuotient(right.numerator, secondCancellation);
     const denominator = sharedDenominator * sharedDenominator *
       (leftResidualDenominator / secondCancellation) *
       (rightResidualDenominator / firstCancellation);
@@ -429,8 +450,8 @@ function multiplyRationalValue(leftValue: ExactRational, rightValue: ExactRation
   }
   const firstCancellation = gcd(left.numerator, right.denominator);
   const secondCancellation = gcd(right.numerator, left.denominator);
-  const numerator = (left.numerator / firstCancellation) * (right.numerator / secondCancellation);
-  const denominator = (left.denominator / secondCancellation) * (right.denominator / firstCancellation);
+  const numerator = integerQuotient(left.numerator, firstCancellation) * integerQuotient(right.numerator, secondCancellation);
+  const denominator = integerQuotient(left.denominator, secondCancellation) * integerQuotient(right.denominator, firstCancellation);
   return rational(numerator, denominator);
 }
 
@@ -459,8 +480,8 @@ function divideRationalValue(
   }
   const numeratorCancellation = gcd(left.numerator, right.numerator);
   const denominatorCancellation = gcd(right.denominator, left.denominator);
-  let numerator = (left.numerator / numeratorCancellation) * (right.denominator / denominatorCancellation);
-  let denominator = (left.denominator / denominatorCancellation) * (right.numerator / numeratorCancellation);
+  let numerator = integerQuotient(left.numerator, numeratorCancellation) * integerQuotient(right.denominator, denominatorCancellation);
+  let denominator = integerQuotient(left.denominator, denominatorCancellation) * integerQuotient(right.numerator, numeratorCancellation);
   if (denominator < 0n) {
     numerator = -numerator;
     denominator = -denominator;
@@ -472,8 +493,7 @@ function divideRationalValue(
 }
 
 function roundPositiveRatio(numerator: bigint, denominator: bigint) {
-  const quotient = numerator / denominator;
-  const remainder = numerator % denominator;
+  const [quotient, remainder] = positiveQuotientAndRemainder(numerator, denominator);
   const doubledRemainder = remainder * 2n;
   return doubledRemainder > denominator ||
     (doubledRemainder === denominator && quotient % 2n === 1n)
@@ -481,12 +501,57 @@ function roundPositiveRatio(numerator: bigint, denominator: bigint) {
     : quotient;
 }
 
+/** Divides positive integers, certifying a small leading-word quotient exactly. */
+function positiveQuotientAndRemainder(numerator: bigint, denominator: bigint): [bigint, bigint] {
+  if (numerator < denominator) { return [0n, numerator]; }
+  if (denominator >= MAX_SMALL_DEFERRED_OPERAND) {
+    let shift = bitLength(denominator) - 128;
+    // biome-ignore lint/suspicious/noBitwiseOperators: exact BigInt shift extracts the leading integer words
+    const leadingNumerator = numerator >> BigInt(shift);
+    // Retain guard bits beyond the quotient's width, including for exact
+    // denominator divisions with a larger-than-binary64 quotient.
+    shift = Math.max(0, shift - Math.max(0, bitLength(leadingNumerator) - 128));
+    const shiftAmount = BigInt(shift);
+    // biome-ignore lint/suspicious/noBitwiseOperators: exact BigInt shifts estimate an integer quotient, never a rational result
+    let quotient = (numerator >> shiftAmount) / (denominator >> shiftAmount);
+    let remainder = numerator - quotient * denominator;
+    if (remainder < 0n) { quotient -= 1n; remainder += denominator; }
+    else if (remainder >= denominator) { quotient += 1n; remainder -= denominator; }
+    // This certificate alone authorizes the result. Truncated leading words
+    // cannot change the answer, including at an integer or rounding midpoint.
+    if (remainder >= 0n && remainder < denominator) { return [quotient, remainder]; }
+  }
+  const quotient = numerator / denominator;
+  return [quotient, numerator - quotient * denominator];
+}
+
+function integerQuotient(numerator: bigint, denominator: bigint) {
+  if (denominator === 1n) { return numerator; }
+  if (denominator < MAX_SMALL_DEFERRED_OPERAND) { return numerator / denominator; }
+  const [quotient] = positiveQuotientAndRemainder(absolute(numerator), denominator);
+  return numerator < 0n ? -quotient : quotient;
+}
+
 function bitLength(value: bigint) {
-  const magnitude = absolute(value);
+  let magnitude = absolute(value);
   if (magnitude === 0n) { return 1; }
-  const hexadecimal = magnitude.toString(16);
-  const leadingBits = 32 - Math.clz32(Number.parseInt(hexadecimal[0]!, 16));
-  return (hexadecimal.length - 1) * 4 + leadingBits;
+  let upperBits = 32;
+  let thresholdIndex = 0;
+  while (magnitude >= bitLengthThresholds[thresholdIndex]!) {
+    upperBits *= 2;
+    thresholdIndex += 1;
+    if (thresholdIndex === bitLengthThresholds.length) {
+      bitLengthThresholds.push(2n ** BigInt(upperBits));
+    }
+  }
+  let length = 0;
+  for (let shift = upperBits / 2; shift >= 32; shift /= 2) {
+    // biome-ignore lint/suspicious/noBitwiseOperators: exact shifts locate the highest nonzero integer word
+    const leading = magnitude >> BigInt(shift);
+    if (leading !== 0n) { magnitude = leading; length += shift; }
+  }
+  // The remaining word fits uint32 exactly; no rational is projected here.
+  return length + 32 - Math.clz32(Number(magnitude));
 }
 
 function integerSquareRoot(value: bigint) {
@@ -584,8 +649,8 @@ function positiveRationalBoundsAtScale(value: ExactRational, binaryScale: number
   const scaledDenominator = binaryScale > 0
     ? denominator * (2n ** BigInt(binaryScale))
     : denominator;
-  const lower = scaledNumerator / scaledDenominator;
-  const upper = scaledNumerator === lower * scaledDenominator ? lower : lower + 1n;
+  const [lower, remainder] = positiveQuotientAndRemainder(scaledNumerator, scaledDenominator);
+  const upper = remainder === 0n ? lower : lower + 1n;
   return { lower, upper };
 }
 
@@ -1080,7 +1145,12 @@ function solveExactRealLinearSystemUnchecked(
 
 function exactEquationHolds(terms: readonly ExactRational[], rhs: ExactRational) {
   const sum = sumExactRationals(terms);
-  return sum.numerator * rhs.denominator === rhs.numerator * sum.denominator;
+  if (sum.denominator === rhs.denominator) { return sum.numerator === rhs.numerator; }
+  // Cancelling the positive common denominator preserves the exact equation
+  // while avoiding products of two full transient-history-sized integers.
+  const common = gcd(sum.denominator, rhs.denominator);
+  return sum.numerator * integerQuotient(rhs.denominator, common) ===
+    rhs.numerator * integerQuotient(sum.denominator, common);
 }
 
 /**
