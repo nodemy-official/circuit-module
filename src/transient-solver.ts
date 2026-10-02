@@ -355,6 +355,11 @@ function createElectricalNodes(document: CircuitDocument, switchStates: Record<s
   for (const part of document.parts) {
     if (part.kind === "ammeter" || (part.kind === "switch" && isSwitchClosed(part, switchStates))) {
       nodes.union(endpointKey(part.id, "a"), endpointKey(part.id, "b"));
+    } else if (part.kind === "potentiometer" && (part.wiperPosition === 0 || part.wiperPosition === 1)) {
+      // Only an endpoint position makes a segment exactly ideal. A tiny
+      // nonzero segment may round to 0 ohms while retaining resistance in
+      // the analog solver, so do not infer connectivity from its product.
+      nodes.union(endpointKey(part.id, part.wiperPosition === 0 ? "a" : "b"), endpointKey(part.id, "c"));
     }
   }
   return nodes;
@@ -738,108 +743,6 @@ function initialOverrides(
   return overrides;
 }
 
-interface InitialSourceVoltageEdge {
-  node: string;
-  voltage: ExactRational;
-  acSource: boolean;
-}
-
-function initialSourceVoltageGraph(
-  document: CircuitDocument,
-  nodes: EndpointSet,
-  overrides: SourceOverrides,
-) {
-  const adjacency = new Map<string, InitialSourceVoltageEdge[]>();
-  const sourceNodes = new EndpointSet();
-  const dcNodes = new EndpointSet();
-  for (const part of document.parts) {
-    if ((part.kind !== "ac-source" && part.kind !== "battery") || (part.internalResistanceOhms ?? 0) !== 0) { continue; }
-    const voltage = overrides.voltageConstraints.get(part.id)?.voltageValue ??
-      numberToExactRational(part.voltageVolts ?? circuitPartCatalog.battery.defaults.voltageVolts!)!;
-    const a = nodes.find(endpointKey(part.id, "a"));
-    const b = nodes.find(endpointKey(part.id, "b"));
-    const acSource = part.kind === "ac-source" && (part.voltageVolts ?? DEFAULT_AC_RMS) !== 0;
-    if (!acSource) { dcNodes.union(a, b); }
-    // Match the solver's source forest in document order. Redundant source
-    // cycles must not select another independently rounded voltage basis.
-    if (sourceNodes.find(a) === sourceNodes.find(b)) { continue; }
-    sourceNodes.union(a, b);
-    const fromA = adjacency.get(a) ?? [];
-    fromA.push({ node: b, voltage: exactProductSumRatio([{ factors: [voltage], sign: -1 }], 1)!, acSource });
-    adjacency.set(a, fromA);
-    const fromB = adjacency.get(b) ?? [];
-    fromB.push({ node: a, voltage, acSource });
-    adjacency.set(b, fromB);
-  }
-  return { adjacency, dcNodes };
-}
-
-function initialSourceVoltagePotentials(adjacency: ReadonlyMap<string, readonly InitialSourceVoltageEdge[]>) {
-  const potentials = new Map<string, { component: string; voltage: ExactRational }>();
-  for (const root of adjacency.keys()) {
-    if (potentials.has(root)) { continue; }
-    potentials.set(root, { component: root, voltage: numberToExactRational(0)! });
-    const pending = [root];
-    for (const node of pending) {
-      for (const edge of adjacency.get(node) ?? []) {
-        if (potentials.has(edge.node)) { continue; }
-        const voltage = exactProductSumRatio([
-          { factors: [potentials.get(node)!.voltage] }, { factors: [edge.voltage] },
-        ], 1)!;
-        potentials.set(edge.node, { component: root, voltage });
-        pending.push(edge.node);
-      }
-    }
-  }
-  return potentials;
-}
-
-function pathHasAcSource(adjacency: ReadonlyMap<string, readonly InitialSourceVoltageEdge[]>, from: string, to: string) {
-  const visited = new Set([from]);
-  const pending = [{ node: from, acSource: false }];
-  for (const entry of pending) {
-    if (entry.node === to) { return entry.acSource; }
-    for (const edge of adjacency.get(entry.node) ?? []) {
-      if (visited.has(edge.node)) { continue; }
-      visited.add(edge.node);
-      pending.push({ node: edge.node, acSource: entry.acSource || edge.acSource });
-    }
-  }
-  return false;
-}
-
-function alignInitialAcCapacitorVoltages(
-  document: CircuitDocument,
-  switchStates: Record<string, boolean>,
-  overrides: SourceOverrides,
-  constraints: Map<string, InitialVoltageConstraint>,
-  operatingPointState?: StoredState,
-) {
-  // Operating-point histories already have exact values; they are not
-  // rounded user inputs and must retain the usual exact consistency check.
-  if (operatingPointState) { return; }
-  const nodes = createElectricalNodes(document, switchStates);
-  const { adjacency, dcNodes } = initialSourceVoltageGraph(document, nodes, overrides);
-  const potentials = initialSourceVoltagePotentials(adjacency);
-  for (const part of document.parts) {
-    if (part.kind !== "capacitor") { continue; }
-    const aNode = nodes.find(endpointKey(part.id, "a"));
-    const bNode = nodes.find(endpointKey(part.id, "b"));
-    const a = potentials.get(aNode);
-    const b = potentials.get(bNode);
-    if (!a || !b || a.component !== b.component || dcNodes.find(aNode) === dcNodes.find(bNode) ||
-        !pathHasAcSource(adjacency, aNode, bNode)) { continue; }
-    const voltageValue = exactProductSumRatio([{ factors: [a.voltage] }, { factors: [b.voltage], sign: -1 }], 1)!;
-    // The input is binary64, while a source constraint retains its rational
-    // waveform correction. Accept only the identical rounded input value,
-    // then preserve that source value as capacitor history (also for sums
-    // of series sources). A neighboring input remains inconsistent.
-    if (exactRationalToNumber(voltageValue) === (part.initialVoltageVolts ?? DEFAULT_INITIAL_VOLTAGE)) {
-      constraints.set(part.id, { ...constraints.get(part.id), voltageValue });
-    }
-  }
-}
-
 function initialDocument(
   document: CircuitDocument,
 ): CircuitDocument {
@@ -1192,7 +1095,6 @@ function initializeTransient(
   for (const [partId, constraint] of overrides.voltageConstraints) {
     initialConstraints.set(partId, { ...initialConstraints.get(partId), ...constraint });
   }
-  alignInitialAcCapacitorVoltages(initialConditionDocument, options.switchStates ?? {}, overrides, initialConstraints, operatingPointState);
   const analysis = solveAnalogStep(initialDocument(initialConditionDocument), {
     mode: "dc",
     switchStates: options.switchStates,

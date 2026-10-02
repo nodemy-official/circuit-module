@@ -10,7 +10,7 @@ import {
   joinCircuitPartTerminals,
   type CircuitConnectivityGraph,
 } from "./circuit-connectivity.js";
-import { circuitDocumentShapeIssue, isSimulationRecord, simulationRecordField } from "./simulation-input.js";
+import { circuitDocumentShapeIssue, isSimulationRecord, simulationRecordEntries, simulationRecordField } from "./simulation-input.js";
 import type { CircuitAnalysis, CircuitAnalysisOptions, CircuitPartReading } from "./circuit-solver.js";
 import { readingPrecision, terminalVoltageDifferences } from "./circuit-reading.js";
 
@@ -265,11 +265,11 @@ export function analyzeExtendedCircuit(
 
 function analyzeExtendedCircuitFromInput(
   document: CircuitDocument,
-  switchStates: Record<string, boolean>,
+  inputSwitchStates: Record<string, boolean>,
   options: CircuitAnalysisOptions,
 ): CircuitAnalysis {
-  const inputIssue = adapterInputIssue(document, switchStates, options);
-  if (inputIssue) { return invalidAdapterResult(inputIssue); }
+  const switchStates = adapterInput(document, inputSwitchStates, options);
+  if (typeof switchStates === "string") { return invalidAdapterResult(switchStates); }
   let validatedOptions: CircuitAnalysisOptions;
   try {
     validatedOptions = {
@@ -349,23 +349,32 @@ function invalidAdapterResult(message: string): CircuitAnalysis {
   };
 }
 
-function adapterInputIssue(document: unknown, switchStates: unknown, options: unknown) {
+function adapterInput(document: unknown, switchStates: unknown, options: unknown): string | Record<string, boolean> {
   try {
     const shapeIssue = circuitDocumentShapeIssue(document);
     if (shapeIssue) { return shapeIssue; }
-    if (!isSimulationRecord(switchStates)) {
+    const kinds = new Map((document as CircuitDocument).parts.map((part) => [part.id, part.kind]));
+    if (!isSimulationRecord(switchStates, kinds.keys())) {
       return "スイッチ状態は部品 ID ごとの真偽値で指定してください。";
     }
+    // Share one own-data snapshot between the analog solver, scalar readings,
+    // and connectivity status even if a caller's Proxy changes later reads.
+    const snapshot = Object.fromEntries(simulationRecordEntries(switchStates));
     if (!isSimulationRecord(options)) { return "解析条件はオブジェクトで指定してください。"; }
     const mode = simulationRecordField(options, "mode");
     const frequencyHz = simulationRecordField(options, "frequencyHz");
     if (mode !== undefined && mode !== "auto" && mode !== "dc" && mode !== "ac") {
       return "解析方式は auto、dc、または ac で指定してください。";
     }
-    return frequencyHz !== undefined &&
-      (typeof frequencyHz !== "number" || !Number.isFinite(frequencyHz) || frequencyHz <= 0)
-      ? "解析周波数は有限な0より大きい数値にしてください。"
-      : null;
+    if (frequencyHz !== undefined &&
+      (typeof frequencyHz !== "number" || !Number.isFinite(frequencyHz) || frequencyHz <= 0)) {
+      return "解析周波数は有限な0より大きい数値にしてください。";
+    }
+    for (const [partId, state] of Object.entries(snapshot)) {
+      if (kinds.get(partId) !== "switch") { return `スイッチ状態の対象「${partId}」はスイッチ部品ではありません。`; }
+      if (typeof state !== "boolean") { return "スイッチ状態は部品 ID ごとの真偽値で指定してください。"; }
+    }
+    return snapshot as Record<string, boolean>;
   } catch {
     return "解析条件またはスイッチ状態を読み取れません。";
   }

@@ -1119,6 +1119,60 @@ function compatibleTransientSourceWaveforms(
   }))));
 }
 
+function initialDcConstraintNodes(branches: readonly Branch[], nodeCount: number, partById: ReadonlyMap<string, CircuitPart>) {
+  const nodes = Array.from({ length: nodeCount }, (_, node) => node);
+  for (const branch of branches) {
+    if (branch.initialCapacitanceFarads !== undefined || !isIdealVoltageConstraint(branch)) { continue; }
+    const part = partById.get(branch.partId)!;
+    if (part.kind === "ac-source" && part.voltageVolts !== 0) { continue; }
+    unionNodes(nodes, branch.positiveNode, branch.negativeNode);
+  }
+  return nodes;
+}
+
+function alignInitialCapacitorConstraint(
+  branch: Branch,
+  path: IdealVoltageConstraintPath,
+  dcNodes: number[],
+  partById: ReadonlyMap<string, CircuitPart>,
+  constraint: InitialVoltageConstraint | undefined,
+  mode: AnalogAnalysisMode,
+) {
+  // Operating-point histories are already exact. Only a rounded user input
+  // may acquire the waveform's hidden bits, and a separate pure-DC path
+  // must continue to enforce its exact voltage constraint.
+  if (mode !== "dc" || branch.initialCapacitanceFarads === undefined || constraint?.voltageValue !== undefined ||
+      findRoot(dcNodes, branch.positiveNode) === findRoot(dcNodes, branch.negativeNode) ||
+      path.edges.some((edge) => edge.branch.initialCapacitanceFarads !== undefined)) { return; }
+  const hasAcSource = path.edges.some((edge) => {
+    const part = partById.get(edge.partId)!;
+    return part.kind === "ac-source" && part.voltageVolts !== 0 && edge.branch.initialVoltageDerivative !== undefined;
+  });
+  if (!hasAcSource) { return; }
+  // Use the very same source forest as the MNA constraints, including
+  // ideal meters, switches and potentiometer segments in their branch order.
+  // A neighboring binary64 input remains inconsistent; there is no tolerance.
+  if (path.voltageDifference.real === branch.sourceVoltage.real) {
+    branch.sourceVoltage = path.voltageDifference;
+  }
+}
+
+function idealVoltageConstraintOrder(
+  branch: Branch,
+  mode: AnalogAnalysisMode,
+  partById: ReadonlyMap<string, CircuitPart>,
+  constraints?: ReadonlyMap<string, InitialVoltageConstraint>,
+) {
+  if (branch.initialCapacitanceFarads !== undefined) { return 2; }
+  if (branch.kind !== "ac-source") { return 0; }
+  if (mode === "ac") {
+    const voltage = exactComplexValue(branch.sourceVoltage)!;
+    return voltage.real.numerator !== 0n || voltage.imaginary.numerator !== 0n ? 1 : 0;
+  }
+  return partById.get(branch.partId)!.voltageVolts !== 0 &&
+    hasTransientSourceVoltage(constraints?.get(branch.partId)) ? 1 : 0;
+}
+
 function markRedundantIdealVoltageCycles(
   document: CircuitDocument,
   branches: Branch[],
@@ -1131,11 +1185,15 @@ function markRedundantIdealVoltageCycles(
     { length: nodeCount },
     () => [] as IdealVoltageConstraintNeighbor[],
   );
-  // Build the source-only forest first. Otherwise two source loops sharing
-  // a capacitor can produce the same derivative equation and leave source
-  // currents underdetermined instead of choosing their usual zero gauge.
+  const dcNodes = initialDcConstraintNodes(branches, nodeCount, partById);
+  // Preserve exact DC and zero-voltage constraints before approximate AC
+  // waveforms. Otherwise a rounded source loop can impose a false voltage
+  // on an ideal meter/switch, or displace an exact battery constraint.
+  // Capacitors remain last so shared source loops do not duplicate their
+  // derivative equations and leave source currents underdetermined.
   const orderedBranches = branches.toSorted((left, right) =>
-    Number(left.initialCapacitanceFarads !== undefined) - Number(right.initialCapacitanceFarads !== undefined));
+    idealVoltageConstraintOrder(left, mode, partById, initialVoltageConstraints) -
+    idealVoltageConstraintOrder(right, mode, partById, initialVoltageConstraints));
   for (const branch of orderedBranches) {
     if (!isIdealVoltageConstraint(branch)) { continue; }
     if (branch.positiveNode === branch.negativeNode) { continue; }
@@ -1145,6 +1203,8 @@ function markRedundantIdealVoltageCycles(
       addIdealVoltageConstraint(adjacency, branch);
       continue;
     }
+
+    alignInitialCapacitorConstraint(branch, path, dcNodes, partById, initialVoltageConstraints?.get(branch.partId), mode);
 
     const waveformCompatible = mode === "dc" && branch.initialCapacitanceFarads === undefined
       ? compatibleTransientSourceWaveforms(branch, path, partById, initialVoltageConstraints)
@@ -1623,11 +1683,12 @@ function mosChannelValues(
 
 function mosControlAtModelBoundary(value: ExactRational): ResidualTerm {
   const projected = exactRationalToNumber(value);
-  // Subnormal controls can still produce normal currents after beta/lambda
-  // amplification. Bound their significands, not their exponent: 512 bits
-  // keeps relative rounding error below 2^-512 without recursive denominator
-  // growth through the square-law model and transient storage.
-  return Math.abs(projected) < 2 ** -1022
+  // Controls outside the normal binary64 range can still yield finite
+  // currents: tiny controls can be amplified, while a large negative
+  // overdrive is simply cutoff. Bound their significands, not their exponent:
+  // 512 bits keeps relative rounding error below 2^-512 without recursive
+  // denominator growth through the square-law model and transient storage.
+  return !Number.isFinite(projected) || Math.abs(projected) < 2 ** -1022
     ? roundExactRationalSignificand(value, 512)
     : projected;
 }
@@ -2275,7 +2336,6 @@ function mosLinearizationCenter(part: CircuitPart, voltages: readonly ResidualTe
   ], 1)!;
   const drain = mosControlAtModelBoundary(vds);
   const control = mosControlAtModelBoundary(overdrive);
-  if (!Number.isFinite(roundedResidualTerm(drain)) || !Number.isFinite(roundedResidualTerm(control))) { return [...voltages]; }
   const gate = exactProductSumRatio([
     { factors: [reverse ? drain : 0] },
     { factors: [sign, control] }, { factors: [sign, threshold] },
@@ -4981,7 +5041,7 @@ function balancedDcResult(solution: DcSolution, quality: ReturnType<typeof dcSol
 }
 
 function requiresOpAmpGainContinuation(document: CircuitDocument, layout: MnaLayout) {
-  if (!document.parts.some((part) => part.kind === "npn-transistor" || part.kind === "pnp-transistor") ||
+  if (!document.parts.some((part) => part.kind !== "op-amp" && isNonlinearPart(part)) ||
       !document.parts.some((part) => part.kind === "op-amp")) { return false; }
   const seed = linearOpAmpSeed(document, layout);
   // An independent current-driven transistor island can make the linear
@@ -5237,10 +5297,12 @@ function voltageFromBranch(branch: Branch, solution: ComplexValue[]) {
 }
 
 function branchVoltageMeasurement(branch: Branch, layout: MnaLayout, solution: ComplexValue[]) {
-  if (branch.transientCompanion) {
+  if (branch.transientCompanion || branch.redundantIdealSource) {
     // The solved node values retain their exact fractions, including hidden
     // subnormal differences. Reconstructing the same voltage from history
-    // would repeat expensive cancellations as that history grows.
+    // would repeat expensive cancellations as that history grows. A redundant
+    // source also follows the chosen source forest; its independently rounded
+    // nominal voltage is not an additional node-voltage constraint.
     const voltage = voltageDifference(
       nodeComplexValue(layout, branch.positiveNode, solution),
       nodeComplexValue(layout, branch.negativeNode, solution),

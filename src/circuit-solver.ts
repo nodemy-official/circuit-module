@@ -3293,11 +3293,11 @@ export function analyzeCircuit(
 
 function analyzeCircuitFromInput(
   document: CircuitDocument,
-  switchStates: Record<string, boolean>,
+  inputSwitchStates: Record<string, boolean>,
   options: CircuitAnalysisOptions,
 ): CircuitAnalysis {
-  const inputIssue = circuitAnalysisInputIssue(document, switchStates, options);
-  if (inputIssue) { return invalidInputResult(inputIssue); }
+  const switchStates = circuitAnalysisInput(document, inputSwitchStates, options);
+  if (typeof switchStates === "string") { return invalidInputResult(switchStates); }
   const normalizedDocument = documentWithCatalogDefaults(copySimulationDocument(document));
   let normalizedOptions: CircuitAnalysisOptions;
   try {
@@ -3383,13 +3383,17 @@ function invalidInputResult(message: string): CircuitAnalysis {
   return result("invalid", message, { issues: [{ severity: "error", message }] });
 }
 
-function circuitAnalysisInputIssue(document: unknown, switchStates: unknown, options: unknown) {
+function circuitAnalysisInput(document: unknown, switchStates: unknown, options: unknown): string | Record<string, boolean> {
   try {
     const shapeIssue = circuitDocumentShapeIssue(document);
     if (shapeIssue) { return shapeIssue; }
-    if (!isSimulationRecord(switchStates)) {
+    const kinds = new Map((document as CircuitDocument).parts.map((part) => [part.id, part.kind]));
+    if (!isSimulationRecord(switchStates, kinds.keys())) {
       return "スイッチ状態は部品 ID ごとの真偽値で指定してください。";
     }
+    // Capture own data fields once so solving and reporting cannot observe
+    // different values through a caller-owned Proxy's later get traps.
+    const snapshot = Object.fromEntries(simulationRecordEntries(switchStates));
     if (!isSimulationRecord(options)) { return "解析条件はオブジェクトで指定してください。"; }
     const mode = simulationRecordField(options, "mode");
     const frequencyHz = simulationRecordField(options, "frequencyHz");
@@ -3400,8 +3404,7 @@ function circuitAnalysisInputIssue(document: unknown, switchStates: unknown, opt
         (typeof frequencyHz !== "number" || !Number.isFinite(frequencyHz) || frequencyHz <= 0)) {
       return "解析周波数は有限な0より大きい数値にしてください。";
     }
-    const kinds = new Map((document as CircuitDocument).parts.map((part) => [part.id, part.kind]));
-    return switchStateIssue(switchStates, kinds);
+    return switchStateIssue(snapshot, kinds) ?? snapshot as Record<string, boolean>;
   } catch {
     return "解析条件またはスイッチ状態を読み取れません。";
   }

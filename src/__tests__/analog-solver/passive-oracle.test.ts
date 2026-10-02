@@ -327,9 +327,18 @@ function assertPhasorClose(actual: ComplexValue, expected: ComplexValue, context
   }
 }
 
+const passiveSeeds = Array.from({ length: 512 }, (_, index) => 0x5e_ed_00_00 + index);
+const seedBatches = Array.from({ length: 8 }, (_, batchIndex) => {
+  const firstSeedIndex = batchIndex * 64;
+  return {
+    firstSeedIndex,
+    lastSeedIndex: firstSeedIndex + 63,
+    seeds: passiveSeeds.slice(firstSeedIndex, firstSeedIndex + 64),
+  };
+});
+
 describe("seeded passive AC circuits against an independent nodal oracle", () => {
-  it("matches branch voltages, currents, KCL, and KVL for parallel and bridge networks", () => {
-    const seeds = Array.from({ length: 512 }, (_, index) => 0x5e_ed_00_00 + index);
+  it.each(seedBatches)("matches branch voltages, currents, KCL, and KVL for parallel and bridge networks (seeds $firstSeedIndex–$lastSeedIndex)", ({ seeds }) => {
     const coverage = {
       grounded: false,
       ungrounded: false,

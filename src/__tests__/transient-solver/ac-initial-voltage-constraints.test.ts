@@ -2,6 +2,22 @@ import { expect, it } from "vitest";
 import { simulateTransient } from "../../transient-solver.js";
 import { createCircuitFromSpecs } from "../helpers/circuit-fixture.js";
 
+it("keeps an AC source ideal when it carries an unused battery resistance field", () => {
+  const voltage = 0.1 * Math.SQRT2;
+  const document = createCircuitFromSpecs([
+    ["source", "ac-source", ["v", "g"], {
+      voltageVolts: 0.1, frequencyHz: 1, phaseDegrees: 0, internalResistanceOhms: 1,
+    }],
+    ["cap", "capacitor", ["v", "g"], { capacitanceFarads: 1, initialVoltageVolts: voltage }],
+  ], "An AC source ignores battery-only parameters");
+  const step = 1e-5;
+  const result = simulateTransient(document, { durationSeconds: step, timeStepSeconds: step });
+  expect(result.status, result.message).toBe("valid");
+  expect(result.samples[0]!.parts.cap.voltageVolts).toBe(voltage);
+  const expectedCurrent = -2 * voltage * Math.sin(Math.PI * step) ** 2 / step;
+  expect(Math.abs(result.samples[1]!.parts.cap.currentAmps / expectedCurrent - 1)).toBeLessThan(1e-13);
+});
+
 it.each([0, 1].flatMap((voltageVolts) => [
   { voltageVolts, reverse: false }, { voltageVolts, reverse: true },
 ]))("keeps a pure DC capacitor constraint exact with another AC branch $voltageVolts; reverse=$reverse", ({ voltageVolts, reverse }) => {
