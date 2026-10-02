@@ -5,7 +5,8 @@ import {
   divideExactComplex,
   exactRationalToNumber,
   exactRationalSquareRootToNumber,
-  floorExactRationalSquareRoot,
+  exactRationalMagnitudeExponent,
+  floorExactRationalSquareRootWithRelativeError,
   multiplyExactComplex,
   multiplyExactRational,
   numberToExactRational,
@@ -64,27 +65,71 @@ function sumMagnitudeNormalization(left: ComplexValue, right: ComplexValue) {
   return isZero(left) ? second : isZero(right) ? first : ONE;
 }
 
-const normalizationScales = new WeakMap<ExactRational, ExactRational>();
+const normalizationScales = new WeakMap<ExactRational, { scale: ExactRational; errorExponent: number }>();
 
-function componentsAtNormalization(value: ComplexValue, target: ExactRational) {
+function componentsAtNormalization(value: ComplexValue, target: ExactRational, sumErrorExponent?: number) {
   const exact = exactComplexValue(value);
   const squared = complexMagnitudeNormalization(value);
   if (!exact || squared.numerator * target.denominator === target.numerator * squared.denominator) { return exact; }
-  // Only mixed corrections need an irrational square-root boundary. A floor
-  // at 512 fractional bits has absolute coefficient error below 2^-512.
-  let scale = normalizationScales.get(squared);
-  if (!scale) {
-    scale = floorExactRationalSquareRoot(squared, 512) ?? undefined;
+  const ratio = divideExactRational(squared, target);
+  if (!ratio) { return null; }
+  const maximumExponent = Math.max(exactRationalMagnitudeExponent(exact.real) ?? Number.NEGATIVE_INFINITY, exactRationalMagnitudeExponent(exact.imaginary) ?? Number.NEGATIVE_INFINITY);
+  const componentExponent = Number.isFinite(maximumExponent) ? maximumExponent : 0;
+  // Each expanded operand contributes less than half the sum's error budget.
+  const errorExponent = sumErrorExponent === undefined ? undefined : sumErrorExponent - componentExponent - 2;
+  const scaleKey = target === ONE ? squared : ratio;
+  let stored = normalizationScales.get(scaleKey);
+  if (!stored || (errorExponent !== undefined && stored.errorExponent > errorExponent)) {
+    const scale = floorExactRationalSquareRootWithRelativeError(ratio, 512, errorExponent);
     if (!scale) { return null; }
-    normalizationScales.set(squared, scale);
+    stored = { scale, errorExponent: errorExponent ?? Number.POSITIVE_INFINITY };
+    normalizationScales.set(scaleKey, stored);
   }
-  return { real: multiplyExactRational(exact.real, scale), imaginary: multiplyExactRational(exact.imaginary, scale) };
+  return { real: multiplyExactRational(exact.real, stored.scale), imaginary: multiplyExactRational(exact.imaginary, stored.scale) };
 }
 
-/** Expands a uniform amplitude correction at the documented 512-bit boundary. */
+/** Expands an amplitude correction while preserving its magnitude and departure from one. */
 export function complexRectangularValue(value: ComplexValue): ComplexValue {
   const exact = componentsAtNormalization(value, ONE);
   return exact ? complexFromExact(exact) : complex(value.real, value.imaginary);
+}
+
+function componentSumMagnitudeBound(
+  left: ExactRational,
+  right: ExactRational,
+  leftNormalization: ExactRational,
+  rightNormalization: ExactRational,
+  subtract: boolean,
+) {
+  const leftSquared = multiplyExactRational(multiplyExactRational(left, left), leftNormalization);
+  const rightSquared = multiplyExactRational(multiplyExactRational(right, right), rightNormalization);
+  const leftExponent = exactRationalMagnitudeExponent(leftSquared);
+  const rightExponent = exactRationalMagnitudeExponent(rightSquared);
+  if (leftExponent === null && rightExponent === null) { return { zero: true, exponent: null }; }
+  const maximumExponent = Math.floor(Math.max(leftExponent ?? Number.NEGATIVE_INFINITY, rightExponent ?? Number.NEGATIVE_INFINITY) / 2);
+  const oppositeSigns = (left.numerator < 0n) !== (right.numerator < 0n);
+  if (leftExponent === null || rightExponent === null || oppositeSigns === subtract) {
+    return { zero: false, exponent: maximumExponent };
+  }
+  const difference = subtractExactRational(leftSquared, rightSquared);
+  const differenceExponent = exactRationalMagnitudeExponent(difference);
+  if (differenceExponent === null) { return { zero: true, exponent: null }; }
+  // For opposing terms L,R, |L+R| = |L²-R²|/(|L|+|R|), and the
+  // denominator is below 2^(maximumExponent+2). No projection is used.
+  return { zero: false, exponent: differenceExponent - maximumExponent - 2 };
+}
+
+function mixedNormalizationSumBounds(left: ComplexValue, right: ComplexValue, subtract: boolean) {
+  const first = complexMagnitudeNormalization(left);
+  const second = complexMagnitudeNormalization(right);
+  if (first.numerator * second.denominator === second.numerator * first.denominator) { return; }
+  const exactLeft = exactComplexValue(left);
+  const exactRight = exactComplexValue(right);
+  if (!exactLeft || !exactRight) { return; }
+  const real = componentSumMagnitudeBound(exactLeft.real, exactRight.real, first, second, subtract);
+  const imaginary = componentSumMagnitudeBound(exactLeft.imaginary, exactRight.imaginary, first, second, subtract);
+  const exponent = Math.min(real.exponent ?? Number.POSITIVE_INFINITY, imaginary.exponent ?? Number.POSITIVE_INFINITY);
+  return { real, imaginary, errorExponent: Number.isFinite(exponent) ? exponent - 512 : undefined };
 }
 
 // floor(sqrt(1/2) * 2^512): n^2 <= 2^1023 < (n+1)^2.
@@ -223,20 +268,26 @@ export function scaledProduct(values: readonly number[]): number {
 
 export const complexAdd = (left: ComplexValue, right: ComplexValue): ComplexValue => {
   const normalization = sumMagnitudeNormalization(left, right);
-  const exactLeft = componentsAtNormalization(left, normalization);
-  const exactRight = componentsAtNormalization(right, normalization);
-  const result = exactLeft && exactRight
-    ? complexFromExact(addExactComplex(exactLeft, exactRight))
+  const bounds = mixedNormalizationSumBounds(left, right, false);
+  const exactLeft = componentsAtNormalization(left, normalization, bounds?.errorExponent);
+  const exactRight = componentsAtNormalization(right, normalization, bounds?.errorExponent);
+  const sum = exactLeft && exactRight ? addExactComplex(exactLeft, exactRight) : null;
+  const result = sum
+    ? complexFromExact({ real: bounds?.real.zero ? { numerator: 0n, denominator: 1n } : sum.real,
+      imaginary: bounds?.imaginary.zero ? { numerator: 0n, denominator: 1n } : sum.imaginary })
     : complex(left.real + right.real, left.imaginary + right.imaginary);
   return withComplexMagnitudeNormalization(result, normalization);
 };
 
 export const complexSubtract = (left: ComplexValue, right: ComplexValue): ComplexValue => {
   const normalization = sumMagnitudeNormalization(left, right);
-  const exactLeft = componentsAtNormalization(left, normalization);
-  const exactRight = componentsAtNormalization(right, normalization);
-  const result = exactLeft && exactRight
-    ? complexFromExact(subtractExactComplex(exactLeft, exactRight))
+  const bounds = mixedNormalizationSumBounds(left, right, true);
+  const exactLeft = componentsAtNormalization(left, normalization, bounds?.errorExponent);
+  const exactRight = componentsAtNormalization(right, normalization, bounds?.errorExponent);
+  const difference = exactLeft && exactRight ? subtractExactComplex(exactLeft, exactRight) : null;
+  const result = difference
+    ? complexFromExact({ real: bounds?.real.zero ? { numerator: 0n, denominator: 1n } : difference.real,
+      imaginary: bounds?.imaginary.zero ? { numerator: 0n, denominator: 1n } : difference.imaginary })
     : complex(left.real - right.real, left.imaginary - right.imaginary);
   return withComplexMagnitudeNormalization(result, normalization);
 };

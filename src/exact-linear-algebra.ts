@@ -573,6 +573,14 @@ function floorLog2Ratio(numerator: bigint, denominator: bigint) {
   return exponent;
 }
 
+/** Exact floor(log2(abs(value))), with null for zero or an invalid rational. */
+export function exactRationalMagnitudeExponent(value: ExactRational): number | null {
+  const input = normalized(value);
+  return !input || input.numerator === 0n
+    ? null
+    : floorLog2Ratio(absolute(input.numerator), input.denominator);
+}
+
 /** Rounds a significand while preserving its exponent beyond binary64's range. */
 export function roundExactRationalSignificand(value: ExactRational, significantBits: number): ExactRational {
   if (!Number.isSafeInteger(significantBits) || significantBits < 2) {
@@ -736,6 +744,43 @@ export function floorExactRationalSquareRoot(value: ExactRational, fractionalBit
   if (!normalizedValue || normalizedValue.numerator < 0n || !Number.isSafeInteger(fractionalBits) || fractionalBits < 0) { return null; }
   const scale = 2n ** BigInt(fractionalBits);
   return rational(integerSquareRoot((normalizedValue.numerator * scale * scale) / normalizedValue.denominator), scale);
+}
+
+/**
+ * Returns a rational square root exactly when possible; otherwise floors it
+ * with relative error below 2^-relativeBits, preserving its departure from
+ * one to the same accuracy. An optional absolute error bound
+ * 2^absoluteErrorExponent protects a subsequent cancelling sum.
+ */
+export function floorExactRationalSquareRootWithRelativeError(
+  value: ExactRational,
+  relativeBits: number,
+  absoluteErrorExponent?: number,
+): ExactRational | null {
+  const input = normalized(value);
+  if (!input || input.numerator < 0n || !Number.isSafeInteger(relativeBits) || relativeBits < 2 ||
+      (absoluteErrorExponent !== undefined && !Number.isSafeInteger(absoluteErrorExponent))) { return null; }
+  if (input.numerator === 0n) { return ZERO; }
+  // A non-binary rational root must stay exact too: a floor can otherwise
+  // move a later exact binary64 midpoint to the wrong side of its tie.
+  const reduced = canonicalized(input);
+  const numeratorRoot = integerSquareRoot(reduced.numerator);
+  if (numeratorRoot * numeratorRoot === reduced.numerator) {
+    const denominatorRoot = integerSquareRoot(reduced.denominator);
+    if (denominatorRoot * denominatorRoot === reduced.denominator) {
+      return reducedRational(numeratorRoot, denominatorRoot);
+    }
+  }
+  const rootExponent = Math.floor(floorLog2Ratio(input.numerator, input.denominator) / 2);
+  let fractionalBits = Math.max(0, relativeBits - rootExponent, -(absoluteErrorExponent ?? 0));
+  const difference = absolute(input.numerator - input.denominator);
+  if (difference !== 0n) {
+    // |sqrt(value)-1| = |value-1|/(sqrt(value)+1). The denominator is
+    // below 2^(max(rootExponent,0)+2); the numerator is at least 2^gapExponent.
+    const gapExponent = floorLog2Ratio(difference, input.denominator);
+    fractionalBits = Math.max(fractionalBits, relativeBits + Math.max(rootExponent, 0) + 2 - gapExponent);
+  }
+  return floorExactRationalSquareRoot(input, fractionalBits);
 }
 
 /** Rounds the square root of an exact nonnegative rational to binary64. */

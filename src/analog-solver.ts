@@ -1336,12 +1336,23 @@ function diodeControlAtModelBoundary(controlVoltage: ResidualTerm, ideality: num
 function exactDiodeCurrent(value: DiodeValues) { return value.exactCurrent ?? numberToExactRational(value.current); }
 function exactDiodeSlope(value: DiodeValues) { return value.exactSlope ?? numberToExactRational(value.slope); }
 
-function bjtBaseCurrent(transport: DiodeValues, scaled: DiodeValues | undefined, exactBeta: ExactRational) {
-  return scaled && !transport.exactCurrent ? exactDiodeCurrent(scaled) : divideExactRational(exactDiodeCurrent(transport)!, exactBeta);
-}
-
-function bjtBaseSlope(transport: DiodeValues, scaled: DiodeValues | undefined, exactBeta: ExactRational) {
-  return scaled && !transport.exactSlope ? exactDiodeSlope(scaled) : divideExactRational(exactDiodeSlope(transport)!, exactBeta);
+function bjtBaseSlope(transport: DiodeValues, voltage: ResidualTerm, saturation: number, exactBeta: ExactRational) {
+  if (transport.exactSlope || transport.slope >= 2 ** -1022 || exactBeta.numerator >= exactBeta.denominator) {
+    return divideExactRational(exactDiodeSlope(transport)!, exactBeta);
+  }
+  // A subnormal transport derivative can lose bits that become representable
+  // after division by beta. Scale the exponential coefficient exactly instead
+  // of rounding Is/beta before evaluating the base junction.
+  const exponent = exactRationalToNumber(typeof voltage === "number" ? numberToExactRational(voltage)! : voltage) / THERMAL_VOLTAGE;
+  const exponential = Math.exp(Math.min(EXPONENT_MAX, exponent));
+  if (exponential >= 2 ** -1022) {
+    const slope = exactProductSumRatio([{ factors: [saturation, exponential] }], THERMAL_VOLTAGE);
+    return slope ? divideExactRational(slope, exactBeta) : null;
+  }
+  // Deep reverse bias needs a combined logarithmic boundary: exp(V/Vt)
+  // itself may underflow while the amplified base derivative remains normal.
+  const baseSaturation = divideExactRational(numberToExactRational(saturation)!, exactBeta)!;
+  return numberToExactRational(Math.exp(logPositiveExactRational(baseSaturation) - Math.log(THERMAL_VOLTAGE) + exponent));
 }
 
 function linearizedDiodeValues(voltage: ExactRational, scale: ExactRational, saturationCurrent: number): DiodeValues | undefined {
@@ -1349,9 +1360,13 @@ function linearizedDiodeValues(voltage: ExactRational, scale: ExactRational, sat
   const slope = exactRationalToNumber(exactSlope);
   // Preserve the model's existing representable-derivative boundary: an
   // underflowed slope is an open small-signal path, overflow is rejected.
-  if (!Number.isFinite(slope) || slope === 0) { return; }
+  // Its DC current still survives exact products and later load/rating ratios.
+  if (!Number.isFinite(slope)) { return; }
   const exactCurrent = multiplyExactRational(exactSlope, voltage);
-  return { current: exactRationalToNumber(exactCurrent), slope, exactCurrent, exactSlope };
+  return {
+    current: exactRationalToNumber(exactCurrent), slope, exactCurrent,
+    ...(slope === 0 ? {} : { exactSlope }),
+  };
 }
 
 function diodeCurrentAndSlope(controlVoltage: ResidualTerm, saturationCurrent: number, ideality: number): DiodeValues {
@@ -1399,13 +1414,23 @@ function diodeCurrentAndSlope(controlVoltage: ResidualTerm, saturationCurrent: n
       slope,
     };
   }
+  return diodeExponentialValues(voltage, rawExponent, saturationCurrent, slope);
+}
+
+function diodeExponentialValues(voltage: number, rawExponent: number, saturationCurrent: number, slope: number): DiodeValues {
+  const currentFactor = Math.expm1(rawExponent);
+  const current = voltage === 0 ? 0 : Math.abs(rawExponent) < 2 ** -1022
+    ? slope * voltage : saturationCurrent * currentFactor;
+  // expm1 is the binary64 model boundary. Preserve the following product
+  // when its subnormal rounding could erase KCL or a finite rated-current ratio.
+  const exactCurrent = Math.abs(rawExponent) >= 2 ** -1022 && Math.abs(current) < 2 ** -1022
+    ? exactProductSumRatio([{ factors: [saturationCurrent, currentFactor] }], 1) : null;
   return {
     // In the subnormal exponent range expm1(x) = x to binary64 accuracy, but
     // rounding V / (n * Vt) first can erase a representable Is * x current.
-    current: voltage === 0 ? 0 : Math.abs(rawExponent) < 2 ** -1022
-      ? slope * voltage
-      : saturationCurrent * Math.expm1(rawExponent),
+    current,
     slope,
+    ...(exactCurrent ? { exactCurrent } : {}),
   };
 }
 
@@ -1469,12 +1494,6 @@ function bjtModel(
   // saturation by 1 / alpha can overflow before a zero bias is evaluated.
   const forward = diodeCurrentAndSlope(vbe, saturation, 1);
   const reverse = diodeCurrentAndSlope(vbc, saturation, 1);
-  const baseSaturation = saturation / beta;
-  // For beta < 1, scale saturation up before the transport current can
-  // underflow. For beta >= 1, divide last to avoid rounding saturation down.
-  const scaledForwardBase = beta < 1 && Number.isFinite(baseSaturation)
-    ? diodeCurrentAndSlope(vbe, baseSaturation, 1)
-    : undefined;
   const exactBeta = numberToExactRational(beta);
   const exactForward = exactDiodeCurrent(forward);
   const exactReverse = exactDiodeCurrent(reverse);
@@ -1490,8 +1509,8 @@ function bjtModel(
     };
   }
 
-  const exactForwardBase = bjtBaseCurrent(forward, scaledForwardBase, exactBeta);
-  const exactForwardBaseSlope = bjtBaseSlope(forward, scaledForwardBase, exactBeta);
+  const exactForwardBase = divideExactRational(exactForward, exactBeta);
+  const exactForwardBaseSlope = bjtBaseSlope(forward, vbe, saturation, exactBeta);
   if (!exactForwardBase || !exactForwardBaseSlope) {
     return {
       currents: [Number.NaN, Number.NaN, Number.NaN],
@@ -4801,6 +4820,23 @@ function dcReferenceOffsets(
   return componentIds.map((component) => component === referenceComponent ? offset : complex());
 }
 
+function acDisplayReferenceComponentIds(
+  document: CircuitDocument,
+  layout: MnaLayout,
+  channelConducting?: Readonly<Record<string, boolean>>,
+  smallSignalConnections?: SmallSignalConnectionsByPartId,
+) {
+  const parent = referenceConnectivityParents(document, layout, "ac", channelConducting, smallSignalConnections);
+  // An op-amp's input current is zero, but its output still depends on the
+  // input difference. Shift both input islands together when restoring
+  // display coordinates; semiconductor small-signal groups stay unchanged.
+  for (const part of document.parts) {
+    if (part.kind !== "op-amp") { continue; }
+    joinConductiveNodes(parent, nodeForTerminal(layout.topology, part, "a"), nodeForTerminal(layout.topology, part, "b"));
+  }
+  return parent.map((_, node) => findRoot(parent, node));
+}
+
 function restoreFloatingReferenceOffsets(
   document: CircuitDocument,
   layout: MnaLayout,
@@ -4813,7 +4849,7 @@ function restoreFloatingReferenceOffsets(
   if (layout.initialInductorCurrents) { return initialOffsets; }
   const componentIds = mode === "dc"
     ? dcDisplayReferenceComponentIds(document, layout, channelConducting)
-    : referenceComponentIds(document, layout, mode, channelConducting, smallSignalConnections);
+    : acDisplayReferenceComponentIds(document, layout, channelConducting, smallSignalConnections);
   const physicalReferenceRoot = componentIds[layout.physicalReferenceNode];
   const firstNodeByRoot = new Map<number, number>();
   for (let node = 0; node < componentIds.length; node += 1) {
@@ -4823,9 +4859,9 @@ function restoreFloatingReferenceOffsets(
 
   const offsets = Array.from({ length: layout.topology.nodeCount }, (_, node) => initialOffsets[node] ?? complex());
   for (const [root, anchor] of firstNodeByRoot) {
-    if (root === physicalReferenceRoot) { continue; }
-    const potential = nodeComplexValue(layout, anchor, solution);
-    const offset = complexSubtract(complex(), potential);
+    const offset = root === physicalReferenceRoot
+      ? offsets[layout.physicalReferenceNode] ?? complex()
+      : complexSubtract(complex(), nodeComplexValue(layout, anchor, solution));
     for (let node = 0; node < componentIds.length; node += 1) {
       if (componentIds[node] !== root) { continue; }
       offsets[node] = offset;
@@ -5368,7 +5404,7 @@ function resolvedBranchVoltage(
 
 function resistiveMeasurements(part: CircuitPart, currents: ComplexValue[], mode: AnalogAnalysisMode) {
   if (part.kind === "resistor" || part.kind === "bulb") {
-    return impedanceMeasurements(resistorValue(part), 0, currents[0] ?? complex(), undefined, mode === "ac");
+    return impedanceMeasurements(resistorValue(part), 0, currents[0] ?? complex(), undefined, mode === "ac" || part.kind === "bulb");
   }
   if (part.kind !== "potentiometer") { return null; }
   const segments = potentiometerSegments(part);
@@ -5593,7 +5629,7 @@ function makeReadings(
     };
     if (part.kind === "bulb") {
       const rated = part.ratedPowerWatts ?? 2;
-      reading.brightness = Math.min(1, Math.max(0, power.real / rated));
+      reading.brightness = Math.min(1, Math.max(0, complexDivide(power, complex(rated)).real));
     }
     setRecordValue(parts, part.id, reading);
   }
@@ -6112,7 +6148,7 @@ function normalizeAcReadings(document: CircuitDocument, frequencyHz: number, rea
     if (!groups.has(part.id)) {
       reading.voltage = localAcPrimaryVoltage(part, layout, localDifference);
     }
-    if (part.kind === "bulb") { reading.brightness = Math.min(1, Math.max(0, reading.power.real / (part.ratedPowerWatts ?? 2))); }
+    if (part.kind === "bulb") { reading.brightness = Math.min(1, Math.max(0, complexDivide(reading.power, complex(part.ratedPowerWatts ?? 2)).real)); }
   }
   for (const [node, label] of layout.topology.nodeLabels) { nodeVoltages[label] = nodes[node]!; }
 }

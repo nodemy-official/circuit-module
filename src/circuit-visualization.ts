@@ -1,5 +1,5 @@
 import { circuitPartCatalog, endpointName, terminalsOf, type CircuitDocument, type CircuitEndpoint, type CircuitPart, type CircuitTerminal } from "./circuit-model.js";
-import { complex, complexAdd, complexFromPolar, complexMagnitude, complexMultiply, complexPhaseDegrees, complexSubtract } from "./analog-math.js";
+import { complex, complexAdd, complexDivide, complexFromPolar, complexMagnitude, complexMultiply, complexPhaseDegrees, complexSubtract } from "./analog-math.js";
 import {
   circuitEndpointsConnected,
   connectCircuitEndpoints,
@@ -50,15 +50,22 @@ export const circuitEndpointKey = (endpoint: CircuitEndpoint) => JSON.stringify(
 const sourceKinds = new Set(["battery", "ac-source", "current-source"]);
 const finite = (value: number | undefined): value is number => value !== undefined && Number.isFinite(value);
 
-function transientFrameParts(document: CircuitDocument, sample: TransientAnalysis["samples"][number]) {
+function transientFrameParts(document: CircuitDocument, sample: TransientAnalysis["samples"][number], expressions?: readonly ExactExpressionNode[]) {
   const parts = Object.create(null) as Record<string, CircuitPartReading>;
   for (const part of document.parts) {
     if (!Object.hasOwn(sample.parts, part.id)) { continue; }
     const reading = sample.parts[part.id];
     if (!reading) { continue; }
     const powerWatts = reading.powerWatts * (sourceKinds.has(part.kind) ? -1 : 1);
-    const brightness = part.kind === "bulb" ? Math.max(0, Math.min(1, powerWatts / (part.ratedPowerWatts ?? 2)))
-      : part.kind === "led" ? Math.max(0, Math.min(1, reading.currentAmps / (part.ratedCurrentAmps ?? 0.02))) : undefined;
+    let brightness: number | undefined;
+    if (part.kind === "bulb" || part.kind === "led") {
+      const current = restoredReadingComplex(reading.exactTerminalCurrents?.a, reading.currentAmps, undefined, false, expressions) ?? complex(reading.currentAmps);
+      const voltage = restoredReadingComplex(reading.exactVoltage, reading.voltageVolts, undefined, false, expressions) ?? complex(reading.voltageVolts);
+      const relative = part.kind === "bulb"
+        ? complexDivide(complexMultiply(voltage, current), complex(part.ratedPowerWatts ?? 2))
+        : complexDivide(current, complex(part.ratedCurrentAmps ?? 0.02));
+      brightness = Math.max(0, Math.min(1, relative.real));
+    }
     parts[part.id] = { ...reading, powerWatts, ...(brightness === undefined ? {} : { brightness }) };
   }
   return parts;
@@ -184,7 +191,7 @@ export function analysisAtTransientFrame(document: CircuitDocument, frame: Circu
   if (frame.analysis.status !== "valid") { return null; }
   const sample = frame.analysis.samples[frame.sampleIndex];
   if (!sample) { return null; }
-  const parts = transientFrameParts(document, sample);
+  const parts = transientFrameParts(document, sample, frame.analysis.precisionExpressions);
   const sources = document.parts.filter((part) => sourceKinds.has(part.kind));
   const hasOpAmp = document.parts.some((part) => part.kind === "op-amp");
   const sourceCurrent = sources.length === 1 && !hasOpAmp ? parts[sources[0].id]?.currentAmps : undefined;

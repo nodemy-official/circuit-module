@@ -7,7 +7,7 @@ import {
   type CircuitTerminal,
 } from "./circuit-model.js";
 import { analyzeExtendedCircuit } from "./circuit-analog-adapter.js";
-import { solveRealLinearSystem } from "./analog-math.js";
+import { exactProductSumRatio, solveRealLinearSystem } from "./analog-math.js";
 import {
   divideExactRational,
   exactRationalToNumber,
@@ -16,10 +16,10 @@ import {
   subtractExactRational,
   type ExactRational,
 } from "./exact-linear-algebra.js";
-import { addRealStateValue, complexFromExact, exactRealStateValue } from "./exact-numeric-state.js";
+import { addRealStateValue, complexFromExact, exactComplexValue, exactRealStateValue } from "./exact-numeric-state.js";
 import { meterStatuses, type MeterStatus } from "./meter-status.js";
 import { circuitDocumentShapeIssue, copySimulationDocument, isSimulationRecord, simulationRecordEntries, simulationRecordField } from "./simulation-input.js";
-import { readingPrecision, type CircuitReadingPrecision, type CircuitTerminalVoltageDifference } from "./circuit-reading.js";
+import { readingPrecision, restoredComplex, type CircuitReadingPrecision, type CircuitTerminalVoltageDifference } from "./circuit-reading.js";
 import type { ExactExpressionNode } from "./exact-expression.js";
 
 export type { CircuitExactComplex, CircuitExactRational, CircuitReadingPrecision, CircuitTerminalVoltageDifference } from "./circuit-reading.js";
@@ -704,16 +704,18 @@ function readPart(
   const voltageExact = exactDifferenceValue(voltageDrop);
   const absorbsPower = part.kind !== "battery" && ohms !== null;
   const deliversPower = part.kind === "battery";
+  const exactPower = (absorbsPower || deliversPower) && voltageExact && currentExact
+    ? multiplyExactRational(voltageExact, currentExact) : null;
   let powerWatts = 0;
-  if ((absorbsPower || deliversPower) && voltageExact && currentExact) {
-    const exactPower = multiplyExactRational(voltageExact, currentExact);
+  if (exactPower) {
     powerWatts = exactRationalToNumber(deliversPower ? negateExact(exactPower) : exactPower);
   } else if (absorbsPower || deliversPower) {
     powerWatts = voltageVolts * currentAmps * (deliversPower ? -1 : 1);
   }
   if (part.kind !== "bulb") { return { voltageVolts, currentAmps, powerWatts }; }
   const rated = part.ratedPowerWatts ?? 2;
-  return { voltageVolts, currentAmps, powerWatts, brightness: Math.min(1, powerWatts / rated) };
+  const relativePower = exactPower ? exactRationalToNumber(divideExactRational(exactPower, exactInput(rated)!)!) : powerWatts / rated;
+  return { voltageVolts, currentAmps, powerWatts, brightness: Math.min(1, relativePower) };
 }
 
 function tidy(value: number, uncertainty = 0) {
@@ -3224,6 +3226,17 @@ function connectedTerminals(document: CircuitDocument) {
   return connected;
 }
 
+function bulbIsOverloaded(part: CircuitPart, reading: CircuitPartReading) {
+  const voltage = restoredComplex(reading.exactVoltage);
+  const current = restoredComplex(reading.exactTerminalCurrents?.a);
+  const excess = exactProductSumRatio([
+    { factors: [voltage ? exactComplexValue(voltage)?.real ?? reading.voltageVolts : reading.voltageVolts,
+      current ? exactComplexValue(current)?.real ?? reading.currentAmps : reading.currentAmps] },
+    { factors: [part.ratedPowerWatts ?? 2, OVERLOAD_RATIO], sign: -1 },
+  ], 1);
+  return excess !== null && excess.numerator > 0n;
+}
+
 /** Warnings that do not stop the calculation but deserve the author's attention. */
 function collectIssues(document: CircuitDocument, parts: Record<string, CircuitPartReading>) {
   const issues: CircuitIssue[] = [];
@@ -3233,7 +3246,7 @@ function collectIssues(document: CircuitDocument, parts: Record<string, CircuitP
     if (
       part.kind === "bulb" &&
       reading &&
-      reading.powerWatts > (part.ratedPowerWatts ?? 2) * OVERLOAD_RATIO
+      bulbIsOverloaded(part, reading)
     ) {
       issues.push({
         severity: "warning",

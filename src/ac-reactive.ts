@@ -16,7 +16,12 @@ export function frequencyMatches(first: number, second: number) {
   if (!Number.isFinite(first) || !Number.isFinite(second)) { return false; }
   if (first === second) { return true; }
   const scale = Math.max(Math.abs(first), Math.abs(second));
-  return Math.abs(first - second) <= scale * Number.EPSILON * 4;
+  const excess = exactProductSumRatio([
+    { factors: [Math.max(first, second)] },
+    { factors: [Math.min(first, second)], sign: -1 },
+    { factors: [scale, Number.EPSILON, 4], sign: -1 },
+  ], 1);
+  return excess !== null && excess.numerator <= 0n;
 }
 
 function angularProduct(frequencyHz: number, value: number) {

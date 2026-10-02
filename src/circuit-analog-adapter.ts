@@ -1,5 +1,5 @@
 import { analyzeAnalogCircuit, type ComplexValue, type AnalogCircuitPartReading } from "./analog-solver.js";
-import { complexMagnitude, complexPhaseDegrees } from "./analog-math.js";
+import { complex, complexDivide, complexMagnitude, complexPhaseDegrees } from "./analog-math.js";
 import { exactComplexValue } from "./exact-numeric-state.js";
 import { acAnalysisFrequency, frequencyMatches, isAcReactiveConductive } from "./ac-reactive.js";
 import { circuitPartCatalog, terminalsOf, type CircuitDocument, type CircuitPart, type CircuitTerminal } from "./circuit-model.js";
@@ -245,8 +245,8 @@ function adaptReading(
     result.terminalVoltagePhasesDegrees = Object.fromEntries(Object.entries(reading.terminalVoltages).map(([terminal, value]) => [terminal, phase(value)]));
     result.terminalCurrentPhasesDegrees = Object.fromEntries(Object.entries(reading.terminalCurrents).map(([terminal, value]) => [terminal, phase(value)]));
   }
-  if (part.kind === "bulb") { result.brightness = Math.max(0, Math.min(1, powerWatts / (part.ratedPowerWatts ?? 2))); }
-  if (part.kind === "led" && !ac) { result.brightness = Math.max(0, Math.min(1, result.currentAmps / (part.ratedCurrentAmps ?? 0.02))); }
+  if (part.kind === "bulb") { result.brightness = reading.brightness; }
+  if (part.kind === "led" && !ac) { result.brightness = Math.max(0, Math.min(1, complexDivide(reading.current, complex(part.ratedCurrentAmps ?? 0.02)).real)); }
   return result;
 }
 

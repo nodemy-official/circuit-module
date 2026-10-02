@@ -20,7 +20,7 @@ import {
   MAX_CIRCUIT_ANALYSIS_TERMINALS,
   type CircuitIssue,
 } from "./circuit-solver.js";
-import { copySimulationDocument, isSimulationArray, isSimulationRecord, simulationRecordEntries } from "./simulation-input.js";
+import { copySimulationDocument, isSimulationArray, isSimulationRecord, simulationRecordEntries, simulationRecordField } from "./simulation-input.js";
 import { readingPrecision, terminalVoltageDifferences, type CircuitReadingPrecision, type CircuitTerminalVoltageDifference } from "./circuit-reading.js";
 import { createExactExpressionCapture, freezeCapturedExactExpressions, snapshotExactExpressions, withExactExpressionCapture, type ExactExpressionNode } from "./exact-expression.js";
 import { createTransientEnergyCollector, type TransientEnergyReadings } from "./transient-energy.js";
@@ -542,6 +542,11 @@ function finiteWaveformSettings(rms: number, frequency: number, phaseDegrees: nu
     Number.isFinite(phaseDegrees) && Number.isFinite(offset) && Number.isFinite(timeSeconds);
 }
 
+function waveformAnchorOffset(offsetDegrees: number): number | null {
+  if (Math.abs(offsetDegrees) < 1e-7) { return 0; }
+  return Math.abs(Math.abs(offsetDegrees) - 45) < 1e-7 ? Math.sign(offsetDegrees) * 45 : null;
+}
+
 function sourceWaveformValue(part: CircuitPart, timeSeconds: number, orderLimit = 12, reducedOrder = 0, quadrantOffset = 0, phasePi = DEFAULT_PHASE_PI): ExactRational | null {
   const rms = part.voltageVolts ?? DEFAULT_AC_RMS;
   const frequency = part.frequencyHz ?? DEFAULT_AC_FREQUENCY;
@@ -554,10 +559,8 @@ function sourceWaveformValue(part: CircuitPart, timeSeconds: number, orderLimit 
     return smallTurnVoltage(part, frequency, timeSeconds, offset, orderLimit, quadrantOffset, phasePi);
   }
   const combined = exactTimeQuadrant(frequency, timeSeconds, phaseDegrees);
-  const nearAxis = Math.abs(combined.offsetDegrees) < 1e-7;
-  const nearDiagonal = Math.abs(Math.abs(combined.offsetDegrees) - 45) < 1e-7;
-  if (nearAxis || nearDiagonal) {
-    const anchor = nearAxis ? 0 : Math.sign(combined.offsetDegrees) * 45;
+  const anchor = waveformAnchorOffset(combined.offsetDegrees);
+  if (anchor !== null) {
     const cosine = quadrantalPeakVoltage(rms, 90 * combined.quadrant + anchor, quadrantOffset);
     const sine = quadrantalPeakVoltage(rms, 90 * combined.quadrant + anchor, (quadrantOffset + 3) % 4);
     const angle = exactProductSumRatio([
@@ -611,6 +614,14 @@ function steppedTimeVoltage(part: CircuitPart, timeSeconds: number, orderLimit: 
   const previousVoltage = previous?.voltages.get(part.id);
   const frequency = part.frequencyHz ?? DEFAULT_AC_FREQUENCY;
   if (!previous || !previousVoltage || Math.abs(frequency * previous.stepSeconds) >= 1e-8) {
+    return timeVoltage(part, timeSeconds, orderLimit, reducedOrder, phasePi);
+  }
+  const phaseDegrees = (part.phaseDegrees ?? DEFAULT_AC_PHASE) % 360;
+  const combined = exactTimeQuadrant(frequency, timeSeconds, phaseDegrees);
+  if (waveformAnchorOffset(combined.offsetDegrees) !== null) {
+    // Absolute evaluation here retains the exact reduced phase and rational
+    // corrections. Reanchor instead of carrying ordinary trig rounding or
+    // an increment-series truncation residue into a canceled axis/diagonal.
     return timeVoltage(part, timeSeconds, orderLimit, reducedOrder, phasePi);
   }
   // Small final steps use a voltage increment, avoiding a discontinuity
@@ -1127,7 +1138,7 @@ export function simulateTransient(
 
 function simulateTransientFromInput(
   inputDocument: CircuitDocument,
-  options: TransientAnalysisOptions,
+  inputOptions: TransientAnalysisOptions,
 ): TransientAnalysis {
   try {
     const shapeIssue = validateDocumentShape(inputDocument);
@@ -1135,8 +1146,18 @@ function simulateTransientFromInput(
     const document = copySimulationDocument(inputDocument);
     const reactiveIssue = validateReactiveValues(document);
     if (reactiveIssue) { return invalid(reactiveIssue); }
+    if (!isSimulationRecord(inputOptions)) { return invalid("解析条件はオブジェクトで指定してください。"); }
+    const options: TransientAnalysisOptions = {
+      durationSeconds: simulationRecordField(inputOptions, "durationSeconds") as number,
+      timeStepSeconds: simulationRecordField(inputOptions, "timeStepSeconds") as number,
+      startFromOperatingPoint: simulationRecordField(inputOptions, "startFromOperatingPoint") as boolean | undefined,
+      switchStates: simulationRecordField(inputOptions, "switchStates") as Record<string, boolean> | undefined,
+    };
     const optionsIssue = validateOptions(options, document);
     if (optionsIssue) { return invalid(optionsIssue); }
+    if (options.switchStates !== undefined) {
+      options.switchStates = Object.fromEntries(simulationRecordEntries(options.switchStates)) as Record<string, boolean>;
+    }
     if (!document.parts.length) { return invalid("過渡解析には部品が必要です。"); }
     const steps = stepCount(options.durationSeconds, options.timeStepSeconds);
     if (steps === null) {
