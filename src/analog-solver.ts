@@ -21,7 +21,6 @@ import {
   exactDotProductRational,
   exactProductSumRatio,
   scaledProduct,
-  solveComplexLinearSystem,
   solveRealLinearSystem,
   withComplexMagnitudeNormalization,
   type ComplexValue,
@@ -57,6 +56,7 @@ import {
   setRealStateValue,
 } from "./exact-numeric-state.js";
 import { solveRealLinearSystemWithExactInverseCache } from "./exact-linear-cache.js";
+import { finiteComplexReferenceShift } from "./analog-reference.js";
 import { acAnalysisFrequency, acReactiveAdmittance, acReactiveImpedance, acReactiveReactance, frequencyMatches } from "./ac-reactive.js";
 import { meterStatuses, type MeterStatus } from "./meter-status.js";
 import { circuitDocumentShapeIssue, copySimulationDocument, isSimulationRecord, simulationRecordEntries, simulationRecordField } from "./simulation-input.js";
@@ -228,6 +228,7 @@ interface AcSolution {
   biasLayout: MnaLayout;
   values: ComplexValue[];
   nodeVoltageOffsets: ComplexValue[];
+  smallSignalConnections: SmallSignalConnectionsByPartId;
 }
 
 interface NonlinearModel {
@@ -1396,8 +1397,13 @@ function diodeExactExponent(controlVoltage: ResidualTerm, ideality: number) {
 }
 
 function diodeControlAtModelBoundary(controlVoltage: ResidualTerm, ideality: number): ResidualTerm {
-  return Math.abs(exactRationalToNumber(diodeExactExponent(controlVoltage, ideality))) < 2 ** -1022
-    ? controlVoltage : roundedResidualTerm(controlVoltage);
+  if (Math.abs(exactRationalToNumber(diodeExactExponent(controlVoltage, ideality))) < 2 ** -1022) { return controlVoltage; }
+  const projected = roundedResidualTerm(controlVoltage);
+  // A subnormal voltage can have a normal exponent when n*Vt is small.
+  // Bound its significand without rounding away that voltage before the
+  // exponent evaluation. The relative boundary error is below 2^-512.
+  return typeof controlVoltage !== "number" && Math.abs(projected) < 2 ** -1022
+    ? roundExactRationalSignificand(controlVoltage, 512) : projected;
 }
 
 function exactDiodeCurrent(value: DiodeValues) { return value.exactCurrent ?? numberToExactRational(value.current); }
@@ -1437,7 +1443,8 @@ function linearizedDiodeValues(voltage: ExactRational, scale: ExactRational, sat
 }
 
 function diodeCurrentAndSlope(controlVoltage: ResidualTerm, saturationCurrent: number, ideality: number): DiodeValues {
-  const exactVoltage = typeof controlVoltage === "number" ? numberToExactRational(controlVoltage)! : controlVoltage;
+  const modelControl = diodeControlAtModelBoundary(controlVoltage, ideality);
+  const exactVoltage = typeof modelControl === "number" ? numberToExactRational(modelControl)! : modelControl;
   const exactScale = multiplyExactRational(numberToExactRational(ideality)!, numberToExactRational(THERMAL_VOLTAGE)!);
   const exactExponent = divideExactRational(exactVoltage, exactScale)!;
   if (Math.abs(exactRationalToNumber(exactExponent)) < 2 ** -1022) {
@@ -1451,9 +1458,10 @@ function diodeCurrentAndSlope(controlVoltage: ResidualTerm, saturationCurrent: n
   const scale = ideality * THERMAL_VOLTAGE;
   // Divide in stages when forming n * Vt would round a subnormal value or zero.
   const subnormalScale = scale < 2 ** -1022;
-  const rawExponent = subnormalScale ? (voltage / ideality) / THERMAL_VOLTAGE : voltage / scale;
+  const rawExponent = Math.abs(voltage) < 2 ** -1022
+    ? exactRationalToNumber(exactExponent)
+    : subnormalScale ? (voltage / ideality) / THERMAL_VOLTAGE : voltage / scale;
   const exponential = Math.exp(Math.min(EXPONENT_MAX, rawExponent));
-  const exponentialCurrent = saturationCurrent * exponential;
   // exp is the binary64 approximation boundary. Complete Is*exp/(n*Vt)
   // exactly after it: neither a rounded subnormal product nor Is/(n*Vt)
   // may lose bits that a later base/load ratio or amplifier makes visible.
@@ -1470,14 +1478,18 @@ function diodeCurrentAndSlope(controlVoltage: ResidualTerm, saturationCurrent: n
     exactSlope = undefined;
   }
   if (rawExponent > EXPONENT_MAX) {
+    // Continue from exp(80) with one exact affine equation. Rounding its
+    // current or slope separately can erase the knee voltage in I - g*V
+    // and send Newton to a spurious reverse-biased state at tiny n*Vt.
+    const exactCurrent = exactProductSumRatio([
+      { factors: [saturationCurrent, exponential, exactExponent] },
+      { factors: [saturationCurrent, exponential, EXPONENT_MAX - 1], sign: -1 },
+      { factors: [saturationCurrent], sign: -1 },
+    ], 1)!;
     return {
-      // Scale the exponential before the continuation factor. The current at
-      // the knee stays normal even for subnormal saturation, unlike the slope.
-      current: Number.isFinite(rawExponent)
-        ? exponentialCurrent * (1 + rawExponent - EXPONENT_MAX) - saturationCurrent
-        : slope * (voltage - scale * (EXPONENT_MAX - 1)) - saturationCurrent,
-      slope,
-      ...(exactSlope ? { exactSlope } : {}),
+      current: exactRationalToNumber(exactCurrent),
+      slope, exactCurrent,
+      ...(slope > 0 && Number.isFinite(slope) ? { exactSlope: exactExponentialSlope } : {}),
     };
   }
   return diodeExponentialValues(voltage, rawExponent, saturationCurrent, slope, exactSlope);
@@ -1485,7 +1497,7 @@ function diodeCurrentAndSlope(controlVoltage: ResidualTerm, saturationCurrent: n
 
 function diodeExponentialValues(voltage: number, rawExponent: number, saturationCurrent: number, slope: number, exactSlope?: ExactRational): DiodeValues {
   const currentFactor = Math.expm1(rawExponent);
-  const current = voltage === 0 ? 0 : Math.abs(rawExponent) < 2 ** -1022
+  const current = rawExponent === 0 ? 0 : Math.abs(rawExponent) < 2 ** -1022
     ? slope * voltage : saturationCurrent * currentFactor;
   // expm1 is the binary64 model boundary. Preserve the following product
   // when its subnormal rounding could erase KCL or a finite rated-current ratio.
@@ -1969,8 +1981,18 @@ function smallSignalConnectionsForBias(
   for (const part of document.parts) {
     if (!usesSmallSignalConnections(part)) { continue; }
     const model = nonlinearModel(part, nonlinearTerminalVoltages(part, biasLayout, dcState));
-    const groups = [...(model?.smallSignalConnections ?? [])];
+    let groups = [...(model?.smallSignalConnections ?? [])];
     if ((part.kind === "nmos" || part.kind === "pmos") && model) {
+      const drain = nodeForTerminal(connectivityLayout.topology, part, "a");
+      const gate = nodeForTerminal(connectivityLayout.topology, part, "b");
+      const source = nodeForTerminal(connectivityLayout.topology, part, "c");
+      if (findRoot(passiveParents, drain) === findRoot(passiveParents, source) &&
+          findRoot(passiveParents, gate) !== findRoot(passiveParents, source)) {
+        // A passive output return can absorb gm's current without fixing Vgs.
+        // In that case the zero-current gate island still needs its own gauge;
+        // declaring a gate-source reference would hide it and make MNA singular.
+        groups = groups.filter((group) => !group.includes("b"));
+      }
       // When the output and control terminals share a passive small-signal
       // component, gm becomes a drain-source path. This includes direct wires,
       // ideal voltage constraints, and finite resistance in the gate return.
@@ -2360,7 +2382,8 @@ function nonlinearLinearizationCenter(part: CircuitPart, voltages: readonly Resi
     return mosLinearizationCenter(part, voltages);
   }
   const ideality = part.emissionCoefficient ?? (part.kind === "led" ? 2 : 1);
-  if (typeof diodeControlAtModelBoundary(voltages[0] ?? 0, ideality) !== "number") { return [...voltages]; }
+  const control = diodeControlAtModelBoundary(voltages[0] ?? 0, ideality);
+  if (typeof control !== "number") { return [control, 0]; }
   return voltages.map(roundedResidualTerm);
 }
 
@@ -3325,8 +3348,12 @@ function solveLinearTargetState(
 ) {
   const cached = solveRealLinearSystemWithExactInverseCache(size, matrix, rhs);
   if (cached.status === "solved") { return cached.solution; }
-  if (cached.status === "singular") { return null; }
-  return solveRealLinearSystem(size, matrix, rhs);
+  // A floating linear island may exceed the display range even when another
+  // island needs Newton iterations. Keep the exact target and its sidecar;
+  // only the final, restored physical readings must fit binary64. The cache
+  // also reports projected overflow as singular, so retry it exactly here.
+  const exact = solveExactRealLinearSystem(size, exactRealStateInput(matrix), rhs);
+  return exact ? realStateFromExact(exact) : null;
 }
 
 function nonlinearCenters(document: CircuitDocument, layout: MnaLayout, state: Float64Array) {
@@ -4146,13 +4173,10 @@ function solveAcSourceResponse(
   matrixReal: Float64Array,
   matrixImaginary: Float64Array,
   response: AcSourceResponse,
-  mixed: boolean,
 ) {
-  if (!mixed) {
-    return solveComplexLinearSystem(size, matrixReal, matrixImaginary, response.rhsReal, response.rhsImaginary);
-  }
-  // An individual contribution may exceed binary64 even when their sum is
-  // finite. Keep mixed-response coefficients exact until superposition.
+  // A response or an arbitrary node reference may exceed binary64 even
+  // when the final branch quantities and displayed coordinates are finite.
+  // Keep coefficients exact through superposition and reference restoration.
   return solveExactComplexLinearSystem(
     size, exactRealStateInput(matrixReal), exactRealStateInput(matrixImaginary),
     exactRealStateInput(response.rhsReal), exactRealStateInput(response.rhsImaginary),
@@ -4294,24 +4318,91 @@ function stampAcSmallSignalPart(
   }
 }
 
+function withoutFloatingControlReferences(
+  document: CircuitDocument,
+  layout: MnaLayout,
+  connections: SmallSignalConnectionsByPartId,
+  currentConnections: SmallSignalConnectionsByPartId,
+  added: readonly ReferenceConstraint[],
+  channelConducting: Readonly<Record<string, boolean>>,
+): SmallSignalConnectionsByPartId {
+  const parent = referenceConnectivityParents(document, layout, "ac", channelConducting, currentConnections);
+  const floatingRoots = new Set(added.map(({ node }) => findRoot(parent, node)));
+  const resolved: Record<string, readonly (readonly CircuitTerminal[])[]> = Object.create(null);
+  for (const part of document.parts) {
+    const groups = connections[part.id];
+    if (!groups) { continue; }
+    setRecordValue(resolved, part.id, groups.filter((group) => {
+      const roots = group.map((terminal) => findRoot(parent, nodeForTerminal(layout.topology, part, terminal)));
+      return !roots.some((root) => floatingRoots.has(root)) || roots.every((root) => root === roots[0]);
+    }));
+  }
+  return resolved;
+}
+
+function retryAcWithCurrentReferences(
+  document: CircuitDocument,
+  layout: MnaLayout,
+  dcLayout: MnaLayout,
+  dcState: Float64Array,
+  matrixReal: Float64Array,
+  matrixImaginary: Float64Array,
+  response: AcSourceResponse,
+  references: readonly ReferenceConstraint[],
+  smallSignalConnections: SmallSignalConnectionsByPartId,
+  channelConducting: Readonly<Record<string, boolean>>,
+) {
+  if (!document.parts.some((part) => part.kind === "nmos" || part.kind === "pmos")) { return null; }
+  // Cascaded controlled outputs can carry a gate's response even without
+  // a passive output return. Resolve remaining free input coordinates
+  // from current connectivity; the caller certifies the original equations.
+  const currentConnections = smallSignalCurrentConnectionsForBias(document, dcLayout, dcState);
+  const additional = referenceConstraints(document, layout, "ac", channelConducting, currentConnections)
+    .filter(({ node }) => !references.some((reference) => reference.node === node));
+  if (additional.length === 0) { return null; }
+  const retryReal = cloneRealState(matrixReal);
+  const retryImaginary = cloneRealState(matrixImaginary);
+  stampAcReferences(retryReal, retryImaginary, response.rhsReal, response.rhsImaginary, layout,
+    [...references, ...additional]);
+  const solution = solveAcSourceResponse(layout.size, retryReal, retryImaginary, response);
+  return solution ? {
+    solution,
+    connections: withoutFloatingControlReferences(document, layout, smallSignalConnections,
+      currentConnections, additional, channelConducting),
+  } : null;
+}
+
+function isPhysicalAcResponse(
+  size: number,
+  matrixReal: Float64Array,
+  matrixImaginary: Float64Array,
+  response: AcSourceResponse,
+  solution: readonly ComplexValue[],
+) {
+  const exactSolution = solution.map(exactComplexValue);
+  return exactSolution.every((value) => value !== null) && isExactComplexLinearSolution(
+    size, exactRealStateInput(matrixReal), exactRealStateInput(matrixImaginary),
+    exactRealStateInput(response.rhsReal), exactRealStateInput(response.rhsImaginary), exactSolution,
+  );
+}
+
 function solveAcForLayout(
   document: CircuitDocument,
   layout: MnaLayout,
   dcLayout: MnaLayout,
   dcState: Float64Array,
   smallSignalConnections: SmallSignalConnectionsByPartId,
-): ComplexValue[] | null {
+): { values: ComplexValue[]; smallSignalConnections: SmallSignalConnectionsByPartId } | null {
   const matrixReal = new Float64Array(layout.size * layout.size);
   const matrixImaginary = new Float64Array(layout.size * layout.size);
   const rhsReal = new Float64Array(layout.size);
   const rhsImaginary = new Float64Array(layout.size);
   const channelConducting = mosChannelConductingByPartId(document, dcLayout, dcState);
 
+  for (const branch of [...layout.branches, ...layout.internalBranches]) {
+    stampAcVoltageBranch(matrixReal, matrixImaginary, rhsReal, rhsImaginary, layout, branch);
+  }
   for (const part of document.parts) {
-    const branch = layout.branchByPartId.get(part.id);
-    if (branch) {
-      stampAcVoltageBranch(matrixReal, matrixImaginary, rhsReal, rhsImaginary, layout, branch);
-    }
     const unboundedReactiveAdmittance = layout.unboundedReactiveAdmittances.get(part.id);
     if (unboundedReactiveAdmittance) {
       stampAcAdmittance(
@@ -4324,9 +4415,6 @@ function solveAcForLayout(
       );
     }
     stampAcSmallSignalPart(matrixReal, matrixImaginary, layout, dcLayout, part, dcState);
-  }
-  for (const branch of layout.internalBranches) {
-    stampAcVoltageBranch(matrixReal, matrixImaginary, rhsReal, rhsImaginary, layout, branch);
   }
   const references = referenceConstraints(document, layout, "ac", channelConducting, smallSignalConnections);
   // A gauge reference replaces a KCL row. It must only remove a redundant
@@ -4344,27 +4432,23 @@ function solveAcForLayout(
 
   const responses = acSourceResponses(layout, rhsReal, rhsImaginary);
   let combined = Array.from({ length: layout.size }, () => complex());
+  let resolvedConnections = smallSignalConnections;
   // Solve rational coefficients before restoring each correction. Combining
   // expanded square roots in the RHS would erase exact source cancellation.
   for (const response of responses) {
-    const solution = solveAcSourceResponse(layout.size, matrixReal, matrixImaginary, response, responses.length > 1);
+    const primary = solveAcSourceResponse(layout.size, matrixReal, matrixImaginary, response);
+    const retry = primary ? null : retryAcWithCurrentReferences(document, layout, dcLayout, dcState,
+      physicalMatrixReal, physicalMatrixImaginary, response, references, smallSignalConnections, channelConducting);
+    const solution = primary ?? retry?.solution;
     if (!solution) { return null; }
-    if (references.length > 0) {
-      const exactSolution = solution.map(exactComplexValue);
-      if (!exactSolution.every((value) => value !== null) || !isExactComplexLinearSolution(
-        layout.size,
-        exactRealStateInput(physicalMatrixReal),
-        exactRealStateInput(physicalMatrixImaginary),
-        exactRealStateInput(response.rhsReal),
-        exactRealStateInput(response.rhsImaginary),
-        exactSolution,
-      )) { return null; }
-    }
-    if (responses.length === 1) { return solution; }
+    if (retry) { resolvedConnections = retry.connections; }
+    if ((references.length > 0 || retry) && !isPhysicalAcResponse(layout.size,
+      physicalMatrixReal, physicalMatrixImaginary, response, solution)) { return null; }
+    if (responses.length === 1) { return { values: solution, smallSignalConnections: resolvedConnections }; }
     combined = combined.map((value, index) => complexAdd(value,
       withComplexMagnitudeNormalization(solution[index]!, response.normalization)));
   }
-  return combined;
+  return { values: combined, smallSignalConnections: resolvedConnections };
 }
 
 interface AcReferenceCandidate {
@@ -4597,14 +4681,15 @@ function rebasedAcSolutionForQuality(
     smallSignalConnections,
   ).slice(0, 8)) {
     const rebasedLayout = layoutWithReferenceNode(layout, referenceNode);
-    const rebasedValues = solveAcForLayout(
+    const rebased = solveAcForLayout(
       document,
       rebasedLayout,
       layout,
       dcState,
       smallSignalConnections,
     );
-    if (!rebasedValues) { continue; }
+    if (!rebased) { continue; }
+    const rebasedValues = rebased.values;
     const rebasedResidual = acBranchEquationResidual(rebasedLayout, rebasedValues);
     if (rebasedResidual > 1e-10) { continue; }
     const rebasedKclQuality = acKclQuality(
@@ -4640,6 +4725,7 @@ function rebasedAcSolutionForQuality(
         layout: rebasedLayout,
         biasLayout: layout,
         values: rebasedValues,
+        smallSignalConnections: rebased.smallSignalConnections,
         nodeVoltageOffsets: component.map((isInReferenceComponent) =>
           isInReferenceComponent ? offset : complex()),
       };
@@ -4657,12 +4743,13 @@ function solveAc(
   frequencyHz: number,
 ): AcSolution | null {
   const channelConducting = mosChannelConductingByPartId(document, layout, dcState);
-  const smallSignalConnections = smallSignalConnectionsForBias(document, layout, dcState);
+  const biasConnections = smallSignalConnectionsForBias(document, layout, dcState);
   prepareMixedAcSources(document, layout, dcState, frequencyHz);
-  const values = solveAcForLayout(document, layout, layout, dcState, smallSignalConnections);
-  if (!values) { return null; }
+  const resolved = solveAcForLayout(document, layout, layout, dcState, biasConnections);
+  if (!resolved) { return null; }
+  const { values, smallSignalConnections } = resolved;
   const noOffsets = Array.from({ length: layout.topology.nodeCount }, () => complex());
-  const solution: AcSolution = { layout, biasLayout: layout, values, nodeVoltageOffsets: noOffsets };
+  const solution: AcSolution = { layout, biasLayout: layout, values, smallSignalConnections, nodeVoltageOffsets: noOffsets };
 
   // Re-referencing is safe only when every nonlinear small-signal stamp is
   // common-mode invariant. The op-amp stamp includes its physical GND return.
@@ -4693,14 +4780,15 @@ function solveAc(
     smallSignalConnections,
   )) {
     const rebasedLayout = layoutWithReferenceNode(layout, candidate.node);
-    const rebasedValues = solveAcForLayout(
+    const rebased = solveAcForLayout(
       document,
       rebasedLayout,
       layout,
       dcState,
       smallSignalConnections,
     );
-    if (!rebasedValues) { continue; }
+    if (!rebased) { continue; }
+    const rebasedValues = rebased.values;
     const rebasedResidual = acBranchEquationResidual(rebasedLayout, rebasedValues);
     if (rebasedResidual > 1e-10 || rebasedResidual >= originalResidual * 0.1) { continue; }
 
@@ -4723,6 +4811,7 @@ function solveAc(
       layout: rebasedLayout,
       biasLayout: layout,
       values: rebasedValues,
+      smallSignalConnections: rebased.smallSignalConnections,
       nodeVoltageOffsets: component.map((isInReferenceComponent) =>
         isInReferenceComponent ? offset : complex()),
     };
@@ -5076,21 +5165,104 @@ function dcReferenceOffsets(
   return componentIds.map((component) => component === referenceComponent ? offset : complex());
 }
 
+function smallSignalControlConnectionsForBias(
+  document: CircuitDocument,
+  biasLayout: MnaLayout,
+  dcState: Float64Array,
+): SmallSignalConnectionsByPartId {
+  const connections: Record<string, CircuitTerminal[][]> = Object.create(null);
+  for (const part of document.parts) {
+    if (!usesSmallSignalConnections(part)) { continue; }
+    const model = nonlinearModel(part, nonlinearTerminalVoltages(part, biasLayout, dcState));
+    if (!model) { continue; }
+    const terminals = terminalsOf(part.kind);
+    const groups = model.jacobian.map((_derivatives, row) => {
+      const coefficients = nonlinearModelCoefficients(model, row);
+      return terminals.filter((_, column) => {
+        const coefficient = coefficients[column] ?? 0;
+        return typeof coefficient === "number" ? coefficient !== 0 : coefficient.numerator !== 0n;
+      });
+    }).filter((group) => group.length > 1);
+    setRecordValue(connections, part.id, groups);
+  }
+  return connections;
+}
+
 function acDisplayReferenceComponentIds(
   document: CircuitDocument,
   layout: MnaLayout,
   channelConducting?: Readonly<Record<string, boolean>>,
   smallSignalConnections?: SmallSignalConnectionsByPartId,
+  smallSignalControls?: SmallSignalConnectionsByPartId,
 ) {
   const parent = referenceConnectivityParents(document, layout, "ac", channelConducting, smallSignalConnections);
-  // An op-amp's input current is zero, but its output still depends on the
-  // input difference. Shift both input islands together when restoring
-  // display coordinates; semiconductor small-signal groups stay unchanged.
+  // Display shifts must preserve voltage controls even when a control
+  // terminal carries no current. Each semiconductor Jacobian row sums to
+  // zero, so shift its nonzero columns together. These display dependencies
+  // do not turn a floating gate into a conductive meter reference path.
   for (const part of document.parts) {
-    if (part.kind !== "op-amp") { continue; }
-    joinConductiveNodes(parent, nodeForTerminal(layout.topology, part, "a"), nodeForTerminal(layout.topology, part, "b"));
+    const groups = part.kind === "op-amp" ? [["a", "b"] as const] : smallSignalControls?.[part.id] ?? [];
+    for (const group of groups) {
+      const first = group[0];
+      if (first === undefined) { continue; }
+      const firstNode = nodeForTerminal(layout.topology, part, first);
+      for (const terminal of group.slice(1)) {
+        joinConductiveNodes(parent, firstNode, nodeForTerminal(layout.topology, part, terminal));
+      }
+    }
   }
   return parent.map((_, node) => findRoot(parent, node));
+}
+
+function floatingVoltageRangeShifts(
+  document: CircuitDocument,
+  layout: MnaLayout,
+  parent: number[],
+  values: readonly (ComplexValue | undefined)[],
+) {
+  const fixedRoot = document.parts.some((part) => part.kind === "ground" || part.kind === "op-amp")
+    ? findRoot(parent, layout.physicalReferenceNode) : -1;
+  const nodesByRoot = new Map<number, number[]>();
+  for (let node = 0; node < parent.length; node += 1) {
+    const root = findRoot(parent, node);
+    const nodes = nodesByRoot.get(root) ?? [];
+    nodes.push(node);
+    nodesByRoot.set(root, nodes);
+  }
+  const shifts = new Map<number, ComplexValue>();
+  for (const [root, nodes] of nodesByRoot) {
+    if (root === fixedRoot) { continue; }
+    const coordinates = nodes.map((node) => values[node] ?? complex());
+    if (coordinates.every((value) => Number.isFinite(complexMagnitude(value)))) { continue; }
+    const shift = finiteComplexReferenceShift(coordinates);
+    if (!shift) { continue; }
+    for (const node of nodes) { shifts.set(node, shift); }
+  }
+  return shifts;
+}
+
+function centerFloatingVoltageRanges(
+  document: CircuitDocument,
+  layout: MnaLayout,
+  solution: ComplexValue[],
+  offsets: ComplexValue[],
+  componentIds: number[],
+) {
+  const parent = componentIds.slice();
+  if (layout.initialInductorCurrents) {
+    // Initial inductor voltages determine di/dt even though the fixed-current
+    // branch does not provide a conductive reference. Preserve those drops.
+    for (const part of document.parts) {
+      if (part.kind === "inductor") {
+        joinConductiveNodes(parent, nodeForTerminal(layout.topology, part, "a"), nodeForTerminal(layout.topology, part, "b"));
+      }
+    }
+  }
+  const values = parent.map((_, node) => applyNodeVoltageOffset(nodeComplexValue(layout, node, solution), offsets[node]));
+  for (const [node, shift] of floatingVoltageRangeShifts(document, layout, parent, values)) {
+    offsets[node] = complexAdd(offsets[node] ?? complex(), shift);
+  }
+  return offsets;
 }
 
 function restoreFloatingReferenceOffsets(
@@ -5101,11 +5273,14 @@ function restoreFloatingReferenceOffsets(
   mode: AnalogAnalysisMode,
   channelConducting?: Readonly<Record<string, boolean>>,
   smallSignalConnections?: SmallSignalConnectionsByPartId,
+  smallSignalControls?: SmallSignalConnectionsByPartId,
 ) {
-  if (layout.initialInductorCurrents) { return initialOffsets; }
   const componentIds = mode === "dc"
     ? dcDisplayReferenceComponentIds(document, layout, channelConducting)
-    : acDisplayReferenceComponentIds(document, layout, channelConducting, smallSignalConnections);
+    : acDisplayReferenceComponentIds(document, layout, channelConducting, smallSignalConnections, smallSignalControls);
+  if (layout.initialInductorCurrents) {
+    return centerFloatingVoltageRanges(document, layout, solution, initialOffsets.slice(), componentIds);
+  }
   const physicalReferenceRoot = componentIds[layout.physicalReferenceNode];
   const firstNodeByRoot = new Map<number, number>();
   for (let node = 0; node < componentIds.length; node += 1) {
@@ -5123,7 +5298,7 @@ function restoreFloatingReferenceOffsets(
       offsets[node] = offset;
     }
   }
-  return offsets;
+  return centerFloatingVoltageRanges(document, layout, solution, offsets, componentIds);
 }
 
 function physicalDcQualityAcceptable(quality: ReturnType<typeof dcSolutionQuality>) {
@@ -5469,11 +5644,11 @@ function exactImpedance(
     : complex(resistance, reactance);
 }
 
-function measuredPower(voltage: ComplexValue, current: ComplexValue) {
+function measuredPower(voltage: ComplexValue, current: ComplexValue, retainExactPower = false) {
   const exactVoltage = exactComplexValue(voltage);
   const exactCurrent = exactComplexValue(current);
   if (
-    exactVoltage?.imaginary.numerator === 0n &&
+    !retainExactPower && exactVoltage?.imaginary.numerator === 0n &&
     exactCurrent?.imaginary.numerator === 0n
   ) {
     return complex(exactRationalProductToNumber(exactVoltage.real, exactCurrent.real));
@@ -5924,7 +6099,7 @@ function componentMeasurements(
     ? terminalVoltages.map((value) => voltageDifference(value, physicalReferenceVoltage))
     : terminalVoltages;
   const power = resistive?.power ?? reactive?.power ??
-    (branchVoltage ? measuredPower(voltage, current) : componentPower(part, powerVoltages, terminalCurrents));
+    (branchVoltage ? measuredPower(voltage, current, mode === "ac") : componentPower(part, powerVoltages, terminalCurrents));
   return { voltage, power };
 }
 
@@ -6367,12 +6542,7 @@ function acResult(document: CircuitDocument, options: AnalogStepOptions): Analog
   if ("status" in solution) { return solution; }
 
   const issues = analysisIssuesForAc(document, frequencyHz);
-  const smallSignalConnections = smallSignalConnectionsForBias(
-    document,
-    solution.biasLayout,
-    bias.state,
-    solution.layout,
-  );
+  const smallSignalConnections = solution.smallSignalConnections;
   const smallSignalCurrentConnections = smallSignalCurrentConnectionsForBias(
     document,
     solution.biasLayout,
@@ -6386,6 +6556,7 @@ function acResult(document: CircuitDocument, options: AnalogStepOptions): Analog
     "ac",
     mosChannelConductingByPartId(document, solution.biasLayout, bias.state),
     smallSignalConnections,
+    smallSignalControlConnectionsForBias(document, solution.biasLayout, bias.state),
   );
   const readings = makeReadings(
     document,
@@ -6539,7 +6710,7 @@ function acNodeResponseGroups(nodeCount: number, edges: readonly AcResponseEdge[
   return memberships;
 }
 
-function acLocalDifference(raw: readonly ComplexValue[], nodes: readonly (ComplexValue | undefined)[], memberships: readonly ReadonlyMap<string, ExactRational | undefined>[]) {
+function acLocalDifference(raw: readonly ComplexValue[], nodes: readonly (ComplexValue | undefined)[], memberships: readonly ReadonlyMap<string, ExactRational | undefined>[], shifts: ReadonlyMap<number, ComplexValue>) {
   return (first: number, second: number) => {
     if (first === second) { return complex(); }
     for (const [group, normalization] of memberships[first]!) {
@@ -6548,7 +6719,12 @@ function acLocalDifference(raw: readonly ComplexValue[], nodes: readonly (Comple
       // rectangular basis. Expanding another group's square root first can
       // move a local subnormal RMS midpoint to the wrong side of its tie.
       const difference = complexSubtract(raw[first]!, raw[second]!);
-      return normalization ? withComplexMagnitudeNormalization(difference, normalization) : difference;
+      const normalized = normalization ? withComplexMagnitudeNormalization(difference, normalization) : difference;
+      const firstShift = shifts.get(first);
+      const secondShift = shifts.get(second);
+      // Response groups can span independently floating input and output
+      // references. Their later display shifts also contribute to the voltage.
+      return firstShift === secondShift ? normalized : complexAdd(normalized, complexSubtract(firstShift ?? complex(), secondShift ?? complex()));
     }
     return complexSubtract(nodes[first]!, nodes[second]!);
   };
@@ -6569,8 +6745,21 @@ function normalizeAcReadings(document: CircuitDocument, frequencyHz: number, rea
   if (![...normalizations.values()].some((value) => value && value.numerator !== value.denominator)) { return; }
   const raw = Array.from({ length: layout.topology.nodeCount }, (_, node) => applyNodeVoltageOffset(nodeComplexValue(layout, node, solution.values), offsets[node]));
   const nodes = normalizedAcNodeVoltages(layout, edges, raw, normalizations);
+  // A direction correction can cross the RMS overflow boundary even when
+  // its raw coefficients fit. Center the normalized coordinates as well.
+  // Keep current paths and voltage controls together. An op-amp's zero-current
+  // inputs share only their differential reference, not the output's GND.
+  // Floating meters are measured from these final coordinates.
+  const parent = acDisplayReferenceComponentIds(document, layout,
+    mosChannelConductingByPartId(document, solution.biasLayout, state),
+    smallSignalCurrentConnectionsForBias(document, solution.biasLayout, state),
+    smallSignalControlConnectionsForBias(document, solution.biasLayout, state));
+  const shifts = floatingVoltageRangeShifts(document, layout, parent, nodes);
+  for (const [node, shift] of shifts) {
+    nodes[node] = complexAdd(nodes[node]!, shift);
+  }
   const memberships = acNodeResponseGroups(layout.topology.nodeCount, edges, groups, normalizations);
-  const localDifference = acLocalDifference(raw, nodes, memberships);
+  const localDifference = acLocalDifference(raw, nodes, memberships, shifts);
   for (const part of document.parts) {
     const reading = readings[part.id];
     if (!reading) { continue; }

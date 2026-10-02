@@ -69,7 +69,7 @@ function usableAcAnalysis(
   reading: CircuitPartReading | undefined,
 ): boolean {
   return options.mode !== "dc" && analysis.mode === "ac" &&
-    (analysis.status === "closed" || analysis.status === "idle") &&
+    (analysis.status === "closed" || analysis.status === "idle" || analysis.status === "open") &&
     document.parts.some((part) => part.kind === "ac-source") && finite(frequencyHz) && frequencyHz > 0 &&
     analysis.frequencyHz === requestedFrequencyHz &&
     Boolean(selectedPart && reading);
@@ -122,7 +122,7 @@ function createFrequencySweep(
     };
     const pointAnalysis = analyzeCircuit(sweptDocument, switchStates, { mode: "ac", frequencyHz });
     const reading = pointAnalysis.parts[partId];
-    const voltage = (pointAnalysis.status === "closed" || pointAnalysis.status === "idle") &&
+    const voltage = (pointAnalysis.status === "closed" || pointAnalysis.status === "idle" || pointAnalysis.status === "open") &&
       reading?.meterStatus !== "floating" && reading?.meterStatus !== "unconnected"
       ? reading?.voltageVolts
       : undefined;

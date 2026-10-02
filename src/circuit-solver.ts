@@ -7,16 +7,18 @@ import {
   type CircuitTerminal,
 } from "./circuit-model.js";
 import { analyzeExtendedCircuit } from "./circuit-analog-adapter.js";
-import { exactProductSumRatio, solveRealLinearSystem } from "./analog-math.js";
+import { exactProductSumRatio } from "./analog-math.js";
 import {
+  addExactRational,
   divideExactRational,
   exactRationalToNumber,
   multiplyExactRational,
   numberToExactRational,
+  solveExactRealLinearSystem,
   subtractExactRational,
   type ExactRational,
 } from "./exact-linear-algebra.js";
-import { addRealStateValue, complexFromExact, exactComplexValue, exactRealStateValue } from "./exact-numeric-state.js";
+import { addRealStateValue, complexFromExact, exactComplexValue, exactRealStateInput } from "./exact-numeric-state.js";
 import { meterStatuses, type MeterStatus } from "./meter-status.js";
 import { circuitDocumentShapeIssue, copySimulationDocument, isSimulationRecord, simulationRecordEntries, simulationRecordField } from "./simulation-input.js";
 import { readingPrecision, restoredComplex, type CircuitReadingPrecision, type CircuitTerminalVoltageDifference } from "./circuit-reading.js";
@@ -540,7 +542,7 @@ function nodalUnknownIndices(size: number, conductances: readonly Conductance[])
   for (let node = 0; node < size; node += 1) {
     if (!references.has(node)) { unknownByNode[node] = count++; }
   }
-  return { unknownByNode, count };
+  return { unknownByNode, count, components };
 }
 
 function stampConductanceBranch(
@@ -603,38 +605,170 @@ function exactNodeDifference(
   return { value, scale: Math.abs(value), valueExact: exactDifference };
 }
 
+interface VoltageReferenceConstraint {
+  from: number;
+  to: number;
+  limit: ExactRational;
+}
+
+function realizeStrictReferenceShifts(
+  shifts: readonly ExactRational[],
+  strictSteps: readonly number[],
+  constraints: readonly VoltageReferenceConstraint[],
+) {
+  // Each symbolic shift is value - strictSteps * epsilon. Choose an exact
+  // positive epsilon from the remaining slack, rather than a numerical tolerance.
+  let epsilon = EXACT_ONE;
+  for (const { from, to, limit } of constraints) {
+    const excess = strictSteps[from]! - strictSteps[to]!;
+    if (excess < 0) { continue; }
+    const slack = subtractExactRational(limit, subtractExactRational(shifts[to]!, shifts[from]!));
+    const bound = divideExactRational(slack, exactInput(excess + 1)!)!;
+    if (subtractExactRational(bound, epsilon).numerator < 0n) { epsilon = bound; }
+  }
+  return shifts.map((shift, node) => subtractExactRational(shift,
+    multiplyExactRational(epsilon, exactInput(strictSteps[node]!)!)));
+}
+
+/** Find shifts satisfying shift[to] - shift[from] < limit, or reject a negative cycle. */
+function voltageReferenceShifts(size: number, constraints: readonly VoltageReferenceConstraint[]) {
+  const shifts = Array.from({ length: size }, () => EXACT_ZERO);
+  const strictSteps = Array.from({ length: size }, () => 0);
+  for (let pass = 0; pass < size; pass += 1) {
+    let changed = false;
+    for (const { from, to, limit } of constraints) {
+      const bound = addExactRational(shifts[from]!, limit);
+      const order = subtractExactRational(shifts[to]!, bound).numerator;
+      const steps = strictSteps[from]! + 1;
+      if (order < 0n || (order === 0n && strictSteps[to]! >= steps)) { continue; }
+      shifts[to] = bound;
+      strictSteps[to] = steps;
+      changed = true;
+    }
+    if (!changed) { return realizeStrictReferenceShifts(shifts, strictSteps, constraints); }
+  }
+  return null;
+}
+
+function fitFloatingVoltageReferences(
+  voltages: ExactRational[],
+  components: readonly number[],
+  pairs: readonly Pick<Conductance, "a" | "b">[],
+  affected: ReadonlySet<number>,
+) {
+  const local = new Map([...affected].map((component, position) => [component, position]));
+  const reference = local.size;
+  // Round-to-nearest stays finite strictly below MAX_VALUE + half an ULP.
+  // The midpoint itself rounds to infinity; strict constraints preserve that
+  // boundary while allowing exact values that round back to MAX_VALUE.
+  const limit = addExactRational(exactInput(Number.MAX_VALUE)!, exactInput(2 ** 970)!);
+  const constraints: VoltageReferenceConstraint[] = [];
+  for (const [node, voltage] of voltages.entries()) {
+    const component = local.get(components[node]!);
+    if (component === undefined) { continue; }
+    constraints.push(
+      { from: reference, to: component, limit: subtractExactRational(limit, voltage) },
+      { from: component, to: reference, limit: addExactRational(limit, voltage) },
+    );
+  }
+  for (const { a, b } of pairs) {
+    const from = local.get(components[a]!);
+    const to = local.get(components[b]!);
+    if (from === undefined || to === undefined || from === to) { continue; }
+    const drop = subtractExactRational(voltages[a]!, voltages[b]!);
+    constraints.push(
+      { from: to, to: from, limit: subtractExactRational(limit, drop) },
+      { from, to, limit: addExactRational(limit, drop) },
+    );
+  }
+  const shifts = voltageReferenceShifts(local.size + 1, constraints);
+  if (!shifts) { return voltages; }
+  return voltages.map((voltage, node) => {
+    const component = local.get(components[node]!);
+    return component === undefined ? voltage
+      : addExactRational(voltage, subtractExactRational(shifts[component]!, shifts[reference]!));
+  });
+}
+
+function centerOverflowingVoltageComponents(
+  voltages: ExactRational[],
+  components: readonly number[],
+  pairs: readonly Pick<Conductance, "a" | "b">[],
+) {
+  // A voltmeter or open switch does not conduct, but its displayed voltage
+  // couples the arbitrary references. Correct the entire affected group so
+  // shifting one island cannot overflow another floating reading.
+  const groups = conductiveComponents(voltages.length, [
+    ...components.map((a, b) => ({ a, b })), ...pairs,
+  ]);
+  const overflowing = new Set(groups.filter((_, node) => !Number.isFinite(exactRationalToNumber(voltages[node]!))));
+  for (const { a, b } of pairs) {
+    if (!Number.isFinite(exactNodeDifference(voltages, a, b, 0).value)) { overflowing.add(groups[a]!); }
+  }
+  if (overflowing.size === 0) { return voltages; }
+  const bounds = new Map<number, { min: ExactRational; max: ExactRational }>();
+  for (const [node, voltage] of voltages.entries()) {
+    const component = components[node]!;
+    if (!overflowing.has(groups[node]!)) { continue; }
+    const range = bounds.get(component) ?? { min: voltage, max: voltage };
+    if (subtractExactRational(voltage, range.min).numerator < 0n) { range.min = voltage; }
+    if (subtractExactRational(voltage, range.max).numerator > 0n) { range.max = voltage; }
+    bounds.set(component, range);
+  }
+  // Only legacy DC output uses this correction; internal resistance probes
+  // retain their exact, possibly unbounded potentials. Conductive differences,
+  // currents and powers are invariant under every component shift.
+  const offsets = new Map([...bounds].map(([component, range]) => [component,
+    multiplyExactRational(addExactRational(range.min, range.max), exactInput(0.5)!),
+  ]));
+  const centered = voltages.map((voltage, node) => {
+    const offset = offsets.get(components[node]!);
+    return offset ? subtractExactRational(voltage, offset) : voltage;
+  });
+  const overflowingPairs = pairs.filter(({ a, b }) => !Number.isFinite(exactNodeDifference(centered, a, b, 0).value));
+  // A component too wide to center, or a physical voltage outside the range,
+  // cannot be repaired by changing its reference. Keep the normal rejection.
+  if (centered.some((voltage) => !Number.isFinite(exactRationalToNumber(voltage))) ||
+    overflowingPairs.length === 0 || overflowingPairs.some(({ a, b }) => components[a] === components[b])) { return centered; }
+  // Centering is usually sufficient. Otherwise solve all terminal and floating
+  // difference bounds together, including constraints imposed by other meters.
+  return fitFloatingVoltageReferences(centered, components, pairs, new Set(bounds.keys()));
+}
+
+function nodeVoltageReadings(exactVoltages: ExactRational[]) {
+  return {
+    voltages: exactVoltages.map(exactRationalToNumber),
+    exactVoltages,
+    difference: (from: number, to: number, offset = 0) =>
+      exactNodeDifference(exactVoltages, from, to, offset),
+  };
+}
+
 /** Solve conductance nodal equations with one exact reference per component. */
 function nodeVoltages(
   size: number,
   conductances: readonly Conductance[],
   currentSource?: { from: number; to: number; amps: number },
 ) {
-  const { unknownByNode, count } = nodalUnknownIndices(size, conductances);
+  const { unknownByNode, count, components } = nodalUnknownIndices(size, conductances);
   const matrix = new Float64Array(count * count);
   const rhs = new Float64Array(count);
   for (const branch of conductances) {
     if (!stampConductanceBranch(matrix, rhs, count, unknownByNode, branch)) { return null; }
   }
   if (currentSource && !stampCurrentSource(rhs, unknownByNode, currentSource)) { return null; }
-  const solution = solveRealLinearSystem(count, matrix, rhs);
+  const solution = solveExactRealLinearSystem(count, exactRealStateInput(matrix), exactRealStateInput(rhs));
   if (!solution) { return null; }
-  const exactVoltages = Array.from({ length: size }, () => EXACT_ZERO);
+  const unshiftedVoltages = Array.from({ length: size }, () => EXACT_ZERO);
   for (let node = 0; node < size; node += 1) {
     const unknown = unknownByNode[node] ?? -1;
     if (unknown >= 0) {
-      const value = exactRealStateValue(solution, unknown);
+      const value = solution[unknown];
       if (!value) { return null; }
-      exactVoltages[node] = value;
+      unshiftedVoltages[node] = value;
     }
   }
-  const voltages = exactVoltages.map(exactRationalToNumber);
-  if (!voltages.every(Number.isFinite)) { return null; }
-  return {
-    voltages,
-    exactVoltages,
-    difference: (from: number, to: number, offset = 0) =>
-      exactNodeDifference(exactVoltages, from, to, offset),
-  };
+  return { ...nodeVoltageReadings(unshiftedVoltages), components };
 }
 
 /** Equivalent resistance of the passive network between two terminals. */
@@ -756,7 +890,7 @@ function legacyReadingPrecision(
 function readAll(
   document: CircuitDocument,
   index: Map<string, number>,
-  solved: NonNullable<ReturnType<typeof nodeVoltages>>,
+  solved: ReturnType<typeof nodeVoltageReadings>,
   switchStates: Record<string, boolean>,
 ) {
   const { voltages, difference } = solved;
@@ -3335,7 +3469,10 @@ function analyzeCircuitFromInput(
     const message = "回路を計算できませんでした。接続と部品の数値を確認してください。";
     return result("invalid", message, { issues: [{ severity: "error", message }] });
   }
-  const { parts, wireCurrents } = readAll(normalizedDocument, index, solved, switchStates);
+  const voltagePairs = normalizedDocument.parts.filter((part) => part.kind !== "junction")
+    .map((part) => ({ a: index.get(`${part.id}:a`)!, b: index.get(`${part.id}:b`)! }));
+  const centered = centerOverflowingVoltageComponents(solved.exactVoltages, solved.components, voltagePairs);
+  const { parts, wireCurrents } = readAll(normalizedDocument, index, nodeVoltageReadings(centered), switchStates);
   if (!hasOnlyFiniteReadings(parts, wireCurrents)) {
     const message = "回路の計算結果が数値の範囲を超えました。電圧・電流・抵抗値を確認してください。";
     return result("invalid", message, { issues: [{ severity: "error", message }] });
