@@ -353,6 +353,10 @@ npm pack --dry-run
 
 `npm run build-storybook` は Docs を含む Storybook の静的ビルドで、CI でも検証します。操作確認用のアセットを速く生成する場合は `npm run build-storybook:test` を使えます。この test build は Docs を省略して `storybook-static/test` に出力しますが、自動ブラウザテストは実行しません。詳しくは[Storybook の build 設定](https://storybook.js.org/docs/api/main-config/main-config-build)と[telemetry 設定](https://storybook.js.org/docs/configure/telemetry)を参照してください。
 
-テストは `npm test` で全件、`npm test -- --project headless` でヘッドレス処理、`npm test -- --project ui` で React UI を実行できます。Vitest はスレッドで並列実行し、`src/**/__tests__/**/*.test.ts` はワーカー内でモジュールを再利用します。このため、ヘッドレスのテストでは共有モジュールやグローバル変数への変更を残さないでください。`src/**/__tests__/**/*.test.tsx` はファイルごとに分離し、操作テストの jsdom とサーバーレンダリングテストの Node 環境を使い分けます。
+テストは `npm test` で全件、`npm test -- --project headless` でヘッドレス処理、`npm test -- --project ui` で React UI を実行できます。Vitest は単一ワーカーのスレッドプールで実行し、`src/**/__tests__/**/*.test.ts` はワーカー内でモジュールを再利用します。このため、ヘッドレスのテストでは共有モジュールやグローバル変数への変更を残さないでください。`src/**/__tests__/**/*.test.tsx` はファイルごとに分離し、操作テストの jsdom とサーバーレンダリングテストの Node 環境を使い分けます。
+
+ヘッドレスのテストは `src/__tests__/` の下で検証対象ごとにまとめています。`analog-solver/`、`circuit-solver/`、`transient-solver/` に各ソルバー、`numerics/` に数値基盤、`circuit-analog-adapter/` に公開 API への変換、`circuit-visualization/` に表示用の解析、`simulation-input/` に入力検証、`integration/` に複数の API・解析モード間の整合性を置きます。モデル・編集・幾何・診断・シリアライズ・例題の基本テストは直下に残します。ファイル名は検証対象を表し、調査時の `audit`・`review`・`subagent` といった名前は使いません。
+
+対象を絞る場合は、例えば `npm test -- --project headless src/__tests__/transient-solver` で過渡解析、`npm run check:numerics` で数値契約と数値ポリシーを検証できます。回路の生成処理は `src/__tests__/helpers/`、UI 操作テストの環境準備と後片付けは `src/ui/__tests__/helpers/` に置きます。期待値には独立した有理数オラクルや物理式・保存則を使い、共通化の際もソルバーの演算関数から期待値を求めたり許容誤差を広げたりしません。
 
 配布先は `https://npm.pkg.github.com` に限定しています。GitHub Release を公開すると、Actions がテスト・ビルドを確認してから `GITHUB_TOKEN` で公開パッケージを発行します。Release の前に `package.json` の version と tag を一致させてください。ライセンス表記は抽出元に合わせて `UNLICENSED` です。
