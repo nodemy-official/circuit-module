@@ -256,7 +256,7 @@ interface DcAssembly {
   matrix: Float64Array;
   residual: Float64Array;
   exactResidual: ExactRational[] | null;
-  /** Absolute KCL contributions before either device or node cancellation. */
+  /** KCL magnitudes, canceling exact independent sources before taking absolute values. */
   exactCurrentScales: (ExactRational | null)[];
 }
 
@@ -2440,6 +2440,22 @@ function initialInductorCurrent(layout: MnaLayout, part: CircuitPart): ResidualT
   return layout.initialCurrentValues.get(part.id) ?? part.initialCurrentAmps ?? 0;
 }
 
+function independentSourceCurrents(document: CircuitDocument, layout: MnaLayout) {
+  const termsByNode = new Map<number, ResidualTerm[]>();
+  const add = (node: number, value: ResidualTerm) => {
+    const terms = termsByNode.get(node) ?? [];
+    terms.push(value);
+    termsByNode.set(node, terms);
+  };
+  for (const part of document.parts) {
+    if (part.kind !== "current-source") { continue; }
+    const current = part.currentAmps ?? 0;
+    add(nodeForTerminal(layout.topology, part, "a"), current);
+    add(nodeForTerminal(layout.topology, part, "b"), negatedResidualTerm(current));
+  }
+  return new Map([...termsByNode].map(([node, terms]) => [node, exactResidualSum(terms)!]));
+}
+
 function stampDcPassivePart(
   residual: ResidualTerms,
   layout: MnaLayout,
@@ -2873,8 +2889,13 @@ function assembleDc(
   const residual: ResidualTerms = Array.from({ length: layout.size }, () => []);
   const independentCurrentRows = new Set<number>();
 
+  // Prescribed source values are exact. Their cancellation must not inflate
+  // the tolerance for an independently approximated semiconductor current.
+  for (const [node, current] of independentSourceCurrents(document, layout)) {
+    addResidual(residual, layout.topology.nodeUnknowns[node] ?? -1, current);
+  }
   for (const part of document.parts) {
-    stampDcPassivePart(residual, layout, part);
+    if (part.kind !== "current-source") { stampDcPassivePart(residual, layout, part); }
     const branch = layout.branchByPartId.get(part.id);
     if (branch) { addVoltageBranch(matrix, residual, layout, state, branch); }
     stampDcNonlinearPart(matrix, residual, layout, state, part, independentCurrentRows);
@@ -3201,6 +3222,8 @@ function linearDcSeed(document: CircuitDocument, layout: MnaLayout, includeFeedb
   return voltageSeed ? currentBiasedDcSeed(document, layout, voltageSeed) : null;
 }
 
+type DcLineSearch = "bounded" | "decreasing";
+
 function solveDcNewtonStep(
   document: CircuitDocument,
   layout: MnaLayout,
@@ -3208,6 +3231,7 @@ function solveDcNewtonStep(
   assembly: DcAssembly,
   tolerances: ExactRational[] | null,
   score: number,
+  lineSearch: DcLineSearch,
 ) {
   // Keep this iteration's floating-node constraints fixed while comparing
   // line-search candidates. The next Newton iteration recalculates them from
@@ -3218,10 +3242,14 @@ function solveDcNewtonStep(
   const targetState = rhs ? solveLinearTargetState(layout.size, assembly.matrix, rhs) : null;
   if (!targetState) { return { nextState: undefined, singular: true }; }
 
-  let step = 1;
   let nextState: Float64Array | undefined;
   let delta: Float64Array | null = null;
-  for (let search = 0; search < 14; search += 1) {
+  // Keep the bounded search for the usual solve, including paths that must
+  // cross a flat cutoff region. A current-continuation retry instead needs
+  // decreasing residuals: a weak junction slope may need many more halvings
+  // before its voltage step is usable. Equal scores end that retry without
+  // scanning subnormal factors whose exact state changes cannot improve it.
+  for (let step = 1; step > 0; step *= 0.5) {
     let candidate: Float64Array;
     if (step === 1) {
       candidate = cloneRealState(targetState);
@@ -3240,11 +3268,11 @@ function solveDcNewtonStep(
     // Compare candidates using this iteration's scale so an exponential current cannot
     // increase its own tolerance and make a divergent step appear better.
     const candidateScore = residualScore(layout, candidateAssembly, tolerances);
-    if (candidateScore < score || candidateScore <= 1 || step <= 1 / 8192) {
+    if (candidateScore < score || candidateScore <= 1 || (lineSearch === "bounded" && step <= 1 / 8192)) {
       nextState = candidate;
       break;
     }
-    step *= 0.5;
+    if (lineSearch === "decreasing" && candidateScore === score) { break; }
   }
   return { nextState, singular: false };
 }
@@ -3295,6 +3323,20 @@ function nonlinearCentersMatch(left: readonly ResidualTerm[][], right: readonly 
   });
 }
 
+function floorLimitedDcQuality(document: CircuitDocument, layout: MnaLayout, state: Float64Array) {
+  const floor = numberToExactRational(NEWTON_CURRENT_TOLERANCE_AMPS)!;
+  const relative = numberToExactRational(NEWTON_RELATIVE_TOLERANCE)!;
+  let quality = 0;
+  for (const terms of dcKclContributions(document, layout, state)) {
+    const values = terms.map((value) => exactComplexValue(value)?.real);
+    if (!values.every((value): value is ExactRational => value !== undefined)) { return Number.POSITIVE_INFINITY; }
+    const scale = sumExactRationals(values.map(absoluteExactRational));
+    if (subtractExactRational(multiplyExactRational(relative, scale), floor).numerator > 0n) { continue; }
+    quality = Math.max(quality, relativeRealResidual(terms));
+  }
+  return quality;
+}
+
 function polishConvergedDcState(
   document: CircuitDocument,
   layout: MnaLayout,
@@ -3302,10 +3344,15 @@ function polishConvergedDcState(
   tolerances: ExactRational[],
   score: number,
 ) {
-  if (score === 0 || !hasNonlinearParts(document, layout)) { return state; }
+  if (!hasNonlinearParts(document, layout)) { return state; }
   let polished = state;
   let polishedScore = score;
-  for (let iteration = 0; iteration < 3; iteration += 1) {
+  for (let iteration = 0; iteration < MAX_NEWTON_ITERATIONS; iteration += 1) {
+    // Use actual terminal currents for the extra polish, independent of the
+    // coordinate-sensitive Jacobian scale. An unrelated high-common-mode
+    // circuit must not hide a subnormal junction's remaining KCL error.
+    const floorQuality = floorLimitedDcQuality(document, layout, polished);
+    if ((iteration >= 3 || polishedScore === 0) && floorQuality <= 1e-12) { break; }
     const channelConducting = mosChannelConductingByPartId(document, layout, polished);
     const assembly = assembleDc(document, layout, polished, true, channelConducting);
     const rhs = absoluteDcRhs(document, layout, polished, channelConducting);
@@ -3313,7 +3360,9 @@ function polishConvergedDcState(
     if (!target) { break; }
     const candidateAssembly = assembleDc(document, layout, target, true, channelConducting);
     const candidateScore = residualScore(layout, candidateAssembly, tolerances);
-    if (!(candidateScore < polishedScore)) { break; }
+    const improves = candidateScore < polishedScore ||
+      (floorQuality > 1e-12 && candidateScore <= 1 && floorLimitedDcQuality(document, layout, target) < floorQuality);
+    if (!improves) { break; }
     const centersUnchanged = nonlinearCentersMatch(
       nonlinearCenters(document, layout, polished),
       nonlinearCenters(document, layout, target),
@@ -3391,6 +3440,7 @@ function finishDcAtReference(
   layout: MnaLayout,
   state: Float64Array,
   usedLinearSeed: boolean,
+  lineSearch: DcLineSearch,
 ): { state?: Float64Array; converged: boolean; singular: boolean; invalidPhysicalSolution?: boolean } {
   const finalAssembly = assembleDc(document, layout, state);
   const exactSolution = exactZeroPhysicalSolution(document, layout, state, finalAssembly);
@@ -3404,7 +3454,7 @@ function finishDcAtReference(
   // bias is reached. Retry once with those linear voltage biases established.
   const seed = usedLinearSeed ? null : linearDcSeed(document, layout);
   return seed
-    ? solveDcAtReference(document, layout, seed)
+    ? solveDcAtReference(document, layout, seed, lineSearch)
     : { converged: false, singular: false };
 }
 
@@ -3412,6 +3462,7 @@ function solveDcAtReference(
   document: CircuitDocument,
   layout: MnaLayout,
   initialState?: Float64Array,
+  lineSearch: DcLineSearch = "bounded",
 ): { state?: Float64Array; converged: boolean; singular: boolean; invalidPhysicalSolution?: boolean } {
   const initial = currentSeededDcState(document, layout, initialState);
   let state: Float64Array = initial.state;
@@ -3431,7 +3482,7 @@ function solveDcAtReference(
       const candidate = convergedDcCandidate(document, layout, state, tolerances, score, usedMosSeed);
       if (candidate) { return candidate; }
     }
-    const step = solveDcNewtonStep(document, layout, state, assembled, tolerances, score);
+    const step = solveDcNewtonStep(document, layout, state, assembled, tolerances, score, lineSearch);
     if (!step.nextState) {
       const seed = iteration === 0
         ? failedDcSeed(document, layout, state, usedLinearSeed, step.singular)
@@ -3446,7 +3497,7 @@ function solveDcAtReference(
     }
     state = step.nextState;
   }
-  return finishDcAtReference(document, layout, state, usedLinearSeed);
+  return finishDcAtReference(document, layout, state, usedLinearSeed, lineSearch);
 }
 
 function convergedDcCandidate(document: CircuitDocument, layout: MnaLayout, state: Float64Array, tolerances: ExactRational[] | null, score: number, requireBalanced: boolean) {
@@ -4862,10 +4913,15 @@ interface DcSolution {
   nodeVoltageOffsets?: ComplexValue[];
 }
 
-function dcKclQuality(document: CircuitDocument, layout: MnaLayout, state: Float64Array) {
+function dcKclContributions(document: CircuitDocument, layout: MnaLayout, state: Float64Array) {
   const values = Array.from({ length: layout.size }, (_, index) => complexFromRealState(state, index));
-  const currentsByNode = Array.from({ length: layout.topology.nodeCount }, () => [] as ComplexValue[]);
+  const sources = independentSourceCurrents(document, layout);
+  const currentsByNode = Array.from({ length: layout.topology.nodeCount }, (_, node) => {
+    const current = sources.get(node);
+    return current ? [complexFromScalar(current)] : [];
+  });
   for (const part of document.parts) {
+    if (part.kind === "current-source") { continue; }
     const model = isNonlinearPart(part)
       ? nonlinearModel(part, nonlinearTerminalVoltages(part, layout, state))
       : null;
@@ -4885,7 +4941,11 @@ function dcKclQuality(document: CircuitDocument, layout: MnaLayout, state: Float
     }
   }
 
-  return Math.max(0, ...currentsByNode.map(relativeRealResidual));
+  return currentsByNode;
+}
+
+function dcKclQuality(document: CircuitDocument, layout: MnaLayout, state: Float64Array) {
+  return Math.max(0, ...dcKclContributions(document, layout, state).map(relativeRealResidual));
 }
 
 /** Measures conservation before public number rounding changes the terms. */
@@ -5070,9 +5130,106 @@ function solveDcWithOpAmpGainContinuation(document: CircuitDocument, layout: Mna
       parts: document.parts.map((part) => part.kind === "op-amp"
         ? { ...part, openLoopGain: Math.min(part.openLoopGain ?? 100_000, gain) } : part),
     };
-    const solution = solveDcAtReference(gainDocument, layout, previousState);
+    let solution = solveDcAtReference(gainDocument, layout, previousState);
+    if (!previousState && !solution.converged) {
+      // Establish current-biased junctions before raising the gain. A
+      // floating junction island must not force feedback to start at full
+      // gain, where a clipped rail can consume every reference retry.
+      const seeded = solveDcWithCurrentContinuation(gainDocument, layout);
+      if (seeded.converged) { solution = seeded; }
+    }
     if (!solution.converged || !solution.state) { return null; }
     if (gain === maximumGain) { return solution; }
+    previousState = solution.state;
+  }
+}
+
+function currentContinuationExponent(document: CircuitDocument, layout: MnaLayout) {
+  let maximumCurrent: ExactRational = { numerator: 0n, denominator: 1n };
+  for (const current of independentSourceCurrents(document, layout).values()) {
+    maximumCurrent = largerNonnegativeRational(maximumCurrent, absoluteExactRational(current));
+  }
+  let minimumSaturation = Number.POSITIVE_INFINITY;
+  for (const part of document.parts) {
+    if (part.kind === "diode" || part.kind === "led") {
+      minimumSaturation = Math.min(minimumSaturation, part.saturationCurrentAmps ?? (part.kind === "led" ? 1e-20 : 1e-12));
+    } else if (part.kind === "npn-transistor" || part.kind === "pnp-transistor") {
+      minimumSaturation = Math.min(minimumSaturation, part.saturationCurrentAmps ?? 1e-14);
+    }
+  }
+  if (maximumCurrent.numerator === 0n || !Number.isFinite(minimumSaturation)) { return null; }
+  // Logs only choose a seed scale; avoid underflowing Is / I for extreme inputs.
+  return Math.min(0, Math.floor((Math.log(minimumSaturation) - logPositiveExactRational(maximumCurrent)) / Math.LN2));
+}
+
+function junctionDcSeed(document: CircuitDocument, layout: MnaLayout) {
+  const edges = document.parts.flatMap((part): [number, number][] => {
+    const terminals = part.kind === "npn-transistor" || part.kind === "pnp-transistor" ? ["b", "c"] as const :
+      part.kind === "diode" || part.kind === "led" ? ["a", "b"] as const : null;
+    return terminals ? [[nodeForTerminal(layout.topology, part, terminals[0]), nodeForTerminal(layout.topology, part, terminals[1])]] : [];
+  });
+  if (edges.length === 0) { return; }
+  const seed = linearDcSeed(document, layout);
+  if (!seed) { return; }
+  const references = referenceConstraints(document, layout, "dc", mosChannelConductingByPartId(document, layout, seed));
+  const constrained = new Set([
+    layout.topology.referenceNode,
+    ...references.map(({ node }) => node),
+    ...[...layout.branches, ...layout.internalBranches].flatMap((branch) => [branch.positiveNode, branch.negativeNode]),
+  ]);
+  const parent = Array.from({ length: layout.topology.nodeCount }, (_, node) => node);
+  for (const [left, right] of edges) {
+    if (!constrained.has(left) && !constrained.has(right)) { joinConductiveNodes(parent, left, right); }
+  }
+  const controls = new Map<number, ResidualTerm[]>();
+  const addControl = (node: number, control: number) => {
+    if (constrained.has(node) || !constrained.has(control)) { return; }
+    const root = findRoot(parent, node);
+    const values = controls.get(root) ?? [];
+    values.push(exactStateValue(seed, layout.topology.nodeUnknowns[control] ?? -1));
+    controls.set(root, values);
+  };
+  for (const [left, right] of edges) { addControl(left, right); addControl(right, left); }
+  const centers = new Map([...controls].map(([root, values]) => [root,
+    exactProductSumRatio(values.map((value) => ({ factors: [value] })), values.length)!,
+  ]));
+  // Anchor free junction chains to their local voltage-controlled neighbors.
+  // Their arbitrary global zero must not reverse-bias every device before
+  // Newton starts. Exact local means also retain tiny offsets at large biases.
+  const biased = cloneRealState(seed);
+  for (let node = 0; node < layout.topology.nodeCount; node += 1) {
+    const unknown = layout.topology.nodeUnknowns[node] ?? -1;
+    const center = centers.get(findRoot(parent, node));
+    if (unknown >= 0 && !constrained.has(node) && center) { setRealStateValue(biased, unknown, center); }
+  }
+  return biased;
+}
+
+function solveDcWithCurrentContinuation(document: CircuitDocument, layout: MnaLayout): DcSolution {
+  const failed: DcSolution = { converged: false, singular: false };
+  const startingExponent = currentContinuationExponent(document, layout);
+  if (startingExponent === null) { return failed; }
+  const direct = solveDcAtReference(document, layout, junctionDcSeed(document, layout), "decreasing");
+  if (direct.converged) { return direct; }
+  if (startingExponent === 0) { return failed; }
+
+  let previousState: Float64Array | undefined;
+  // Start near the junction leakage scale, then increase the current by at
+  // most 16 each time. Intermediate source parameters round to binary64 only
+  // to construct seed models; the final solve uses the original document,
+  // exact state, and unchanged physical residual checks.
+  for (let exponent = startingExponent; ; exponent = Math.min(0, exponent + 4)) {
+    const scale = { numerator: 1n, denominator: 2n ** BigInt(-exponent) };
+    const currentDocument = exponent === 0 ? document : {
+      ...document,
+      parts: document.parts.map((part) => part.kind === "current-source" ? {
+        ...part,
+        currentAmps: exactRationalToNumber(exactProductSumRatio([{ factors: [part.currentAmps ?? 0, scale] }], 1)!),
+      } : part),
+    };
+    const solution = solveDcAtReference(currentDocument, layout, previousState ?? junctionDcSeed(currentDocument, layout), "decreasing");
+    if (!solution.converged || !solution.state) { return failed; }
+    if (exponent === 0) { return solution; }
     previousState = solution.state;
   }
 }
@@ -5089,12 +5246,13 @@ function solveDcWithAlternativeSeed(document: CircuitDocument, layout: MnaLayout
   return independentSeed ? solveDcAtReference(document, layout, independentSeed) : initial;
 }
 
-function solveDc(
+function solveDcWithReferences(
   document: CircuitDocument,
   layout: MnaLayout,
-  adjustReference = false,
+  adjustReference: boolean,
+  solveAtReference: (document: CircuitDocument, layout: MnaLayout) => DcSolution = solveDcWithAlternativeSeed,
 ): DcSolution {
-  const baseline = solveDcWithAlternativeSeed(document, layout);
+  const baseline = solveAtReference(document, layout);
   const baselineChannelConducting = baseline.state
     ? mosChannelConductingByPartId(document, layout, baseline.state)
     : undefined;
@@ -5117,7 +5275,7 @@ function solveDc(
     // when the strongest candidate shares another badly conditioned branch.
   for (const referenceNode of preferredReferenceNodes(document, layout, "dc", baselineChannelConducting).slice(0, 8)) {
     const candidateLayout = layoutWithReferenceNode(layout, referenceNode);
-    const candidate = solveDcWithAlternativeSeed(document, candidateLayout);
+    const candidate = solveAtReference(document, candidateLayout);
     if (!candidate.converged || !candidate.state) { continue; }
     const candidateQuality = dcSolutionQuality(document, candidateLayout, candidate.state);
     if (improvesDcQuality(candidateQuality, bestQuality)) {
@@ -5139,6 +5297,16 @@ function solveDc(
     (!improvesDcQuality(bestQuality, baselineQuality, 0.5) && physicalDcQualityAcceptable(baselineQuality)) ? baselineResult : best;
   const quality = chosen === baselineResult ? baselineQuality : bestQuality;
   return balancedDcResult(chosen, quality);
+}
+
+function solveDc(document: CircuitDocument, layout: MnaLayout, adjustReference = false): DcSolution {
+  const initial = solveDcWithReferences(document, layout, adjustReference);
+  // Exhaust the usual reference choices before the more expensive retry.
+  // A separate feedback island can be solved by a better reference even
+  // when its first coordinate system cannot balance a current-biased BJT.
+  if (initial.converged || currentContinuationExponent(document, layout) === null) { return initial; }
+  const continued = solveDcWithReferences(document, layout, adjustReference, solveDcWithCurrentContinuation);
+  return continued.converged ? continued : initial;
 }
 
 function primaryVoltage(part: CircuitPart, values: ComplexValue[]) {
