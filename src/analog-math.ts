@@ -38,12 +38,12 @@ export const complex = (real = 0, imaginary = 0): ComplexValue => ({ real, imagi
 const ONE: ExactRational = { numerator: 1n, denominator: 1n };
 const ZERO: ExactRational = { numerator: 0n, denominator: 1n };
 const magnitudeNormalizations = new WeakMap<ComplexValue, { squared: ExactRational; real: number; imaginary: number }>();
-interface NormalizedTerm {
+export interface NormalizedTerm {
   coefficient: ExactComplexValue;
   squared: ExactRational;
 }
 const normalizedSums = new WeakMap<ComplexValue, { terms: readonly NormalizedTerm[]; real: number; imaginary: number }>();
-interface NormalizedFraction {
+export interface NormalizedFraction {
   numerator: readonly NormalizedTerm[];
   denominator: readonly NormalizedTerm[];
 }
@@ -53,6 +53,14 @@ function storedNormalizedFraction(value: ComplexValue) {
   const stored = normalizedFractions.get(value);
   if (stored && Object.is(stored.real, value.real) && Object.is(stored.imaginary, value.imaginary)) { return stored.fraction; }
   normalizedFractions.delete(value);
+}
+
+/** Preserve algebraic provenance when rectangular expansions are transported. */
+export function complexNormalizedFraction(value: ComplexValue): NormalizedFraction | undefined {
+  const fraction = storedNormalizedFraction(value);
+  if (fraction) { return fraction; }
+  const terms = storedNormalizedTerms(value);
+  return terms ? { numerator: terms, denominator: [{ coefficient: { real: ONE, imaginary: ZERO }, squared: ONE }] } : undefined;
 }
 
 function normalizedFraction(value: ComplexValue): NormalizedFraction | null {
@@ -362,7 +370,7 @@ function expandNormalizedFraction(fraction: NormalizedFraction, target: ExactRat
   }
 }
 
-function complexFromNormalizedFraction(input: NormalizedFraction, target = ONE): ComplexValue {
+export function complexFromNormalizedFraction(input: NormalizedFraction, target = ONE): ComplexValue {
   const numerator = compactNormalizedTerms(input.numerator);
   const denominator = compactNormalizedTerms(input.denominator);
   if (denominator.length === 0) { return complex(Number.NaN, Number.NaN); }

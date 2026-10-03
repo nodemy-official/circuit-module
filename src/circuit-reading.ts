@@ -1,4 +1,4 @@
-import { complexMagnitude, complexMagnitudeNormalization, complexPhaseDegrees, complexSubtract, withComplexMagnitudeNormalization, type ComplexValue } from "./analog-math.js";
+import { complexMagnitude, complexMagnitudeNormalization, complexNormalizedFraction, complexFromNormalizedFraction, complexPhaseDegrees, complexSubtract, withComplexMagnitudeNormalization, type ComplexValue, type NormalizedTerm } from "./analog-math.js";
 import type { CircuitTerminal } from "./circuit-model.js";
 import { complexFromExact, exactComplexValue } from "./exact-numeric-state.js";
 import { addExactRational, subtractExactRational, multiplyExactRational, divideExactRational, sumExactRationals, numberToExactRational, deferExactRationalReduction, type ExactRational } from "./exact-linear-algebra.js";
@@ -6,11 +6,19 @@ import { capturedExactExpressionSign, capturedExactReference, restoreExactExpres
 
 export type CircuitExactRational = { numerator: string; denominator: string } | ExactExpressionReference;
 
+export interface CircuitExactNormalizedTerm {
+  real: CircuitExactRational;
+  imaginary: CircuitExactRational;
+  magnitudeNormalizationSquared: CircuitExactRational;
+}
+
 /** JSON-safe exact components, retained before scalar and polar display rounding. */
 export interface CircuitExactComplex {
   real: CircuitExactRational;
   imaginary: CircuitExactRational;
   magnitudeNormalizationSquared?: CircuitExactRational;
+  /** Algebraic terms, retained so cancellation remains exact after transport. */
+  normalizedFraction?: { numerator: readonly CircuitExactNormalizedTerm[]; denominator: readonly CircuitExactNormalizedTerm[] };
   /** Original scalar projections, used to detect later scalar-only edits. */
   projection?: { real: number; magnitude: number; phaseDegrees: number };
 }
@@ -40,6 +48,7 @@ export function retainedComplex(value: ComplexValue): CircuitExactComplex | unde
   const exact = exactComplexValue(value);
   if (!exact) { return; }
   const normalization = complexMagnitudeNormalization(value);
+  const fraction = complexNormalizedFraction(value);
   const normalized = normalization.numerator !== normalization.denominator;
   const represented = (component: ExactRational, projection: number) => {
     const projected = numberToExactRational(projection);
@@ -48,7 +57,7 @@ export function retainedComplex(value: ComplexValue): CircuitExactComplex | unde
   // Rectangular components with a nonzero phase generally cannot be rebuilt
   // from a rounded RMS/angle pair. On axes, retain non-binary rational values
   // too: individually rounded voltages and currents must not be summed.
-  if (!normalized && (exact.real.numerator === 0n || exact.imaginary.numerator === 0n) &&
+  if (!fraction && !normalized && (exact.real.numerator === 0n || exact.imaginary.numerator === 0n) &&
     represented(exact.real, value.real) && represented(exact.imaginary, value.imaginary)) { return; }
   const onRealAxis = exact.imaginary.numerator === 0n;
   const onImaginaryAxis = exact.real.numerator === 0n;
@@ -56,8 +65,15 @@ export function retainedComplex(value: ComplexValue): CircuitExactComplex | unde
     : onImaginaryAxis ? exact.imaginary.numerator < 0n ? -90 : 90 : complexPhaseDegrees(value);
   return { real: serializedRational(exact.real), imaginary: serializedRational(exact.imaginary),
     ...(normalized ? { magnitudeNormalizationSquared: serializedRational(normalization) } : {}),
+    ...(fraction ? { normalizedFraction: { numerator: fraction.numerator.map(serializedNormalizedTerm),
+      denominator: fraction.denominator.map(serializedNormalizedTerm) } } : {}),
     projection: { real: value.real, magnitude: normalized ? complexMagnitude(value) : onRealAxis ? Math.abs(value.real)
       : onImaginaryAxis ? Math.abs(value.imaginary) : complexMagnitude(value), phaseDegrees } };
+}
+
+function serializedNormalizedTerm(term: NormalizedTerm): CircuitExactNormalizedTerm {
+  return { real: serializedRational(term.coefficient.real), imaginary: serializedRational(term.coefficient.imaginary),
+    magnitudeNormalizationSquared: serializedRational(term.squared) };
 }
 
 const LARGE_REPLAY_VALUE = 2n ** 4096n;
@@ -93,6 +109,20 @@ function restoredRational(component: unknown, expressions: readonly ExactExpress
       return denominator > 0n ? replayOperand({ numerator, denominator }) : undefined;
 }
 
+function restoredNormalizedTerms(value: unknown, expressions: readonly ExactExpressionNode[] | undefined): NormalizedTerm[] | undefined {
+  if (!Array.isArray(value)) { return; }
+  const result: NormalizedTerm[] = [];
+  for (const term of value) {
+    if (typeof term !== "object" || term === null) { return; }
+    const real = restoredRational(term.real, expressions);
+    const imaginary = restoredRational(term.imaginary, expressions);
+    const squared = restoredRational(term.magnitudeNormalizationSquared, expressions);
+    if (!real || !imaginary || !squared || squared.numerator <= 0n) { return; }
+    result.push({ coefficient: { real, imaginary }, squared });
+  }
+  return result;
+}
+
 /** Ignore malformed optional metadata and let scalar-reading fallbacks apply. */
 export function restoredComplex(value: CircuitExactComplex | undefined, expressions?: readonly ExactExpressionNode[]): ComplexValue | undefined {
   if (!value) { return; }
@@ -105,6 +135,12 @@ export function restoredComplex(value: CircuitExactComplex | undefined, expressi
       const normalization = restoredRational(value.magnitudeNormalizationSquared, expressions);
       if (!normalization || normalization.numerator <= 0n) { return; }
       result = withComplexMagnitudeNormalization(result, normalization);
+    }
+    if (value.normalizedFraction) {
+      const numerator = restoredNormalizedTerms(value.normalizedFraction.numerator, expressions);
+      const denominator = restoredNormalizedTerms(value.normalizedFraction.denominator, expressions);
+      if (!numerator || !denominator || denominator.length === 0) { return; }
+      result = complexFromNormalizedFraction({ numerator, denominator }, complexMagnitudeNormalization(result));
     }
     return Number.isFinite(result.real) && Number.isFinite(result.imaginary) ? result : undefined;
   } catch {

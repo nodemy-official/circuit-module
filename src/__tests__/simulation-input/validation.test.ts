@@ -228,11 +228,21 @@ describe("simulation API runtime input validation", () => {
     },
   );
 
-  it("preserves catalog label defaults for analog calls from untyped JavaScript", () => {
+  it.each(publicAnalyzers)("preserves catalog label defaults for untyped JavaScript through %s", (_name, analyze) => {
     const document = {
       ...validDocument,
       parts: [{ id: "source", kind: "ac-source", x: 0, y: 0, voltageVolts: 5, frequencyHz: 1000 }],
     } as unknown as CircuitDocument;
-    expect(analyzeAnalogCircuit(document, { mode: "ac" }).status).toBe("valid");
+    expect(analyze(document).status).not.toBe("invalid");
+  });
+
+  it.each(publicAnalyzers)("uses catalog labels in invalid numeric input diagnostics through %s", (_name, analyze) => {
+    const document = { ...validDocument,
+      parts: [{ id: "r", kind: "resistor", x: 0, y: 0, resistanceOhms: null }],
+    } as unknown as CircuitDocument;
+    const result = analyze(document);
+    expect(result.status).toBe("invalid");
+    expect(result.message).toContain("抵抗");
+    expect(result.message).not.toContain("undefined");
   });
 });

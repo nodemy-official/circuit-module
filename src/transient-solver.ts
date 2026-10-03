@@ -144,12 +144,18 @@ function deduplicateIssues(issues: readonly CircuitIssue[]): CircuitIssue[] {
 
 function stepCount(duration: number, timeStep: number): number | null {
   if (duration <= timeStep) { return 1; }
-  const ratio = duration / timeStep;
-  if (!Number.isFinite(ratio) || ratio <= 0) { return null; }
-  const nearest = Math.round(ratio);
-  const tolerance = Number.EPSILON * Math.max(1, ratio) * 8;
-  const count = Math.max(1, Math.abs(ratio - nearest) <= tolerance ? nearest : Math.ceil(ratio));
-  return count <= MAX_TRANSIENT_STEPS ? count : null;
+  // Count the represented sample times used by timeAtStep. Rounding a ratio
+  // to a nearby integer can erase a distinct final interval and replace its
+  // capacitor current with an average over a whole source cycle.
+  if (MAX_TRANSIENT_STEPS * timeStep < duration) { return null; }
+  let first = 1;
+  let last = MAX_TRANSIENT_STEPS;
+  while (first < last) {
+    const middle = Math.floor((first + last) / 2);
+    if (middle * timeStep < duration) { first = middle + 1; }
+    else { last = middle; }
+  }
+  return first;
 }
 
 function validateOptions(options: unknown, document: CircuitDocument): string | TransientAnalysisOptions {
@@ -193,7 +199,7 @@ function validatePartShape(value: unknown, index: number, parts: Map<string, Rec
   if (typeof value.kind !== "string" || !Object.hasOwn(circuitPartCatalog, value.kind)) {
     return `部品「${value.id}」の種類が不明です。`;
   }
-  if (typeof value.label !== "string") { return `部品「${value.id}」のラベルが正しくありません。`; }
+  if (value.label !== undefined && typeof value.label !== "string") { return `部品「${value.id}」のラベルが正しくありません。`; }
   parts.set(value.id, value);
   return null;
 }
@@ -272,15 +278,16 @@ function sameEndpointValues(first: unknown, second: unknown) {
 function validateNumericFieldValue(part: CircuitPart, field: ReturnType<typeof circuitPartNumericFields>[number]) {
   const value = (part as unknown as Record<string, unknown>)[field.key];
   if (value === undefined) { return null; }
+  const label = simulationRecordField(part, "label") ?? circuitPartCatalog[part.kind].defaults.label;
   if (typeof value !== "number" || !Number.isFinite(value)) {
-    return `${part.label}の${field.label}は有限な数値で指定してください。`;
+    return `${label}の${field.label}は有限な数値で指定してください。`;
   }
   if (field.min !== undefined && (field.exclusiveMin ? value <= field.min : value < field.min)) {
     const comparator = field.exclusiveMin ? "より大きい" : "以上";
-    return `${part.label}の${field.label}は${field.min}${field.unit}${comparator}の数値で指定してください。`;
+    return `${label}の${field.label}は${field.min}${field.unit}${comparator}の数値で指定してください。`;
   }
   if (field.max !== undefined && value > field.max) {
-    return `${part.label}の${field.label}は${field.max}${field.unit}以下の数値で指定してください。`;
+    return `${label}の${field.label}は${field.max}${field.unit}以下の数値で指定してください。`;
   }
   return null;
 }
@@ -291,7 +298,7 @@ function validateReactivePart(part: CircuitPart) {
     if (issue) { return issue; }
   }
   if (part.kind === "ac-source" && timeVoltage(part, 0) === null) {
-    return `${part.label}の交流設定は有限な値で指定してください。`;
+    return `${simulationRecordField(part, "label") ?? circuitPartCatalog[part.kind].defaults.label}の交流設定は有限な値で指定してください。`;
   }
   return null;
 }

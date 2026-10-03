@@ -3394,6 +3394,56 @@ function linearDcSeed(document: CircuitDocument, layout: MnaLayout, includeFeedb
 
 type DcLineSearch = "bounded" | "decreasing" | "previous";
 
+function withinOpAmpRails(value: ExactRational, negativeRail: ExactRational, positiveRail: ExactRational) {
+  return subtractExactRational(value, negativeRail).numerator > 0n && subtractExactRational(value, positiveRail).numerator < 0n;
+}
+
+function interpolatedNewtonState(state: Float64Array, target: Float64Array, step: ExactRational) {
+  const candidate = cloneRealState(state);
+  for (let index = 0; index < candidate.length; index += 1) {
+    const start = exactStateValue(state, index);
+    setRealStateValue(candidate, index, exactProductSumRatio([
+      { factors: [start] }, { factors: [step, residualTermDifference(exactStateValue(target, index), start)] },
+    ], 1)!);
+  }
+  return candidate;
+}
+
+function opAmpInteriorNewtonState(document: CircuitDocument, layout: MnaLayout, state: Float64Array, target: Float64Array,
+  tolerances: ExactRational[] | null, score: number, channelConducting: Readonly<Record<string, boolean>>) {
+  let bestState: Float64Array | undefined;
+  let bestScore = score;
+  for (const part of document.parts) {
+    if (part.kind !== "op-amp") { continue; }
+    const gain = part.openLoopGain ?? 100_000;
+    const positiveRail = numberToExactRational(part.positiveRailVolts ?? 15)!;
+    const negativeRail = numberToExactRational(part.negativeRailVolts ?? -15)!;
+    const center = nonlinearTerminalVoltages(part, layout, state);
+    const raw = exactProductSumRatio([{ factors: [gain, center[0] ?? 0] }], 1)!;
+    if (withinOpAmpRails(raw, negativeRail, positiveRail)) { continue; }
+    const end = nonlinearTerminalVoltages(part, layout, target);
+    const change = exactProductSumRatio([
+      { factors: [gain, end[0] ?? 0] }, { factors: [raw], sign: -1 },
+    ], 1)!;
+    const output = residualTermDifference(center[2] ?? 0, 0);
+    const desired = withinOpAmpRails(output, negativeRail, positiveRail)
+      ? output : exactProductSumRatio([{ factors: [negativeRail] }, { factors: [positiveRail] }], 2)!;
+    const step = divideExactRational(subtractExactRational(desired, raw), change);
+    if (!step || step.numerator <= 0n || step.numerator >= step.denominator) { continue; }
+    // A high gain can make the linear input region narrower than the usual
+    // minimum damping step. Interpolate into it exactly to recover feedback
+    // slope, without rounding the input difference or relaxing residuals.
+    const candidate = interpolatedNewtonState(state, target, step);
+    const assembly = assembleDc(document, layout, candidate, true, channelConducting);
+    const candidateScore = residualScore(layout, assembly, tolerances);
+    if (candidateScore < bestScore || candidateScore <= 1) {
+      bestState = candidate;
+      bestScore = candidateScore;
+    }
+  }
+  return bestState;
+}
+
 function solveDcNewtonStep(
   document: CircuitDocument,
   layout: MnaLayout,
@@ -3438,8 +3488,12 @@ function solveDcNewtonStep(
     // Compare candidates using this iteration's scale so an exponential current cannot
     // increase its own tolerance and make a divergent step appear better.
     const candidateScore = residualScore(layout, candidateAssembly, tolerances);
-    if (candidateScore < score || candidateScore <= 1 || (lineSearch === "bounded" && step <= 1 / 8192)) {
+    if (candidateScore < score || candidateScore <= 1) {
       nextState = candidate;
+      break;
+    }
+    if (lineSearch === "bounded" && step <= 1 / 8192) {
+      nextState = opAmpInteriorNewtonState(document, layout, state, targetState, tolerances, score, channelConductingForReferences) ?? candidate;
       break;
     }
     if (lineSearch !== "bounded" && candidateScore === score) { break; }
