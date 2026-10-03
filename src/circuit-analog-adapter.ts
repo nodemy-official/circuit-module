@@ -1,3 +1,4 @@
+import { circuitAnalysisOptionsSchema, simulationBooleanSchema } from "./circuit-validation.js";
 import { analyzeAnalogCircuit, type ComplexValue, type AnalogCircuitPartReading } from "./analog-solver.js";
 import { complex, complexDivide, complexMagnitude, complexPhaseDegrees } from "./analog-math.js";
 import { exactComplexValue } from "./exact-numeric-state.js";
@@ -360,21 +361,15 @@ function adapterInput(document: unknown, switchStates: unknown, options: unknown
     }
     const capturedOptions = snapshotSimulationRecord(options, undefined, context);
     if (!capturedOptions) { return "解析条件はオブジェクトで指定してください。"; }
-    const { mode, frequencyHz } = capturedOptions;
-    if (mode !== undefined && mode !== "auto" && mode !== "dc" && mode !== "ac") {
-      return "解析方式は auto、dc、または ac で指定してください。";
-    }
-    if (frequencyHz !== undefined &&
-      (typeof frequencyHz !== "number" || !Number.isFinite(frequencyHz) || frequencyHz <= 0)) {
-      return "解析周波数は有限な0より大きい数値にしてください。";
-    }
+    const parsed = circuitAnalysisOptionsSchema.safeParse(capturedOptions);
+    if (!parsed.success) { return parsed.error.issues[0]!.message; }
     for (const [partId, state] of Object.entries(snapshot)) {
       if (kinds.get(partId) !== "switch") { return `スイッチ状態の対象「${partId}」はスイッチ部品ではありません。`; }
-      if (typeof state !== "boolean") { return "スイッチ状態は部品 ID ごとの真偽値で指定してください。"; }
+      if (!simulationBooleanSchema.safeParse(state).success) { return "スイッチ状態は部品 ID ごとの真偽値で指定してください。"; }
     }
     if (!context.isStable()) { return "回路データまたは解析条件が取得中に変更されました。"; }
     // Keep mode selection, solving and readings on the validated option values.
-    return { document: validatedDocument, switchStates: snapshot as Record<string, boolean>, options: { mode, frequencyHz } };
+    return { document: validatedDocument, switchStates: snapshot as Record<string, boolean>, options: parsed.data };
   } catch {
     return "解析条件またはスイッチ状態を読み取れません。";
   }

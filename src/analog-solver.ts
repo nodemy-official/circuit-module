@@ -61,6 +61,7 @@ import { finiteComplexReferenceShift } from "./analog-reference.js";
 import { acAnalysisFrequency, acReactiveAdmittance, acReactiveImpedance, acReactiveReactance, frequencyMatches } from "./ac-reactive.js";
 import { meterStatuses, type MeterStatus } from "./meter-status.js";
 import { isSimulationRecord, SimulationSnapshotContext, simulationRecordEntries, snapshotSimulationRecord, validatedSimulationDocument } from "./simulation-input.js";
+import { analogAnalysisOptionsSchema, simulationBooleanSchema, simulationFiniteNumberSchema, simulationPartValueSchemas } from "./circuit-validation.js";
 import { acResponsePartGroups, type AcResponseEdge } from "./ac-response-groups.js";
 import { compatibleIdealAcVoltageCycle } from "./ac-voltage-constraints.js";
 
@@ -268,10 +269,6 @@ type ResidualTerms = (number | ExactRational)[][];
 type ResidualTerm = number | ExactRational;
 
 const endpointKey = (partId: string, terminal: CircuitTerminal) => `${partId}:${terminal}`;
-const positive = (value: number | undefined) =>
-  value !== undefined && Number.isFinite(value) && value > 0;
-const nonnegative = (value: number | undefined) =>
-  value !== undefined && Number.isFinite(value) && value >= 0;
 
 function result(
   status: AnalogAnalysisStatus,
@@ -316,103 +313,9 @@ function documentWithCatalogDefaults(document: CircuitDocument): CircuitDocument
   };
 }
 
-function fieldIssue(part: CircuitPart, invalid: boolean, field: string, expectation: string) {
-  return invalid ? `${part.label}の${field}は${expectation}にしてください。` : null;
-}
-
-type PartValidator = (part: CircuitPart) => string | null;
-
-const partValidators: Partial<Record<CircuitPartKind, PartValidator>> = {
-  battery: (part) =>
-    fieldIssue(part, !positive(part.voltageVolts), "電圧", "0より大きい数値") ??
-    fieldIssue(part, !nonnegative(part.internalResistanceOhms), "内部抵抗", "0以上の数値"),
-  switch: (part) =>
-    fieldIssue(
-      part,
-      part.initiallyClosed !== undefined && typeof part.initiallyClosed !== "boolean",
-      "初期状態",
-      "真偽値",
-    ),
-  "ac-source": (part) =>
-    fieldIssue(part, !nonnegative(part.voltageVolts), "実効電圧", "0以上の数値") ??
-    fieldIssue(part, !positive(part.frequencyHz), "周波数", "0より大きい数値") ??
-    fieldIssue(part, !Number.isFinite(part.phaseDegrees), "位相", "有限の数値") ??
-    fieldIssue(part, !Number.isFinite(part.offsetVolts), "直流オフセット", "有限の数値"),
-  resistor: (part) => fieldIssue(part, !positive(part.resistanceOhms), "抵抗値", "0より大きい数値"),
-  bulb: (part) =>
-    fieldIssue(part, !positive(part.resistanceOhms), "抵抗値", "0より大きい数値") ??
-    fieldIssue(
-      part,
-      part.ratedPowerWatts !== undefined && !positive(part.ratedPowerWatts),
-      "定格電力",
-      "0より大きい数値",
-    ),
-  capacitor: (part) => fieldIssue(part, !positive(part.capacitanceFarads), "静電容量", "0より大きい数値"),
-  inductor: (part) => fieldIssue(part, !positive(part.inductanceHenries), "インダクタンス", "0より大きい数値"),
-  "current-source": (part) =>
-    fieldIssue(part, !Number.isFinite(part.currentAmps), "電流", "有限の数値"),
-  potentiometer: (part) =>
-    fieldIssue(part, !positive(part.resistanceOhms), "抵抗値", "0より大きい数値") ??
-    fieldIssue(
-      part,
-      !Number.isFinite(part.wiperPosition) || (part.wiperPosition ?? -1) < 0 || (part.wiperPosition ?? 2) > 1,
-      "摺動位置",
-      "0から1の数値",
-    ),
-  diode: (part) =>
-    fieldIssue(part, !positive(part.saturationCurrentAmps), "飽和電流", "0より大きい数値") ??
-    fieldIssue(part, !positive(part.emissionCoefficient), "理想係数", "0より大きい数値"),
-  led: (part) =>
-    fieldIssue(part, !positive(part.saturationCurrentAmps), "飽和電流", "0より大きい数値") ??
-    fieldIssue(part, !positive(part.emissionCoefficient), "理想係数", "0より大きい数値") ??
-    fieldIssue(part, !positive(part.ratedCurrentAmps), "定格電流", "0より大きい数値"),
-  "npn-transistor": (part) =>
-    fieldIssue(part, !positive(part.currentGain), "電流増幅率", "0より大きい数値") ??
-    fieldIssue(part, !positive(part.saturationCurrentAmps), "飽和電流", "0より大きい数値"),
-  "pnp-transistor": (part) =>
-    fieldIssue(part, !positive(part.currentGain), "電流増幅率", "0より大きい数値") ??
-    fieldIssue(part, !positive(part.saturationCurrentAmps), "飽和電流", "0より大きい数値"),
-  nmos: validateMos,
-  pmos: validateMos,
-  "op-amp": (part) =>
-    fieldIssue(part, !positive(part.openLoopGain), "開ループ利得", "0より大きい数値") ??
-    fieldIssue(
-      part,
-      !Number.isFinite(part.positiveRailVolts) || !Number.isFinite(part.negativeRailVolts),
-      "電源レール",
-      "有限の数値",
-    ) ??
-    fieldIssue(
-      part,
-      (part.negativeRailVolts ?? 0) >= (part.positiveRailVolts ?? 0),
-      "電源レール",
-      "負側が正側より小さい値",
-    ),
-};
-
-function validateMos(part: CircuitPart) {
-  return fieldIssue(
-    part,
-    !Number.isFinite(part.thresholdVolts) || (part.thresholdVolts ?? -1) < 0,
-    "しきい値",
-    "0以上の数値",
-  ) ??
-  fieldIssue(
-    part,
-    !positive(part.transconductanceAmpsPerVoltSquared),
-    "相互コンダクタンス係数",
-    "0より大きい数値",
-  ) ??
-  fieldIssue(
-    part,
-    !nonnegative(part.channelLengthModulation),
-    "チャネル長変調係数",
-    "0以上の数値",
-  );
-}
-
 function validationIssue(part: CircuitPart) {
-  return partValidators[part.kind]?.(part) ?? null;
+  const parsed = simulationPartValueSchemas[part.kind]?.safeParse(part);
+  return parsed && !parsed.success ? `${part.label}の${parsed.error.issues[0]!.message}` : null;
 }
 
 function documentIssue(
@@ -459,7 +362,7 @@ function validateVoltageOverrides(
     if (!part || (part.kind !== "battery" && part.kind !== "ac-source")) {
       return `電圧上書きの対象「${partId}」は電圧源ではありません。`;
     }
-    if (!Number.isFinite(voltage)) { return `${part.label}の電圧上書きは有限の数値にしてください。`; }
+    if (!simulationFiniteNumberSchema.safeParse(voltage).success) { return `${part.label}の電圧上書きは有限の数値にしてください。`; }
   }
   return null;
 }
@@ -468,14 +371,7 @@ function validateSwitchStates(
   switchStates: unknown,
   partById: Map<string, CircuitPart>,
 ) {
-  if (
-    switchStates === null ||
-    typeof switchStates !== "object" ||
-    Array.isArray(switchStates) ||
-    switchStates instanceof Map ||
-    switchStates instanceof Set ||
-    !isSimulationRecord(switchStates, partById.keys())
-  ) {
+  if (!isSimulationRecord(switchStates, partById.keys())) {
     return "スイッチ状態は部品 ID ごとの真偽値オブジェクトにしてください。";
   }
   for (const [partId, state] of simulationRecordEntries(switchStates)) {
@@ -483,7 +379,7 @@ function validateSwitchStates(
     if (part?.kind !== "switch") {
       return `スイッチ状態の対象「${partId}」はスイッチ部品ではありません。`;
     }
-    if (typeof state !== "boolean") {
+    if (!simulationBooleanSchema.safeParse(state).success) {
       return `${part.label}のスイッチ状態は真偽値にしてください。`;
     }
   }
@@ -730,7 +626,7 @@ function initialInductorIssues(
   initialConstraints?: ReadonlyMap<string, InitialVoltageConstraint>,
 ): AnalogCircuitIssue[] {
   const invalid = document.parts.find((part) => part.kind === "inductor" &&
-    part.initialCurrentAmps !== undefined && !Number.isFinite(part.initialCurrentAmps));
+    part.initialCurrentAmps !== undefined && !simulationFiniteNumberSchema.safeParse(part.initialCurrentAmps).success);
   return invalid
     ? [{ severity: "error", partId: invalid.id, message: `${invalid.label}の初期電流は有限の数値にしてください。` }]
     : balancedInitialInductorIssues(document, topology, switchStates, initialConstraints);
@@ -7737,12 +7633,6 @@ function solveAnalogStepFromInput(
     const message = "回路データまたは解析条件が取得中に変更されました。";
     return result("invalid", mode, message, { issues: [{ severity: "error", message }] });
   }
-  if (validatedOptions.initialInductorCurrents !== undefined &&
-      (typeof validatedOptions.initialInductorCurrents !== "boolean" ||
-       (validatedOptions.initialInductorCurrents && validatedOptions.mode !== "dc"))) {
-    const message = "コイルの初期電流を使う設定は直流の初期状態解析でのみ真偽値として指定してください。";
-    return result("invalid", validatedOptions.mode, message, { issues: [{ severity: "error", message }] });
-  }
   return validatedOptions.mode === "dc"
     ? dcResult(document, validatedOptions, [], transientCompanions, initialVoltageConstraints, previousAnalysis)
     : acResult(document, validatedOptions);
@@ -7752,14 +7642,8 @@ function validatedAnalogOptions(options: unknown, partIds: readonly string[], co
   try {
     const capturedOptions = snapshotSimulationRecord(options, undefined, context);
     if (!capturedOptions) { return "解析条件はオブジェクトで指定してください。"; }
-    const { mode, frequencyHz, initialInductorCurrents } = capturedOptions;
-    if (mode !== "dc" && mode !== "ac") {
-      return "解析方式は dc または ac で指定してください。";
-    }
-    if (frequencyHz !== undefined &&
-        (typeof frequencyHz !== "number" || !Number.isFinite(frequencyHz) || frequencyHz <= 0)) {
-      return "交流解析の周波数は有限な0より大きい数値にしてください。";
-    }
+    const parsed = analogAnalysisOptionsSchema.safeParse(capturedOptions);
+    if (!parsed.success) { return parsed.error.issues[0]!.message; }
     const controls: Partial<Pick<AnalogStepOptions, "switchStates" | "voltageOverrides">> = {};
     for (const [key, name] of [["switchStates", "スイッチ状態"], ["voltageOverrides", "電圧上書き"]] as const) {
       const field = capturedOptions[key];
@@ -7769,10 +7653,7 @@ function validatedAnalogOptions(options: unknown, partIds: readonly string[], co
       // Value validation and every later stamp use this same own-data copy.
       Object.defineProperty(controls, key, { value: snapshot, enumerable: true });
     }
-    if (initialInductorCurrents !== undefined && typeof initialInductorCurrents !== "boolean") {
-      return "コイルの初期電流を使う設定は真偽値で指定してください。";
-    }
-    return { mode, frequencyHz, initialInductorCurrents, ...controls };
+    return { ...parsed.data, ...controls };
   } catch {
     return "解析条件を読み取れません。";
   }

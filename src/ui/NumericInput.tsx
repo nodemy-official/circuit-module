@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type ComponentPropsWithoutRef, type KeyboardEvent } from "react";
+import { circuitNumericValueSchema } from "../circuit-validation.js";
 
 interface NumericInputOptions {
   value: number;
@@ -23,11 +24,10 @@ export function useNumericDraft({ value, onValueChange, min, max, exclusiveMin, 
   const change = (nextText: string) => {
     setText(nextText);
     const next = nextText.trim() === "" ? Number.NaN : Number(nextText);
-    if (!Number.isFinite(next) || (integer && !Number.isInteger(next))) { return; }
-    if (min !== undefined && (exclusiveMin ? next <= min : next < min)) { return; }
-    if (max !== undefined && next > max) { return; }
-    emittedValue.current = next;
-    if (!Object.is(next, value)) { onValueChange(next); }
+    const parsed = circuitNumericValueSchema({ min, max, exclusiveMin, integer }).safeParse(next);
+    if (!parsed.success) { return; }
+    emittedValue.current = parsed.data;
+    if (!Object.is(parsed.data, value)) { onValueChange(parsed.data); }
   };
   const restore = () => {
     emittedValue.current = value;

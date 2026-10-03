@@ -1,4 +1,5 @@
 import { circuitPartCatalog, type CircuitDocument, type CircuitPartKind, type CircuitTerminal } from "./circuit-model.js";
+import { simulationDocumentCollectionsSchema, simulationEndpointSchema, simulationPartShapeSchema, simulationWireIdSchema } from "./circuit-validation.js";
 
 const simulationRecordFields = new Set([
   ...Object.values(circuitPartCatalog).flatMap(({ defaults }) => Object.keys(defaults)),
@@ -207,11 +208,12 @@ export function circuitDocumentShapeIssue(input: unknown): string | null {
 
 function capturedDocumentShapeIssue(input: unknown): string | null {
   try {
-    if (!isSimulationRecord(input) || !isSimulationArray(input.parts) || !isSimulationArray(input.wires)) {
+    const parsed = simulationDocumentCollectionsSchema.safeParse(input);
+    if (!parsed.success) {
       return "回路データには部品一覧と導線一覧が必要です。";
     }
-    const parts = partKindsAndIssue(input.parts);
-    return parts.issue ?? wireShapeIssue(input.wires, parts.kinds);
+    const parts = partKindsAndIssue(parsed.data.parts);
+    return parts.issue ?? wireShapeIssue(parsed.data.wires, parts.kinds);
   } catch {
     return "回路データの部品一覧または導線一覧を読み取れません。";
   }
@@ -220,18 +222,16 @@ function capturedDocumentShapeIssue(input: unknown): string | null {
 function partKindsAndIssue(values: unknown[]): { kinds: Map<string, CircuitPartKind>; issue: string | null } {
   const kinds = new Map<string, CircuitPartKind>();
   for (const [index, value] of values.entries()) {
-    if (!isSimulationRecord(value) || typeof value.id !== "string" || value.id.trim() === "") {
+    const parsed = simulationPartShapeSchema.safeParse(value);
+    if (!parsed.success) {
+      const field = parsed.error.issues[0]!.path[0];
+      const record = value as Record<string, unknown> | null;
+      if (field === "label") { return { kinds, issue: `部品「${record!.id}」の名前が正しくありません。` }; }
+      if (field === "kind") { return { kinds, issue: `${record!.label ?? record!.id}の部品種類を認識できません。` }; }
       return { kinds, issue: `部品${index + 1}の ID が正しくありません。` };
     }
-    if (value.label !== undefined && typeof value.label !== "string") {
-      return { kinds, issue: `部品「${value.id}」の名前が正しくありません。` };
-    }
-    if (kinds.has(value.id)) { return { kinds, issue: "部品 ID が重複しています。" }; }
-    if (typeof value.kind !== "string" || !Object.hasOwn(circuitPartCatalog, value.kind)) {
-      const label = typeof value.label === "string" ? value.label : value.id;
-      return { kinds, issue: `${label}の部品種類を認識できません。` };
-    }
-    kinds.set(value.id, value.kind as CircuitPartKind);
+    if (kinds.has(parsed.data.id)) { return { kinds, issue: "部品 ID が重複しています。" }; }
+    kinds.set(parsed.data.id, parsed.data.kind);
   }
   return { kinds, issue: null };
 }
@@ -240,19 +240,21 @@ function wireShapeIssue(values: unknown[], kinds: ReadonlyMap<string, CircuitPar
   const wireIds = new Set<string>();
   const wireEndpointPairs = new Set<string>();
   for (const [index, wire] of values.entries()) {
-    if (!isSimulationRecord(wire) || typeof wire.id !== "string" || wire.id.trim() === "") {
+    const parsed = simulationWireIdSchema.safeParse(wire);
+    if (!parsed.success) {
       return `導線${index + 1}の ID が正しくありません。`;
     }
-    if (wireIds.has(wire.id)) { return "導線 ID が重複しています。"; }
-    wireIds.add(wire.id);
-    const fromIssue = endpointShapeIssue(wire.from, kinds, `導線${index + 1}の始点`);
+    const record = parsed.data;
+    if (wireIds.has(parsed.data.id)) { return "導線 ID が重複しています。"; }
+    wireIds.add(parsed.data.id);
+    const fromIssue = endpointShapeIssue(record.from, kinds, `導線${index + 1}の始点`);
     if (fromIssue) { return fromIssue; }
-    const toIssue = endpointShapeIssue(wire.to, kinds, `導線${index + 1}の終点`);
+    const toIssue = endpointShapeIssue(record.to, kinds, `導線${index + 1}の終点`);
     if (toIssue) { return toIssue; }
-    if (sameEndpoint(wire.from, wire.to)) {
+    if (sameEndpoint(record.from, record.to)) {
       return `導線${index + 1}は同じ端子同士を接続しています。`;
     }
-    const endpointPair = unorderedWireKey(wire.from, wire.to);
+    const endpointPair = unorderedWireKey(record.from, record.to);
     if (wireEndpointPairs.has(endpointPair)) {
       return `導線${index + 1}は既存の導線と同じ端子間を接続しています。`;
     }
@@ -266,14 +268,15 @@ function endpointShapeIssue(
   kinds: ReadonlyMap<string, CircuitPartKind>,
   description: string,
 ) {
-  if (!isSimulationRecord(value) || typeof value.partId !== "string" ||
-      (value.terminal !== "a" && value.terminal !== "b" && value.terminal !== "c")) {
+  const parsed = simulationEndpointSchema.safeParse(value);
+  if (!parsed.success) {
     return `${description}の端子指定が正しくありません。`;
   }
-  const kind = kinds.get(value.partId);
-  if (!kind) { return `${description}の部品「${value.partId}」が見つかりません。`; }
-  if (!circuitPartCatalog[kind].terminals.includes(value.terminal as CircuitTerminal)) {
-    return `${description}の端子「${value.terminal}」はこの部品にありません。`;
+  const { partId, terminal } = parsed.data;
+  const kind = kinds.get(partId);
+  if (!kind) { return `${description}の部品「${partId}」が見つかりません。`; }
+  if (!circuitPartCatalog[kind].terminals.includes(terminal as CircuitTerminal)) {
+    return `${description}の端子「${terminal}」はこの部品にありません。`;
   }
   return null;
 }

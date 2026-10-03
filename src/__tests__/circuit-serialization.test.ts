@@ -35,6 +35,20 @@ function parseRaw(document: unknown) {
 }
 
 describe("circuit document serialization", () => {
+  it("counts UTF-16 units at the JSON input length boundary", () => {
+    const prefix = '{"title":"';
+    const suffix = '","parts":[],"wires":[]}';
+    const titleLength = MAX_CIRCUIT_DOCUMENT_JSON_LENGTH - prefix.length - suffix.length;
+    const title = "😀".repeat(Math.floor(titleLength / 2)) + "a".repeat(titleLength % 2);
+    const json = prefix + title + suffix;
+    expect(json.length).toBe(MAX_CIRCUIT_DOCUMENT_JSON_LENGTH);
+    expect(parseCircuitDocument(json)).toEqual({ ok: true, document: { title, parts: [], wires: [] } });
+    expect(parseCircuitDocument(`${prefix}${title}a${suffix}`)).toEqual({
+      ok: false,
+      reason: `読み込みデータは${MAX_CIRCUIT_DOCUMENT_JSON_LENGTH}文字以下にしてください。`,
+    });
+  });
+
   it("round trips a versioned document into a fresh normalized object", () => {
     const json = serializeCircuitDocument(simpleDocument);
     const envelope = JSON.parse(json) as Record<string, unknown>;
@@ -146,6 +160,18 @@ describe("circuit document serialization", () => {
     };
     const result = parseRaw(raw);
     expect(result).toEqual({ ok: true, document: simpleDocument });
+  });
+
+  it("ignores unknown getters when saving a document", () => {
+    const document = structuredClone(simpleDocument);
+    for (const record of [document, ...document.parts, ...document.wires,
+      ...document.wires.flatMap((wire) => [wire.from, wire.to])]) {
+      Object.defineProperty(record, "futureProperty", {
+        enumerable: true,
+        get() { throw new Error("Unknown getter must not run"); },
+      });
+    }
+    expect(parseCircuitDocument(serializeCircuitDocument(document))).toEqual({ ok: true, document: simpleDocument });
   });
 
   it("preserves omitted model properties and allows empty, incomplete, and unpowered circuits", () => {

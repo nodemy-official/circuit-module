@@ -21,6 +21,7 @@ import {
 import { addRealStateValue, complexFromExact, exactComplexValue, exactRealStateInput } from "./exact-numeric-state.js";
 import { meterStatuses, type MeterStatus } from "./meter-status.js";
 import { isSimulationRecord, SimulationSnapshotContext, simulationRecordEntries, snapshotSimulationRecord, validatedSimulationDocument } from "./simulation-input.js";
+import { circuitAnalysisOptionsSchema, legacySwitchValueSchema, simulationBooleanSchema, simulationPartValueSchemas } from "./circuit-validation.js";
 import { readingPrecision, restoredComplex, type CircuitReadingPrecision, type CircuitTerminalVoltageDifference } from "./circuit-reading.js";
 import type { ExactExpressionNode } from "./exact-expression.js";
 
@@ -143,9 +144,6 @@ function result(
   };
 }
 
-const positive = (value: number | undefined) =>
-  value !== undefined && Number.isFinite(value) && value > 0;
-
 function documentWithCatalogDefaults(document: CircuitDocument): CircuitDocument {
   return {
     ...document,
@@ -163,23 +161,10 @@ function documentWithCatalogDefaults(document: CircuitDocument): CircuitDocument
 }
 
 function partValueIssue(part: CircuitPart): string | null {
-  if (part.kind === "switch" && part.initiallyClosed !== undefined && typeof part.initiallyClosed !== "boolean") {
-    return `${part.label}のスイッチ状態は真偽値にしてください。`;
-  }
-  if (part.kind === "battery") {
-    if (!positive(part.voltageVolts)) { return `${part.label}の電圧は0より大きい数値にしてください。`; }
-    const internal = part.internalResistanceOhms;
-    if (internal === undefined || !Number.isFinite(internal) || internal < 0) {
-      return `${part.label}の内部抵抗は0以上の数値にしてください。`;
-    }
-  }
-  if ((part.kind === "resistor" || part.kind === "bulb") && !positive(part.resistanceOhms)) {
-    return `${part.label}の抵抗値は0より大きい数値にしてください。`;
-  }
-  if (part.kind === "bulb" && part.ratedPowerWatts !== undefined && !positive(part.ratedPowerWatts)) {
-    return `${part.label}の定格電力は0より大きい数値にしてください。`;
-  }
-  return null;
+  const schema = part.kind === "switch" ? legacySwitchValueSchema
+    : ["battery", "resistor", "bulb"].includes(part.kind) ? simulationPartValueSchemas[part.kind] : undefined;
+  const parsed = schema?.safeParse(part);
+  return parsed && !parsed.success ? `${part.label}の${parsed.error.issues[0]!.message}` : null;
 }
 
 function documentIssue(document: CircuitDocument, switchStates: Record<string, boolean>): string | null {
@@ -214,7 +199,7 @@ function switchStateIssue(value: unknown, kinds: Map<string, CircuitPart["kind"]
   }
   for (const [partId, state] of simulationRecordEntries(value)) {
     if (kinds.get(partId) !== "switch") { return `スイッチ状態の対象「${partId}」はスイッチ部品ではありません。`; }
-    if (typeof state !== "boolean") { return "スイッチ状態は部品 ID ごとの真偽値で指定してください。"; }
+    if (!simulationBooleanSchema.safeParse(state).success) { return "スイッチ状態は部品 ID ごとの真偽値で指定してください。"; }
   }
   return null;
 }
@@ -3530,19 +3515,13 @@ function circuitAnalysisInput(document: unknown, switchStates: unknown, options:
     }
     const capturedOptions = snapshotSimulationRecord(options, undefined, context);
     if (!capturedOptions) { return "解析条件はオブジェクトで指定してください。"; }
-    const { mode, frequencyHz } = capturedOptions;
-    if (mode !== undefined && mode !== "auto" && mode !== "dc" && mode !== "ac") {
-      return "解析方式は auto、dc、または ac で指定してください。";
-    }
-    if (frequencyHz !== undefined &&
-        (typeof frequencyHz !== "number" || !Number.isFinite(frequencyHz) || frequencyHz <= 0)) {
-      return "解析周波数は有限な0より大きい数値にしてください。";
-    }
+    const parsed = circuitAnalysisOptionsSchema.safeParse(capturedOptions);
+    if (!parsed.success) { return parsed.error.issues[0]!.message; }
     const stateIssue = switchStateIssue(snapshot, kinds);
     if (stateIssue) { return stateIssue; }
     if (!context.isStable()) { return "回路データまたは解析条件が取得中に変更されました。"; }
     // Solve with the same values just validated, without rereading caller data.
-    return { document: validatedDocument, switchStates: snapshot as Record<string, boolean>, options: { mode, frequencyHz } };
+    return { document: validatedDocument, switchStates: snapshot as Record<string, boolean>, options: parsed.data };
   } catch {
     return "解析条件またはスイッチ状態を読み取れません。";
   }

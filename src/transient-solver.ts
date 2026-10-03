@@ -20,7 +20,8 @@ import {
   MAX_CIRCUIT_ANALYSIS_TERMINALS,
   type CircuitIssue,
 } from "./circuit-solver.js";
-import { isSimulationArray, isSimulationRecord, SimulationSnapshotContext, simulationRecordField, snapshotSimulationDocument, snapshotSimulationRecord } from "./simulation-input.js";
+import { SimulationSnapshotContext, simulationRecordField, snapshotSimulationRecord, validatedSimulationDocument } from "./simulation-input.js";
+import { circuitNumericValueSchema, simulationBooleanSchema, transientAnalysisOptionsSchema } from "./circuit-validation.js";
 import { readingPrecision, terminalVoltageDifferences, type CircuitReadingPrecision, type CircuitTerminalVoltageDifference } from "./circuit-reading.js";
 import { createExactExpressionCapture, freezeCapturedExactExpressions, snapshotExactExpressions, withExactExpressionCapture, type ExactExpressionNode } from "./exact-expression.js";
 import { createTransientEnergyCollector, type TransientEnergyReadings } from "./transient-energy.js";
@@ -161,14 +162,9 @@ function stepCount(duration: number, timeStep: number): number | null {
 function validateOptions(options: unknown, document: CircuitDocument, context: SimulationSnapshotContext): string | TransientAnalysisOptions {
   const capturedOptions = snapshotSimulationRecord(options, undefined, context);
   if (!capturedOptions) { return "解析条件はオブジェクトで指定してください。"; }
-  const { durationSeconds: duration, timeStepSeconds: timeStep, startFromOperatingPoint, switchStates: inputSwitchStates } = capturedOptions;
-  if (typeof duration !== "number" || !Number.isFinite(duration) || duration <= 0 ||
-      typeof timeStep !== "number" || !Number.isFinite(timeStep) || timeStep <= 0) {
-    return "解析時間と時間刻みは、有限な正の数値で指定してください。";
-  }
-  if (startFromOperatingPoint !== undefined && typeof startFromOperatingPoint !== "boolean") {
-    return "直流動作点から開始する設定は真偽値で指定してください。";
-  }
+  const parsed = transientAnalysisOptionsSchema.safeParse(capturedOptions);
+  if (!parsed.success) { return parsed.error.issues[0]!.message; }
+  const inputSwitchStates = capturedOptions.switchStates;
   let switchStates: Record<string, boolean> | undefined;
   if (inputSwitchStates !== undefined) {
     const snapshot = snapshotSimulationRecord(inputSwitchStates, document.parts.map(({ id }) => id), context);
@@ -180,114 +176,30 @@ function validateOptions(options: unknown, document: CircuitDocument, context: S
       if (!switchIds.has(partId)) {
         return `スイッチ状態の対象「${partId}」はスイッチ部品ではありません。`;
       }
-      if (typeof state !== "boolean") {
+      if (!simulationBooleanSchema.safeParse(state).success) {
         return "スイッチ状態は部品 ID ごとの真偽値で指定してください。";
       }
     }
     switchStates = snapshot as Record<string, boolean>;
   }
-  return { durationSeconds: duration, timeStepSeconds: timeStep, startFromOperatingPoint, switchStates };
-}
-
-function validatePartShape(value: unknown, index: number, parts: Map<string, Record<string, unknown>>) {
-  if (!isSimulationRecord(value) || typeof value.id !== "string" || value.id.trim() === "") {
-    return `部品${index + 1}の ID が正しくありません。`;
-  }
-  if (parts.has(value.id)) { return `部品 ID「${value.id}」が重複しています。`; }
-  if (typeof value.kind !== "string" || !Object.hasOwn(circuitPartCatalog, value.kind)) {
-    return `部品「${value.id}」の種類が不明です。`;
-  }
-  if (value.label !== undefined && typeof value.label !== "string") { return `部品「${value.id}」のラベルが正しくありません。`; }
-  parts.set(value.id, value);
-  return null;
-}
-
-function validatePartsShape(values: unknown[]): { parts?: Map<string, Record<string, unknown>>; reason?: string } {
-  const parts = new Map<string, Record<string, unknown>>();
-  for (const [index, value] of values.entries()) {
-    const issue = validatePartShape(value, index, parts);
-    if (issue) { return { reason: issue }; }
-  }
-  return { parts };
-}
-
-function validateWireShape(
-  value: unknown,
-  index: number,
-  parts: ReadonlyMap<string, Record<string, unknown>>,
-  wireIds: Set<string>,
-) {
-  if (!isSimulationRecord(value) || typeof value.id !== "string" || value.id.trim() === "") {
-    return `導線${index + 1}の ID が正しくありません。`;
-  }
-  if (wireIds.has(value.id)) { return `導線 ID「${value.id}」が重複しています。`; }
-  wireIds.add(value.id);
-  const fromIssue = validateEndpointShape(value.from, parts, `導線${index + 1}の始点`);
-  if (fromIssue) { return fromIssue; }
-  const toIssue = validateEndpointShape(value.to, parts, `導線${index + 1}の終点`);
-  if (toIssue) { return toIssue; }
-  if (sameEndpointValues(value.from, value.to)) {
-    return `導線${index + 1}は同じ端子同士を接続しています。`;
-  }
-  return null;
-}
-
-function validateWiresShape(values: unknown[], parts: ReadonlyMap<string, Record<string, unknown>>) {
-  const wireIds = new Set<string>();
-  for (const [index, value] of values.entries()) {
-    const issue = validateWireShape(value, index, parts, wireIds);
-    if (issue) { return issue; }
-  }
-  return null;
-}
-
-function validateDocumentShape(input: unknown): string | null {
-  if (!isSimulationRecord(input) || !isSimulationArray(input.parts) || !isSimulationArray(input.wires)) {
-    return "回路データには部品一覧と導線一覧が必要です。";
-  }
-  const partResult = validatePartsShape(input.parts);
-  if (!partResult.parts) { return partResult.reason ?? "部品一覧が正しくありません。"; }
-  return validateWiresShape(input.wires, partResult.parts);
-}
-
-function validateEndpointShape(
-  value: unknown,
-  parts: ReadonlyMap<string, Record<string, unknown>>,
-  label: string,
-): string | null {
-  if (!isSimulationRecord(value) || typeof value.partId !== "string" ||
-      (value.terminal !== "a" && value.terminal !== "b" && value.terminal !== "c")) {
-    return `${label}の端子指定が正しくありません。`;
-  }
-  const part = parts.get(value.partId);
-  if (!part) { return `${label}の部品「${value.partId}」が見つかりません。`; }
-  const kind = part.kind as CircuitPart["kind"];
-  if (!circuitPartCatalog[kind].terminals.includes(value.terminal as CircuitTerminal)) {
-    return `${label}の端子「${value.terminal}」はこの部品にありません。`;
-  }
-  return null;
-}
-
-function sameEndpointValues(first: unknown, second: unknown) {
-  if (!isSimulationRecord(first) || !isSimulationRecord(second)) { return false; }
-  return first.partId === second.partId && first.terminal === second.terminal;
+  return { ...parsed.data, switchStates };
 }
 
 function validateNumericFieldValue(part: CircuitPart, field: ReturnType<typeof circuitPartNumericFields>[number]) {
   const value = (part as unknown as Record<string, unknown>)[field.key];
   if (value === undefined) { return null; }
   const label = simulationRecordField(part, "label") ?? circuitPartCatalog[part.kind].defaults.label;
-  if (typeof value !== "number" || !Number.isFinite(value)) {
-    return `${label}の${field.label}は有限な数値で指定してください。`;
-  }
-  if (field.min !== undefined && (field.exclusiveMin ? value <= field.min : value < field.min)) {
+  const parsed = circuitNumericValueSchema(field).safeParse(value);
+  if (parsed.success) { return null; }
+  const issue = parsed.error.issues[0]!;
+  if (issue.code === "too_small") {
     const comparator = field.exclusiveMin ? "より大きい" : "以上";
     return `${label}の${field.label}は${field.min}${field.unit}${comparator}の数値で指定してください。`;
   }
-  if (field.max !== undefined && value > field.max) {
+  if (issue.code === "too_big") {
     return `${label}の${field.label}は${field.max}${field.unit}以下の数値で指定してください。`;
   }
-  return null;
+  return `${label}の${field.label}は有限な数値で指定してください。`;
 }
 
 function validateReactivePart(part: CircuitPart) {
@@ -1229,10 +1141,8 @@ function simulateTransientFromInput(
 ): TransientAnalysis {
   try {
     const context = new SimulationSnapshotContext();
-    const capturedDocument = snapshotSimulationDocument(inputDocument, context);
-    const shapeIssue = validateDocumentShape(capturedDocument);
-    if (shapeIssue) { return invalid(shapeIssue); }
-    const document = capturedDocument as unknown as CircuitDocument;
+    const document = validatedSimulationDocument(inputDocument, context);
+    if (typeof document === "string") { return invalid(document); }
     const reactiveIssue = validateReactiveValues(document);
     if (reactiveIssue) { return invalid(reactiveIssue); }
     const options = validateOptions(inputOptions, document, context);

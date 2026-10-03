@@ -1,3 +1,5 @@
+import { z } from "zod";
+import { circuitNumericValueSchema, simulationBooleanSchema, simulationIdentifierSchema, simulationPartKindSchema, simulationRecordSchema, simulationTerminalSchema } from "./circuit-validation.js";
 import {
   circuitPartKinds,
   circuitPartNumericFields,
@@ -12,7 +14,6 @@ import type {
   CircuitPart,
   CircuitPartKind,
   CircuitRotation,
-  CircuitTerminal,
   CircuitWire,
 } from "./circuit-model.js";
 
@@ -29,15 +30,14 @@ export const MAX_CIRCUIT_DOCUMENT_WIRES = 20_000;
 /** Maximum number of stored route points on a single wire. */
 export const MAX_CIRCUIT_DOCUMENT_WIRE_WAYPOINTS = MAX_CIRCUIT_WIRE_WAYPOINTS;
 
-const rotations: readonly CircuitRotation[] = [0, 90, 180, 270];
-const knownKinds = new Set<string>(circuitPartKinds);
+const rotationSchema = z.literal([0, 90, 180, 270]);
 
 type ValidationResult =
   | { ok: true; document: CircuitDocument }
   | { ok: false; reason: string };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+  return simulationRecordSchema.safeParse(value).success;
 }
 
 function fail(reason: string): ValidationResult {
@@ -45,9 +45,10 @@ function fail(reason: string): ValidationResult {
 }
 
 function checkString(value: unknown, description: string, allowEmpty: boolean): string | null {
-  if (typeof value !== "string") { return `${description}は文字列で指定してください。`; }
-  if (!allowEmpty && value.trim().length === 0) { return `${description}を空にできません。`; }
-  return null;
+  const schema = z.string({ error: `${description}は文字列で指定してください。` })
+    .refine((text) => allowEmpty || text.trim().length > 0, { error: `${description}を空にできません。` });
+  const parsed = schema.safeParse(value);
+  return parsed.success ? null : parsed.error.issues[0]!.message;
 }
 
 const allNumericKeys = new Set<CircuitPartNumericKey>(
@@ -66,17 +67,17 @@ function fieldForPart(kind: CircuitPartKind, key: CircuitPartNumericKey) {
 
 function validateNumericValue(value: unknown, field: ReturnType<typeof circuitPartNumericFields>[number] | undefined, key: CircuitPartNumericKey, label: string) {
   const fieldLabel = field?.label ?? key;
-  if (typeof value !== "number" || !Number.isFinite(value)) {
-    return `${label}の${fieldLabel}は有限な数値で指定してください。`;
-  }
-  if (field?.min !== undefined && (field.exclusiveMin ? value <= field.min : value < field.min)) {
+  const parsed = circuitNumericValueSchema(field ?? {}).safeParse(value);
+  if (parsed.success) { return null; }
+  const issue = parsed.error.issues[0]!;
+  if (field && issue.code === "too_small") {
     const comparison = field.exclusiveMin ? "より大きい" : "以上";
     return `${label}の${fieldLabel}は${field.min}${field.unit} ${comparison}で指定してください。`;
   }
-  if (field?.max !== undefined && value > field.max) {
+  if (field && issue.code === "too_big") {
     return `${label}の${fieldLabel}は${field.max}${field.unit}以下で指定してください。`;
   }
-  return null;
+  return `${label}の${fieldLabel}は有限な数値で指定してください。`;
 }
 
 function validateNumericPartFields(candidate: Record<string, unknown>, kind: CircuitPartKind, label: string) {
@@ -96,18 +97,20 @@ function validateEndpoint(
 ): { endpoint?: CircuitEndpoint; reason?: string } {
   if (!isRecord(value)) { return { reason: `${side}の接続先の形式が正しくありません。` }; }
   const { partId, terminal } = value;
-  if (typeof partId !== "string" || partId.trim().length === 0) {
+  const id = simulationIdentifierSchema.safeParse(partId);
+  if (!id.success) {
     return { reason: `${side}の接続先部品 ID が正しくありません。` };
   }
-  if (terminal !== "a" && terminal !== "b" && terminal !== "c") {
+  const pin = simulationTerminalSchema.safeParse(terminal);
+  if (!pin.success) {
     return { reason: `${side}の端子は「a」「b」「c」のいずれかで指定してください。` };
   }
-  const part = partsById.get(partId);
+  const part = partsById.get(id.data);
   if (!part) { return { reason: `${side}の接続先部品「${partId}」が見つかりません。` }; }
-  if (!terminalsOf(part.kind).includes(terminal as CircuitTerminal)) {
+  if (!terminalsOf(part.kind).includes(pin.data)) {
     return { reason: `${part.label || part.id}には端子「${terminal}」がありません。` };
   }
-  return { endpoint: { partId, terminal: terminal as CircuitTerminal } };
+  return { endpoint: { partId: id.data, terminal: pin.data } };
 }
 
 function endpointKey(endpoint: CircuitEndpoint) {
@@ -122,40 +125,40 @@ function unorderedWireKey(from: CircuitEndpoint, to: CircuitEndpoint) {
 function validateOptionalPartValues(candidate: Record<string, unknown>, kind: CircuitPartKind, label: string): string | null {
   const numberIssue = validateNumericPartFields(candidate, kind, label);
   if (numberIssue) { return numberIssue; }
-  if (candidate.initiallyClosed !== undefined && typeof candidate.initiallyClosed !== "boolean") {
+  if (candidate.initiallyClosed !== undefined && !simulationBooleanSchema.safeParse(candidate.initiallyClosed).success) {
     return `${label}のスイッチ状態は真偽値で指定してください。`;
   }
   if (kind === "op-amp") {
-    const positive = typeof candidate.positiveRailVolts === "number" ? candidate.positiveRailVolts : 15;
-    const negative = typeof candidate.negativeRailVolts === "number" ? candidate.negativeRailVolts : -15;
-    if (negative >= positive) { return `${label}の負側電源は正側電源より低くしてください。`; }
+    const parsed = z.object({ positiveRailVolts: z.number().default(15), negativeRailVolts: z.number().default(-15) })
+      .refine((part) => part.negativeRailVolts < part.positiveRailVolts)
+      .safeParse(candidate);
+    if (!parsed.success) { return `${label}の負側電源は正側電源より低くしてください。`; }
   }
   return null;
 }
 
+function coordinateSchema(description: string) {
+  const error = `${description}は±${MAX_CIRCUIT_DOCUMENT_COORDINATE}セル以内で指定してください。`;
+  return z.number({ error: `${description}は有限な数値で指定してください。` })
+    .min(-MAX_CIRCUIT_DOCUMENT_COORDINATE, { error })
+    .max(MAX_CIRCUIT_DOCUMENT_COORDINATE, { error });
+}
+
 function validatePartShape(candidate: Record<string, unknown>, label: string): string | null {
-  if (typeof candidate.kind !== "string" || !knownKinds.has(candidate.kind)) {
-    return `${label}の種類が不明です。`;
+  const parsed = z.object({
+    kind: simulationPartKindSchema,
+    x: coordinateSchema(`${label}の x 座標`),
+    y: coordinateSchema(`${label}の y 座標`),
+    label: z.string({ error: `${label}のラベルは文字列で指定してください。` }),
+    rotation: rotationSchema.optional(),
+  }).safeParse(candidate);
+  if (!parsed.success) {
+    const issue = parsed.error.issues[0]!;
+    if (issue.path[0] === "kind") { return `${label}の種類が不明です。`; }
+    if (issue.path[0] === "rotation") { return `${label}の回転角度は0、90、180、270のいずれかで指定してください。`; }
+    return issue.message;
   }
-  if (typeof candidate.x !== "number" || !Number.isFinite(candidate.x)) {
-    return `${label}の x 座標は有限な数値で指定してください。`;
-  }
-  if (Math.abs(candidate.x) > MAX_CIRCUIT_DOCUMENT_COORDINATE) {
-    return `${label}の x 座標は±${MAX_CIRCUIT_DOCUMENT_COORDINATE}セル以内で指定してください。`;
-  }
-  if (typeof candidate.y !== "number" || !Number.isFinite(candidate.y)) {
-    return `${label}の y 座標は有限な数値で指定してください。`;
-  }
-  if (Math.abs(candidate.y) > MAX_CIRCUIT_DOCUMENT_COORDINATE) {
-    return `${label}の y 座標は±${MAX_CIRCUIT_DOCUMENT_COORDINATE}セル以内で指定してください。`;
-  }
-  const labelIssue = checkString(candidate.label, `${label}のラベル`, true);
-  if (labelIssue) { return labelIssue; }
-  if (candidate.rotation !== undefined &&
-    (typeof candidate.rotation !== "number" || !rotations.includes(candidate.rotation as CircuitRotation))) {
-    return `${label}の回転角度は0、90、180、270のいずれかで指定してください。`;
-  }
-  return validateOptionalPartValues(candidate, candidate.kind as CircuitPartKind, label);
+  return validateOptionalPartValues(candidate, parsed.data.kind, label);
 }
 
 function normalizePart(
@@ -190,13 +193,13 @@ function normalizePart(
 }
 
 function normalizeParts(value: unknown): { parts?: CircuitPart[]; reason?: string } {
-  if (!Array.isArray(value)) { return { reason: "部品一覧は配列で指定してください。" }; }
-  if (value.length > MAX_CIRCUIT_DOCUMENT_PARTS) {
-    return { reason: `部品数は${MAX_CIRCUIT_DOCUMENT_PARTS}個以下にしてください。` };
-  }
+  const parsed = z.array(z.unknown(), { error: "部品一覧は配列で指定してください。" })
+    .max(MAX_CIRCUIT_DOCUMENT_PARTS, { error: `部品数は${MAX_CIRCUIT_DOCUMENT_PARTS}個以下にしてください。` })
+    .safeParse(value);
+  if (!parsed.success) { return { reason: parsed.error.issues[0]!.message }; }
   const ids = new Set<string>();
   const parts: CircuitPart[] = [];
-  for (const [index, candidate] of value.entries()) {
+  for (const [index, candidate] of parsed.data.entries()) {
     const result = normalizePart(candidate, index, ids);
     if (result.reason) { return { reason: result.reason }; }
     if (result.part) { parts.push(result.part); }
@@ -206,26 +209,20 @@ function normalizeParts(value: unknown): { parts?: CircuitPart[]; reason?: strin
 
 function normalizeWireWaypoints(value: unknown, label: string): { waypoints?: { x: number; y: number }[]; reason?: string } {
   if (value === undefined) { return {}; }
-  if (!Array.isArray(value)) { return { reason: `${label}の経由点は配列で指定してください。` }; }
-  if (value.length > MAX_CIRCUIT_DOCUMENT_WIRE_WAYPOINTS) {
-    return { reason: `${label}の経由点は${MAX_CIRCUIT_DOCUMENT_WIRE_WAYPOINTS}個以下にしてください。` };
-  }
+  const parsed = z.array(z.unknown(), { error: `${label}の経由点は配列で指定してください。` })
+    .max(MAX_CIRCUIT_DOCUMENT_WIRE_WAYPOINTS, { error: `${label}の経由点は${MAX_CIRCUIT_DOCUMENT_WIRE_WAYPOINTS}個以下にしてください。` })
+    .safeParse(value);
+  if (!parsed.success) { return { reason: parsed.error.issues[0]!.message }; }
   const waypoints: { x: number; y: number }[] = [];
-  for (const [index, candidate] of value.entries()) {
+  for (const [index, candidate] of parsed.data.entries()) {
     const waypointLabel = `${label}の経由点${index + 1}`;
     if (!isRecord(candidate)) { return { reason: `${waypointLabel}の形式が正しくありません。` }; }
-    const point: { x: number; y: number } = { x: 0, y: 0 };
-    for (const axis of ["x", "y"] as const) {
-      const coordinate = candidate[axis];
-      if (typeof coordinate !== "number" || !Number.isFinite(coordinate)) {
-        return { reason: `${waypointLabel}の${axis}座標は有限な数値で指定してください。` };
-      }
-      if (Math.abs(coordinate) > MAX_CIRCUIT_DOCUMENT_COORDINATE) {
-        return { reason: `${waypointLabel}の${axis}座標は±${MAX_CIRCUIT_DOCUMENT_COORDINATE}セル以内で指定してください。` };
-      }
-      point[axis] = coordinate;
-    }
-    waypoints.push(point);
+    const point = z.object({
+      x: coordinateSchema(`${waypointLabel}のx座標`),
+      y: coordinateSchema(`${waypointLabel}のy座標`),
+    }).safeParse(candidate);
+    if (!point.success) { return { reason: point.error.issues[0]!.message }; }
+    waypoints.push(point.data);
   }
   return waypoints.length > 0 ? { waypoints } : {};
 }
@@ -269,15 +266,15 @@ function normalizeWire(
 }
 
 function normalizeWires(value: unknown, parts: readonly CircuitPart[]): { wires?: CircuitWire[]; reason?: string } {
-  if (!Array.isArray(value)) { return { reason: "導線一覧は配列で指定してください。" }; }
-  if (value.length > MAX_CIRCUIT_DOCUMENT_WIRES) {
-    return { reason: `導線数は${MAX_CIRCUIT_DOCUMENT_WIRES}本以下にしてください。` };
-  }
+  const parsed = z.array(z.unknown(), { error: "導線一覧は配列で指定してください。" })
+    .max(MAX_CIRCUIT_DOCUMENT_WIRES, { error: `導線数は${MAX_CIRCUIT_DOCUMENT_WIRES}本以下にしてください。` })
+    .safeParse(value);
+  if (!parsed.success) { return { reason: parsed.error.issues[0]!.message }; }
   const partsById = new Map(parts.map((part) => [part.id, part]));
   const ids = new Set<string>();
   const seenWireKeys = new Set<string>();
   const wires: CircuitWire[] = [];
-  for (const [index, candidate] of value.entries()) {
+  for (const [index, candidate] of parsed.data.entries()) {
     const result = normalizeWire(candidate, index, partsById, ids, seenWireKeys);
     if (result.reason) { return { reason: result.reason }; }
     if (result.wire) { wires.push(result.wire); }
@@ -318,17 +315,15 @@ export function serializeCircuitDocument(document: CircuitDocument): string {
 export function parseCircuitDocument(
   json: string,
 ): { ok: true; document: CircuitDocument } | { ok: false; reason: string } {
-  if (typeof json !== "string") { return { ok: false, reason: "JSONデータは文字列で指定してください。" }; }
-  if (json.length > MAX_CIRCUIT_DOCUMENT_JSON_LENGTH) {
-    return {
-      ok: false,
-      reason: `読み込みデータは${MAX_CIRCUIT_DOCUMENT_JSON_LENGTH}文字以下にしてください。`,
-    };
-  }
+  const text = z.string({ error: "JSONデータは文字列で指定してください。" })
+    // The public limit counts UTF-16 units; Zod's string limits count code points.
+    .refine((value) => value.length <= MAX_CIRCUIT_DOCUMENT_JSON_LENGTH, { error: `読み込みデータは${MAX_CIRCUIT_DOCUMENT_JSON_LENGTH}文字以下にしてください。` })
+    .safeParse(json);
+  if (!text.success) { return { ok: false, reason: text.error.issues[0]!.message }; }
 
   let parsed: unknown;
   try {
-    parsed = JSON.parse(json) as unknown;
+    parsed = JSON.parse(text.data) as unknown;
   } catch {
     return { ok: false, reason: "JSONの形式が正しくありません。" };
   }
@@ -336,10 +331,10 @@ export function parseCircuitDocument(
 
   let documentValue: unknown = parsed;
   if ("format" in parsed) {
-    if (parsed.format !== DOCUMENT_FORMAT) {
+    if (!z.literal(DOCUMENT_FORMAT).safeParse(parsed.format).success) {
       return { ok: false, reason: "回路ファイルの形式が対応していません。" };
     }
-    if (parsed.version !== DOCUMENT_VERSION) {
+    if (!z.literal(DOCUMENT_VERSION).safeParse(parsed.version).success) {
       return { ok: false, reason: `回路ファイルのバージョン${DOCUMENT_VERSION}に対応しています。` };
     }
     if (!("document" in parsed)) {

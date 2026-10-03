@@ -38,7 +38,7 @@ const malformedDocuments: [string, unknown][] = [
   ] }],
 ];
 
-const publicAnalyzers: [string, (document: unknown) => { status: string }][] = [
+const publicAnalyzers: [string, (document: unknown) => { status: string; message: string }][] = [
   ["analyzeCircuit", (document) => analyzeCircuit(document as CircuitDocument)],
   ["analyzeAnalogCircuit", (document) => analyzeAnalogCircuit(document as CircuitDocument, { mode: "ac" })],
   ["solveAnalogStep", (document) => solveAnalogStep(document as CircuitDocument, { mode: "ac" })],
@@ -47,6 +47,21 @@ const publicAnalyzers: [string, (document: unknown) => { status: string }][] = [
 ];
 
 describe("simulation API runtime input validation", () => {
+  it.each(publicAnalyzers)("rejects numeric strings and coercible values through %s", (_name, analyze) => {
+    let conversions = 0;
+    const coercible = { valueOf() { conversions += 1; return 10; } };
+    for (const resistanceOhms of ["10", true, false, 10n, [], coercible]) {
+      const document = {
+        ...validDocument,
+        parts: [{ id: "r", kind: "resistor", label: "R", x: 0, y: 0, resistanceOhms }],
+      };
+      const result = analyze(document);
+      expect(result.status).toBe("invalid");
+      expect(result.message).toContain("抵抗値");
+    }
+    expect(conversions).toBe(0);
+  });
+
   it.each(["nmos", "pmos"] as const)("validates explicit null %s channel modulation across DC, AC and transient APIs", (kind) => {
     const sign = kind === "nmos" ? 1 : -1;
     for (const value of [null, Number.NaN, undefined]) {
