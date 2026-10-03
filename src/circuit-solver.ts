@@ -7,6 +7,7 @@ import {
   type CircuitTerminal,
 } from "./circuit-model.js";
 import { analyzeExtendedCircuit } from "./circuit-analog-adapter.js";
+import { bulbOverloadIssue } from "./circuit-power-diagnostics.js";
 import { exactProductSumRatio } from "./analog-math.js";
 import {
   addExactRational,
@@ -111,7 +112,6 @@ const IDEAL_OHMS = 1e-6;
 /** Below this external resistance a battery counts as short-circuited. */
 const SHORT_OHMS = 1e-3;
 const ROUNDING_GUARD = 4 * Number.EPSILON;
-const OVERLOAD_RATIO = 1.5;
 
 interface Conductance {
   a: number;
@@ -3346,15 +3346,14 @@ function connectedTerminals(document: CircuitDocument) {
   return connected;
 }
 
-function bulbIsOverloaded(part: CircuitPart, reading: CircuitPartReading) {
+function bulbOverloadWarning(part: CircuitPart, reading: CircuitPartReading) {
   const voltage = restoredComplex(reading.exactVoltage);
   const current = restoredComplex(reading.exactTerminalCurrents?.a);
-  const excess = exactProductSumRatio([
+  const power = exactProductSumRatio([
     { factors: [voltage ? exactComplexValue(voltage)?.real ?? reading.voltageVolts : reading.voltageVolts,
       current ? exactComplexValue(current)?.real ?? reading.currentAmps : reading.currentAmps] },
-    { factors: [part.ratedPowerWatts ?? 2, OVERLOAD_RATIO], sign: -1 },
   ], 1);
-  return excess !== null && excess.numerator > 0n;
+  return power === null ? undefined : bulbOverloadIssue(part, power);
 }
 
 /** Warnings that do not stop the calculation but deserve the author's attention. */
@@ -3363,16 +3362,9 @@ function collectIssues(document: CircuitDocument, parts: Record<string, CircuitP
   const connected = connectedTerminals(document);
   for (const part of document.parts) {
     const reading = parts[part.id];
-    if (
-      part.kind === "bulb" &&
-      reading &&
-      bulbIsOverloaded(part, reading)
-    ) {
-      issues.push({
-        severity: "warning",
-        partId: part.id,
-        message: `${part.label}に定格の${OVERLOAD_RATIO}倍を超える電力がかかっています。`,
-      });
+    if (part.kind === "bulb" && reading) {
+      const warning = bulbOverloadWarning(part, reading);
+      if (warning) { issues.push(warning); }
     }
     if (part.kind === "voltmeter" || part.kind === "ammeter") { continue; }
     const loose = terminalsOf(part.kind).filter(

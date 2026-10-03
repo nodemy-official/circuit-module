@@ -1072,6 +1072,31 @@ function idealVoltageConstraintOrder(
     hasTransientSourceVoltage(constraints?.get(branch.partId)) ? 1 : 0;
 }
 
+function compareAcVoltageConstraints(left: Branch, right: Branch, partById: ReadonlyMap<string, CircuitPart>) {
+  // Axis/diagonal waveforms have exact normalized coefficients. Prefer them
+  // to independent trigonometric approximations of an equivalent source
+  // loop. Order the remaining waveforms by their physical parameters so
+  // neither rearranging nor renaming parts changes the rounded basis.
+  const exactPhase = (branch: Branch) => (partById.get(branch.partId)!.phaseDegrees ?? 0) % 45 === 0;
+  const phaseOrder = Number(exactPhase(right)) - Number(exactPhase(left));
+  if (phaseOrder !== 0) { return phaseOrder; }
+  const leftPart = partById.get(left.partId)!;
+  const rightPart = partById.get(right.partId)!;
+  const normalizedPhase = (part: CircuitPart) => {
+    const phase = (part.phaseDegrees ?? 0) % 360;
+    return phase < 0 ? phase + 360 : phase;
+  };
+  const values = (part: CircuitPart) => [normalizedPhase(part), part.phaseDegrees ?? 0,
+    part.frequencyHz ?? 0, part.voltageVolts ?? 0, part.offsetVolts ?? 0, part.internalResistanceOhms ?? 0];
+  const leftValues = values(leftPart);
+  const rightValues = values(rightPart);
+  for (let index = 0; index < leftValues.length; index += 1) {
+    if (leftValues[index]! < rightValues[index]!) { return -1; }
+    if (leftValues[index]! > rightValues[index]!) { return 1; }
+  }
+  return left.partId < right.partId ? -1 : left.partId > right.partId ? 1 : 0;
+}
+
 function markRedundantIdealVoltageCycles(
   document: CircuitDocument,
   branches: Branch[],
@@ -1090,9 +1115,13 @@ function markRedundantIdealVoltageCycles(
   // on an ideal meter/switch, or displace an exact battery constraint.
   // Capacitors remain last so shared source loops do not duplicate their
   // derivative equations and leave source currents underdetermined.
-  const orderedBranches = branches.toSorted((left, right) =>
-    idealVoltageConstraintOrder(left, mode, partById, initialVoltageConstraints) -
-    idealVoltageConstraintOrder(right, mode, partById, initialVoltageConstraints));
+  const orderedBranches = branches.toSorted((left, right) => {
+    const leftOrder = idealVoltageConstraintOrder(left, mode, partById, initialVoltageConstraints);
+    const rightOrder = idealVoltageConstraintOrder(right, mode, partById, initialVoltageConstraints);
+    const order = leftOrder - rightOrder;
+    return order || (leftOrder === 1 && left.kind === "ac-source" && right.kind === "ac-source"
+      ? compareAcVoltageConstraints(left, right, partById) : 0);
+  });
   for (const branch of orderedBranches) {
     if (!isIdealVoltageConstraint(branch)) { continue; }
     if (branch.positiveNode === branch.negativeNode) { continue; }
@@ -3481,6 +3510,101 @@ function floorLimitedDcQuality(document: CircuitDocument, layout: MnaLayout, sta
   return quality;
 }
 
+function dcPolishTarget(layout: MnaLayout, state: Float64Array, matrix: Float64Array,
+  rhs: readonly ExactRational[] | null, allowFreeCoordinates: boolean) {
+  if (!rhs) { return null; }
+  return solveLinearTargetState(layout.size, matrix, rhs) ??
+    (allowFreeCoordinates ? constrainedDcPolishTarget(layout, state, matrix, rhs) : null);
+}
+
+function constrainedDcPolishTarget(layout: MnaLayout, state: Float64Array, matrix: Float64Array, rhs: readonly ExactRational[]) {
+  const rows = Array.from({ length: layout.size }, () => new Map<number, ExactRational>());
+  const correctionRhs: ExactRational[] = [];
+  for (let row = 0; row < layout.size; row += 1) {
+    const terms: Array<{ factors: ResidualTerm[]; sign?: 1 | -1 }> = [{ factors: [rhs[row]!] }];
+    for (let column = 0; column < layout.size; column += 1) {
+      const coefficient = exactRealStateValue(matrix, row * layout.size + column)!;
+      if (coefficient.numerator === 0n) { continue; }
+      rows[row]!.set(column, coefficient);
+      terms.push({ factors: [coefficient, exactStateValue(state, column)], sign: -1 });
+    }
+    const value = exactProductSumRatio(terms, 1);
+    if (!value) { return null; }
+    correctionRhs.push(value);
+  }
+  // A balanced flat MOS island has a free voltage. Solve for corrections,
+  // leaving free coordinates unchanged, rather than assigning them zero.
+  const correction = solveExactRealLinearConstraints(layout.size, rows, correctionRhs);
+  if (!correction) { return null; }
+  const target = cloneRealState(state);
+  for (const [index, value] of correction.entries()) { addRealStateValue(target, index, value); }
+  return target;
+}
+
+function flatMosInteriorShift(part: CircuitPart, layout: MnaLayout, state: Float64Array,
+  assembly: DcAssembly, parents: number[], anchored: ReadonlySet<number>) {
+  if (part.kind !== "nmos" && part.kind !== "pmos") { return null; }
+  const sign = part.kind === "nmos" ? 1 : -1;
+  const voltages = nonlinearTerminalVoltages(part, layout, state);
+  const reverse = exactProductSumRatio([{ factors: [sign, voltages[0]!] }, { factors: [sign, voltages[2]!], sign: -1 }], 1)!.numerator < 0n;
+  const drainTerminal = reverse ? "c" : "a";
+  const drainIndex = reverse ? 2 : 0;
+  const sourceIndex = reverse ? 0 : 2;
+  const node = nodeForTerminal(layout.topology, part, drainTerminal);
+  const unknown = layout.topology.nodeUnknowns[node] ?? -1;
+  const residual = assembly.exactResidual?.[unknown];
+  if (!residual || residual.numerator * BigInt(sign) <= 0n ||
+    anchored.has(findRoot(parents, node))) { return null; }
+  const overdrive = exactProductSumRatio([{ factors: [sign, voltages[1]!] },
+    { factors: [sign, voltages[sourceIndex]!], sign: -1 }, { factors: [part.thresholdVolts ?? 2], sign: -1 }], 1)!;
+  if (overdrive.numerator <= 0n) { return null; }
+  const vds = exactProductSumRatio([{ factors: [sign, voltages[drainIndex]!] },
+    { factors: [sign, voltages[sourceIndex]!], sign: -1 }], 1)!;
+  if (subtractExactRational(vds, overdrive).numerator < 0n) { return null; }
+  const interior = exactProductSumRatio([{ factors: [voltages[sourceIndex]!] }, { factors: [sign, 0.5, overdrive] }], 1)!;
+  const shift = subtractExactRational(interior, residualTermDifference(voltages[drainIndex]!, 0));
+  return { shift, root: findRoot(parents, node) };
+}
+
+function flatMosInteriorState(document: CircuitDocument, layout: MnaLayout, state: Float64Array, assembly: DcAssembly) {
+  const parents = Array.from({ length: layout.topology.nodeCount }, (_, node) => node);
+  for (const branch of [...layout.branches, ...layout.internalBranches]) {
+    if (isIdealVoltageConstraint(branch)) { joinConductiveNodes(parents, branch.positiveNode, branch.negativeNode); }
+  }
+  const anchored = new Set([findRoot(parents, layout.topology.referenceNode)]);
+  for (const reference of referenceConstraints(document, layout, "dc", mosChannelConductingByPartId(document, layout, state))) {
+    if (reference.derivatives.length === 0) { anchored.add(findRoot(parents, reference.node)); }
+  }
+  for (const part of document.parts) {
+    const move = flatMosInteriorShift(part, layout, state, assembly, parents, anchored);
+    if (!move) { continue; }
+    const candidate = cloneRealState(state);
+    for (let other = 0; other < parents.length; other += 1) {
+      const otherUnknown = layout.topology.nodeUnknowns[other] ?? -1;
+      if (otherUnknown >= 0 && findRoot(parents, other) === move.root) { addRealStateValue(candidate, otherUnknown, move.shift); }
+    }
+    return candidate;
+  }
+  return null;
+}
+
+function acceptedDcPolishTarget(document: CircuitDocument, layout: MnaLayout, state: Float64Array,
+  assembly: DcAssembly, tolerances: ExactRational[], score: number, floorQuality: number, hasMosChannels: boolean) {
+  const rhs = absoluteDcRhs(document, layout, state, mosChannelConductingByPartId(document, layout, state));
+  const target = dcPolishTarget(layout, state, assembly.matrix, rhs, hasMosChannels);
+  if (!target) { return null; }
+  const candidateAssembly = assembleDc(document, layout, target, true, mosChannelConductingByPartId(document, layout, state));
+  const candidateScore = residualScore(layout, candidateAssembly, tolerances);
+  // A separate exponential junction can have irreducible binary64 noise.
+  // Its maximum residual need not decrease while a weak MOS output keeps
+  // approaching its unique voltage. Keep full Newton targets inside the
+  // existing converged tolerance, and stop when the controls stabilize.
+  const acceptsTarget = !hasNonzeroExactResidual(candidateAssembly) || candidateScore < score ||
+    (hasMosChannels && candidateScore <= 1) ||
+    (floorQuality > 1e-12 && candidateScore <= 1 && floorLimitedDcQuality(document, layout, target) < floorQuality);
+  return acceptsTarget ? { target, score: candidateScore } : null;
+}
+
 function polishConvergedDcState(
   document: CircuitDocument,
   layout: MnaLayout,
@@ -3491,35 +3615,37 @@ function polishConvergedDcState(
   if (!hasNonlinearParts(document, layout)) { return state; }
   let polished = state;
   let polishedScore = score;
-  const flatMos = document.parts.some((part) =>
-    (part.kind === "nmos" || part.kind === "pmos") && part.channelLengthModulation === 0);
+  const hasMosChannels = document.parts.some((part) =>
+    part.kind === "nmos" || part.kind === "pmos");
   for (let iteration = 0; iteration < MAX_NEWTON_ITERATIONS; iteration += 1) {
     // Use actual terminal currents for the extra polish, independent of the
     // coordinate-sensitive Jacobian scale. An unrelated high-common-mode
     // circuit must not hide a subnormal junction's remaining KCL error.
     const floorQuality = floorLimitedDcQuality(document, layout, polished);
-    // Near a flat MOS knee, a tiny current residual can still hide a large
-    // voltage error, both at a DC operating point and during initialization.
-    if (iteration >= 3 && floorQuality <= 1e-12 && !flatMos) { break; }
+    // A small positive output slope can hide a large voltage error just as
+    // a flat MOS knee does. Continue improving the physical equations until
+    // the controls stabilize instead of stopping after three corrections.
+    if (iteration >= 3 && floorQuality <= 1e-12 && !hasMosChannels) { break; }
     const channelConducting = mosChannelConductingByPartId(document, layout, polished);
     const assembly = assembleDc(document, layout, polished, true, channelConducting);
-    const rhs = absoluteDcRhs(document, layout, polished, channelConducting);
-    const target = rhs ? solveLinearTargetState(layout.size, assembly.matrix, rhs) : null;
-    if (!target) { break; }
-    const candidateAssembly = assembleDc(document, layout, target, true, channelConducting);
-    const candidateScore = residualScore(layout, candidateAssembly, tolerances);
-    // A normalized score may underflow to zero even though an exact residual
-    // remains. Prefer an exactly balanced target instead of preserving a
-    // spurious subnormal voltage amplified by a large circulating current.
-    const improves = !hasNonzeroExactResidual(candidateAssembly) || candidateScore < polishedScore ||
-      (floorQuality > 1e-12 && candidateScore <= 1 && floorLimitedDcQuality(document, layout, target) < floorQuality);
-    if (!improves) { break; }
+    const candidate = acceptedDcPolishTarget(document, layout, polished, assembly, tolerances, polishedScore, floorQuality, hasMosChannels);
+    if (!candidate) {
+      // Unequal saturation currents can hide a large voltage error even
+      // with a tiny positive output slope. Re-enter the triode region in
+      // the residual's direction, then solve only the original model.
+      const interior = flatMosInteriorState(document, layout, polished, assembly);
+      if (!interior) { break; }
+      polished = interior;
+      polishedScore = residualScore(layout, assembleDc(document, layout, polished, true), tolerances);
+      continue;
+    }
+    const { target } = candidate;
     const centersUnchanged = nonlinearCentersMatch(
       nonlinearCenters(document, layout, polished),
       nonlinearCenters(document, layout, target),
     );
     polished = target;
-    polishedScore = candidateScore;
+    polishedScore = candidate.score;
     if (centersUnchanged) { break; }
   }
   return polished;

@@ -12,8 +12,52 @@ import {
   type CircuitConnectivityGraph,
 } from "./circuit-connectivity.js";
 import { SimulationSnapshotContext, snapshotSimulationRecord, validatedSimulationDocument } from "./simulation-input.js";
-import type { CircuitAnalysis, CircuitAnalysisOptions, CircuitPartReading } from "./circuit-solver.js";
+import type { CircuitAnalysis, CircuitAnalysisOptions, CircuitIssue, CircuitPartReading } from "./circuit-solver.js";
 import { readingPrecision, terminalVoltageDifferences } from "./circuit-reading.js";
+import { bulbOverloadIssue } from "./circuit-power-diagnostics.js";
+
+function shortedDcBattery(document: CircuitDocument, switchStates: Record<string, boolean>, readings: Record<string, AnalogCircuitPartReading>) {
+  const graph = createCircuitConnectivityGraph(document);
+  for (const part of document.parts) {
+    if (part.kind === "ammeter" || (part.kind === "switch" && switchClosedState(part, switchStates)) ||
+        part.kind === "inductor") {
+      joinCircuitPartTerminals(graph, part.id, ["a", "b"]);
+    }
+    if (part.kind === "potentiometer") {
+      const position = part.wiperPosition ?? circuitPartCatalog.potentiometer.defaults.wiperPosition ?? 0.5;
+      if (position === 0) { joinCircuitPartTerminals(graph, part.id, ["a", "c"]); }
+      if (position === 1) { joinCircuitPartTerminals(graph, part.id, ["b", "c"]); }
+    }
+  }
+  return document.parts.find((part) => {
+    if (part.kind !== "battery") { return false; }
+    const reading = readings[part.id];
+    const current = reading && exactComplexValue(reading.current);
+    return current !== null && current !== undefined && current.real.numerator !== 0n && circuitEndpointsConnected(
+      graph, graph.endpointKey(part.id, "a"), graph.endpointKey(part.id, "b"),
+    );
+  });
+}
+
+function extendedAnalysisMessage(status: CircuitAnalysis["status"], analogMessage: string, shorted?: CircuitPart) {
+  if (shorted) { return `${shorted.label}が短絡しています。抵抗か電球を直列に入れてください。`; }
+  return status === "open"
+    ? "回路が開いているため電流は流れていません。導線とスイッチを確認してください。"
+    : analogMessage;
+}
+
+function extendedAnalysisIssues(document: CircuitDocument, readings: Record<string, AnalogCircuitPartReading>,
+  analogIssues: readonly CircuitIssue[], message: string, shorted?: CircuitPart) {
+  const issues = [...analogIssues];
+  if (shorted) { issues.unshift({ severity: "error", partId: shorted.id, message }); }
+  for (const part of document.parts) {
+    if (part.kind !== "bulb" || !Object.hasOwn(readings, part.id)) { continue; }
+    const power = exactComplexValue(readings[part.id]!.power);
+    const warning = power && bulbOverloadIssue(part, power.real);
+    if (warning) { issues.push(warning); }
+  }
+  return issues;
+}
 
 const sourceKinds = new Set(["battery", "ac-source", "current-source"]);
 const directlyConductiveKinds = new Set<CircuitPart["kind"]>([
@@ -311,10 +355,9 @@ function analyzeExtendedCircuitFromInput(
     };
   }
   const sources = document.parts.filter((part) => sourceKinds.has(part.kind));
-  const status = analysisStatus(document, analog.status, sources, mode, frequencyHz, switchStates, parts, analog.parts);
-  const message = status === "open"
-    ? "回路が開いているため電流は流れていません。導線とスイッチを確認してください。"
-    : analog.message;
+  const shorted = analog.status === "valid" && mode === "dc" ? shortedDcBattery(document, switchStates, analog.parts) : undefined;
+  const status = shorted ? "short" : analysisStatus(document, analog.status, sources, mode, frequencyHz, switchStates, parts, analog.parts);
+  const message = extendedAnalysisMessage(status, analog.message, shorted);
   const currentAmps = analog.status === "valid" && sources.length === 1 && !document.parts.some((part) => part.kind === "op-amp")
     ? Math.abs(parts[sources[0].id]?.currentAmps ?? 0) : null;
   return {
@@ -329,7 +372,7 @@ function analyzeExtendedCircuitFromInput(
       .map((part) => [part.id, parts[part.id]!.powerWatts])),
     // Ideal wires can form loops with indeterminate branch currents; do not invent flow directions.
     wireCurrents: {},
-    issues: analog.issues,
+    issues: extendedAnalysisIssues(document, analog.parts, analog.issues, message, shorted),
   };
 }
 
