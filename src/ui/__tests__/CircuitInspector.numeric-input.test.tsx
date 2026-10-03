@@ -3,6 +3,9 @@ import { act, useState, type Dispatch, type SetStateAction } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { circuitPartCatalog, type CircuitPart, type CircuitPartNumericKey } from "../../circuit-model.js";
+import { analyzeAnalogCircuit } from "../../analog-solver.js";
+import { analyzeCircuit } from "../../circuit-solver.js";
+import { createCircuitFromSpecs } from "../../__tests__/helpers/circuit-fixture.js";
 import { CircuitInspector } from "../CircuitInspector.js";
 
 const mounted: Array<{ root: Root; container: HTMLElement }> = [];
@@ -31,6 +34,7 @@ function mount(kind: CircuitPart["kind"]) {
   act(() => root.render(<Harness />));
   mounted.push({ root, container });
   return {
+    container,
     get part() { return latest; },
     field(key: CircuitPartNumericKey) {
       const input = container.querySelector<HTMLInputElement>(`input[data-field="${key}"]`);
@@ -56,6 +60,55 @@ function inputValue(input: HTMLInputElement, value: string) {
 }
 
 describe("Inspector numeric drafts", () => {
+  it("shows the analyzed default switch state instead of a phantom Proxy value", () => {
+    const document = createCircuitFromSpecs([
+      ["source", "battery", ["s", "0"], { voltageVolts: 9 }],
+      ["load", "resistor", ["s", "return"], { resistanceOhms: 100 }],
+      ["switch", "switch", ["return", "0"]],
+    ], "Inspector and solver switch agreement");
+    const part = document.parts[2]!;
+    Reflect.deleteProperty(part, "initiallyClosed");
+    const proxy = new Proxy(part, {
+      get(target, key, receiver) {
+        return key === "initiallyClosed" ? false : Reflect.get(target, key, receiver);
+      },
+    });
+    document.parts[2] = proxy;
+    const analysis = analyzeCircuit(document);
+    const ui = mount("switch");
+    ui.replace(proxy);
+
+    expect(analysis.status, analysis.message).toBe("closed");
+    expect(analysis.parts.switch!.switchClosed).toBe(true);
+    expect(ui.container.querySelector<HTMLInputElement>('input[role="switch"]')!.checked).toBe(true);
+    expect(ui.container.querySelector('input[role="switch"]')!.getAttribute("aria-checked")).toBe("true");
+  });
+
+  it.each([undefined, 100])("shows the analyzed own resistance or its default instead of a Proxy get value (%s)", (resistanceOhms) => {
+    const document = createCircuitFromSpecs([
+      ["source", "battery", ["s", "0"], { voltageVolts: 9 }],
+      ["load", "resistor", ["s", "0"]],
+      ["ground", "ground", ["0"]],
+    ], "Inspector and solver resistance agreement");
+    const part = document.parts[1]!;
+    if (resistanceOhms === undefined) { Reflect.deleteProperty(part, "resistanceOhms"); }
+    else { Object.defineProperty(part, "resistanceOhms", { value: resistanceOhms, enumerable: false }); }
+    const proxy = new Proxy(part, {
+      get(target, key, receiver) {
+        return key === "resistanceOhms" && resistanceOhms === undefined ? 1000 : Reflect.get(target, key, receiver);
+      },
+    });
+    document.parts[1] = proxy;
+    const analysis = analyzeAnalogCircuit(document);
+    const ui = mount("resistor");
+    ui.replace(proxy);
+
+    expect(analysis.status).toBe("valid");
+    const expected = resistanceOhms ?? 10;
+    expect(analysis.parts.load!.current.real).toBe(9 / expected);
+    expect(ui.field("resistanceOhms").value).toBe(String(expected));
+  });
+
   it.each([
     ["ac-source", "offsetVolts"],
     ["capacitor", "initialVoltageVolts"],

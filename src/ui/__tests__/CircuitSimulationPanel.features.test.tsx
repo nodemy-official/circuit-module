@@ -7,6 +7,8 @@ import { createCircuitExample } from "../../circuit-examples.js";
 import type { CircuitDocument } from "../../circuit-model.js";
 import { analyzeCircuit, type CircuitAnalysisOptions } from "../../circuit-solver.js";
 import { CircuitSimulationPanel, type CircuitSimulationPanelProps } from "../CircuitSimulationPanel.js";
+import { CircuitAcPanel } from "../CircuitAcPanel.js";
+import { createCircuitFromSpecs } from "../../__tests__/helpers/circuit-fixture.js";
 
 const mounted: Array<{ root: Root; container: HTMLElement }> = [];
 
@@ -47,6 +49,109 @@ function panelProps(
 }
 
 describe("CircuitSimulationPanel learning feature visibility", () => {
+  it("keeps standalone AC tools active when a Proxy supplies an absent mode", () => {
+    const document = createCircuitExample("ac");
+    const options = new Proxy<CircuitAnalysisOptions>({}, {
+      get(target, key, receiver) {
+        return key === "mode" ? "dc" : Reflect.get(target, key, receiver);
+      },
+    });
+    const analysis = analyzeCircuit(document, {}, options);
+    const { container } = mount(<CircuitAcPanel document={document} analysis={analysis} options={options} />);
+
+    expect(analysis.mode).toBe("ac");
+    expect(container.querySelector('[data-analysis-frequency="1000"]')).not.toBeNull();
+  });
+
+  it("preserves an analyzed open switch when a Proxy supplies an absent initial state", () => {
+    const document = createCircuitFromSpecs([
+      ["source", "battery", ["s", "0"], { voltageVolts: 9 }],
+      ["load", "resistor", ["s", "return"], { resistanceOhms: 100 }],
+      ["switch", "switch", ["return", "0"]],
+    ], "Steady-state and transient switch agreement");
+    const part = document.parts[2]!;
+    Reflect.deleteProperty(part, "initiallyClosed");
+    document.parts[2] = new Proxy(part, {
+      get(target, key, receiver) {
+        return key === "initiallyClosed" ? false : Reflect.get(target, key, receiver);
+      },
+    });
+    const analysis = analyzeCircuit(document, { switch: false });
+    const onFrameChange = vi.fn();
+    const props = panelProps(document, { mode: "dc" }, { analysis, onFrameChange });
+    const { container } = mount(<CircuitSimulationPanel {...props} />);
+    const button = Array.from(container.querySelectorAll("button")).find((item) => item.textContent === "波形を計算")!;
+    act(() => button.click());
+
+    expect(analysis.parts.switch!.switchClosed).toBe(false);
+    expect(analysis.parts.load!.currentAmps).toBe(0);
+    const frame = onFrameChange.mock.calls.at(-1)![0];
+    expect(frame.analysis.status).toBe("valid");
+    for (const sample of frame.analysis.samples) {
+      expect(sample.parts.switch.switchClosed).toBe(false);
+      expect(sample.parts.load.currentAmps).toBe(0);
+    }
+  });
+
+  it("preserves a non-enumerable analysis frequency when the mode changes", () => {
+    const document = createCircuitExample("ac");
+    const options: CircuitAnalysisOptions = { mode: "ac" };
+    Object.defineProperty(options, "frequencyHz", { value: 2000, enumerable: false });
+    const onChange = vi.fn();
+    const props = panelProps(document, options, { onChange, showLearningPanels: false });
+    const { container } = mount(<CircuitSimulationPanel {...props} />);
+    const select = container.querySelector("select")!;
+    act(() => {
+      select.value = "auto";
+      select.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+
+    const nextOptions = onChange.mock.calls.at(-1)![0] as CircuitAnalysisOptions;
+    expect(nextOptions).toEqual({ mode: "auto", frequencyHz: 2000 });
+    const nextAnalysis = analyzeCircuit(document, {}, nextOptions);
+    expect(nextAnalysis.frequencyHz).toBe(2000);
+    expect(nextAnalysis.parts.load!.currentAmps).toBe(props.analysis.parts.load!.currentAmps);
+    expect(Object.getOwnPropertyDescriptor(options, "frequencyHz")?.enumerable).toBe(false);
+  });
+
+  it("ignores a phantom Proxy frequency just as the analysis does", () => {
+    const document = createCircuitExample("ac");
+    const options = new Proxy<CircuitAnalysisOptions>({ mode: "ac" }, {
+      get(target, key, receiver) {
+        if (key === "frequencyHz") { return 2000; }
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    const props = panelProps(document, options, { showLearningPanels: false });
+    const { container } = mount(<CircuitSimulationPanel {...props} />);
+
+    expect(props.analysis.mode).toBe("ac");
+    expect(props.analysis.frequencyHz).toBe(1000);
+    expect(container.querySelector<HTMLSelectElement>("select")!.value).toBe("ac");
+    expect(container.querySelector<HTMLInputElement>('input[type="number"]')!.value).toBe("1000");
+    const ac = mount(<CircuitAcPanel document={document} analysis={props.analysis} options={options} />);
+    expect(ac.container.querySelector('[data-analysis-frequency="1000"]')).not.toBeNull();
+  });
+
+  it("uses the catalog frequency when a source Proxy supplies an absent field", () => {
+    const document = createCircuitExample("ac");
+    const source = document.parts.find((part) => part.kind === "ac-source")!;
+    Reflect.deleteProperty(source, "frequencyHz");
+    document.parts = document.parts.map((part) => part === source ? new Proxy(part, {
+      get(target, key, receiver) {
+        return key === "frequencyHz" ? 2000 : Reflect.get(target, key, receiver);
+      },
+    }) : part);
+    const options: CircuitAnalysisOptions = { mode: "ac" };
+    const props = panelProps(document, options, { showLearningPanels: false });
+    const { container } = mount(<CircuitSimulationPanel {...props} />);
+
+    expect(props.analysis.frequencyHz).toBe(1000);
+    expect(container.querySelector<HTMLInputElement>('input[type="number"]')!.value).toBe("1000");
+    const ac = mount(<CircuitAcPanel document={document} analysis={props.analysis} options={options} />);
+    expect(ac.container.querySelector('[data-analysis-frequency="1000"]')).not.toBeNull();
+  });
+
   it("retains non-enumerable circuit and switch fields while applying the analyzed switch state", () => {
     const document: CircuitDocument = {
       title: "非列挙スイッチの波形",

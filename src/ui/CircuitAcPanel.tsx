@@ -3,7 +3,7 @@ import { frequencyMatches } from "../ac-reactive.js";
 import { circuitPartCatalog, type CircuitDocument, type CircuitPart } from "../circuit-model.js";
 import { analyzeCircuit, type CircuitAnalysis, type CircuitAnalysisOptions, type CircuitPartReading } from "../circuit-solver.js";
 import { formatCircuitNumber } from "../number-format.js";
-import { copySimulationDocument } from "../simulation-input.js";
+import { copySimulationDocument, simulationRecordField } from "../simulation-input.js";
 import { NumericInput } from "./NumericInput.js";
 
 const MIN_SWEEP_POINTS = 3;
@@ -12,7 +12,7 @@ const WAVEFORM_SAMPLES = 96;
 
 function acSourceFrequencyHz(part: CircuitPart): number {
   return part.kind === "ac-source"
-    ? part.frequencyHz ?? circuitPartCatalog["ac-source"].defaults.frequencyHz ?? 1000
+    ? (simulationRecordField(part, "frequencyHz") as number | undefined) ?? circuitPartCatalog["ac-source"].defaults.frequencyHz ?? 1000
     : 0;
 }
 
@@ -313,9 +313,14 @@ function FrequencyResponse({ points, partLabel }: { points: SweepPoint[]; partLa
 }
 
 /** Displays AC phasor waveforms and runs an explicit, bounded logarithmic frequency sweep. */
-export function CircuitAcPanel({ document, analysis, options }: CircuitAcPanelProps) {
+export function CircuitAcPanel({ document, analysis, options: inputOptions }: CircuitAcPanelProps) {
   const id = useId();
-  const sourceFrequency = document.parts.find((part) => part.kind === "ac-source")?.frequencyHz;
+  const options: CircuitAnalysisOptions = {
+    mode: simulationRecordField(inputOptions, "mode") as CircuitAnalysisOptions["mode"],
+    frequencyHz: simulationRecordField(inputOptions, "frequencyHz") as number | undefined,
+  };
+  const source = document.parts.find((part) => part.kind === "ac-source");
+  const sourceFrequency = source ? acSourceFrequencyHz(source) : undefined;
   const requestedFrequencyHz = options.frequencyHz ?? sourceFrequency ?? circuitPartCatalog["ac-source"].defaults.frequencyHz ?? 1000;
   const centerFrequencyHz = analysis.frequencyHz ?? requestedFrequencyHz;
   const [selectedPartId, setSelectedPartId] = useState("");

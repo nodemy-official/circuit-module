@@ -1,6 +1,7 @@
 import { circuitPartCatalog, circuitPartNumericFields, type CircuitPart, type CircuitPartNumericKey, type CircuitWire } from "../circuit-model.js";
 import type { CircuitAnalysis, CircuitPartReading } from "../circuit-solver.js";
 import { formatCircuitNumber } from "../number-format.js";
+import { simulationRecordField } from "../simulation-input.js";
 import { circuitSlot, type CircuitStyleProps } from "./style-props.js";
 import { CircuitIcon } from "./CircuitIcon.js";
 import { measurementLabels } from "./measurement-labels.js";
@@ -216,9 +217,10 @@ function InspectorFields({
   const change = (patch: Partial<CircuitPart>) => onChange?.(part.id, patch);
   const inputId = useId();
   const defaults = circuitPartCatalog[part.kind].defaults;
+  const initiallyClosed = (simulationRecordField(part, "initiallyClosed") as boolean | undefined) ?? defaults.initiallyClosed ?? false;
   const numericFields = circuitPartNumericFields(part.kind);
   const numeric = (key: CircuitPartNumericKey, label: string, unit: string, min?: number, max?: number, step?: number, exclusiveMin?: boolean) => {
-    const value = part[key] ?? defaults[key] ?? 0;
+    const value = (simulationRecordField(part, key) as number | undefined) ?? defaults[key] ?? 0;
     return (
       <label {...circuitSlot("circuit-field", slotProps?.field)} key={key} data-field={key} htmlFor={`${inputId}-${key}`}>
         <span {...circuitSlot("circuit-field__label", slotProps?.fieldLabel)}>{label}</span>
@@ -268,8 +270,8 @@ function InspectorFields({
             type="checkbox"
             role="switch"
             aria-label="スイッチを閉じる"
-            aria-checked={part.initiallyClosed ?? circuitPartCatalog.switch.defaults.initiallyClosed ?? false}
-            checked={part.initiallyClosed ?? circuitPartCatalog.switch.defaults.initiallyClosed ?? false}
+            aria-checked={initiallyClosed}
+            checked={initiallyClosed}
             onChange={(event) => change({ initiallyClosed: event.target.checked })}
             disabled={!onChange}
             data-field="initiallyClosed"

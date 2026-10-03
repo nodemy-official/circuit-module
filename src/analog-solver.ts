@@ -5744,7 +5744,7 @@ function linearBiasKclRow(node: number, layout: MnaLayout, derivative = false) {
     : layout.size * (layout.initialInductorCurrents ? 2 : 1) + (derivative ? 1 : 0);
 }
 
-function stampLinearBiasBranch(branch: Branch, layout: MnaLayout, rows: Map<number, ExactRational>[], rhs: ExactRational[], freeKcl: (node: number) => boolean) {
+function stampLinearBiasBranch(branch: Branch, layout: MnaLayout, rows: Map<number, ExactRational>[], rhs: ExactRational[], freeKcl: (node: number) => boolean, freeDerivativeKcl = freeKcl) {
   const one = numberToExactRational(1)!;
   const size = layout.size;
   const row = branch.unknownIndex;
@@ -5758,7 +5758,7 @@ function stampLinearBiasBranch(branch: Branch, layout: MnaLayout, rows: Map<numb
     if (freeKcl(node)) { addConstraintCoefficient(rows[linearBiasKclRow(node, layout)]!, row, coefficient); }
     if (!layout.initialInductorCurrents) { continue; }
     if (voltage >= 0) { addConstraintCoefficient(rows[size + row]!, size + voltage, coefficient); }
-    if (freeKcl(node)) { addConstraintCoefficient(rows[linearBiasKclRow(node, layout, true)]!, size + row, coefficient); }
+    if (freeDerivativeKcl(node)) { addConstraintCoefficient(rows[linearBiasKclRow(node, layout, true)]!, size + row, coefficient); }
   }
   if (!layout.initialInductorCurrents) { return; }
   if (branch.initialCapacitanceFarads !== undefined) {
@@ -5779,10 +5779,21 @@ function linearMosBiasEquations(document: CircuitDocument, layout: MnaLayout, kn
   const rowCount = count + (layout.initialInductorCurrents ? 2 : 1);
   const rows = Array.from({ length: rowCount }, () => new Map<number, ExactRational>());
   const rhs = Array.from({ length: rowCount }, () => zero);
-  const boundaries = nonlinearBiasBoundaries(document, layout);
+  const derivativeBoundaries = nonlinearBiasBoundaries(document, layout);
+  const zeroJunctions = new Set(document.parts.filter((part) => {
+    const nodes = passiveJunctionNodes(part, layout);
+    return nodes?.every((node) => {
+      const path = idealVoltageConstraintPath(known, node, nodes[0]!);
+      return path && exactComplexValue(path.voltageDifference)!.real.numerator === 0n;
+    });
+  }).map((part) => part.id));
+  const boundaries = nonlinearBiasBoundaries(document, layout, zeroJunctions);
   const unknown = (node: number) => layout.topology.nodeUnknowns[node] ?? -1;
-  const blockedRows = new Set([...boundaries].map(unknown));
+  const blockedRows = new Set([...derivativeBoundaries].map(unknown));
   const freeKcl = (node: number) => !boundaries.has(node);
+  // A proven zero junction drop fixes its current at this instant only.
+  // Its current derivative remains unknown; never differentiate that proof.
+  const freeDerivativeKcl = (node: number) => !derivativeBoundaries.has(node);
   if (layout.initialInductorCurrents) {
     stampInitialInductorDerivatives(document, layout, (row, column, coefficient) => {
       if (!blockedRows.has(row)) { addConstraintCoefficient(rows[row >= 0 ? size + row : count + 1]!, column, coefficient); }
@@ -5792,7 +5803,7 @@ function linearMosBiasEquations(document: CircuitDocument, layout: MnaLayout, kn
     if (freeKcl(node)) { rhs[linearBiasKclRow(node, layout)] = negativeExact(current); }
   }
   for (const branch of [...layout.branches, ...layout.internalBranches]) {
-    if (!branch.transientCompanion) { stampLinearBiasBranch(branch, layout, rows, rhs, freeKcl); }
+    if (!branch.transientCompanion) { stampLinearBiasBranch(branch, layout, rows, rhs, freeKcl, freeDerivativeKcl); }
   }
   // Compose already-proven passive voltage relations with the linear DAE.
   // They constrain this instant only; differentiating them would assume an
@@ -5897,16 +5908,27 @@ function zeroCurrentPassiveGroups(document: CircuitDocument, layout: MnaLayout) 
   });
   const boundaries = nonlinearBiasBoundaries(document, layout, new Set(junctions.map(({ part }) => part.id)));
   const parents = Array.from({ length: layout.topology.nodeCount }, (_, node) => node);
+  const neighbors = Array.from({ length: layout.topology.nodeCount }, () => new Set<number>());
+  const joinPassiveNodes = (first: number, second: number) => {
+    joinConductiveNodes(parents, first, second);
+    if (first === second) { return; }
+    neighbors[first]!.add(second);
+    neighbors[second]!.add(first);
+  };
   const ideal = passiveIdealVoltagePorts(document, layout);
   for (const branch of [...layout.branches, ...layout.internalBranches]) {
-    if (branches.has(branch)) { joinConductiveNodes(parents, branch.positiveNode, branch.negativeNode); continue; }
+    if (branches.has(branch)) { joinPassiveNodes(branch.positiveNode, branch.negativeNode); continue; }
     const root = findRoot(ideal.parents, branch.positiveNode);
     const neutral = isIdealVoltageConstraint(branch) && root === findRoot(ideal.parents, branch.negativeNode) && ideal.neutral.has(root);
     if (!neutral) { boundaries.add(branch.positiveNode); boundaries.add(branch.negativeNode); }
   }
-  for (const [a, b] of ideal.links) { joinConductiveNodes(parents, a, b); }
+  for (const [a, b] of ideal.links) { joinPassiveNodes(a, b); }
   for (const { nodes } of junctions) {
-    for (const node of nodes.slice(1)) { joinConductiveNodes(parents, nodes[0]!, node); }
+    // Keep a multi-terminal passive device together when removing any port.
+    // A star would incorrectly split the device at its center terminal.
+    for (let first = 0; first < nodes.length; first += 1) {
+      for (const second of nodes.slice(first + 1)) { joinPassiveNodes(nodes[first]!, second); }
+    }
   }
   const groups = new Map<number, number[]>();
   for (let node = 0; node < parents.length; node += 1) {
@@ -5915,21 +5937,102 @@ function zeroCurrentPassiveGroups(document: CircuitDocument, layout: MnaLayout) 
     group.push(node);
     groups.set(root, group);
   }
-  return { groups, boundaries };
+  return { groups, boundaries, neighbors };
+}
+
+function passiveComponent(start: number, neighbors: readonly ReadonlySet<number>[], visited: Set<number>) {
+  const component = [start];
+  visited.add(start);
+  for (const node of component) {
+    for (const next of neighbors[node]!) {
+      if (!visited.has(next)) { visited.add(next); component.push(next); }
+    }
+  }
+  return component;
+}
+
+function voltageConstraintComponent(start: number, adjacency: readonly IdealVoltageConstraintNeighbor[][], voltages: Map<number, ExactRational>) {
+  const component = [start];
+  voltages.set(start, numberToExactRational(0)!);
+  for (const node of component) {
+    for (const edge of adjacency[node]!) {
+      if (voltages.has(edge.node)) { continue; }
+      voltages.set(edge.node, subtractExactRational(voltages.get(node)!, exactComplexValue(edge.voltageDifference)!.real));
+      component.push(edge.node);
+    }
+  }
+  return component;
+}
+
+function zeroVoltageConstraintParents(adjacency: readonly IdealVoltageConstraintNeighbor[][]) {
+  const parents = Array.from({ length: adjacency.length }, (_, node) => node);
+  const voltages = new Map<number, ExactRational>();
+  for (let start = 0; start < adjacency.length; start += 1) {
+    if (voltages.has(start)) { continue; }
+    const component = voltageConstraintComponent(start, adjacency, voltages);
+    for (let first = 0; first < component.length; first += 1) {
+      const node = component[first]!;
+      for (const second of component.slice(first + 1)) {
+        if (subtractExactRational(voltages.get(node)!, voltages.get(second)!).numerator === 0n) { joinConductiveNodes(parents, node, second); }
+      }
+    }
+  }
+  return parents;
+}
+
+function addLocalPassiveConstraints(
+  nodes: readonly number[],
+  neighbors: readonly ReadonlySet<number>[],
+  blocked: ReadonlySet<number>,
+  adjacency: IdealVoltageConstraintNeighbor[][],
+) {
+  const provenParents = zeroVoltageConstraintParents(adjacency);
+  for (const anchor of nodes) {
+    // Remove all proven-equal ports together. Separate physical terminals may
+    // be tied by cancelling ideal sources with loaded offset internal nodes.
+    const ports = nodes.filter((node) => findRoot(provenParents, node) === findRoot(provenParents, anchor));
+    const visited = new Set(ports);
+    const starts = ports.flatMap((node) => [...neighbors[node]!]);
+    for (const start of starts) {
+      if (visited.has(start)) { continue; }
+      const component = passiveComponent(start, neighbors, visited);
+      if (component.some((node) => blocked.has(node))) { continue; }
+      // The anchor and every other current port have proven equal voltages.
+      // KCL gives zero external power even when the rest of the passive
+      // network is energized, so every dissipative drop here is zero. Ideal
+      // source paths may tie separate ports without making their loaded
+      // internal nodes equipotential; only proven equal ports enter this proof.
+      for (const node of component) {
+        if (findRoot(provenParents, node) === findRoot(provenParents, anchor)) { continue; }
+        addIdealVoltageConstraint(adjacency, { partId: "single-port-bias", kind: "resistor",
+          positiveNode: node, negativeNode: anchor, sourceVoltage: complex(), seriesResistanceOhms: 0, unknownIndex: -1 });
+        joinConductiveNodes(provenParents, node, anchor);
+      }
+    }
+  }
 }
 
 function addZeroCurrentPassiveConstraints(document: CircuitDocument, layout: MnaLayout, adjacency: IdealVoltageConstraintNeighbor[][]) {
-  const { groups, boundaries } = zeroCurrentPassiveGroups(document, layout);
+  const { groups, boundaries, neighbors } = zeroCurrentPassiveGroups(document, layout);
   const sources = linearBiasSourceCurrents(document, layout);
+  const blocked = new Set(boundaries);
+  for (const [node, current] of sources) { if (current.numerator !== 0n) { blocked.add(node); } }
   for (const nodes of groups.values()) {
-    if (nodes.length < 2 || nodes.some((node) => (sources.get(node)?.numerator ?? 0n) !== 0n)) { continue; }
+    if (nodes.length < 2) { continue; }
+    if (nodes.some((node) => (sources.get(node)?.numerator ?? 0n) !== 0n)) {
+      addLocalPassiveConstraints(nodes, neighbors, blocked, adjacency);
+      continue;
+    }
     const boundary = nodes.filter((node) => boundaries.has(node));
     const anchor = boundary[0] ?? nodes[0]!;
     const equipotential = boundary.every((node) => {
       const path = idealVoltageConstraintPath(adjacency, node, anchor);
       return path && exactComplexValue(path.voltageDifference)!.real.numerator === 0n;
     });
-    if (!equipotential) { continue; }
+    if (!equipotential) {
+      addLocalPassiveConstraints(nodes, neighbors, blocked, adjacency);
+      continue;
+    }
     // Positive resistors and monotone diode/LED junctions dissipate positive
     // power for every nonzero drop. With zero injected current and identical
     // boundary potentials, KCL gives zero total power, so every drop is zero.

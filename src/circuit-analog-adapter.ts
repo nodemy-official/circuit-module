@@ -10,7 +10,7 @@ import {
   joinCircuitPartTerminals,
   type CircuitConnectivityGraph,
 } from "./circuit-connectivity.js";
-import { circuitDocumentShapeIssue, isSimulationRecord, simulationRecordEntries, simulationRecordField } from "./simulation-input.js";
+import { circuitDocumentShapeIssue, copySimulationDocument, isSimulationRecord, simulationRecordEntries, simulationRecordField } from "./simulation-input.js";
 import type { CircuitAnalysis, CircuitAnalysisOptions, CircuitPartReading } from "./circuit-solver.js";
 import { readingPrecision, terminalVoltageDifferences } from "./circuit-reading.js";
 
@@ -264,12 +264,14 @@ export function analyzeExtendedCircuit(
 }
 
 function analyzeExtendedCircuitFromInput(
-  document: CircuitDocument,
+  inputDocument: CircuitDocument,
   inputSwitchStates: Record<string, boolean>,
   options: CircuitAnalysisOptions,
 ): CircuitAnalysis {
-  const input = adapterInput(document, inputSwitchStates, options);
+  const input = adapterInput(inputDocument, inputSwitchStates, options);
   if (typeof input === "string") { return invalidAdapterResult(input); }
+  // The solver, scalar readings and connectivity must share one document.
+  const document = copySimulationDocument(inputDocument);
   const { switchStates, options: validatedOptions } = input;
   const firstAc = document.parts.find((part) => part.kind === "ac-source");
   const mode = validatedOptions.mode === "ac" || (validatedOptions.mode !== "dc" && firstAc) ? "ac" : "dc";

@@ -2,7 +2,7 @@ import { useCallback, useId, useMemo, useState, type ComponentPropsWithoutRef } 
 import type { CircuitDocument } from "../circuit-model.js";
 import { analyzeCircuit, type CircuitAnalysis, type CircuitAnalysisOptions } from "../circuit-solver.js";
 import { analysisAtTransientFrame, type CircuitTransientFrame } from "../circuit-visualization.js";
-import { copySimulationDocument } from "../simulation-input.js";
+import { copySimulationDocument, simulationRecordField } from "../simulation-input.js";
 import { CircuitEnergyPanel } from "./CircuitEnergyPanel.js";
 import { CircuitAcPanel } from "./CircuitAcPanel.js";
 import { CircuitComparisonPanel } from "./CircuitComparisonPanel.js";
@@ -119,7 +119,7 @@ function LearningPanels({
 function analyzedSwitchOverrides(document: CircuitDocument, analysis: CircuitAnalysis) {
   return JSON.stringify(document.parts.flatMap((part) => {
     const closed = analysis.parts[part.id]?.switchClosed;
-    return part.kind === "switch" && closed !== undefined && closed !== (part.initiallyClosed ?? true)
+    return part.kind === "switch" && closed !== undefined && closed !== (simulationRecordField(part, "initiallyClosed") ?? true)
       ? [[part.id, closed]] : [];
   }));
 }
@@ -136,7 +136,7 @@ function documentWithSwitchOverrides(document: CircuitDocument, serializedOverri
 export function CircuitSimulationPanel({
   document,
   analysis,
-  options,
+  options: inputOptions,
   onChange,
   baselineDocument,
   onFrameChange,
@@ -147,6 +147,11 @@ export function CircuitSimulationPanel({
   className = "",
   ...props
 }: CircuitSimulationPanelProps) {
+  const mode = simulationRecordField(inputOptions, "mode") as CircuitAnalysisOptions["mode"];
+  const frequencyHz = simulationRecordField(inputOptions, "frequencyHz") as number | undefined;
+  // Keep edits and settings on the same own data fields as the solver,
+  // including non-enumerable values and absent fields supplied by a Proxy.
+  const options = useMemo(() => ({ mode, frequencyHz }), [mode, frequencyHz]);
   const showTransient = showLearningPanels && (learningFeatures?.transient ?? true);
   const showEnergy = showLearningPanels && (learningFeatures?.energy ?? true);
   const showAc = showLearningPanels && resolveAcFeature(learningFeatures?.ac, document, analysis, options);
@@ -161,7 +166,9 @@ export function CircuitSimulationPanel({
     setFrameState({ document: transientDocument, frame: next });
     onFrameChange?.(next);
   }, [transientDocument, onFrameChange]);
-  const frequency = options.frequencyHz ?? document.parts.find((part) => part.kind === "ac-source")?.frequencyHz ?? 1000;
+  const source = document.parts.find((part) => part.kind === "ac-source");
+  const sourceFrequencyHz = source ? simulationRecordField(source, "frequencyHz") as number | undefined : undefined;
+  const frequency = options.frequencyHz ?? sourceFrequencyHz ?? 1000;
   const ariaLabel = props["aria-label"] ?? (showAnalysisSettings ? "解析の設定" : "解析結果と学習ビュー");
   if (!showAnalysisSettings && !showTransient && !showEnergy && !showAc && !showComparison) { return null; }
   return <section {...props} className={`circuit-panel circuit-simulation ${className}`} aria-label={ariaLabel}>

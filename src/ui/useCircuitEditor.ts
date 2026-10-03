@@ -23,6 +23,7 @@ import { createCircuitExample, type CircuitExampleKind } from "../circuit-exampl
 import { analyzeCircuit, type CircuitAnalysisOptions } from "../circuit-solver.js";
 import { inspectCircuit } from "../circuit-diagnostics.js";
 import { parseCircuitDocument, serializeCircuitDocument } from "../circuit-serialization.js";
+import { circuitDocumentShapeIssue, copySimulationDocument } from "../simulation-input.js";
 import {
   createEmptyCircuit,
   createExampleCircuit,
@@ -43,10 +44,16 @@ function toggleId(ids: string[], id: string) {
   return ids.includes(id) ? ids.filter((item) => item !== id) : [...ids, id];
 }
 
+function editableDocument(document: CircuitDocument) {
+  // Preserve every own data field before edits use ordinary object spreads.
+  // Keep malformed input intact so analysis can still report it as invalid.
+  return circuitDocumentShapeIssue(document) ? document : copySimulationDocument(document);
+}
+
 /** State and commands for the optional editor UI. The circuit functions remain usable on their own. */
 export function useCircuitEditor(initialDocument?: CircuitDocument) {
   const [history, dispatch] = useReducer(editorHistoryReducer, initialDocument, (initial): EditorHistory => ({
-    past: [], present: initial ?? createExampleCircuit(), future: [],
+    past: [], present: editableDocument(initial ?? createExampleCircuit()), future: [],
   }));
   const document = history.present;
   const [selection, setSelection] = useState<CircuitSelection>(noSelection);
@@ -261,7 +268,7 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
   }
 
   function replaceDocument(next: CircuitDocument) {
-    setDocument(next);
+    setDocument(editableDocument(next));
     setSelection(noSelection());
     cancelConnection();
   }
