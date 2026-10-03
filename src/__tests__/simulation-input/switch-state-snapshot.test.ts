@@ -55,7 +55,7 @@ it.each(analyzers)("snapshots the validated switch override before solving throu
     expect(result.parts.load!.currentAmps).toBeGreaterThan(0.99);
     expect(result.parts.switch!.currentAmps).toBe(result.parts.load!.currentAmps);
     expect(result).toEqual(run({ switch: true }));
-    expect(reads).toBe(1);
+    expect(reads).toBe(0);
   }
 });
 
@@ -70,4 +70,5 @@ it.each([
     },
   });
   expect(analyzer.run(states)).toEqual(analyzer.run({ switch: true }));
+  expect(reads).toBe(0);
 });

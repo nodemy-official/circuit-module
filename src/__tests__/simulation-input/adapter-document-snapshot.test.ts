@@ -3,7 +3,7 @@ import { analyzeExtendedCircuit } from "../../circuit-analog-adapter.js";
 import { createCircuitFromSpecs } from "../helpers/circuit-fixture.js";
 
 describe("direct adapter document snapshots", () => {
-  it("keeps the solved switch state for readings and connectivity after a Proxy changes", () => {
+  it("uses switch data descriptors for readings and connectivity without invoking a Proxy get", () => {
     const document = createCircuitFromSpecs([
       ["source", "battery", ["s", "0"], { voltageVolts: 9 }],
       ["load", "resistor", ["s", "return"], { resistanceOhms: 100 }],
@@ -21,6 +21,6 @@ describe("direct adapter document snapshots", () => {
     expect(result.parts.switch!.switchClosed).toBe(true);
     expect(result.parts.load!.currentAmps).toBe(0.09);
     expect(result.currentAmps).toBe(0.09);
-    expect(reads).toBe(1);
+    expect(reads).toBe(0);
   });
 });

@@ -76,45 +76,61 @@ describe("simulation input accessor validation", () => {
     expect(calls).toBe(0);
   });
 
-  it("rejects array proxies that override methods, length, or indexed reads across analysis APIs", () => {
+  it("uses own data descriptors without invoking array Proxy get traps across analysis APIs", () => {
+    const document: CircuitDocument = {
+      ...source,
+      parts: [...source.parts, { id: "load", kind: "resistor", label: "R", x: 0, y: 0, resistanceOhms: 10 }],
+      wires: [
+        { id: "a", from: { partId: "s", terminal: "a" }, to: { partId: "load", terminal: "a" } },
+        { id: "b", from: { partId: "s", terminal: "b" }, to: { partId: "load", terminal: "b" } },
+      ],
+    };
     const calls: [string, (parts: CircuitDocument["parts"]) => { status: string }][] = [
-      ["analyzeCircuit", (parts) => analyzeCircuit({ ...source, parts })],
-      ["analyzeExtendedCircuit", (parts) => analyzeExtendedCircuit({ ...source, parts }, {}, { mode: "ac" })],
-      ["analyzeAnalogCircuit", (parts) => analyzeAnalogCircuit({ ...source, parts }, { mode: "ac" })],
-      ["solveAnalogStep", (parts) => solveAnalogStep({ ...source, parts }, { mode: "ac" })],
-      ["simulateTransient", (parts) => simulateTransient({ ...source, parts }, { durationSeconds: 1, timeStepSeconds: 0.1 })],
+      ["analyzeCircuit", (parts) => analyzeCircuit({ ...document, parts })],
+      ["analyzeExtendedCircuit", (parts) => analyzeExtendedCircuit({ ...document, parts }, {}, { mode: "ac" })],
+      ["analyzeAnalogCircuit", (parts) => analyzeAnalogCircuit({ ...document, parts }, { mode: "ac" })],
+      ["solveAnalogStep", (parts) => solveAnalogStep({ ...document, parts }, { mode: "ac" })],
+      ["simulateTransient", (parts) => simulateTransient({ ...document, parts }, { durationSeconds: 1, timeStepSeconds: 0.1 })],
     ];
+    let reads = 0;
     const overriddenArrays = [
-      new Proxy([...source.parts], {
+      new Proxy([...document.parts], {
         get(target, key, receiver) {
+          reads += 1;
           if (key === "map") { throw new Error("proxy map trap"); }
           return Reflect.get(target, key, receiver);
         },
       }),
-      new Proxy([...source.parts], {
+      new Proxy([...document.parts], {
         get(target, key, receiver) {
+          reads += 1;
           if (key === "length") { return 0; }
           return Reflect.get(target, key, receiver);
         },
       }),
-      new Proxy([...source.parts], {
+      new Proxy([...document.parts], {
         get(target, key, receiver) {
+          reads += 1;
           if (key === "0") { return { ...source.parts[0], id: "substituted" }; }
           return Reflect.get(target, key, receiver);
         },
       }),
     ];
 
+    expect(analyzeAnalogCircuit(document, { mode: "ac" }).parts.load!.current.real).toBe(0.5);
     for (const [name, call] of calls) {
+      const expected = call([...document.parts]);
+      expect(["closed", "valid"], name).toContain(expected.status);
       for (const parts of overriddenArrays) {
         let result: { status: string } | undefined;
         expect(() => { result = call(parts); }, name).not.toThrow();
-        expect(result?.status, name).toBe("invalid");
+        expect(result, name).toEqual(expected);
+        expect(reads, name).toBe(0);
       }
     }
   });
 
-  it("does not throw when an array proxy changes its method behavior after validation across public APIs", () => {
+  it("keeps the captured result without rereading caller array methods across public APIs", () => {
     const calls: [string, (parts: CircuitDocument["parts"]) => { status: string }][] = [
       ["analyzeCircuit", (parts) => analyzeCircuit({ ...source, parts })],
       ["analyzeExtendedCircuit", (parts) => analyzeExtendedCircuit({ ...source, parts }, {}, { mode: "ac" })],
@@ -124,6 +140,7 @@ describe("simulation input accessor validation", () => {
     ];
 
     for (const [name, call] of calls) {
+      const expected = call([...source.parts]);
       let mapReads = 0;
       const parts = new Proxy([...source.parts], {
         get(target, key, receiver) {
@@ -138,7 +155,8 @@ describe("simulation input accessor validation", () => {
 
       let result: { status: string } | undefined;
       expect(() => { result = call(parts); }, name).not.toThrow();
-      expect(result?.status, name).toBe("invalid");
+      expect(result, name).toEqual(expected);
+      expect(mapReads, name).toBe(0);
     }
   });
 
@@ -196,12 +214,6 @@ describe("simulation input accessor validation", () => {
     const throwingFrequency = Object.defineProperty({ mode: "ac" }, "frequencyHz", { get() { throw new Error("bad frequency"); } });
     const throwingPart = { id: "s", kind: "ac-source", label: "s", x: 0, y: 0 };
     Object.defineProperty(throwingPart, "voltageVolts", { get() { throw new Error("bad source"); } });
-    const getTrapOptions = new Proxy({ mode: "ac" }, {
-      get(target, key, receiver) {
-        if (key === "mode") { throw new Error("bad get trap"); }
-        return Reflect.get(target, key, receiver);
-      },
-    });
     const throwingParts: unknown[] = [];
     Object.defineProperty(throwingParts, "0", { get() { throw new Error("bad part index"); } });
     const throwingWires: unknown[] = [];
@@ -214,7 +226,6 @@ describe("simulation input accessor validation", () => {
       ["circuit options frequency getter", () => analyzeCircuit(source, {}, throwingFrequency as never)],
       ["extended options frequency getter", () => analyzeExtendedCircuit(source, {}, throwingFrequency as never)],
       ["analog options Proxy trap", () => analyzeAnalogCircuit(source, new Proxy({}, { getPrototypeOf() { throw new Error("bad proxy"); } }) as never)],
-      ["analog options get trap", () => analyzeAnalogCircuit(source, getTrapOptions as never)],
       ["analog part voltage getter", () => analyzeAnalogCircuit({ ...source, parts: [throwingPart as never] }, { mode: "ac" })],
       ["circuit part voltage getter", () => analyzeCircuit({ ...source, parts: [throwingPart as never] })],
       ["extended part voltage getter", () => analyzeExtendedCircuit({ ...source, parts: [throwingPart as never] }, {}, { mode: "ac" })],
@@ -233,6 +244,26 @@ describe("simulation input accessor validation", () => {
       expect(() => { result = call(); }, name).not.toThrow();
       expect(result?.status, name).toBe("invalid");
     }
+  });
+
+  it("uses option descriptors without invoking Proxy get traps for present fields", () => {
+    let reads = 0;
+    const options = new Proxy({ mode: "ac" as const, frequencyHz: 1000 }, {
+      get() { reads += 1; throw new Error("Option get trap ran"); },
+    });
+    const transientOptions = new Proxy({ durationSeconds: 1, timeStepSeconds: 0.1 }, {
+      get() { reads += 1; throw new Error("Transient option get trap ran"); },
+    });
+    expect(analyzeCircuit(source, {}, options)).toEqual(analyzeCircuit(source, {}, { mode: "ac", frequencyHz: 1000 }));
+    expect(analyzeExtendedCircuit(source, {}, options)).toEqual(analyzeExtendedCircuit(source, {}, { mode: "ac", frequencyHz: 1000 }));
+    for (const analyze of [analyzeAnalogCircuit, solveAnalogStep]) {
+      const result = analyze(source, options);
+      expect(result).toEqual(analyze(source, { mode: "ac", frequencyHz: 1000 }));
+      expect(result.parts.s!.voltage.real).toBe(5);
+    }
+    expect(simulateTransient(source, transientOptions))
+      .toEqual(simulateTransient(source, { durationSeconds: 1, timeStepSeconds: 0.1 }));
+    expect(reads).toBe(0);
   });
 
   it("returns invalid rather than throwing for revoked proxies", () => {

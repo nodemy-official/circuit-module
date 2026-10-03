@@ -35,7 +35,7 @@ it.each(["startFromOperatingPoint", "switchStates"])("does not read an absent tr
   expect(reads).toBe(0);
 });
 
-it("uses descriptor snapshots after checking the required transient option reads", () => {
+it("uses required transient option descriptors without invoking a Proxy get", () => {
   const options = { durationSeconds: 1, timeStepSeconds: 0.5 };
   const reads = new Map<PropertyKey, number>();
   const trapped = new Proxy(options, {
@@ -49,8 +49,7 @@ it("uses descriptor snapshots after checking the required transient option reads
     },
   });
   expect(simulateTransient(document, trapped)).toEqual(simulateTransient(document, options));
-  expect(reads.get("durationSeconds")).toBe(1);
-  expect(reads.get("timeStepSeconds")).toBe(1);
+  expect(reads.size).toBe(0);
 });
 
 it("uses the validated switch override snapshot for every sample", () => {
@@ -67,7 +66,7 @@ it("uses the validated switch override snapshot for every sample", () => {
   const options = { durationSeconds: 1, timeStepSeconds: 0.5 };
   const result = simulateTransient(document, { ...options, switchStates });
   expect(result).toEqual(simulateTransient(document, { ...options, switchStates: { switch: true } }));
-  expect(reads).toBe(1);
+  expect(reads).toBe(0);
   for (const sample of result.samples) {
     expect(sample.parts.switch!.switchClosed).toBe(true);
     expect(sample.parts.load!.currentAmps).toBe(1);

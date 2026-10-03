@@ -20,7 +20,7 @@ import {
   MAX_CIRCUIT_ANALYSIS_TERMINALS,
   type CircuitIssue,
 } from "./circuit-solver.js";
-import { copySimulationDocument, isSimulationArray, isSimulationRecord, simulationRecordEntries, simulationRecordField } from "./simulation-input.js";
+import { isSimulationArray, isSimulationRecord, SimulationSnapshotContext, simulationRecordField, snapshotSimulationDocument, snapshotSimulationRecord } from "./simulation-input.js";
 import { readingPrecision, terminalVoltageDifferences, type CircuitReadingPrecision, type CircuitTerminalVoltageDifference } from "./circuit-reading.js";
 import { createExactExpressionCapture, freezeCapturedExactExpressions, snapshotExactExpressions, withExactExpressionCapture, type ExactExpressionNode } from "./exact-expression.js";
 import { createTransientEnergyCollector, type TransientEnergyReadings } from "./transient-energy.js";
@@ -158,12 +158,10 @@ function stepCount(duration: number, timeStep: number): number | null {
   return first;
 }
 
-function validateOptions(options: unknown, document: CircuitDocument): string | TransientAnalysisOptions {
-  if (!isSimulationRecord(options)) { return "解析条件はオブジェクトで指定してください。"; }
-  const duration = simulationRecordField(options, "durationSeconds");
-  const timeStep = simulationRecordField(options, "timeStepSeconds");
-  const startFromOperatingPoint = simulationRecordField(options, "startFromOperatingPoint");
-  const inputSwitchStates = simulationRecordField(options, "switchStates");
+function validateOptions(options: unknown, document: CircuitDocument, context: SimulationSnapshotContext): string | TransientAnalysisOptions {
+  const capturedOptions = snapshotSimulationRecord(options, undefined, context);
+  if (!capturedOptions) { return "解析条件はオブジェクトで指定してください。"; }
+  const { durationSeconds: duration, timeStepSeconds: timeStep, startFromOperatingPoint, switchStates: inputSwitchStates } = capturedOptions;
   if (typeof duration !== "number" || !Number.isFinite(duration) || duration <= 0 ||
       typeof timeStep !== "number" || !Number.isFinite(timeStep) || timeStep <= 0) {
     return "解析時間と時間刻みは、有限な正の数値で指定してください。";
@@ -173,10 +171,10 @@ function validateOptions(options: unknown, document: CircuitDocument): string | 
   }
   let switchStates: Record<string, boolean> | undefined;
   if (inputSwitchStates !== undefined) {
-    if (!isSimulationRecord(inputSwitchStates, document.parts.map(({ id }) => id))) {
+    const snapshot = snapshotSimulationRecord(inputSwitchStates, document.parts.map(({ id }) => id), context);
+    if (!snapshot) {
       return "スイッチ状態は部品 ID ごとの真偽値で指定してください。";
     }
-    const snapshot = Object.fromEntries(simulationRecordEntries(inputSwitchStates));
     const switchIds = new Set(document.parts.filter((part) => part.kind === "switch").map(({ id }) => id));
     for (const [partId, state] of Object.entries(snapshot)) {
       if (!switchIds.has(partId)) {
@@ -1230,13 +1228,16 @@ function simulateTransientFromInput(
   inputOptions: TransientAnalysisOptions,
 ): TransientAnalysis {
   try {
-    const shapeIssue = validateDocumentShape(inputDocument);
+    const context = new SimulationSnapshotContext();
+    const capturedDocument = snapshotSimulationDocument(inputDocument, context);
+    const shapeIssue = validateDocumentShape(capturedDocument);
     if (shapeIssue) { return invalid(shapeIssue); }
-    const document = copySimulationDocument(inputDocument);
+    const document = capturedDocument as unknown as CircuitDocument;
     const reactiveIssue = validateReactiveValues(document);
     if (reactiveIssue) { return invalid(reactiveIssue); }
-    const options = validateOptions(inputOptions, document);
+    const options = validateOptions(inputOptions, document, context);
     if (typeof options === "string") { return invalid(options); }
+    if (!context.isStable()) { return invalid("回路データまたは解析条件が取得中に変更されました。"); }
     if (!document.parts.length) { return invalid("過渡解析には部品が必要です。"); }
     const steps = stepCount(options.durationSeconds, options.timeStepSeconds);
     if (steps === null) {

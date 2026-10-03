@@ -35,6 +35,10 @@
 
 解析APIには、`CircuitDocument`、各部品・導線、スイッチ状態、解析optionsとして、`Object.prototype` または `null` をプロトタイプに持つデータオブジェクトを渡してください。own data propertyは非列挙でも検証・保持します。getter/setterを持つこれらのレコードやクラスインスタンスは入力不正として扱います。`parts` と `wires` は穴のない通常の配列で指定してください。要素にgetter/setterを持つ配列、独自のプロパティ、独自prototype、または `map`・`entries`・iteratorなどの上書きを持つ配列も入力不正として扱い、accessorは実行しません。
 
+`analyzeCircuit`、`analyzeExtendedCircuit`、`analyzeAnalogCircuit`、`solveAnalogStep`、`simulateTransient` は、呼び出しごとに回路・解析条件・制御値の own data descriptor を取得し、その `value` だけを検証と計算の入力に使います。元オブジェクトの通常のプロパティ取得や、呼び出し側配列のメソッド・callback は実行しません。Proxy の `get` が descriptor と異なる値を返したり例外を投げたりしても、その未使用の振る舞いは入力値や拒否理由になりません。getter の実行を防ぐため、通常のプロパティ取得による descriptor との一致確認も行いません。
+
+回路全体と解析条件の取得後に、元データの prototype、own key、data descriptor を再確認します。取得中に別の部品・導線・解析条件などが変更され、取得済み descriptor との不一致を検出した場合は `invalid` を返します。照合では `NaN` と符号付きゼロも区別・保持し、その後に数値の妥当性を検証します。スナップショットを呼び出し間で共有しないため、解析を終えてから編集したデータは次の呼び出しで取得します。Proxy の `getPrototypeOf`・`ownKeys`・`getOwnPropertyDescriptor` trap 自体は実行されます。これらが変更を隠して一貫した descriptor を偽装する場合、実体の同時点の状態まで保証することはできません。Proxy を渡す場合も、安定したデータの descriptor を提供してください。
+
 ```ts
 import { analyzeCircuit, createCircuitExample } from "@nodemy-official/circuit-module";
 

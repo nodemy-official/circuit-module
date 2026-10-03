@@ -237,12 +237,15 @@ describe("simulation API runtime input validation", () => {
   });
 
   it.each(publicAnalyzers)("uses catalog labels in invalid numeric input diagnostics through %s", (_name, analyze) => {
-    const document = { ...validDocument,
-      parts: [{ id: "r", kind: "resistor", x: 0, y: 0, resistanceOhms: null }],
-    } as unknown as CircuitDocument;
-    const result = analyze(document);
-    expect(result.status).toBe("invalid");
-    expect(result.message).toContain("抵抗");
-    expect(result.message).not.toContain("undefined");
+    for (const resistanceOhms of [null, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+      const document = { ...validDocument,
+        parts: [{ id: "r", kind: "resistor", x: 0, y: 0, resistanceOhms }],
+      } as unknown as CircuitDocument;
+      const result = analyze(document);
+      expect(result.status).toBe("invalid");
+      expect(result.message, `resistanceOhms=${resistanceOhms}`).toContain("抵抗");
+      expect(result.message).not.toContain("undefined");
+      expect(result.message).not.toContain("ID");
+    }
   });
 });

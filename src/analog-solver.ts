@@ -60,7 +60,7 @@ import { solveRealLinearSystemWithExactInverseCache } from "./exact-linear-cache
 import { finiteComplexReferenceShift } from "./analog-reference.js";
 import { acAnalysisFrequency, acReactiveAdmittance, acReactiveImpedance, acReactiveReactance, frequencyMatches } from "./ac-reactive.js";
 import { meterStatuses, type MeterStatus } from "./meter-status.js";
-import { circuitDocumentShapeIssue, copySimulationDocument, isSimulationRecord, simulationRecordEntries, simulationRecordField } from "./simulation-input.js";
+import { isSimulationRecord, SimulationSnapshotContext, simulationRecordEntries, snapshotSimulationRecord, validatedSimulationDocument } from "./simulation-input.js";
 import { acResponsePartGroups, type AcResponseEdge } from "./ac-response-groups.js";
 import { compatibleIdealAcVoltageCycle } from "./ac-voltage-constraints.js";
 
@@ -7692,19 +7692,21 @@ export function solveAnalogStep(
 ): AnalogCircuitAnalysis {
   let mode: AnalogAnalysisMode = "dc";
   try {
-    if (!isSimulationRecord(options)) {
+    const context = new SimulationSnapshotContext();
+    const capturedOptions = snapshotSimulationRecord(options, undefined, context);
+    if (!capturedOptions) {
       const message = "解析条件はオブジェクトで指定してください。";
       return result("invalid", mode, message, { issues: [{ severity: "error", message }] });
     }
     const snapshot: AnalogStepOptions = {
-      mode: simulationRecordField(options, "mode") as AnalogAnalysisMode,
-      frequencyHz: simulationRecordField(options, "frequencyHz") as number | undefined,
-      switchStates: simulationRecordField(options, "switchStates") as Record<string, boolean> | undefined,
-      voltageOverrides: simulationRecordField(options, "voltageOverrides") as Record<string, number> | undefined,
-      initialInductorCurrents: simulationRecordField(options, "initialInductorCurrents") as boolean | undefined,
+      mode: capturedOptions.mode as AnalogAnalysisMode,
+      frequencyHz: capturedOptions.frequencyHz as number | undefined,
+      switchStates: capturedOptions.switchStates as Record<string, boolean> | undefined,
+      voltageOverrides: capturedOptions.voltageOverrides as Record<string, number> | undefined,
+      initialInductorCurrents: capturedOptions.initialInductorCurrents as boolean | undefined,
     };
     if (snapshot.mode === "ac") { mode = "ac"; }
-    return solveAnalogStepFromInput(inputDocument, snapshot, mode, transientCompanions, initialVoltageConstraints, previousAnalysis);
+    return solveAnalogStepFromInput(inputDocument, snapshot, mode, context, transientCompanions, initialVoltageConstraints, previousAnalysis);
   } catch {
     // A caller-owned Proxy can change behavior after shape validation. Keep
     // failures at the public API boundary, as in transient analysis.
@@ -7717,18 +7719,23 @@ function solveAnalogStepFromInput(
   inputDocument: CircuitDocument,
   options: AnalogStepOptions,
   mode: AnalogAnalysisMode,
+  context: SimulationSnapshotContext,
   transientCompanions?: ReadonlyMap<string, TransientCompanionConstraint>,
   initialVoltageConstraints?: ReadonlyMap<string, InitialVoltageConstraint>,
   previousAnalysis?: AnalogCircuitAnalysis,
 ): AnalogCircuitAnalysis {
-  const shapeIssue = circuitDocumentShapeIssue(inputDocument);
-  if (shapeIssue) {
-    return result("invalid", mode, shapeIssue, { issues: [{ severity: "error", message: shapeIssue }] });
+  const capturedDocument = validatedSimulationDocument(inputDocument, context);
+  if (typeof capturedDocument === "string") {
+    return result("invalid", mode, capturedDocument, { issues: [{ severity: "error", message: capturedDocument }] });
   }
-  const document = documentWithCatalogDefaults(copySimulationDocument(inputDocument));
-  const validatedOptions = validatedAnalogOptions(options, document.parts.map((part) => part.id));
+  const document = documentWithCatalogDefaults(capturedDocument);
+  const validatedOptions = validatedAnalogOptions(options, document.parts.map((part) => part.id), context);
   if (typeof validatedOptions === "string") {
     return result("invalid", mode, validatedOptions, { issues: [{ severity: "error", message: validatedOptions }] });
+  }
+  if (!context.isStable()) {
+    const message = "回路データまたは解析条件が取得中に変更されました。";
+    return result("invalid", mode, message, { issues: [{ severity: "error", message }] });
   }
   if (validatedOptions.initialInductorCurrents !== undefined &&
       (typeof validatedOptions.initialInductorCurrents !== "boolean" ||
@@ -7741,12 +7748,11 @@ function solveAnalogStepFromInput(
     : acResult(document, validatedOptions);
 }
 
-function validatedAnalogOptions(options: unknown, partIds: readonly string[]): string | AnalogStepOptions {
+function validatedAnalogOptions(options: unknown, partIds: readonly string[], context: SimulationSnapshotContext): string | AnalogStepOptions {
   try {
-    if (!isSimulationRecord(options)) { return "解析条件はオブジェクトで指定してください。"; }
-    const mode = simulationRecordField(options, "mode");
-    const frequencyHz = simulationRecordField(options, "frequencyHz");
-    const initialInductorCurrents = simulationRecordField(options, "initialInductorCurrents");
+    const capturedOptions = snapshotSimulationRecord(options, undefined, context);
+    if (!capturedOptions) { return "解析条件はオブジェクトで指定してください。"; }
+    const { mode, frequencyHz, initialInductorCurrents } = capturedOptions;
     if (mode !== "dc" && mode !== "ac") {
       return "解析方式は dc または ac で指定してください。";
     }
@@ -7756,11 +7762,12 @@ function validatedAnalogOptions(options: unknown, partIds: readonly string[]): s
     }
     const controls: Partial<Pick<AnalogStepOptions, "switchStates" | "voltageOverrides">> = {};
     for (const [key, name] of [["switchStates", "スイッチ状態"], ["voltageOverrides", "電圧上書き"]] as const) {
-      const field = simulationRecordField(options, key);
+      const field = capturedOptions[key];
       if (field === undefined) { continue; }
-      if (!isSimulationRecord(field, partIds)) { return `${name}はオブジェクトで指定してください。`; }
+      const snapshot = snapshotSimulationRecord(field, partIds, context);
+      if (!snapshot) { return `${name}はオブジェクトで指定してください。`; }
       // Value validation and every later stamp use this same own-data copy.
-      Object.defineProperty(controls, key, { value: Object.fromEntries(simulationRecordEntries(field)), enumerable: true });
+      Object.defineProperty(controls, key, { value: snapshot, enumerable: true });
     }
     if (initialInductorCurrents !== undefined && typeof initialInductorCurrents !== "boolean") {
       return "コイルの初期電流を使う設定は真偽値で指定してください。";

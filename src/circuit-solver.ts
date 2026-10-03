@@ -20,7 +20,7 @@ import {
 } from "./exact-linear-algebra.js";
 import { addRealStateValue, complexFromExact, exactComplexValue, exactRealStateInput } from "./exact-numeric-state.js";
 import { meterStatuses, type MeterStatus } from "./meter-status.js";
-import { circuitDocumentShapeIssue, copySimulationDocument, isSimulationRecord, simulationRecordEntries, simulationRecordField } from "./simulation-input.js";
+import { isSimulationRecord, SimulationSnapshotContext, simulationRecordEntries, snapshotSimulationRecord, validatedSimulationDocument } from "./simulation-input.js";
 import { readingPrecision, restoredComplex, type CircuitReadingPrecision, type CircuitTerminalVoltageDifference } from "./circuit-reading.js";
 import type { ExactExpressionNode } from "./exact-expression.js";
 
@@ -3434,7 +3434,7 @@ function analyzeCircuitFromInput(
   const input = circuitAnalysisInput(document, inputSwitchStates, options);
   if (typeof input === "string") { return invalidInputResult(input); }
   const { switchStates, options: normalizedOptions } = input;
-  const normalizedDocument = documentWithCatalogDefaults(copySimulationDocument(document));
+  const normalizedDocument = documentWithCatalogDefaults(input.document);
   const legacyKinds = new Set(["battery", "resistor", "bulb", "switch", "ammeter", "voltmeter", "junction"]);
   if (normalizedOptions.mode === "ac" || normalizedDocument.parts.some((part) => !legacyKinds.has(part.kind))) {
     return analyzeExtendedCircuit(normalizedDocument, switchStates, normalizedOptions);
@@ -3515,22 +3515,22 @@ function invalidInputResult(message: string): CircuitAnalysis {
 }
 
 function circuitAnalysisInput(document: unknown, switchStates: unknown, options: unknown): string | {
+  document: CircuitDocument;
   switchStates: Record<string, boolean>;
   options: CircuitAnalysisOptions;
 } {
   try {
-    const shapeIssue = circuitDocumentShapeIssue(document);
-    if (shapeIssue) { return shapeIssue; }
-    const kinds = new Map((document as CircuitDocument).parts.map((part) => [part.id, part.kind]));
-    if (!isSimulationRecord(switchStates, kinds.keys())) {
+    const context = new SimulationSnapshotContext();
+    const validatedDocument = validatedSimulationDocument(document, context);
+    if (typeof validatedDocument === "string") { return validatedDocument; }
+    const kinds = new Map(validatedDocument.parts.map((part) => [part.id, part.kind]));
+    const snapshot = snapshotSimulationRecord(switchStates, kinds.keys(), context);
+    if (!snapshot) {
       return "スイッチ状態は部品 ID ごとの真偽値で指定してください。";
     }
-    // Capture own data fields once so solving and reporting cannot observe
-    // different values through a caller-owned Proxy's later get traps.
-    const snapshot = Object.fromEntries(simulationRecordEntries(switchStates));
-    if (!isSimulationRecord(options)) { return "解析条件はオブジェクトで指定してください。"; }
-    const mode = simulationRecordField(options, "mode");
-    const frequencyHz = simulationRecordField(options, "frequencyHz");
+    const capturedOptions = snapshotSimulationRecord(options, undefined, context);
+    if (!capturedOptions) { return "解析条件はオブジェクトで指定してください。"; }
+    const { mode, frequencyHz } = capturedOptions;
     if (mode !== undefined && mode !== "auto" && mode !== "dc" && mode !== "ac") {
       return "解析方式は auto、dc、または ac で指定してください。";
     }
@@ -3540,8 +3540,9 @@ function circuitAnalysisInput(document: unknown, switchStates: unknown, options:
     }
     const stateIssue = switchStateIssue(snapshot, kinds);
     if (stateIssue) { return stateIssue; }
+    if (!context.isStable()) { return "回路データまたは解析条件が取得中に変更されました。"; }
     // Solve with the same values just validated, without rereading caller data.
-    return { switchStates: snapshot as Record<string, boolean>, options: { mode, frequencyHz } };
+    return { document: validatedDocument, switchStates: snapshot as Record<string, boolean>, options: { mode, frequencyHz } };
   } catch {
     return "解析条件またはスイッチ状態を読み取れません。";
   }
