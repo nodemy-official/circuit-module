@@ -3431,18 +3431,10 @@ function analyzeCircuitFromInput(
   inputSwitchStates: Record<string, boolean>,
   options: CircuitAnalysisOptions,
 ): CircuitAnalysis {
-  const switchStates = circuitAnalysisInput(document, inputSwitchStates, options);
-  if (typeof switchStates === "string") { return invalidInputResult(switchStates); }
+  const input = circuitAnalysisInput(document, inputSwitchStates, options);
+  if (typeof input === "string") { return invalidInputResult(input); }
+  const { switchStates, options: normalizedOptions } = input;
   const normalizedDocument = documentWithCatalogDefaults(copySimulationDocument(document));
-  let normalizedOptions: CircuitAnalysisOptions;
-  try {
-    normalizedOptions = {
-      mode: simulationRecordField(options, "mode") as CircuitAnalysisOptions["mode"],
-      frequencyHz: simulationRecordField(options, "frequencyHz") as number | undefined,
-    };
-  } catch {
-    return invalidInputResult("解析条件を読み取れません。");
-  }
   const legacyKinds = new Set(["battery", "resistor", "bulb", "switch", "ammeter", "voltmeter", "junction"]);
   if (normalizedOptions.mode === "ac" || normalizedDocument.parts.some((part) => !legacyKinds.has(part.kind))) {
     return analyzeExtendedCircuit(normalizedDocument, switchStates, normalizedOptions);
@@ -3522,7 +3514,10 @@ function invalidInputResult(message: string): CircuitAnalysis {
   return result("invalid", message, { issues: [{ severity: "error", message }] });
 }
 
-function circuitAnalysisInput(document: unknown, switchStates: unknown, options: unknown): string | Record<string, boolean> {
+function circuitAnalysisInput(document: unknown, switchStates: unknown, options: unknown): string | {
+  switchStates: Record<string, boolean>;
+  options: CircuitAnalysisOptions;
+} {
   try {
     const shapeIssue = circuitDocumentShapeIssue(document);
     if (shapeIssue) { return shapeIssue; }
@@ -3543,7 +3538,10 @@ function circuitAnalysisInput(document: unknown, switchStates: unknown, options:
         (typeof frequencyHz !== "number" || !Number.isFinite(frequencyHz) || frequencyHz <= 0)) {
       return "解析周波数は有限な0より大きい数値にしてください。";
     }
-    return switchStateIssue(snapshot, kinds) ?? snapshot as Record<string, boolean>;
+    const stateIssue = switchStateIssue(snapshot, kinds);
+    if (stateIssue) { return stateIssue; }
+    // Solve with the same values just validated, without rereading caller data.
+    return { switchStates: snapshot as Record<string, boolean>, options: { mode, frequencyHz } };
   } catch {
     return "解析条件またはスイッチ状態を読み取れません。";
   }

@@ -73,6 +73,7 @@ export interface TransientAnalysisOptions {
 }
 
 interface StoredState {
+  analysis: ReturnType<typeof solveAnalogStep>;
   acSourceVoltages: Map<string, ExactRational>;
   capacitorVoltages: Map<string, number>;
   exactCapacitorVoltages: Map<string, ExactRational>;
@@ -151,23 +152,27 @@ function stepCount(duration: number, timeStep: number): number | null {
   return count <= MAX_TRANSIENT_STEPS ? count : null;
 }
 
-function validateOptions(options: unknown, document: CircuitDocument): string | null {
+function validateOptions(options: unknown, document: CircuitDocument): string | TransientAnalysisOptions {
   if (!isSimulationRecord(options)) { return "解析条件はオブジェクトで指定してください。"; }
-  const duration = options.durationSeconds;
-  const timeStep = options.timeStepSeconds;
+  const duration = simulationRecordField(options, "durationSeconds");
+  const timeStep = simulationRecordField(options, "timeStepSeconds");
+  const startFromOperatingPoint = simulationRecordField(options, "startFromOperatingPoint");
+  const inputSwitchStates = simulationRecordField(options, "switchStates");
   if (typeof duration !== "number" || !Number.isFinite(duration) || duration <= 0 ||
       typeof timeStep !== "number" || !Number.isFinite(timeStep) || timeStep <= 0) {
     return "解析時間と時間刻みは、有限な正の数値で指定してください。";
   }
-  if (options.startFromOperatingPoint !== undefined && typeof options.startFromOperatingPoint !== "boolean") {
+  if (startFromOperatingPoint !== undefined && typeof startFromOperatingPoint !== "boolean") {
     return "直流動作点から開始する設定は真偽値で指定してください。";
   }
-  if (options.switchStates !== undefined) {
-    if (!isSimulationRecord(options.switchStates, document.parts.map(({ id }) => id))) {
+  let switchStates: Record<string, boolean> | undefined;
+  if (inputSwitchStates !== undefined) {
+    if (!isSimulationRecord(inputSwitchStates, document.parts.map(({ id }) => id))) {
       return "スイッチ状態は部品 ID ごとの真偽値で指定してください。";
     }
+    const snapshot = Object.fromEntries(simulationRecordEntries(inputSwitchStates));
     const switchIds = new Set(document.parts.filter((part) => part.kind === "switch").map(({ id }) => id));
-    for (const [partId, state] of simulationRecordEntries(options.switchStates)) {
+    for (const [partId, state] of Object.entries(snapshot)) {
       if (!switchIds.has(partId)) {
         return `スイッチ状態の対象「${partId}」はスイッチ部品ではありません。`;
       }
@@ -175,8 +180,9 @@ function validateOptions(options: unknown, document: CircuitDocument): string | 
         return "スイッチ状態は部品 ID ごとの真偽値で指定してください。";
       }
     }
+    switchStates = snapshot as Record<string, boolean>;
   }
-  return null;
+  return { durationSeconds: duration, timeStepSeconds: timeStep, startFromOperatingPoint, switchStates };
 }
 
 function validatePartShape(value: unknown, index: number, parts: Map<string, Record<string, unknown>>) {
@@ -953,7 +959,7 @@ function createSample(
   }
   return {
     sample: { timeSeconds: 0, parts },
-    state: { capacitorVoltages, exactCapacitorVoltages, inductorCurrents, exactInductorCurrents, acSourceVoltages, exactResistivePowers },
+    state: { analysis, capacitorVoltages, exactCapacitorVoltages, inductorCurrents, exactInductorCurrents, acSourceVoltages, exactResistivePowers },
   };
 }
 
@@ -1148,7 +1154,7 @@ function solveNextStep(
     mode: "dc",
     switchStates: options.switchStates,
     voltageOverrides: { ...acOverrides.voltageOverrides, ...transformed.voltageOverrides },
-  }, transformed.companionConstraints, acOverrides.voltageConstraints);
+  }, transformed.companionConstraints, acOverrides.voltageConstraints, state.analysis);
   if (analysis.status !== "valid") {
     return { analysis, reason: `t=${timeSeconds} s の解析に失敗しました。${analysis.message}` };
   }
@@ -1222,18 +1228,8 @@ function simulateTransientFromInput(
     const document = copySimulationDocument(inputDocument);
     const reactiveIssue = validateReactiveValues(document);
     if (reactiveIssue) { return invalid(reactiveIssue); }
-    if (!isSimulationRecord(inputOptions)) { return invalid("解析条件はオブジェクトで指定してください。"); }
-    const options: TransientAnalysisOptions = {
-      durationSeconds: simulationRecordField(inputOptions, "durationSeconds") as number,
-      timeStepSeconds: simulationRecordField(inputOptions, "timeStepSeconds") as number,
-      startFromOperatingPoint: simulationRecordField(inputOptions, "startFromOperatingPoint") as boolean | undefined,
-      switchStates: simulationRecordField(inputOptions, "switchStates") as Record<string, boolean> | undefined,
-    };
-    const optionsIssue = validateOptions(options, document);
-    if (optionsIssue) { return invalid(optionsIssue); }
-    if (options.switchStates !== undefined) {
-      options.switchStates = Object.fromEntries(simulationRecordEntries(options.switchStates)) as Record<string, boolean>;
-    }
+    const options = validateOptions(inputOptions, document);
+    if (typeof options === "string") { return invalid(options); }
     if (!document.parts.length) { return invalid("過渡解析には部品が必要です。"); }
     const steps = stepCount(options.durationSeconds, options.timeStepSeconds);
     if (steps === null) {

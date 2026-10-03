@@ -60,7 +60,7 @@ describe("AC reference detection for an underflowed diode slope", () => {
     expect(analysis.parts.meter!.meterStatus).toBe("floating");
   });
 
-  it("keeps a near-saturation MOS AC solution with finite positive triode slope", () => {
+  it.each([1 - 2 ** -52, 1])("distinguishes positive triode slope from exact saturation (current=%s)", (current) => {
     const document: CircuitDocument = {
       title: "Unloaded saturated MOS drain",
       parts: [
@@ -75,7 +75,7 @@ describe("AC reference detection for an underflowed diode slope", () => {
           transconductanceAmpsPerVoltSquared: 2,
           channelLengthModulation: 0,
         }),
-        part("load-current", "current-source", { currentAmps: -1 }),
+        part("load-current", "current-source", { currentAmps: -current }),
         part("meter", "voltmeter"),
       ],
       wires: [
@@ -93,10 +93,15 @@ describe("AC reference detection for an underflowed diode slope", () => {
     const ac = analyzeAnalogCircuit(document, { mode: "ac", frequencyHz: 1000 });
 
     expect(dc.status, dc.message).toBe("valid");
-    expect(dc.parts.mos!.current.real).toBeCloseTo(1, 10);
+    expect(dc.parts.mos!.current.real).toBe(current);
+    // I=2*Vds-Vds^2: I=1-2^-52 gives Vds=1-2^-26 and gds>0.
+    // I=1 requires saturation (Vds>=1), where gds=0 and the AC drain floats.
+    if (current < 1) { expect(dc.parts.mos!.voltage.real).toBe(1 - 2 ** -26); }
+    else { expect(dc.parts.mos!.voltage.real).toBeGreaterThanOrEqual(1); }
     expect(ac.status, ac.message).toBe("valid");
     expect(ac.parts.mos!.channelConducting).toBe(true);
-    expect(ac.parts.meter!.meterStatus).toBe("connected");
+    expect(ac.parts.meter!.meterStatus).toBe(current < 1 ? "connected" : "floating");
+    expect(ac.parts.mos!.acReferenceTerminalGroups).toEqual(current < 1 ? [["a", "c"]] : [["b", "c"]]);
   });
 
   it("reports a diode-connected lambda-zero MOS as AC-connected at saturation", () => {
@@ -126,7 +131,7 @@ describe("AC reference detection for an underflowed diode slope", () => {
     const ac = analyzeAnalogCircuit(document, { mode: "ac", frequencyHz: 1000 });
 
     expect(dc.status, dc.message).toBe("valid");
-    expect(dc.parts.mos!.terminalVoltages.a.real).toBe(1);
+    expect(dc.parts.mos!.terminalVoltages.a!.real).toBe(1);
     expect(dc.parts.mos!.current.real).toBe(1);
     expect(ac.status, ac.message).toBe("valid");
     expect(ac.parts.meter!.meterStatus).toBe("connected");
@@ -202,9 +207,9 @@ describe("AC reference detection for an underflowed diode slope", () => {
     const ac = analyzeAnalogCircuit(document, { mode: "ac", frequencyHz: 1000 });
 
     expect(dc.status, dc.message).toBe("valid");
-    expect(dc.parts.transistor!.terminalVoltages.b.real).toBe(-10 * thermalVoltage);
-    expect(dc.parts.transistor!.terminalVoltages.a.real).toBe(0);
-    expect(dc.parts.transistor!.terminalVoltages.c.real).toBe(0);
+    expect(dc.parts.transistor!.terminalVoltages.b!.real).toBe(-10 * thermalVoltage);
+    expect(dc.parts.transistor!.terminalVoltages.a!.real).toBe(0);
+    expect(dc.parts.transistor!.terminalVoltages.c!.real).toBe(0);
     expect(Number.MIN_VALUE * Math.exp(-10) / thermalVoltage).toBe(0);
     expect(Math.exp(-10) / thermalVoltage).toBeGreaterThan(0);
     expect(ac.status, ac.message).toBe("valid");

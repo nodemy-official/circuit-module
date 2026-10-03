@@ -74,6 +74,57 @@ it("uses the validated switch override snapshot for every sample", () => {
   }
 });
 
+it.each([false, "invalid-state", "throw"])("keeps the validated switch state when later descriptors return %s", (laterValue) => {
+  let reads = 0;
+  const switchStates = new Proxy({ switch: true }, {
+    getOwnPropertyDescriptor(target, key) {
+      const descriptor = Reflect.getOwnPropertyDescriptor(target, key);
+      if (key !== "switch" || !descriptor) { return descriptor; }
+      reads += 1;
+      if (reads <= 2) { return descriptor; }
+      if (laterValue === "throw") { throw new Error("Validated switch descriptor was read again"); }
+      return { ...descriptor, value: laterValue };
+    },
+  });
+  const options = { durationSeconds: 1, timeStepSeconds: 0.5 };
+  const result = simulateTransient(document, { ...options, switchStates });
+  expect(result.status, result.message).toBe("valid");
+  expect(result).toEqual(simulateTransient(document, { ...options, switchStates: { switch: true } }));
+  expect(reads).toBeLessThanOrEqual(2);
+  for (const sample of result.samples) {
+    expect(sample.parts.switch!.switchClosed).toBe(true);
+    expect(sample.parts.load!.currentAmps).toBe(1);
+  }
+});
+
+it.each(["durationSeconds", "timeStepSeconds", "startFromOperatingPoint", "switchStates"])(
+  "keeps the validated top-level %s descriptor snapshot",
+  (field) => {
+    let reads = 0;
+    const options = { durationSeconds: 1, timeStepSeconds: 0.5, startFromOperatingPoint: true, switchStates: { switch: true } };
+    const trapped = new Proxy(options, {
+      getOwnPropertyDescriptor(target, key) {
+        if (key === field && ++reads > 2) { throw new Error("Validated transient option was read again"); }
+        return Reflect.getOwnPropertyDescriptor(target, key);
+      },
+    });
+    const result = simulateTransient(document, trapped);
+    expect(result.status, result.message).toBe("valid");
+    expect(result).toEqual(simulateTransient(document, options));
+    expect(reads).toBeLessThanOrEqual(2);
+  },
+);
+
+it("preserves null-prototype transient options and switch states", () => {
+  const plain: TransientAnalysisOptions = { durationSeconds: 1, timeStepSeconds: 0.5, switchStates: { switch: true } };
+  const options = Object.assign(Object.create(null), plain, {
+    switchStates: Object.assign(Object.create(null), plain.switchStates),
+  });
+  const result = simulateTransient(document, options);
+  expect(result.status, result.message).toBe("valid");
+  expect(result).toEqual(simulateTransient(document, plain));
+});
+
 it("retains non-enumerable required, optional and switch-state data fields", () => {
   const plain: TransientAnalysisOptions = { durationSeconds: 1, timeStepSeconds: 0.5, startFromOperatingPoint: true, switchStates: { switch: true } };
   const values = { ...plain, switchStates: Object.defineProperty({}, "switch", { value: true }) };

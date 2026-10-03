@@ -268,17 +268,9 @@ function analyzeExtendedCircuitFromInput(
   inputSwitchStates: Record<string, boolean>,
   options: CircuitAnalysisOptions,
 ): CircuitAnalysis {
-  const switchStates = adapterInput(document, inputSwitchStates, options);
-  if (typeof switchStates === "string") { return invalidAdapterResult(switchStates); }
-  let validatedOptions: CircuitAnalysisOptions;
-  try {
-    validatedOptions = {
-      mode: simulationRecordField(options, "mode") as CircuitAnalysisOptions["mode"],
-      frequencyHz: simulationRecordField(options, "frequencyHz") as number | undefined,
-    };
-  } catch {
-    return invalidAdapterResult("解析条件を読み取れません。");
-  }
+  const input = adapterInput(document, inputSwitchStates, options);
+  if (typeof input === "string") { return invalidAdapterResult(input); }
+  const { switchStates, options: validatedOptions } = input;
   const firstAc = document.parts.find((part) => part.kind === "ac-source");
   const mode = validatedOptions.mode === "ac" || (validatedOptions.mode !== "dc" && firstAc) ? "ac" : "dc";
   const frequencyHz = acAnalysisFrequency(document, validatedOptions.frequencyHz);
@@ -351,7 +343,10 @@ function invalidAdapterResult(message: string): CircuitAnalysis {
   };
 }
 
-function adapterInput(document: unknown, switchStates: unknown, options: unknown): string | Record<string, boolean> {
+function adapterInput(document: unknown, switchStates: unknown, options: unknown): string | {
+  switchStates: Record<string, boolean>;
+  options: CircuitAnalysisOptions;
+} {
   try {
     const shapeIssue = circuitDocumentShapeIssue(document);
     if (shapeIssue) { return shapeIssue; }
@@ -376,7 +371,8 @@ function adapterInput(document: unknown, switchStates: unknown, options: unknown
       if (kinds.get(partId) !== "switch") { return `スイッチ状態の対象「${partId}」はスイッチ部品ではありません。`; }
       if (typeof state !== "boolean") { return "スイッチ状態は部品 ID ごとの真偽値で指定してください。"; }
     }
-    return snapshot as Record<string, boolean>;
+    // Keep mode selection, solving and readings on the validated option values.
+    return { switchStates: snapshot as Record<string, boolean>, options: { mode, frequencyHz } };
   } catch {
     return "解析条件またはスイッチ状態を読み取れません。";
   }

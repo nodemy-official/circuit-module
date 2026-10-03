@@ -926,10 +926,10 @@ function rationalMatrixNonzeroCount(size: number, matrix: ExactRealArray) {
   return count;
 }
 
-function findSparsePivotRow(rows: RationalRow[], column: number, size: number) {
+function findSparsePivotRow(rows: RationalRow[], column: number, size: number, firstRow = column) {
   let pivotRow = -1;
   let pivotFill = Number.POSITIVE_INFINITY;
-  for (let rowIndex = column; rowIndex < size; rowIndex += 1) {
+  for (let rowIndex = firstRow; rowIndex < rows.length; rowIndex += 1) {
     const row = rows[rowIndex];
     if (!row?.has(column)) { continue; }
     let fill = 0;
@@ -944,8 +944,8 @@ function findSparsePivotRow(rows: RationalRow[], column: number, size: number) {
   return pivotRow;
 }
 
-function eliminateSparseRows(rows: RationalRow[], column: number, pivotEquation: RationalRow, pivot: ExactRational) {
-  for (let rowIndex = column + 1; rowIndex < rows.length; rowIndex += 1) {
+function eliminateSparseRows(rows: RationalRow[], column: number, pivotEquation: RationalRow, pivot: ExactRational, firstRow = column + 1) {
+  for (let rowIndex = firstRow; rowIndex < rows.length; rowIndex += 1) {
     const row = rows[rowIndex];
     const leading = row?.get(column);
     if (!row || !leading) { continue; }
@@ -963,15 +963,16 @@ function eliminateSparseRows(rows: RationalRow[], column: number, pivotEquation:
   return true;
 }
 
-function backSubstituteSparseRationalRows(rows: RationalRow[], size: number): ExactRational[] | null {
+function backSubstituteSparseRationalRows(rows: RationalRow[], size: number, pivotColumns?: readonly number[]): ExactRational[] | null {
   const solution: ExactRational[] = Array.from({ length: size }, () => ZERO);
-  for (let rowIndex = size - 1; rowIndex >= 0; rowIndex -= 1) {
+  for (let rowIndex = (pivotColumns?.length ?? size) - 1; rowIndex >= 0; rowIndex -= 1) {
     const row = rows[rowIndex];
-    const diagonal = row?.get(rowIndex);
+    const pivotColumn = pivotColumns?.[rowIndex] ?? rowIndex;
+    const diagonal = row?.get(pivotColumn);
     if (!row || !diagonal) { return null; }
     let residual = row.get(size) ?? ZERO;
     for (const [column, coefficient] of row) {
-      if (column <= rowIndex || column >= size) { continue; }
+      if (column <= pivotColumn || column >= size) { continue; }
       residual = subtractExactRational(
         residual,
         multiplyExactRational(coefficient, solution[column] ?? ZERO),
@@ -979,7 +980,7 @@ function backSubstituteSparseRationalRows(rows: RationalRow[], size: number): Ex
     }
     const value = divideExactRational(residual, diagonal);
     if (!value) { return null; }
-    solution[rowIndex] = value;
+    solution[pivotColumn] = value;
   }
   return solution;
 }
@@ -1202,6 +1203,86 @@ function exactEquationHolds(terms: readonly ExactRational[], rhs: ExactRational)
   const common = gcd(sum.denominator, rhs.denominator);
   return sum.numerator * integerQuotient(rhs.denominator, common) ===
     rhs.numerator * integerQuotient(sum.denominator, common);
+}
+
+function rationalConstraintRows(
+  variableCount: number,
+  rows: readonly ReadonlyMap<number, ExactRational>[],
+  rhs: readonly ExactRational[],
+): RationalRow[] | null {
+  const equations: RationalRow[] = [];
+  for (let index = 0; index < rows.length; index += 1) {
+    const source = rows[index];
+    const expected = normalized(rhs[index]!);
+    if (!source || typeof source.entries !== "function" || typeof source.get !== "function" || !expected) {
+      return null;
+    }
+    const equation: RationalRow = new Map();
+    for (const [column, input] of source.entries()) {
+      if (!Number.isSafeInteger(column) || column < 0 || column >= variableCount) { return null; }
+      const coefficient = normalized(input);
+      if (!coefficient) { return null; }
+      if (coefficient.numerator !== 0n) { equation.set(column, coefficient); }
+    }
+    if (expected.numerator !== 0n) { equation.set(variableCount, expected); }
+    equations.push(equation);
+  }
+  return equations;
+}
+
+function exactRealConstraintsHold(
+  rows: readonly ReadonlyMap<number, ExactRational>[],
+  rhs: readonly ExactRational[],
+  solution: readonly ExactRational[],
+) {
+  for (let index = 0; index < rows.length; index += 1) {
+    const terms: ExactRational[] = [];
+    for (const [column, coefficient] of rows[index]!.entries()) {
+      terms.push(multiplyExactRational(coefficient, solution[column]!));
+    }
+    const expected = normalized(rhs[index]!);
+    if (!expected || !exactEquationHolds(terms, expected)) { return false; }
+  }
+  return true;
+}
+
+/**
+ * Solves rectangular, possibly singular real constraints without mutating inputs.
+ * Pivots are chosen in ascending column order; free variables are exactly zero.
+ * Invalid inputs or inconsistent equations return null. Every original equation
+ * is checked exactly before the particular solution is exposed.
+ */
+export function solveExactRealLinearConstraints(
+  variableCount: number,
+  rows: readonly ReadonlyMap<number, ExactRational>[],
+  rhs: readonly ExactRational[],
+): ExactRational[] | null {
+  // The result must fit a JavaScript array, including for a system with no rows.
+  if (!Number.isSafeInteger(variableCount) || variableCount < 0 || variableCount >= 2 ** 32 ||
+      !Array.isArray(rows) || !Array.isArray(rhs) || rhs.length !== rows.length) {
+    return null;
+  }
+  const equations = rationalConstraintRows(variableCount, rows, rhs);
+  if (!equations) { return null; }
+  const pivotColumns: number[] = [];
+  for (let column = 0; column < variableCount && pivotColumns.length < equations.length; column += 1) {
+    const firstRow = pivotColumns.length;
+    const pivotRow = findSparsePivotRow(equations, column, variableCount, firstRow);
+    if (pivotRow < 0) { continue; }
+    if (pivotRow !== firstRow) {
+      [equations[firstRow], equations[pivotRow]] = [equations[pivotRow]!, equations[firstRow]!];
+    }
+    const equation = equations[firstRow]!;
+    const pivot = equation.get(column)!;
+    if (!eliminateSparseRows(equations, column, equation, pivot, firstRow + 1)) { return null; }
+    pivotColumns.push(column);
+  }
+  // All remaining coefficient rows are zero after every variable was considered.
+  if (equations.some((row, index) => index >= pivotColumns.length && row.has(variableCount))) {
+    return null;
+  }
+  const solution = backSubstituteSparseRationalRows(equations, variableCount, pivotColumns);
+  return solution && exactRealConstraintsHold(rows, rhs, solution) ? solution : null;
 }
 
 /**
