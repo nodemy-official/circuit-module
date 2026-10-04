@@ -382,62 +382,66 @@ function variant(value: Fixture) {
 // correct binary64 rounding intervals. No production numerical helper or
 // approximate zero/expanded tolerance enters any assertion.
 describe("source discovery against an independent nodal oracle", () => {
-  it.each(cases)("$document.title", (value) => {
-    const response = port(value);
-    expect(compare(response.v, zero), "independent exact open-output polarity").toBe(value.outputSign);
-    if (value.closedForm) { expect(compare(response.r, value.closedForm), "closed form equals rational KCL port experiment").toBe(0); }
-    const status = value.localShort || value.outputSign !== 0 && compare(response.r, threshold) < 0 ? "short" : "closed";
-    expect(status, "physical output experiment, before production analysis").toBe(value.expectedStatus);
-    if (value.rayleigh) {
-      const before = port(value.baseline!);
-      expect(compare(response.r, before.r), "passive Rayleigh bound").toBe(value.rayleigh === "equal" ? 0 : -1);
-      expect(compare(response.v, before.v), "passive equilibrium link preserves ideal Voc exactly").toBe(0);
-    }
-    const point = solve(value.branches);
-    const kcl = new Map<string, Rational>();
-    let power = zero;
-    for (const [i, branch] of value.branches.entries()) {
-      const current = point.currents[i];
-      kcl.set(branch.a, add(kcl.get(branch.a) ?? zero, current));
-      kcl.set(branch.b, subtract(kcl.get(branch.b) ?? zero, current));
-      const drop = add(branch.e, multiply(branch.r, current));
-      expect(compare(subtract(point.voltage(branch.a), point.voltage(branch.b)), drop), "independent exact KVL").toBe(0);
-      power = add(power, multiply(drop, current));
-      if (branch.cell) {
-        const local = solve(value.branches.filter((edge) => !edge.cell), { a: branch.a, b: branch.b });
-        expect(compare(subtract(local.voltage(branch.a), local.voltage(branch.b)), threshold), "passive local short separate from common Voc")
-          .toBe(value.localShort && !branch.unselected ? -1 : 1);
+  for (const value of cases) {
+    // The eight-column audit solves 16 additional independent passive MNA
+    // systems. Give that oracle time while keeping ordinary cases at 10 s.
+    it(value.document.title, () => {
+      const response = port(value);
+      expect(compare(response.v, zero), "independent exact open-output polarity").toBe(value.outputSign);
+      if (value.closedForm) { expect(compare(response.r, value.closedForm), "closed form equals rational KCL port experiment").toBe(0); }
+      const status = value.localShort || value.outputSign !== 0 && compare(response.r, threshold) < 0 ? "short" : "closed";
+      expect(status, "physical output experiment, before production analysis").toBe(value.expectedStatus);
+      if (value.rayleigh) {
+        const before = port(value.baseline!);
+        expect(compare(response.r, before.r), "passive Rayleigh bound").toBe(value.rayleigh === "equal" ? 0 : -1);
+        expect(compare(response.v, before.v), "passive equilibrium link preserves ideal Voc exactly").toBe(0);
       }
-    }
-    expect([...kcl.values()].every((current) => current.numerator === 0n), "exact node conservation").toBe(true);
-    expect(power.numerator, "exact energy conservation includes every 1 microohm physical lead").toBe(0n);
-    const start = performance.now();
-    const actual = analyzeCircuit(value.document);
-    const elapsed = performance.now() - start;
-    const renamed = variant(value);
-    const results = [{ actual, name: (id: string) => id }];
-    if (!value.large) { results.push({ actual: analyzeCircuit(renamed.document), name: (id: string) => renamed.names.get(id)! }); }
-    if (value.large) {
-      console.info(`FINAL_REVIEW_EIGHT_COLUMNS parts=${value.document.parts.length} wires=${value.document.wires.length} analyzeMs=${elapsed.toFixed(3)} status=${actual.status}`);
-    }
-    if (!value.large && results.some((result) => result.actual.status !== value.expectedStatus)) {
-      console.info(`FINAL_REVIEW_MISMATCH title=${value.document.title} expected=${value.expectedStatus} original=${actual.status} renamed=${results[1].actual.status} externalMilliOhms=${Number(response.r.numerator) / Number(response.r.denominator) * 1000} voc=${Number(response.v.numerator) / Number(response.v.denominator)}`);
-    }
-    for (const result of results) {
+      const point = solve(value.branches);
+      const kcl = new Map<string, Rational>();
+      let power = zero;
       for (const [i, branch] of value.branches.entries()) {
         const current = point.currents[i];
-        if (branch.id) {
-          const reading = result.actual.parts[result.name(branch.id)];
-          const voltage = branch.cell ? add(branch.e, multiply(branch.r, current)) : multiply(branch.partR!, current);
-          expect(compare(exactReading(reading.exactTerminalCurrents?.a, reading.currentAmps), current), `${branch.id} exact current`).toBe(0);
-          expect(compare(exactReading(reading.exactVoltage, reading.voltageVolts), voltage), `${branch.id} exact voltage`).toBe(0);
-          assertCorrectRounding(reading.currentAmps, current, `${branch.id} current`);
-          assertCorrectRounding(reading.voltageVolts, voltage, `${branch.id} voltage`);
-          assertCorrectRounding(reading.powerWatts, multiply(voltage, branch.cell ? negate(current) : current), `${branch.id} power`);
+        kcl.set(branch.a, add(kcl.get(branch.a) ?? zero, current));
+        kcl.set(branch.b, subtract(kcl.get(branch.b) ?? zero, current));
+        const drop = add(branch.e, multiply(branch.r, current));
+        expect(compare(subtract(point.voltage(branch.a), point.voltage(branch.b)), drop), "independent exact KVL").toBe(0);
+        power = add(power, multiply(drop, current));
+        if (branch.cell) {
+          const local = solve(value.branches.filter((edge) => !edge.cell), { a: branch.a, b: branch.b });
+          expect(compare(subtract(local.voltage(branch.a), local.voltage(branch.b)), threshold), "passive local short separate from common Voc")
+            .toBe(value.localShort && !branch.unselected ? -1 : 1);
         }
-        for (const id of branch.wires) { assertCorrectRounding(result.actual.wireCurrents[id], current, `${id} current`); }
       }
-      expect(result.actual.status, `${value.document.title} production status`).toBe(value.expectedStatus);
-    }
-  });
+      expect([...kcl.values()].every((current) => current.numerator === 0n), "exact node conservation").toBe(true);
+      expect(power.numerator, "exact energy conservation includes every 1 microohm physical lead").toBe(0n);
+      const start = performance.now();
+      const actual = analyzeCircuit(value.document);
+      const elapsed = performance.now() - start;
+      const renamed = variant(value);
+      const results = [{ actual, name: (id: string) => id }];
+      if (!value.large) { results.push({ actual: analyzeCircuit(renamed.document), name: (id: string) => renamed.names.get(id)! }); }
+      if (value.large) {
+        console.info(`FINAL_REVIEW_EIGHT_COLUMNS parts=${value.document.parts.length} wires=${value.document.wires.length} analyzeMs=${elapsed.toFixed(3)} status=${actual.status}`);
+      }
+      if (!value.large && results.some((result) => result.actual.status !== value.expectedStatus)) {
+        console.info(`FINAL_REVIEW_MISMATCH title=${value.document.title} expected=${value.expectedStatus} original=${actual.status} renamed=${results[1].actual.status} externalMilliOhms=${Number(response.r.numerator) / Number(response.r.denominator) * 1000} voc=${Number(response.v.numerator) / Number(response.v.denominator)}`);
+      }
+      for (const result of results) {
+        for (const [i, branch] of value.branches.entries()) {
+          const current = point.currents[i];
+          if (branch.id) {
+            const reading = result.actual.parts[result.name(branch.id)];
+            const voltage = branch.cell ? add(branch.e, multiply(branch.r, current)) : multiply(branch.partR!, current);
+            expect(compare(exactReading(reading.exactTerminalCurrents?.a, reading.currentAmps), current), `${branch.id} exact current`).toBe(0);
+            expect(compare(exactReading(reading.exactVoltage, reading.voltageVolts), voltage), `${branch.id} exact voltage`).toBe(0);
+            assertCorrectRounding(reading.currentAmps, current, `${branch.id} current`);
+            assertCorrectRounding(reading.voltageVolts, voltage, `${branch.id} voltage`);
+            assertCorrectRounding(reading.powerWatts, multiply(voltage, branch.cell ? negate(current) : current), `${branch.id} power`);
+          }
+          for (const id of branch.wires) { assertCorrectRounding(result.actual.wireCurrents[id], current, `${id} current`); }
+        }
+        expect(result.actual.status, `${value.document.title} production status`).toBe(value.expectedStatus);
+      }
+    }, value.large ? 60_000 : undefined);
+  }
 });

@@ -59,53 +59,57 @@ function gateNetwork(network: typeof networks[number], sign: number): CircuitSpe
 describe("MOS initial constraints through gate bias networks", () => {
   for (const kind of ["nmos", "pmos"] as const) {
     for (const reversed of [false, true]) {
-      it.each(networks)(`kind=${kind}, network=%s, reversed=${reversed}`, (network) => {
-        const sign = kind === "nmos" ? 1 : -1;
-        const specs: CircuitSpec[] = [
-          ["supply", "ac-source", ["supply", "0"], { voltageVolts: 0, offsetVolts: sign * 10 }],
-          ["g1", "ac-source", ["bias", "0"], { voltageVolts: 0, offsetVolts: sign * 2.5 }],
-          ["g2", "ac-source", ["gate2", "0"], { voltageVolts: 0, offsetVolts: sign * 4 }],
-          ["l", "inductor", ["supply", "drain"], { inductanceHenries: 1, initialCurrentAmps: sign }],
-          ["rg", "resistor", ["bias", "gate1"], { resistanceOhms: 2 }],
-          ["cg", "capacitor", ["gate1", "0"], { capacitanceFarads: 1, initialVoltageVolts: sign * 3 }],
-          ["m1", kind, reversed ? ["0", "gate1", "middle"] : ["middle", "gate1", "0"], model],
-          ["m2", kind, reversed ? ["middle", "gate2", "drain"] : ["drain", "gate2", "middle"], model],
-          ["ti", "current-source", ["drain", "td"], { currentAmps: sign * (1 - 2 ** -52) }],
-          ["tm", kind, reversed ? ["drain", "tg", "td"] : ["td", "tg", "drain"], model],
-          ...gateNetwork(network, sign),
-        ];
-        if (network === "opamp") {
-          // Three unknown nonlinear biases must not hide the saturated pair.
-          // A prefix-only subset search misses the correct active set.
-          for (const id of ["extra1", "extra2"]) {
-            specs.push([`${id}-current`, "current-source", ["drain", id], { currentAmps: sign * (1 - 2 ** -52) }],
-              [id, kind, [id, "tg", "drain"], model]);
+      for (const network of networks) {
+        // Near-triode feedback needs repeated exact derivative constraints and
+        // saturated-region candidates. Keep the longer limit local to this audit.
+        it(`kind=${kind}, network=${network}, reversed=${reversed}`, () => {
+          const sign = kind === "nmos" ? 1 : -1;
+          const specs: CircuitSpec[] = [
+            ["supply", "ac-source", ["supply", "0"], { voltageVolts: 0, offsetVolts: sign * 10 }],
+            ["g1", "ac-source", ["bias", "0"], { voltageVolts: 0, offsetVolts: sign * 2.5 }],
+            ["g2", "ac-source", ["gate2", "0"], { voltageVolts: 0, offsetVolts: sign * 4 }],
+            ["l", "inductor", ["supply", "drain"], { inductanceHenries: 1, initialCurrentAmps: sign }],
+            ["rg", "resistor", ["bias", "gate1"], { resistanceOhms: 2 }],
+            ["cg", "capacitor", ["gate1", "0"], { capacitanceFarads: 1, initialVoltageVolts: sign * 3 }],
+            ["m1", kind, reversed ? ["0", "gate1", "middle"] : ["middle", "gate1", "0"], model],
+            ["m2", kind, reversed ? ["middle", "gate2", "drain"] : ["drain", "gate2", "middle"], model],
+            ["ti", "current-source", ["drain", "td"], { currentAmps: sign * (1 - 2 ** -52) }],
+            ["tm", kind, reversed ? ["drain", "tg", "td"] : ["td", "tg", "drain"], model],
+            ...gateNetwork(network, sign),
+          ];
+          if (network === "opamp") {
+            // Three unknown nonlinear biases must not hide the saturated pair.
+            // A prefix-only subset search misses the correct active set.
+            for (const id of ["extra1", "extra2"]) {
+              specs.push([`${id}-current`, "current-source", ["drain", id], { currentAmps: sign * (1 - 2 ** -52) }],
+                [id, kind, [id, "tg", "drain"], model]);
+            }
           }
-        }
-        if (!reversed || network.startsWith("opamp")) { specs.push(["ground", "ground", ["0"]]); }
-        const result = simulateTransient(createCircuitFromSpecs(reversed ? specs.toReversed() : specs, "Zero-current gate paths"), {
-          durationSeconds: 1e-5, timeStepSeconds: 1e-5,
-        });
-        expect(result.status, result.message).toBe("valid");
-        const initial = result.samples[0]!.parts;
-        // The gate networks carry zero current. The lower saturated MOS has
-        // I' = 2*(3-2)*(2.5-3)/(R*C) = -1/2 A/s, hence V_L = -1/2 V.
-        expect(initial.l!.voltageVolts).toBe(-sign * 0.5);
-        expect(initial.tm!.currentAmps).toBe((reversed ? -sign : sign) * (1 - 2 ** -52));
-        expect(initial.tm!.voltageVolts).toBe((reversed ? -sign : sign) * (1 - 2 ** -26));
-        for (const sample of result.samples) {
-          for (const id of ["tr", "tp", "tc", "tl", "sw", "am", "di", "q", "buffer"]) {
-            if (sample.parts[id]) { expect(sample.parts[id]!.currentAmps).toBe(0); }
+          if (!reversed || network.startsWith("opamp")) { specs.push(["ground", "ground", ["0"]]); }
+          const result = simulateTransient(createCircuitFromSpecs(reversed ? specs.toReversed() : specs, "Zero-current gate paths"), {
+            durationSeconds: 1e-5, timeStepSeconds: 1e-5,
+          });
+          expect(result.status, result.message).toBe("valid");
+          const initial = result.samples[0]!.parts;
+          // The gate networks carry zero current. The lower saturated MOS has
+          // I' = 2*(3-2)*(2.5-3)/(R*C) = -1/2 A/s, hence V_L = -1/2 V.
+          expect(initial.l!.voltageVolts).toBe(-sign * 0.5);
+          expect(initial.tm!.currentAmps).toBe((reversed ? -sign : sign) * (1 - 2 ** -52));
+          expect(initial.tm!.voltageVolts).toBe((reversed ? -sign : sign) * (1 - 2 ** -26));
+          for (const sample of result.samples) {
+            for (const id of ["tr", "tp", "tc", "tl", "sw", "am", "di", "q", "buffer"]) {
+              if (sample.parts[id]) { expect(sample.parts[id]!.currentAmps).toBe(0); }
+            }
+            if (sample.parts.tl) { expect(sample.parts.tl.voltageVolts).toBe(0); }
+            if (network === "bjt-ce-offset-tie" || network === "bjt-be-offset-tie") {
+              // Equal external potentials do not make the unloaded midpoint
+              // equipotential: each source must retain its nonzero voltage.
+              expect(sample.parts.tie1!.voltageVolts).toBe(sign * 0.125);
+              expect(sample.parts.tie2!.voltageVolts).toBe(-sign * 0.125);
+            }
           }
-          if (sample.parts.tl) { expect(sample.parts.tl.voltageVolts).toBe(0); }
-          if (network === "bjt-ce-offset-tie" || network === "bjt-be-offset-tie") {
-            // Equal external potentials do not make the unloaded midpoint
-            // equipotential: each source must retain its nonzero voltage.
-            expect(sample.parts.tie1!.voltageVolts).toBe(sign * 0.125);
-            expect(sample.parts.tie2!.voltageVolts).toBe(-sign * 0.125);
-          }
-        }
-      });
+        }, network === "opamp-feedback" ? 60_000 : undefined);
+      }
     }
   }
 });

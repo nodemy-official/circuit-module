@@ -148,3 +148,84 @@ it.each(["table", "arguments"])("recomputes scalar energy after expression %s be
     assertCorrectRounding(joules(), multiplyRational(rational(1n, 2n), multiplyRational(voltage, voltage)), "scalar energy after malformed expression");
   } finally { act(() => root.unmount()); }
 });
+
+it("keeps scalar energy after expression metadata is removed and cached samples override some", () => {
+  const circuit = rc();
+  const transient = structuredClone(simulateTransient(circuit, { durationSeconds: 1 / 16, timeStepSeconds: 1 / 1024 }));
+  transient.precisionExpressions = undefined;
+  transient.energyPrecisionExpressions = undefined;
+  const sampleIndex = transient.samples.length - 1;
+  const container = document.createElement("div");
+  const root = createRoot(container);
+  const analysis = analyzeCircuit(circuit);
+  const render = () => act(() => root.render(<CircuitEnergyPanel
+    document={circuit} analysis={analysis} frame={{ analysis: transient, sampleIndex }}
+  />));
+  const joules = () => Number(container.querySelector("[data-part-id=\"c\"][data-energy-joules]")?.getAttribute("data-energy-joules"));
+  const voltage = rationalFromNumber(transient.samples[sampleIndex]!.parts.c!.voltageVolts)!;
+  const expected = multiplyRational(rational(1n, 2n), multiplyRational(voltage, voltage));
+  try {
+    render();
+    assertCorrectRounding(joules(), expected, "scalar energy without expression metadata");
+    let calls = 0;
+    Reflect.set(transient.energyReadings!.c!.samples, "some", () => {
+      calls += 1;
+      return false;
+    });
+    render();
+    assertCorrectRounding(joules(), expected, "scalar energy after overriding cached samples.some");
+    expect(calls).toBe(0);
+  } finally { act(() => root.unmount()); }
+});
+
+it("uses indexed cached dissipation when energy samples override map", () => {
+  const circuit = rc();
+  const transient = simulateTransient(circuit, { durationSeconds: 1, timeStepSeconds: 0.5 });
+  const container = document.createElement("div");
+  const root = createRoot(container);
+  const analysis = analyzeCircuit(circuit);
+  const render = () => act(() => root.render(<CircuitEnergyPanel
+    document={circuit} analysis={analysis} frame={{ analysis: transient, sampleIndex: 2 }}
+  />));
+  const joules = () => Number(container.querySelector("[data-part-id=\"r\"][data-dissipated-joules]")?.getAttribute("data-dissipated-joules"));
+  try {
+    render();
+    // I0=1, I1=2/3, I2=4/9. The two width-1/2 trapezoids
+    // give (1+4/9)/4 + (4/9+16/81)/4 = 169/324 J.
+    assertCorrectRounding(joules(), rational(169n, 324n), "original resistor dissipation");
+    let calls = 0;
+    Reflect.set(transient.energyReadings!.r!.samples, "map", () => {
+      calls += 1;
+      return [0, 100, 200];
+    });
+    render();
+    assertCorrectRounding(joules(), rational(169n, 324n), "dissipation after overriding cached samples.map");
+    expect(calls).toBe(0);
+  } finally { act(() => root.unmount()); }
+});
+
+it("uses indexed samples for the stored-energy scale when flatMap is overridden", () => {
+  const circuit = rc();
+  const transient = simulateTransient(circuit, { durationSeconds: 1, timeStepSeconds: 0.5 });
+  const container = document.createElement("div");
+  const root = createRoot(container);
+  const analysis = analyzeCircuit(circuit);
+  const render = () => act(() => root.render(<CircuitEnergyPanel
+    document={circuit} analysis={analysis} frame={{ analysis: transient, sampleIndex: 2 }}
+  />));
+  const scale = () => Number(container.querySelector("[data-part-id=\"c\"] [data-scale-max]")?.getAttribute("data-scale-max"));
+  try {
+    render();
+    // V_C rises from 0 through 1/3 to 5/9. Its maximum
+    // stored energy is therefore (1/2)*(5/9)^2 = 25/162 J.
+    assertCorrectRounding(scale(), rational(25n, 162n), "original maximum stored energy");
+    let calls = 0;
+    Reflect.set(transient.samples, "flatMap", () => {
+      calls += 1;
+      return [200];
+    });
+    render();
+    assertCorrectRounding(scale(), rational(25n, 162n), "maximum stored energy after overriding samples.flatMap");
+    expect(calls).toBe(0);
+  } finally { act(() => root.unmount()); }
+});

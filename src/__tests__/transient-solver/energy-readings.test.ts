@@ -186,3 +186,22 @@ it.each(["table", "arguments"])("invalidates computed energy when expression %s 
   }
   expect(matchingTransientEnergy(part, result.samples, result.energyReadings, result.precisionExpressions, result.energyPrecisionExpressions)).toBeUndefined();
 });
+
+it("invalidates expression-dependent energy when its array overrides some", () => {
+  const document = rc();
+  const original = simulateTransient(document, { durationSeconds: 1 / 16, timeStepSeconds: 1 / 1024 });
+  for (const result of [JSON.parse(JSON.stringify(original)) as typeof original, structuredClone(original)]) {
+    const part = document.parts[2]!;
+    expect(matchingTransientEnergy(part, result.samples, result.energyReadings, result.precisionExpressions, result.energyPrecisionExpressions)).toBeDefined();
+    result.precisionExpressions = undefined;
+    result.energyPrecisionExpressions = undefined;
+    expect(matchingTransientEnergy(part, result.samples, result.energyReadings)).toBeUndefined();
+    let calls = 0;
+    Reflect.set(result.energyReadings!.c!.samples, "some", () => {
+      calls += 1;
+      return false;
+    });
+    expect(matchingTransientEnergy(part, result.samples, result.energyReadings)).toBeUndefined();
+    expect(calls).toBe(0);
+  }
+});

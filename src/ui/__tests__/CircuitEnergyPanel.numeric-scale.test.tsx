@@ -5,6 +5,8 @@ import { analyzeCircuit } from "../../circuit-solver.js";
 import { simulateTransient, type TransientAnalysis } from "../../transient-solver.js";
 import { renderToStaticMarkup } from "react-dom/server";
 import { CircuitEnergyPanel } from "../CircuitEnergyPanel.js";
+import { createCircuitFromSpecs } from "../../__tests__/helpers/circuit-fixture.js";
+import { addRational, assertCorrectRounding, multiplyRational, rational } from "../../__tests__/helpers/numeric-oracle.js";
 
 function rowValue(markup: string, partId: string, attribute: string): number | null {
   const match = markup.match(new RegExp(`data-part-id="${partId}"[^>]*${attribute}="([^"]+)"`));
@@ -20,6 +22,34 @@ function panelMarkup(document: CircuitDocument, analysis: TransientAnalysis, sam
 }
 
 describe("energy numeric scale audit", () => {
+  it.each([-1, 0, 1])("preserves algebraic AC energy on midpoint side %s", (side) => {
+    for (const exponent of [-400, 0, 400]) {
+      const scale = 2 ** exponent;
+      const document = createCircuitFromSpecs([
+        ["real", "ac-source", ["a", "b"], { voltageVolts: (1 + 2 ** -26) * scale, frequencyHz: 1, phaseDegrees: 0 }],
+        ["positive", "ac-source", ["b", "c"], { voltageVolts: 2 ** (exponent - 27), frequencyHz: 1, phaseDegrees: 45 }],
+        ["negative", "ac-source", ["c", "d"], { voltageVolts: 2 ** (exponent - 27), frequencyHz: 1, phaseDegrees: 135 }],
+        ["tiny", "ac-source", ["d", "0"], { voltageVolts: side === 0 ? 0 : 2 ** (exponent - 600), frequencyHz: 1, phaseDegrees: side < 0 ? 180 : 0 }],
+        ["load", "capacitor", ["a", "0"], { capacitanceFarads: 2 }],
+        ["ground", "ground", ["0"]],
+      ], "Algebraic AC stored energy");
+      const analysis = analyzeCircuit(document);
+      expect(analysis.status, analysis.message).toBe("closed");
+      expect(analysis.parts.load!.exactVoltage?.normalizedFraction).toBeDefined();
+      // V = 2^exponent * (1 + 2^-26 + side*2^-600 + i*sqrt(2)*2^-27).
+      // With C=2, E=|V|². The unperturbed exact energy is a binary64 tie
+      // with an odd lower significand; the tiny source brackets that tie.
+      const real = addRational(rational(2n ** 27n + 2n, 2n ** 27n), rational(BigInt(side), 2n ** 600n));
+      const imaginarySquared = rational(2n, 2n ** 54n);
+      const squaredScale = exponent < 0 ? rational(1n, 2n ** BigInt(-2 * exponent)) : rational(2n ** BigInt(2 * exponent));
+      const expected = multiplyRational(addRational(multiplyRational(real, real), imaginarySquared), squaredScale);
+      for (const result of [analysis, JSON.parse(JSON.stringify(analysis)) as typeof analysis, structuredClone(analysis)]) {
+        const markup = renderToStaticMarkup(<CircuitEnergyPanel document={document} analysis={result} />);
+        assertCorrectRounding(rowValue(markup, "load", "data-energy-joules")!, expected, `AC energy side=${side}, exponent=${exponent}`);
+      }
+    }
+  });
+
   it.each(["capacitor", "inductor"] as const)("uses the retained fractional %s state for stored energy", (kind) => {
     const document: CircuitDocument = {
       title: "厳密な分数の蓄積エネルギー",

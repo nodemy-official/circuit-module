@@ -152,7 +152,7 @@ export function matchingTransientEnergy(part: CircuitPart, samples: readonly Tra
     if (!matchingExactExpressions(expressions, expectedExpressions)) { return; }
     const energy = energies && Object.hasOwn(energies, part.id) ? energies[part.id] : undefined;
     if (!energy || energy.kind !== part.kind || energy.coefficient !== coefficient(part) || !Array.isArray(energy.samples) || energy.samples.length !== samples.length) { return; }
-    if (!expressions && energy.samples.some((sample) =>
+    if (!expressions && Array.from({ length: energy.samples.length }, (_, index) => energy.samples[index]!).some((sample) =>
       hasExpressionReference(sample.exactVoltage) || hasExpressionReference(sample.exactCurrent))) { return; }
     const quantity = part.kind === "capacitor" || part.kind === "inductor" ? "storedJoules" : "dissipatedJoules";
     return Array.from({ length: samples.length }, (_, index) => index).every((index) => {

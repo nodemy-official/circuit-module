@@ -1,10 +1,10 @@
-import { complexMagnitudeNormalization, scaledProduct } from "../analog-math.js";
+import { complexConjugate, complexMagnitudeNormalization, complexMultiply, scaledProduct } from "../analog-math.js";
 import type { CircuitDocument, CircuitPart } from "../circuit-model.js";
 import { restoredReadingComplex } from "../circuit-reading.js";
 import type { CircuitAnalysis } from "../circuit-solver.js";
 import { snapshotExactExpressions, type ExactExpressionNode } from "../exact-expression.js";
 import { addExactRational, exactRationalToNumber, multiplyExactRational, numberToExactRational, subtractExactRational, type ExactRational } from "../exact-linear-algebra.js";
-import { exactComplexValue } from "../exact-numeric-state.js";
+import { complexFromExact, exactComplexValue } from "../exact-numeric-state.js";
 import { formatCircuitNumber } from "../number-format.js";
 import { formatCircuitQuantity, type CircuitTransientFrame } from "../circuit-visualization.js";
 import type { TransientPartReading, TransientSample } from "../transient-solver.js";
@@ -36,14 +36,15 @@ function storedEnergy(
   const phase = capacitive ? "voltagePhaseDegrees" in reading ? reading.voltagePhaseDegrees : undefined
     : "currentPhaseDegrees" in reading ? reading.currentPhaseDegrees : undefined;
   const retained = restoredReadingComplex(capacitive ? reading.exactVoltage : reading.exactTerminalCurrents?.a, scalar, phase, ac, expressions);
-  const exact = retained && exactComplexValue(retained);
-  if (!retained || !exact) { return scaledProduct([0.5, coefficient, scalar, scalar]); }
-  const squaredMagnitude = multiplyExactRational(addExactRational(
-    multiplyExactRational(exact.real, exact.real), multiplyExactRational(exact.imaginary, exact.imaginary),
+  if (!retained) { return scaledProduct([0.5, coefficient, scalar, scalar]); }
+  // Keep algebraic terms through V*conj(V): the rectangular expansion alone
+  // can lose the correct side of an energy midpoint. The product's squared
+  // normalization has the original normalization as its exact amplitude.
+  const factor = multiplyExactRational(multiplyExactRational(
+    numberToExactRational(0.5)!, numberToExactRational(coefficient)!,
   ), complexMagnitudeNormalization(retained));
-  return exactRationalToNumber(multiplyExactRational(
-    multiplyExactRational(numberToExactRational(0.5)!, numberToExactRational(coefficient)!), squaredMagnitude,
-  ));
+  const squared = complexMultiply(retained, complexConjugate(retained));
+  return complexMultiply(squared, complexFromExact({ real: factor, imaginary: numberToExactRational(0)! })).real;
 }
 
 function resistivePower(reading: TransientPartReading, expressions?: readonly ExactExpressionNode[]): ExactRational {
@@ -161,7 +162,8 @@ function energyEntries(
 
 function maximumStoredEnergy(document: CircuitDocument, transient: CircuitTransientFrame["analysis"] | null, precomputed: Map<string, readonly TransientEnergySample[]>, expressions?: readonly ExactExpressionNode[]): number {
   if (!transient) { return 0; }
-  return Math.max(0, ...transient.samples.flatMap((sample, sampleIndex) => document.parts.flatMap((part) => {
+  return Math.max(0, ...Array.from({ length: transient.samples.length }, (_, index) => transient.samples[index]!)
+    .flatMap((sample, sampleIndex) => document.parts.flatMap((part) => {
     if (!reactiveKinds.has(part.kind)) { return []; }
     const reading = sample.parts[part.id];
     if (!reading || !finite(reading.voltageVolts) || !finite(reading.currentAmps)) { return []; }
@@ -285,8 +287,13 @@ function energyExpressions(table: readonly ExactExpressionNode[] | undefined) {
 function dissipatedEnergy(parts: CircuitPart[], transient: CircuitTransientFrame["analysis"] | null,
   precomputed: Map<string, readonly TransientEnergySample[]>, expressions?: readonly ExactExpressionNode[]) {
   return transient
-    ? new Map(parts.map((part) => [part.id, precomputed.get(part.id)?.map((entry) => entry.dissipatedJoules ?? null)
-      ?? resistorEnergySeries(transient.samples, part.id, expressions)]))
+    ? new Map(parts.map((part) => {
+      const energy = precomputed.get(part.id);
+      // Derived readouts use indexed JSON data, as their validation does.
+      const series = energy ? Array.from({ length: energy.length }, (_, index) => energy[index]!.dissipatedJoules ?? null)
+        : resistorEnergySeries(transient.samples, part.id, expressions);
+      return [part.id, series];
+    }))
     : new Map<string, Array<number | null>>();
 }
 
