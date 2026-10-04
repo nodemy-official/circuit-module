@@ -20,7 +20,8 @@ function shortedDcBattery(document: CircuitDocument, switchStates: Record<string
   const graph = createCircuitConnectivityGraph(document);
   for (const part of document.parts) {
     if (part.kind === "ammeter" || (part.kind === "switch" && switchClosedState(part, switchStates)) ||
-        part.kind === "inductor") {
+        part.kind === "inductor" || part.kind === "ac-source" ||
+        (part.kind === "battery" && (part.internalResistanceOhms ?? 0) === 0)) {
       joinCircuitPartTerminals(graph, part.id, ["a", "b"]);
     }
     if (part.kind === "potentiometer") {
@@ -33,7 +34,11 @@ function shortedDcBattery(document: CircuitDocument, switchStates: Record<string
     if (part.kind !== "battery") { return false; }
     const reading = readings[part.id];
     const current = reading && exactComplexValue(reading.current);
-    return current !== null && current !== undefined && current.real.numerator !== 0n && circuitEndpointsConnected(
+    const voltage = reading && exactComplexValue(reading.voltage);
+    // An ideal source path is a short only when its net imposed voltage is
+    // exactly zero. Individual sources may be nonzero and cancel in series.
+    return current !== null && current !== undefined && current.real.numerator !== 0n &&
+      voltage?.real.numerator === 0n && circuitEndpointsConnected(
       graph, graph.endpointKey(part.id, "a"), graph.endpointKey(part.id, "b"),
     );
   });

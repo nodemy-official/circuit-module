@@ -3010,6 +3010,7 @@ function addPartAbsoluteRhs(
   layout: MnaLayout,
   state: Float64Array,
   part: CircuitPart,
+  modelOverride?: NonlinearModel,
 ) {
   const branch = layout.branchByPartId.get(part.id);
   if (branch && !addBranchAbsoluteRhs(rhs, branch)) { return false; }
@@ -3022,7 +3023,7 @@ function addPartAbsoluteRhs(
   }
   if (!isNonlinearPart(part)) { return true; }
   const center = nonlinearTerminalVoltages(part, layout, state);
-  const model = nonlinearModel(part, center);
+  const model = modelOverride ?? nonlinearModel(part, center);
   return !model || nonlinearAbsoluteRhs(rhs, layout, part, nonlinearLinearizationCenter(part, center), model);
 }
 
@@ -3043,10 +3044,11 @@ function absoluteDcRhs(
   layout: MnaLayout,
   state: Float64Array,
   channelConductingForReferences: Readonly<Record<string, boolean>>,
+  modelOverrides?: ReadonlyMap<string, NonlinearModel>,
 ) {
   const rhs: ResidualTerms = Array.from({ length: layout.size }, () => []);
   for (const part of document.parts) {
-    if (!addPartAbsoluteRhs(rhs, layout, state, part)) { return null; }
+    if (!addPartAbsoluteRhs(rhs, layout, state, part, modelOverrides?.get(part.id))) { return null; }
   }
   for (const branch of layout.internalBranches) {
     if (!addBranchAbsoluteRhs(rhs, branch)) { return null; }
@@ -3325,7 +3327,7 @@ function localMosVoltageSeed(document: CircuitDocument, layout: MnaLayout, state
   return seed;
 }
 
-function linearDcSeed(document: CircuitDocument, layout: MnaLayout, includeFeedback = true, localMosReferences = false) {
+function linearDcSeed(document: CircuitDocument, layout: MnaLayout, includeFeedback = true, localMosReferences = false, includeCurrentSources = false, includeCurrentBias = true) {
   // Seed independent voltage biases before retrying a singular off-state nonlinear Jacobian.
   const state = new Float64Array(layout.size);
   const matrix = new Float64Array(layout.size * layout.size);
@@ -3338,16 +3340,21 @@ function linearDcSeed(document: CircuitDocument, layout: MnaLayout, includeFeedb
   for (const part of document.parts) {
     const branch = layout.branchByPartId.get(part.id);
     if (branch) { addVoltageBranch(matrix, residual, layout, state, branch); }
+    if (includeCurrentSources) { stampDcPassivePart(residual, layout, part); }
   }
   for (const branch of layout.internalBranches) {
     addVoltageBranch(matrix, residual, layout, state, branch);
   }
   stampDcReferences(document, layout, state, matrix, residual);
+  const finishSeed = (seed: Float64Array) => {
+    const local = localMosReferences ? localMosVoltageSeed(document, layout, seed) : seed;
+    return includeCurrentBias ? currentBiasedDcSeed(document, layout, local) : local;
+  };
   const feedbackSeed = includeFeedback ? linearOpAmpSeed(document, layout) : null;
-  if (feedbackSeed) { return currentBiasedDcSeed(document, layout, localMosReferences ? localMosVoltageSeed(document, layout, feedbackSeed) : feedbackSeed); }
+  if (feedbackSeed) { return finishSeed(feedbackSeed); }
   const rhs = exactRhsFromResidualTerms(residual);
   const voltageSeed = rhs ? solveLinearTargetState(layout.size, matrix, rhs) : null;
-  return voltageSeed ? currentBiasedDcSeed(document, layout, localMosReferences ? localMosVoltageSeed(document, layout, voltageSeed) : voltageSeed) : null;
+  return voltageSeed ? finishSeed(voltageSeed) : null;
 }
 
 type DcLineSearch = "bounded" | "decreasing" | "previous";
@@ -4223,6 +4230,7 @@ function solveDcAtReference(
   initialState?: Float64Array,
   lineSearch: DcLineSearch = "bounded",
   retrySeeds = true,
+  maximumIterations = MAX_NEWTON_ITERATIONS,
 ): { state?: Float64Array; converged: boolean; singular: boolean; invalidPhysicalSolution?: boolean } {
   const initial = currentSeededDcState(document, layout, initialState, retrySeeds);
   let state: Float64Array = initial.state;
@@ -4231,7 +4239,7 @@ function solveDcAtReference(
   if (layout.size === 0) { return { state, converged: true, singular: false }; }
   if (!hasNonlinearParts(document, layout)) { return solveLinearDcAtReference(document, layout, state); }
 
-  const iterationLimit = lineSearch === "previous" ? MAX_PREVIOUS_STATE_ITERATIONS : MAX_NEWTON_ITERATIONS;
+  const iterationLimit = lineSearch === "previous" ? Math.min(MAX_PREVIOUS_STATE_ITERATIONS, maximumIterations) : maximumIterations;
   for (let iteration = 0; iteration < iterationLimit; iteration += 1) {
     state = exactMosZeroDropState(document, layout, state) ?? state;
     const assembled = assembleDc(document, layout, state);
@@ -6185,15 +6193,180 @@ function balancedDcResult(solution: DcSolution, quality: ReturnType<typeof dcSol
   return solution;
 }
 
-function requiresOpAmpGainContinuation(document: CircuitDocument, layout: MnaLayout) {
-  if (!document.parts.some((part) => part.kind !== "op-amp" && isNonlinearPart(part)) ||
-      !document.parts.some((part) => part.kind === "op-amp")) { return false; }
+function opAmpFeedbackEdges(document: CircuitDocument, layout: MnaLayout, amplifier: CircuitPart, input: CircuitTerminal, parents: number[], fixedRoot: number) {
+  const edges: (AcResponseEdge & { componentId: string; directed: boolean })[] = [];
+  const addEdge = (partId: string, positiveNode: number, negativeNode: number, directed = false) => {
+    if (positiveNode !== negativeNode && findRoot(parents, positiveNode) !== fixedRoot && findRoot(parents, negativeNode) !== fixedRoot) {
+      // Preserve distinct branches of a potentiometer so a dead leaf cannot
+      // transfer feedback through another interval with the same part ID.
+      edges.push({ partId: String(edges.length), componentId: partId, positiveNode, negativeNode, directed });
+    }
+  };
+  for (const branch of [...layout.branches, ...layout.internalBranches]) {
+    addEdge(branch.partId, branch.positiveNode, branch.negativeNode);
+  }
+  for (const part of document.parts) {
+    if (part.id === amplifier.id || !isNonlinearPart(part)) { continue; }
+    if (part.kind === "op-amp") {
+      const firstInput = nodeForTerminal(layout.topology, part, "a");
+      const secondInput = nodeForTerminal(layout.topology, part, "b");
+      if (findRoot(parents, firstInput) === findRoot(parents, secondInput)) { continue; }
+      for (const terminal of ["a", "b"] as const) {
+        addEdge(part.id, nodeForTerminal(layout.topology, part, terminal), nodeForTerminal(layout.topology, part, "c"), true);
+      }
+      continue;
+    }
+    const nodes = terminalsOf(part.kind).map((terminal) => nodeForTerminal(layout.topology, part, terminal));
+    for (let first = 0; first < nodes.length; first += 1) {
+      for (const second of nodes.slice(first + 1)) { addEdge(part.id, nodes[first]!, second); }
+    }
+  }
+  const output = nodeForTerminal(layout.topology, amplifier, "c");
+  addEdge(amplifier.id, output, nodeForTerminal(layout.topology, amplifier, input));
+  return edges;
+}
+
+interface OpAmpFeedbackArc {
+  node: number;
+  nonlinear: boolean;
+}
+
+function opAmpFeedbackAdjacency(edges: ReturnType<typeof opAmpFeedbackEdges>, nodeCount: number, amplifierId: string, nonlinearIds: ReadonlySet<string>, output: number, input: number) {
+  const adjacency: OpAmpFeedbackArc[][] = Array.from({ length: nodeCount }, () => []);
+  const reverse: OpAmpFeedbackArc[][] = Array.from({ length: nodeCount }, () => []);
+  const addArc = (from: number, to: number, nonlinear: boolean) => {
+    // A simple output-to-input path cannot leave its endpoint or revisit
+    // its starting point. In particular, an input's observed leaf is not
+    // part of feedback merely because an observer joins it to the output.
+    if (from === input || to === output) { return; }
+    adjacency[from]!.push({ node: to, nonlinear });
+    reverse[to]!.push({ node: from, nonlinear });
+  };
+  for (const edge of edges) {
+    if (edge.componentId === amplifierId) { continue; }
+    const nonlinear = nonlinearIds.has(edge.componentId);
+    addArc(edge.positiveNode, edge.negativeNode, nonlinear);
+    // Another amplifier carries control only from its input to its output.
+    if (!edge.directed) { addArc(edge.negativeNode, edge.positiveNode, nonlinear); }
+  }
+
+  return { adjacency, reverse };
+}
+
+function opAmpFeedbackSuffixes(reverse: OpAmpFeedbackArc[][], input: number) {
+  const reachesInput = Array.from({ length: reverse.length }, () => [false, false]);
+  reachesInput[input]![0] = true;
+  const pending = [{ node: input, nonlinear: false }];
+  for (const suffix of pending) {
+    for (const arc of reverse[suffix.node]!) {
+      const nonlinear = suffix.nonlinear || arc.nonlinear;
+      const layer = nonlinear ? 1 : 0;
+      if (!reachesInput[arc.node]![layer]) {
+        reachesInput[arc.node]![layer] = true;
+        pending.push({ node: arc.node, nonlinear });
+      }
+    }
+  }
+
+  return reachesInput;
+}
+
+function opAmpSimpleNonlinearPath(adjacency: OpAmpFeedbackArc[][], reachesInput: boolean[][], output: number, input: number, budget: number): boolean | undefined {
+  let remaining = budget;
+  const visited = new Set([output]);
+  const stack = [{ node: output, next: 0, nonlinear: false }];
+  while (stack.length > 0) {
+    const frame = stack.at(-1)!;
+    const arc = adjacency[frame.node]![frame.next];
+    if (!arc) {
+      visited.delete(frame.node);
+      stack.pop();
+      continue;
+    }
+    if (remaining === 0) { return undefined; }
+    remaining -= 1;
+    frame.next += 1;
+    if (visited.has(arc.node)) { continue; }
+    const nonlinear = frame.nonlinear || arc.nonlinear;
+    if (arc.node === input) {
+      if (nonlinear) { return true; }
+      continue;
+    }
+    const suffix = reachesInput[arc.node]!;
+    if (!(suffix[1] || (nonlinear && suffix[0]))) { continue; }
+    visited.add(arc.node);
+    stack.push({ node: arc.node, next: 0, nonlinear });
+  }
+  return false;
+}
+
+// A completed search certifies a simple directed path, not two unrelated
+// walks. An exhausted budget is unknown and must never mean no feedback.
+function opAmpInputHasNonlinearFeedback(edges: ReturnType<typeof opAmpFeedbackEdges>, nodeCount: number, amplifierId: string, nonlinearIds: ReadonlySet<string>): boolean | undefined {
+  const feedback = edges.find((edge) => edge.componentId === amplifierId);
+  if (!feedback) { return false; }
+  const output = feedback.positiveNode;
+  const input = feedback.negativeNode;
+  const { adjacency, reverse } = opAmpFeedbackAdjacency(edges, nodeCount, amplifierId, nonlinearIds, output, input);
+
+  // Two reverse reachability layers prune linear dead ends in O(V + E).
+  // The nonlinear layer admits walks, so it is only a necessary condition;
+  // the bounded search below checks the actual simple path.
+  const reachesInput = opAmpFeedbackSuffixes(reverse, input);
+  if (!reachesInput[output]![1]) { return false; }
+
+  // Linear meshes can have exponentially many simple paths. Limit edge
+  // inspections, use an iterative stack, and keep uncertainty explicit.
+  return opAmpSimpleNonlinearPath(adjacency, reachesInput, output, input, Math.min(100_000, 8 * (nodeCount + 2 * edges.length)));
+}
+
+function opAmpFeedbackNonlinearIds(document: CircuitDocument, layout: MnaLayout) {
+  const parts = document.parts.filter((part) => part.kind !== "op-amp" && isNonlinearPart(part));
+  if (!parts.some((part) => part.kind === "diode" || part.kind === "led")) { return new Set(parts.map((part) => part.id)); }
+  const constraints = idealDcVoltageConstraints(layout);
+  addZeroCurrentPassiveConstraints(document, layout, constraints);
+  return new Set(parts.filter((part) => {
+    if (part.kind !== "diode" && part.kind !== "led") { return true; }
+    const path = idealVoltageConstraintPath(constraints, nodeForTerminal(layout.topology, part, "a"), nodeForTerminal(layout.topology, part, "b"));
+    const voltage = path && exactComplexValue(path.voltageDifference);
+    // KCL and passive power prove this drop is identically zero, including
+    // when an amplifier senses an otherwise unloaded junction terminal.
+    return voltage?.real.numerator !== 0n || voltage?.imaginary.numerator !== 0n;
+  }).map((part) => part.id));
+}
+
+function hasOpAmpNonlinearFeedback(document: CircuitDocument, layout: MnaLayout, amplifierId: string, nonlinearIds: ReadonlySet<string>) {
+  const parents = Array.from({ length: layout.topology.nodeCount }, (_, node) => node);
+  for (const branch of [...layout.branches, ...layout.internalBranches]) {
+    if (isIdealVoltageConstraint(branch)) { joinConductiveNodes(parents, branch.positiveNode, branch.negativeNode); }
+  }
+  const fixedRoot = findRoot(parents, layout.physicalReferenceNode);
+  const amplifiers = document.parts.filter((part) => part.kind === "op-amp" && part.id === amplifierId);
+  let uncertain = false;
+  for (const amplifier of amplifiers) {
+    if (findRoot(parents, nodeForTerminal(layout.topology, amplifier, "a")) === findRoot(parents, nodeForTerminal(layout.topology, amplifier, "b"))) { continue; }
+    // A feedback device lies on a simple output-to-input path. A shared
+    // fixed bias or a nonlinear leaf attached at one articulation is not
+    // feedback; visiting each node once excludes those unrelated devices.
+    // Test each input separately so that two virtual edges cannot create
+    // apparent feedback through a device connected only between the inputs.
+    for (const input of ["a", "b"] as const) {
+      const edges = opAmpFeedbackEdges(document, layout, amplifier, input, parents, fixedRoot);
+      const feedback = opAmpInputHasNonlinearFeedback(edges, layout.topology.nodeCount, amplifier.id, nonlinearIds);
+      if (feedback === true) { return true; }
+      if (feedback === undefined) { uncertain = true; }
+    }
+  }
+  return uncertain ? undefined : false;
+}
+
+function requiresOpAmpGainContinuation(document: CircuitDocument, layout: MnaLayout, feedbackAmplifiers: readonly CircuitPart[]) {
+  if (feedbackAmplifiers.length === 0) { return false; }
   const seed = linearOpAmpSeed(document, layout);
   // An independent current-driven transistor island can make the linear
   // seed singular without changing the solvability of the feedback circuit.
   if (!seed) { return true; }
-  return document.parts.some((part) => {
-    if (part.kind !== "op-amp") { return false; }
+  return feedbackAmplifiers.some((part) => {
     const output = nonlinearTerminalVoltages(part, layout, seed)[2] ?? 0;
     return residualTermDifference(output, part.positiveRailVolts ?? 15).numerator > 0n ||
       residualTermDifference(output, part.negativeRailVolts ?? -15).numerator < 0n;
@@ -6201,9 +6374,23 @@ function requiresOpAmpGainContinuation(document: CircuitDocument, layout: MnaLay
 }
 
 function solveDcWithOpAmpGainContinuation(document: CircuitDocument, layout: MnaLayout) {
-  if (!requiresOpAmpGainContinuation(document, layout)) { return null; }
-  const maximumGain = Math.max(...document.parts.filter((part) => part.kind === "op-amp")
-    .map((part) => part.openLoopGain ?? 100_000));
+  const amplifiers = document.parts.filter((part) => part.kind === "op-amp");
+  if (amplifiers.length === 0) { return null; }
+  const nonlinearIds = opAmpFeedbackNonlinearIds(document, layout);
+  const candidates = amplifiers.map((part) => ({
+    part, feedback: hasOpAmpNonlinearFeedback(document, layout, part.id, nonlinearIds),
+  })).filter(({ feedback }) => feedback !== false);
+  const feedbackAmplifiers = candidates.map(({ part }) => part);
+  if (!requiresOpAmpGainContinuation(document, layout, feedbackAmplifiers)) { return null; }
+  if (candidates.some(({ feedback }) => feedback === undefined)) {
+    // A budget limit must not disable real feedback. First try the original
+    // equations with the usual Newton solver and explicit physical checks;
+    // if that attempt fails, retain gain continuation for every candidate.
+    const direct = solveDcAtReference(document, layout, undefined, "bounded", true, MAX_PREVIOUS_STATE_ITERATIONS);
+    if (direct.converged && direct.state && physicalDcQualityAcceptable(dcSolutionQuality(document, layout, direct.state))) { return direct; }
+  }
+  const feedbackIds = new Set(feedbackAmplifiers.map((part) => part.id));
+  const maximumGain = Math.max(...feedbackAmplifiers.map((part) => part.openLoopGain ?? 100_000));
   let previousState: Float64Array | undefined;
   // Resolve the nonlinear feedback at low gain before increasing it. Jumping
   // directly to the final gain can clip both rails and lose the input slope.
@@ -6212,7 +6399,7 @@ function solveDcWithOpAmpGainContinuation(document: CircuitDocument, layout: Mna
   for (let gain = Math.min(1, maximumGain); ; gain = Math.min(maximumGain, scaledProduct([gain, 2]))) {
     const gainDocument = gain === maximumGain ? document : {
       ...document,
-      parts: document.parts.map((part) => part.kind === "op-amp"
+      parts: document.parts.map((part) => feedbackIds.has(part.id)
         ? { ...part, openLoopGain: Math.min(part.openLoopGain ?? 100_000, gain) } : part),
     };
     let solution = solveDcAtReference(gainDocument, layout, previousState);
@@ -6319,11 +6506,169 @@ function solveDcWithCurrentContinuation(document: CircuitDocument, layout: MnaLa
   }
 }
 
+function passiveJunctionScaleLowerBound(document: CircuitDocument, layout: MnaLayout, junctions: readonly CircuitPart[]) {
+  const sensitive = junctions.filter((part) => {
+    const scaledSlope = exactProductSumRatio([{ factors: [
+      part.saturationCurrentAmps ?? (part.kind === "led" ? 1e-20 : 1e-12), Math.exp(EXPONENT_MAX),
+    ] }], THERMAL_VOLTAGE)!;
+    const affineSlope = divideExactRational(scaledSlope, numberToExactRational(part.emissionCoefficient ?? (part.kind === "led" ? 2 : 1))!)!;
+    return !Number.isFinite(exactRationalToNumber(affineSlope));
+  });
+  if (sensitive.length === 0) { return -8; }
+  const seed = passiveJunctionContinuationSeed(document, layout, undefined);
+  if (!seed) { return null; }
+  let maximum = numberToExactRational(0)!;
+  for (const part of sensitive) {
+    maximum = largerNonnegativeRational(maximum, junctionExponents(part, layout, seed)[0]!);
+  }
+  if (maximum.numerator === 0n) { return -8; }
+  return Math.min(-8, Math.floor((Math.log(10) - logPositiveExactRational(maximum)) / Math.LN2));
+}
+
+function passiveJunctionContinuationExponent(document: CircuitDocument, layout: MnaLayout) {
+  if ((layout.initialInductorCurrents && document.parts.some((part) => part.kind === "inductor")) ||
+    layout.branches.some((branch) => branch.transientCompanion || branch.initialCapacitanceFarads !== undefined)) { return null; }
+  const junctions = document.parts.filter(isNonlinearPart);
+  if (junctions.length < 2 || junctions.some((part) => part.kind !== "diode" && part.kind !== "led")) { return null; }
+  const seed = linearDcSeed(document, layout, true, false, true);
+  if (!seed) { return null; }
+  const groups = idealVoltageNodeGroups(document, layout, seed);
+  let maximum = numberToExactRational(0)!;
+  for (const part of junctions) {
+    const anode = nodeForTerminal(layout.topology, part, "a");
+    const cathode = nodeForTerminal(layout.topology, part, "b");
+    if (findRoot(groups.parents, anode) === findRoot(groups.parents, cathode)) { continue; }
+    const exponent = junctionExponents(part, layout, seed)[0]!;
+    maximum = largerNonnegativeRational(maximum, exponent);
+  }
+  if (subtractExactRational(maximum, numberToExactRational(EXPONENT_MAX)!).numerator <= 0n) { return null; }
+  // A finite affine slope can resolve a large exponent directly. Only an
+  // overflowing affine slope needs a smaller scale, chosen from the zero-
+  // bias Jacobian's current-aware prediction rather than the open junction.
+  const lowerBound = passiveJunctionScaleLowerBound(document, layout, junctions);
+  return lowerBound === null ? null : Math.max(lowerBound, Math.floor((Math.log(10) - logPositiveExactRational(maximum)) / Math.LN2));
+}
+
+function passiveJunctionContinuationLayout(layout: MnaLayout, scale: ExactRational): MnaLayout {
+  const branches = layout.branches.map((branch) => ({
+    ...branch, sourceVoltage: complexMultiply(branch.sourceVoltage, complexFromScalar(scale)),
+  }));
+  return { ...layout, branches, branchByPartId: new Map(branches.map((branch) => [branch.partId, branch])) };
+}
+
+function passiveJunctionContinuationSeed(document: CircuitDocument, layout: MnaLayout, previousState: Float64Array | undefined) {
+  const state = previousState ?? new Float64Array(layout.size);
+  const assembly = assembleDc(document, layout, state);
+  const rhs = absoluteDcRhs(document, layout, state, {});
+  // Predict at the new source levels with the previous junction derivatives.
+  // The seed then satisfies the new linear branch constraints exactly, while
+  // the junction drops stay close to their previous logarithmic response.
+  return rhs ? solveLinearTargetState(layout.size, assembly.matrix, rhs) ?? undefined : undefined;
+}
+
+function solveDcWithPassiveJunctionContinuation(document: CircuitDocument, layout: MnaLayout): DcSolution | null {
+  const startingExponent = passiveJunctionContinuationExponent(document, layout);
+  if (startingExponent === null) { return null; }
+  // The affine exponential extension can already solve extreme coefficients
+  // in a few corrections. Try a bounded number of ordinary Newton steps
+  // before traversing a potentially very large range of source scales.
+  const direct = solveDcAtReference(document, layout, undefined, "bounded", true, MAX_PREVIOUS_STATE_ITERATIONS);
+  if (direct.converged) { return direct; }
+  let previousState: Float64Array | undefined;
+  for (let exponent = startingExponent; ; exponent = Math.min(0, exponent + 2)) {
+    const scale = { numerator: 1n, denominator: 2n ** BigInt(-exponent) };
+    const currentDocument = exponent === 0 ? document : {
+      ...document,
+      parts: document.parts.map((part) => part.kind === "current-source" ? {
+        ...part, currentAmps: exactRationalToNumber(exactProductSumRatio([{ factors: [part.currentAmps ?? 0, scale] }], 1)!),
+      } : part),
+    };
+    const currentLayout = exponent === 0 ? layout : passiveJunctionContinuationLayout(layout, scale);
+    const seed = passiveJunctionContinuationSeed(currentDocument, currentLayout, previousState);
+    let solution = solveDcAtReference(currentDocument, currentLayout, seed);
+    // A predicted control can overflow the affine slope while the root is
+    // still below that boundary. The previous finite state lets the ordinary
+    // damped Newton steps approach the same source levels safely.
+    if (solution.singular && previousState) {
+      solution = solveDcAtReference(currentDocument, currentLayout, previousState);
+    }
+    if (!solution.converged || !solution.state) { return null; }
+    if (exponent === 0) { return solution; }
+    previousState = solution.state;
+  }
+}
+
+function passiveJunctionOverflowModel(part: CircuitPart, voltages: readonly ResidualTerm[]) {
+  const model = diodeModel(part, voltages);
+  if (model.jacobian.every((row) => row.every(Number.isFinite))) { return null; }
+  const ideality = part.emissionCoefficient ?? (part.kind === "led" ? 2 : 1);
+  const saturation = part.saturationCurrentAmps ?? (part.kind === "led" ? 1e-20 : 1e-12);
+  const control = diodeControlAtModelBoundary(voltages[0]!, ideality);
+  const exponent = exactRationalToNumber(diodeExactExponent(control, ideality));
+  const scale = multiplyExactRational(numberToExactRational(ideality)!, numberToExactRational(THERMAL_VOLTAGE)!);
+  const coefficient = diodeExponentialCoefficient(exponent, Math.exp(Math.min(EXPONENT_MAX, exponent)), saturation, scale, 1).value;
+  const slope = divideExactRational(multiplyExactRational(numberToExactRational(saturation)!, coefficient), scale)!;
+  // An overflowing initial derivative can hide a finite reverse root.
+  // Retain its rational Jacobian only for this auxiliary Newton seed;
+  // the returned state is still validated against the original model.
+  return { ...model, exactJacobian: [[slope, negativeExact(slope)], [negativeExact(slope), slope]] };
+}
+
+function passiveJunctionOverflowSeed(document: CircuitDocument, layout: MnaLayout) {
+  const junctions = document.parts.filter((part) => part.kind === "diode" || part.kind === "led");
+  const sensitive = junctions.filter((part) => {
+    const scaled = exactProductSumRatio([{ factors: [part.saturationCurrentAmps ?? (part.kind === "led" ? 1e-20 : 1e-12), Math.exp(EXPONENT_MAX)] }], THERMAL_VOLTAGE)!;
+    const slope = divideExactRational(scaled, numberToExactRational(part.emissionCoefficient ?? (part.kind === "led" ? 2 : 1))!)!;
+    return !Number.isFinite(exactRationalToNumber(slope));
+  });
+  if (sensitive.length === 0) { return null; }
+  const initial = linearDcSeed(document, layout, true, false, false, false) ?? new Float64Array(layout.size);
+  if (!sensitive.some((part) => {
+    const voltages = nonlinearTerminalVoltages(part, layout, initial);
+    return !Number.isFinite(roundedResidualTerm(voltages[0]!)) || passiveJunctionOverflowModel(part, voltages) !== null;
+  })) { return null; }
+  // Predict with the zero-bias Jacobian and all prescribed currents before
+  // retrying the voltage-only seed that overflowed the forward affine slope.
+  let state: Float64Array = new Float64Array(layout.size);
+  for (let iteration = 0; iteration < MAX_NEWTON_ITERATIONS; iteration += 1) {
+    const overrides = new Map<string, NonlinearModel>();
+    for (const part of junctions) {
+      const model = passiveJunctionOverflowModel(part, nonlinearTerminalVoltages(part, layout, state));
+      if (model) { overrides.set(part.id, model); }
+    }
+    if (overrides.size === 0 && iteration > 0) { return state; }
+    const channels = mosChannelConductingByPartId(document, layout, state);
+    const assembly = assembleDc(document, layout, state, true, channels, overrides);
+    const rhs = absoluteDcRhs(document, layout, state, channels, overrides);
+    const target = rhs ? solveLinearTargetState(layout.size, assembly.matrix, rhs) : null;
+    if (!target) { return null; }
+    // Limit this auxiliary damping to the junctions whose derivatives are
+    // being extended. An independent BJT's reverse junction must not keep
+    // an overflowing diode below a usable bias for every seed iteration.
+    state = interpolatedNewtonState(state, target, reverseTailNewtonStep({ ...document, parts: junctions }, layout, state, target));
+  }
+  return null;
+}
+
 function solveDcWithAlternativeSeed(document: CircuitDocument, layout: MnaLayout) {
+  const overflowSeed = passiveJunctionOverflowSeed(document, layout);
+  if (overflowSeed) {
+    const reverse = solveDcAtReference(document, layout, overflowSeed);
+    if (reverse.converged) { return reverse; }
+  }
+  const passive = solveDcWithPassiveJunctionContinuation(document, layout);
+  if (passive) { return passive; }
   const continued = solveDcWithOpAmpGainContinuation(document, layout);
   if (continued) { return continued; }
   const initial = solveDcAtReference(document, layout);
   if (initial.converged) { return initial; }
+  // A feedback path through an initially open nonlinear device can leave
+  // the linear amplifier seed beyond its rails. Independent voltage biases
+  // can converge before retrying the floating MOS reference candidates.
+  const independentSeed = document.parts.some((part) => part.kind === "op-amp")
+    ? linearDcSeed(document, layout, false) : undefined;
+  const independent = independentSeed ? solveDcAtReference(document, layout, independentSeed) : null;
+  if (independent?.converged) { return independent; }
   if (document.parts.some((part) => part.kind === "nmos" || part.kind === "pmos")) {
     // A floating voltage-bias island has an arbitrary absolute center. A
     // free channel node initially at global zero can therefore appear far
@@ -6335,12 +6680,7 @@ function solveDcWithAlternativeSeed(document: CircuitDocument, layout: MnaLayout
       if (local.converged) { return local; }
     }
   }
-  if (!document.parts.some((part) => part.kind === "op-amp")) { return initial; }
-  // A feedback path through an initially open nonlinear device is absent
-  // from the linear amplifier seed. Its unbounded output can strand Newton
-  // in the exponential continuation. Retry from independent voltage biases.
-  const independentSeed = linearDcSeed(document, layout, false);
-  return independentSeed ? solveDcAtReference(document, layout, independentSeed) : initial;
+  return independent ?? initial;
 }
 
 function solveDcWithReferences(
