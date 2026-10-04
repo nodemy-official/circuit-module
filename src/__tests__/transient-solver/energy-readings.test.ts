@@ -1,6 +1,7 @@
 import { expect, it } from "vitest";
 import type { CircuitDocument } from "../../circuit-model.js";
-import { matchingTransientEnergy } from "../../transient-energy.js";
+import type { ExactExpressionNode } from "../../exact-expression.js";
+import { createTransientEnergyCollector, matchingTransientEnergy } from "../../transient-energy.js";
 import { simulateTransient } from "../../transient-solver.js";
 import { assertCorrectRounding, rational } from "../helpers/numeric-oracle.js";
 
@@ -85,4 +86,103 @@ it("keeps a separate expression-table snapshot and invalidates derived energies 
       ? { operation: "literal", numerator: "1", denominator: "3" } : node);
     expect(matchingTransientEnergy(part, result.samples, result.energyReadings, result.precisionExpressions, result.energyPrecisionExpressions)).toBeUndefined();
   }
+});
+
+it.each(["voltage", "current"])("invalidates derived energy after algebraic %s metadata is added", (field) => {
+  const document = rc();
+  const original = simulateTransient(document, { durationSeconds: 1, timeStepSeconds: 0.5 });
+  for (const result of [original, JSON.parse(JSON.stringify(original)) as typeof original, structuredClone(original)]) {
+    const part = document.parts[2]!;
+    expect(matchingTransientEnergy(part, result.samples, result.energyReadings)).toBeDefined();
+    const reading = result.samples[1]!.parts.c!;
+    const value = field === "voltage" ? reading.exactVoltage! : reading.exactTerminalCurrents!.a!;
+    // Replacing the algebraic representation changes the restored reading to
+    // 1 even though its rounded scalar and rational-component fields stay put.
+    const one = { numerator: "1", denominator: "1" };
+    const zero = { numerator: "0", denominator: "1" };
+    const term = { real: one, imaginary: zero, magnitudeNormalizationSquared: one };
+    value.normalizedFraction = { numerator: [term], denominator: [term] };
+    expect(matchingTransientEnergy(part, result.samples, result.energyReadings)).toBeUndefined();
+  }
+});
+
+it("snapshots algebraic energy inputs deeply and detects later term edits", () => {
+  const document = rc();
+  const result = simulateTransient(document, { durationSeconds: 1, timeStepSeconds: 0.5 });
+  const sample = result.samples[1]!;
+  const reading = sample.parts.c!;
+  const one = { numerator: "1", denominator: "1" };
+  const zero = { numerator: "0", denominator: "1" };
+  const term = { real: { numerator: "1", denominator: "3" }, imaginary: zero, magnitudeNormalizationSquared: one };
+  reading.exactVoltage!.normalizedFraction = {
+    numerator: [term], denominator: [{ real: one, imaginary: zero, magnitudeNormalizationSquared: one }],
+  };
+  const collector = createTransientEnergyCollector(document);
+  collector.append(sample, new Map([["c", { numerator: 1n, denominator: 3n }]]), new Map(), new Map());
+  const part = document.parts[2]!;
+  expect(matchingTransientEnergy(part, [sample], collector.readings)).toBeDefined();
+  expect(collector.readings.c!.samples[0]!.storedJoules).toBe(1 / 18);
+  term.real.numerator = "2";
+  expect(collector.readings.c!.samples[0]!.exactVoltage!.normalizedFraction!.numerator[0]!.real)
+    .toEqual({ numerator: "1", denominator: "3" });
+  expect(matchingTransientEnergy(part, [sample], collector.readings)).toBeUndefined();
+});
+
+it("requires the expression table for algebraic energy inputs", () => {
+  const document = rc();
+  const result = simulateTransient(document, { durationSeconds: 1, timeStepSeconds: 0.5 });
+  const sample = result.samples[1]!;
+  const one = { numerator: "1", denominator: "1" };
+  const zero = { numerator: "0", denominator: "1" };
+  sample.parts.c!.exactVoltage!.normalizedFraction = {
+    numerator: [{ real: { expression: 0, sign: 1 }, imaginary: zero, magnitudeNormalizationSquared: one }],
+    denominator: [{ real: one, imaginary: zero, magnitudeNormalizationSquared: one }],
+  };
+  const collector = createTransientEnergyCollector(document);
+  collector.append(sample, new Map([["c", { numerator: 1n, denominator: 3n }]]), new Map(), new Map());
+  const part = document.parts[2]!;
+  const expressions: ExactExpressionNode[] = [{ operation: "literal", numerator: "1", denominator: "3" }];
+  expect(matchingTransientEnergy(part, [sample], collector.readings, expressions, structuredClone(expressions))).toBeDefined();
+  expect(matchingTransientEnergy(part, [sample], collector.readings)).toBeUndefined();
+});
+
+it.each(["numerator", "denominator", "iterator"] as const)("compares indexed algebraic data after a %s change", (side) => {
+  const document = rc();
+  const result = simulateTransient(document, { durationSeconds: 1, timeStepSeconds: 0.5 });
+  const sample = result.samples[1]!;
+  const one = { numerator: "1", denominator: "1" };
+  const zero = { numerator: "0", denominator: "1" };
+  const fraction = {
+    numerator: [{ real: { numerator: "1", denominator: "3" }, imaginary: zero, magnitudeNormalizationSquared: one }],
+    denominator: [{ real: one, imaginary: zero, magnitudeNormalizationSquared: one }],
+  };
+  sample.parts.c!.exactVoltage!.normalizedFraction = fraction;
+  const collector = createTransientEnergyCollector(document);
+  collector.append(sample, new Map([["c", { numerator: 1n, denominator: 3n }]]), new Map(), new Map());
+  const part = document.parts[2]!;
+  expect(matchingTransientEnergy(part, [sample], collector.readings)).toBeDefined();
+  if (side === "iterator") {
+    Reflect.set(fraction.numerator, Symbol.iterator, function* () {
+      yield { ...fraction.numerator[0]!, real: { numerator: "2", denominator: "1" } };
+    });
+  } else { Reflect.set(fraction, side, { 0: fraction[side][0], length: 1 }); }
+  if (side === "iterator") { expect(matchingTransientEnergy(part, [sample], collector.readings)).toBeDefined(); }
+  else { expect(matchingTransientEnergy(part, [sample], collector.readings)).toBeUndefined(); }
+});
+
+it.each(["table", "arguments"])("invalidates computed energy when expression %s becomes an array-like object", (field) => {
+  const document = rc();
+  const result = simulateTransient(document, { durationSeconds: 1 / 16, timeStepSeconds: 1 / 1024 });
+  const part = document.parts[2]!;
+  expect(matchingTransientEnergy(part, result.samples, result.energyReadings, result.precisionExpressions, result.energyPrecisionExpressions)).toBeDefined();
+  const table = structuredClone(result.precisionExpressions!);
+  if (field === "table") {
+    Reflect.set(result, "precisionExpressions", { ...table, length: table.length });
+  } else {
+    const node = table.find((candidate) => candidate.operation !== "literal")!;
+    if (node.operation === "literal") { throw new Error("Expected operation"); }
+    Reflect.set(node, "arguments", { ...node.arguments, length: node.arguments.length });
+    result.precisionExpressions = table;
+  }
+  expect(matchingTransientEnergy(part, result.samples, result.energyReadings, result.precisionExpressions, result.energyPrecisionExpressions)).toBeUndefined();
 });

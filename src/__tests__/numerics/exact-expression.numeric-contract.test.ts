@@ -71,3 +71,53 @@ it.each(["node", "argument"])("rejects sparse expression tables after a %s is de
   expect(matchingExactExpressions(table, snapshot)).toBe(false);
   expect(restoredComplex(reading, table)).toBeUndefined();
 });
+
+it.each(["table", "arguments"])("rejects array-like objects replacing expression %s", (field) => {
+  const input: { table: ExactExpressionNode[] } = { table: [
+    { operation: "literal", numerator: "5", denominator: "9" },
+    { operation: "literal", numerator: "0", denominator: "1" },
+    { operation: "add", arguments: [0, 1] },
+  ] };
+  const snapshot = snapshotExactExpressions(input.table);
+  const reading = { real: { expression: 2, sign: 1 as const }, imaginary: { numerator: "0", denominator: "1" } };
+  expect(matchingExactExpressions(input.table, snapshot)).toBe(true);
+  expect(restoredComplex(reading, input.table)).toBeDefined();
+  if (field === "table") {
+    Reflect.set(input, "table", { ...input.table, length: input.table.length });
+  } else {
+    const node = input.table[2]!;
+    if (node.operation === "literal") { throw new Error("Expected operation"); }
+    Reflect.set(node, "arguments", { ...node.arguments, length: node.arguments.length });
+  }
+  expect(matchingExactExpressions(input.table, snapshot)).toBe(false);
+  expect(matchingExactExpressions(snapshot, input.table)).toBe(false);
+  expect(() => snapshotExactExpressions(input.table)).toThrow();
+  expect(restoredComplex(reading, input.table)).toBeUndefined();
+});
+
+it.each(["iterator", "map"])("uses indexed expression arguments after a %s method changes", (method) => {
+  const table: ExactExpressionNode[] = [
+    { operation: "literal", numerator: "5", denominator: "9" },
+    { operation: "literal", numerator: "0", denominator: "1" },
+    { operation: "add", arguments: [0, 1] },
+  ];
+  const snapshot = snapshotExactExpressions(table);
+  const reading = { real: { expression: 2, sign: 1 as const }, imaginary: { numerator: "0", denominator: "1" } };
+  expect(restoredComplex(reading, table)!.real).toBe(5 / 9);
+  const node = table[2]!;
+  if (node.operation === "literal") { throw new Error("Expected operation"); }
+  let methodCalls = 0;
+  if (method === "iterator") {
+    Reflect.set(node.arguments, Symbol.iterator, function* () { methodCalls += 1; yield 1; yield 1; });
+  } else {
+    Reflect.set(node.arguments, "map", (callback: (argument: number) => unknown) => {
+      methodCalls += 1;
+      return [callback(1), callback(1)];
+    });
+  }
+  expect(matchingExactExpressions(table, snapshot)).toBe(true);
+  expect(restoredComplex(reading, table)!.real).toBe(5 / 9);
+  expect(restoredComplex(reading, table.slice())!.real).toBe(5 / 9);
+  expect(restoredComplex(reading, snapshotExactExpressions(table))!.real).toBe(5 / 9);
+  expect(methodCalls).toBe(0);
+});

@@ -112,7 +112,9 @@ function restoredRational(component: unknown, expressions: readonly ExactExpress
 function restoredNormalizedTerms(value: unknown, expressions: readonly ExactExpressionNode[] | undefined): NormalizedTerm[] | undefined {
   if (!Array.isArray(value)) { return; }
   const result: NormalizedTerm[] = [];
-  for (const term of value) {
+  // Algebraic terms use the same indexed JSON data as energy snapshots.
+  // An overridden iterator must not change the restored physical reading.
+  for (const term of Array.from({ length: value.length }, (_, index) => value[index])) {
     if (typeof term !== "object" || term === null) { return; }
     const real = restoredRational(term.real, expressions);
     const imaginary = restoredRational(term.imaginary, expressions);

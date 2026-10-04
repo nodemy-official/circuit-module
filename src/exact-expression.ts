@@ -153,15 +153,25 @@ interface ExpressionOperations {
 
 /** A separate immutable snapshot preserves evidence across editable result transports. */
 export function snapshotExactExpressions(table: readonly ExactExpressionNode[]): readonly ExactExpressionNode[] {
-  const snapshot = Object.freeze(table.map((node) => Object.freeze(node.operation === "literal"
-    ? { ...node } : { ...node, arguments: Object.freeze([...node.arguments]) })));
+  if (!Array.isArray(table)) { throw new TypeError("Expression tables must be arrays."); }
+  // Expressions are JSON data: copy indexed entries, without executing an
+  // array's overridden map or iterator and silently changing its equations.
+  const snapshot = Object.freeze(Array.from({ length: table.length }, (_, index) => {
+    const node = table[index];
+    if (!node) { throw new TypeError("Expression tables must contain every node."); }
+    if (node.operation === "literal") { return Object.freeze({ ...node }); }
+    if (!Array.isArray(node.arguments)) { throw new TypeError("Expression arguments must be arrays."); }
+    return Object.freeze({ ...node, arguments: Object.freeze(Array.from(
+      { length: node.arguments.length }, (_entry, argumentIndex) => node.arguments[argumentIndex]!,
+    )) });
+  }));
   immutableTables.add(snapshot);
   return snapshot;
 }
 
 export function matchingExactExpressions(first: readonly ExactExpressionNode[] | undefined, second: readonly ExactExpressionNode[] | undefined): boolean {
-  if (!first || !second) { return first === second; }
-  if (first.length !== second.length) { return false; }
+  if (first === undefined || second === undefined) { return first === second; }
+  if (!Array.isArray(first) || !Array.isArray(second) || first.length !== second.length) { return false; }
   try {
     return Array.from({ length: first.length }, (_, index) => index).every((index) => {
       const node = first[index];
@@ -170,7 +180,8 @@ export function matchingExactExpressions(first: readonly ExactExpressionNode[] |
       if (node.operation === "literal") {
         return other.operation === "literal" && node.numerator === other.numerator && node.denominator === other.denominator;
       }
-      return other.operation !== "literal" && node.arguments.length === other.arguments.length &&
+      return other.operation !== "literal" && Array.isArray(node.arguments) && Array.isArray(other.arguments) &&
+        node.arguments.length === other.arguments.length &&
         Array.from({ length: node.arguments.length }, (_, argumentIndex) => argumentIndex).every((argumentIndex) =>
           Number.isSafeInteger(node.arguments[argumentIndex]) && node.arguments[argumentIndex] === other.arguments[argumentIndex]);
     });
@@ -194,7 +205,8 @@ function expressionDependencies(table: readonly ExactExpressionNode[], reference
     const node = table[index];
     if (!node) { return; }
     if (node.operation === "literal") { continue; }
-    for (const argument of node.arguments) {
+    if (!Array.isArray(node.arguments)) { return; }
+    for (const argument of Array.from({ length: node.arguments.length }, (_, argumentIndex) => node.arguments[argumentIndex]!)) {
       if (!Number.isSafeInteger(argument) || argument < 0 || argument >= index) { return; }
       lastUse.set(argument, Math.max(lastUse.get(argument) ?? -1, index));
       pending.push(argument);
@@ -209,7 +221,7 @@ function evaluateExpression(node: ExactExpressionNode, live: ReadonlyMap<number,
     const denominator = BigInt(node.denominator);
     return denominator > 0n ? operations.literal({ numerator, denominator }) : undefined;
   }
-  const arguments_ = node.arguments.map((argument) => live.get(argument));
+  const arguments_ = Array.from({ length: node.arguments.length }, (_, index) => live.get(node.arguments[index]!));
   if (arguments_.some((argument) => !argument)) { return; }
   const values = arguments_.filter((argument): argument is ExactRational => argument !== undefined);
   if (node.operation !== "sum" && values.length !== 2) { return; }
@@ -234,7 +246,7 @@ function evaluateDependencies(table: readonly ExactExpressionNode[], reference: 
     const value = anchors.get(index) ?? evaluateExpression(node, live, operations);
     if (!value) { return; }
     if (node.operation !== "literal") {
-      for (const argument of node.arguments) {
+      for (const argument of Array.from({ length: node.arguments.length }, (_, argumentIndex) => node.arguments[argumentIndex]!)) {
         if (dependencies.lastUse.get(argument) === index) { live.delete(argument); }
       }
     }
@@ -245,7 +257,7 @@ function evaluateDependencies(table: readonly ExactExpressionNode[], reference: 
 }
 
 export function restoreExactExpression(table: readonly ExactExpressionNode[] | undefined, reference: number, operations: ExpressionOperations): ExactRational | undefined {
-  if (!table || !Number.isSafeInteger(reference) || reference < 0 || reference >= table.length) { return; }
+  if (!Array.isArray(table) || !Number.isSafeInteger(reference) || reference < 0 || reference >= table.length) { return; }
   try {
     const previous = restoredRoots.get(table);
     const immutable = immutableTables.has(table);

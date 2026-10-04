@@ -1,5 +1,5 @@
 import type { CircuitDocument, CircuitPart } from "./circuit-model.js";
-import type { CircuitExactComplex, CircuitExactRational } from "./circuit-reading.js";
+import type { CircuitExactComplex, CircuitExactNormalizedTerm, CircuitExactRational } from "./circuit-reading.js";
 import { addExactRational, exactRationalToNumber, multiplyExactRational, numberToExactRational, subtractExactRational, type ExactRational } from "./exact-linear-algebra.js";
 import { matchingExactExpressions, type ExactExpressionNode } from "./exact-expression.js";
 import type { TransientPartReading, TransientSample } from "./transient-solver.js";
@@ -43,7 +43,18 @@ function snapshotComplex(value: CircuitExactComplex | undefined): CircuitExactCo
   if (!value) { return; }
   return { real: { ...value.real }, imaginary: { ...value.imaginary },
     ...(value.projection ? { projection: { ...value.projection } } : {}),
-    ...(value.magnitudeNormalizationSquared ? { magnitudeNormalizationSquared: { ...value.magnitudeNormalizationSquared } } : {}) };
+    ...(value.magnitudeNormalizationSquared ? { magnitudeNormalizationSquared: { ...value.magnitudeNormalizationSquared } } : {}),
+    ...(value.normalizedFraction ? { normalizedFraction: {
+      numerator: Array.from({ length: value.normalizedFraction.numerator.length }, (_, index) =>
+        snapshotNormalizedTerm(value.normalizedFraction!.numerator[index]!)),
+      denominator: Array.from({ length: value.normalizedFraction.denominator.length }, (_, index) =>
+        snapshotNormalizedTerm(value.normalizedFraction!.denominator[index]!)),
+    } } : {}) };
+}
+
+function snapshotNormalizedTerm(term: CircuitExactNormalizedTerm): CircuitExactNormalizedTerm {
+  return { real: { ...term.real }, imaginary: { ...term.imaginary },
+    magnitudeNormalizationSquared: { ...term.magnitudeNormalizationSquared } };
 }
 
 function finiteProjection(value: ExactRational): number | null {
@@ -98,8 +109,33 @@ function matchingComplex(first: CircuitExactComplex | undefined, second: Circuit
   if (!first || !second) { return first === second; }
   return matchingRational(first.real, second.real) && matchingRational(first.imaginary, second.imaginary) &&
     matchingRational(first.magnitudeNormalizationSquared, second.magnitudeNormalizationSquared) &&
+    matchingNormalizedFraction(first.normalizedFraction, second.normalizedFraction) &&
     first.projection?.real === second.projection?.real && first.projection?.magnitude === second.projection?.magnitude &&
     first.projection?.phaseDegrees === second.projection?.phaseDegrees;
+}
+
+function matchingNormalizedFraction(first: CircuitExactComplex["normalizedFraction"], second: CircuitExactComplex["normalizedFraction"]): boolean {
+  if (!first || !second) { return first === second; }
+  return (["numerator", "denominator"] as const).every((side) => Array.isArray(first[side]) && Array.isArray(second[side]) &&
+    first[side].length === second[side].length &&
+    Array.from({ length: first[side].length }, (_, index) => index).every((index) => {
+      const left = first[side][index];
+      const right = second[side][index];
+      return Boolean(left && right && matchingRational(left.real, right.real) && matchingRational(left.imaginary, right.imaginary) &&
+        matchingRational(left.magnitudeNormalizationSquared, right.magnitudeNormalizationSquared));
+    }));
+}
+
+function hasExpressionReference(value: CircuitExactComplex | undefined): boolean {
+  if (!value) { return false; }
+  const terms = value.normalizedFraction
+    ? (["numerator", "denominator"] as const).flatMap((side) => Array.from(
+      { length: value.normalizedFraction![side].length }, (_, index) => value.normalizedFraction![side][index]!,
+    ))
+    : [];
+  return [value.real, value.imaginary, value.magnitudeNormalizationSquared,
+    ...terms.flatMap((term) => [term.real, term.imaginary, term.magnitudeNormalizationSquared])]
+    .some((component) => component && "expression" in component);
 }
 
 function matchingSample(energy: TransientEnergySample | undefined, sample: TransientSample, reading: TransientPartReading | undefined): boolean {
@@ -116,8 +152,8 @@ export function matchingTransientEnergy(part: CircuitPart, samples: readonly Tra
     if (!matchingExactExpressions(expressions, expectedExpressions)) { return; }
     const energy = energies && Object.hasOwn(energies, part.id) ? energies[part.id] : undefined;
     if (!energy || energy.kind !== part.kind || energy.coefficient !== coefficient(part) || !Array.isArray(energy.samples) || energy.samples.length !== samples.length) { return; }
-    if (!expressions && energy.samples.some((sample) => [sample.exactVoltage, sample.exactCurrent].some((value) =>
-      value && [value.real, value.imaginary, value.magnitudeNormalizationSquared].some((component) => component && "expression" in component)))) { return; }
+    if (!expressions && energy.samples.some((sample) =>
+      hasExpressionReference(sample.exactVoltage) || hasExpressionReference(sample.exactCurrent))) { return; }
     const quantity = part.kind === "capacitor" || part.kind === "inductor" ? "storedJoules" : "dissipatedJoules";
     return Array.from({ length: samples.length }, (_, index) => index).every((index) => {
       const sample = samples[index];
