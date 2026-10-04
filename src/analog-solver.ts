@@ -4554,7 +4554,11 @@ function linearChannelBiasSeed(document: CircuitDocument, layout: MnaLayout, sta
     branches: [...layout.branches, ...branches], size: layout.size + branches.length };
   const initial = new Float64Array(auxiliaryLayout.size);
   for (let index = 0; index < layout.size; index += 1) { setRealStateValue(initial, index, exactStateValue(state, index)); }
-  const solution = solveDcAtReference(auxiliaryDocument, auxiliaryLayout, initial, "bounded", false);
+  // Replacing the channels must not strand a remaining junction mesh in
+  // the same open-junction Newton seed that source continuation resolves.
+  // The auxiliary result only seeds the unchanged original MOS equations.
+  const solution = solveDcWithPassiveJunctionContinuation(auxiliaryDocument, auxiliaryLayout) ??
+    solveDcAtReference(auxiliaryDocument, auxiliaryLayout, initial, "bounded", false);
   if (!solution.converged || !solution.state) { return null; }
   const seed = cloneRealState(state);
   for (let index = 0; index < layout.size; index += 1) { setRealStateValue(seed, index, exactStateValue(solution.state, index)); }
@@ -6528,8 +6532,8 @@ function passiveJunctionScaleLowerBound(document: CircuitDocument, layout: MnaLa
 function passiveJunctionContinuationExponent(document: CircuitDocument, layout: MnaLayout) {
   if ((layout.initialInductorCurrents && document.parts.some((part) => part.kind === "inductor")) ||
     layout.branches.some((branch) => branch.transientCompanion || branch.initialCapacitanceFarads !== undefined)) { return null; }
-  const junctions = document.parts.filter(isNonlinearPart);
-  if (junctions.length < 2 || junctions.some((part) => part.kind !== "diode" && part.kind !== "led")) { return null; }
+  const junctions = document.parts.filter((part) => part.kind === "diode" || part.kind === "led");
+  if (junctions.length < 2) { return null; }
   const seed = linearDcSeed(document, layout, true, false, true);
   if (!seed) { return null; }
   const groups = idealVoltageNodeGroups(document, layout, seed);
@@ -6549,9 +6553,37 @@ function passiveJunctionContinuationExponent(document: CircuitDocument, layout: 
   return lowerBound === null ? null : Math.max(lowerBound, Math.floor((Math.log(10) - logPositiveExactRational(maximum)) / Math.LN2));
 }
 
-function passiveJunctionContinuationLayout(layout: MnaLayout, scale: ExactRational): MnaLayout {
+function passiveJunctionContinuationSources(document: CircuitDocument, layout: MnaLayout) {
+  const parents = Array.from({ length: layout.topology.nodeCount }, (_, node) => node);
+  const join = (nodes: readonly number[]) => {
+    const free = nodes.filter((node) => node !== layout.physicalReferenceNode);
+    for (const node of free.slice(1)) { joinConductiveNodes(parents, free[0]!, node); }
+  };
+  for (const branch of [...layout.branches, ...layout.internalBranches]) {
+    join([branch.positiveNode, branch.negativeNode]);
+  }
+  for (const part of document.parts) {
+    if (isNonlinearPart(part) || part.kind === "current-source") {
+      join(terminalsOf(part.kind).map((terminal) => nodeForTerminal(layout.topology, part, terminal)));
+    }
+  }
+  const junctionRoots = new Set(document.parts.filter((part) => part.kind === "diode" || part.kind === "led")
+    .flatMap((part) => terminalsOf(part.kind).map((terminal) => nodeForTerminal(layout.topology, part, terminal)))
+    .filter((node) => node !== layout.physicalReferenceNode).map((node) => findRoot(parents, node)));
+  // A shared ground does not couple the bias of otherwise independent
+  // circuits. Preserve their sources, notably current-driven MOS channels
+  // whose gate must stay above threshold even at the first junction stage.
+  return new Set(document.parts.filter((part) =>
+    terminalsOf(part.kind).some((terminal) => {
+      const node = nodeForTerminal(layout.topology, part, terminal);
+      return node !== layout.physicalReferenceNode && junctionRoots.has(findRoot(parents, node));
+    })).map((part) => part.id));
+}
+
+function passiveJunctionContinuationLayout(layout: MnaLayout, scale: ExactRational, sources: ReadonlySet<string>): MnaLayout {
   const branches = layout.branches.map((branch) => ({
-    ...branch, sourceVoltage: complexMultiply(branch.sourceVoltage, complexFromScalar(scale)),
+    ...branch, sourceVoltage: sources.has(branch.partId)
+      ? complexMultiply(branch.sourceVoltage, complexFromScalar(scale)) : branch.sourceVoltage,
   }));
   return { ...layout, branches, branchByPartId: new Map(branches.map((branch) => [branch.partId, branch])) };
 }
@@ -6574,16 +6606,17 @@ function solveDcWithPassiveJunctionContinuation(document: CircuitDocument, layou
   // before traversing a potentially very large range of source scales.
   const direct = solveDcAtReference(document, layout, undefined, "bounded", true, MAX_PREVIOUS_STATE_ITERATIONS);
   if (direct.converged) { return direct; }
+  const sources = passiveJunctionContinuationSources(document, layout);
   let previousState: Float64Array | undefined;
   for (let exponent = startingExponent; ; exponent = Math.min(0, exponent + 2)) {
     const scale = { numerator: 1n, denominator: 2n ** BigInt(-exponent) };
     const currentDocument = exponent === 0 ? document : {
       ...document,
-      parts: document.parts.map((part) => part.kind === "current-source" ? {
+      parts: document.parts.map((part) => part.kind === "current-source" && sources.has(part.id) ? {
         ...part, currentAmps: exactRationalToNumber(exactProductSumRatio([{ factors: [part.currentAmps ?? 0, scale] }], 1)!),
       } : part),
     };
-    const currentLayout = exponent === 0 ? layout : passiveJunctionContinuationLayout(layout, scale);
+    const currentLayout = exponent === 0 ? layout : passiveJunctionContinuationLayout(layout, scale, sources);
     const seed = passiveJunctionContinuationSeed(currentDocument, currentLayout, previousState);
     let solution = solveDcAtReference(currentDocument, currentLayout, seed);
     // A predicted control can overflow the affine slope while the root is
