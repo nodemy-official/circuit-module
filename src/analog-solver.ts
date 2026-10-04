@@ -262,6 +262,8 @@ interface DcAssembly {
   exactResidual: ExactRational[] | null;
   /** Nonlinear KCL magnitudes after exact linear-current cancellation. */
   exactCurrentScales: (ExactRational | null)[];
+  /** KCL magnitudes including linear flows, used only for line search. */
+  exactSearchCurrentScales: (ExactRational | null)[];
 }
 
 /** Keep each KCL contribution until cancellation is complete, then round once. */
@@ -2890,6 +2892,7 @@ function assembleDc(
     addVoltageBranch(matrix, residual, layout, state, branch);
   }
   const nonlinearParts = document.parts.filter(isNonlinearPart);
+  const linearCurrentTerms = residual.slice(0, layout.topology.nodeUnknownCount);
   if (nonlinearParts.length > 0) {
     // Linear branch and prescribed currents are exact. Their cancellation
     // must not hide the remaining independently approximated device current.
@@ -2908,6 +2911,7 @@ function assembleDc(
     ? exactResidualTerms
     : null;
   let exactCurrentScales: (ExactRational | null)[] | undefined;
+  let exactSearchCurrentScales: (ExactRational | null)[] | undefined;
   return {
     matrix,
     residual: Float64Array.from(exactResidualTerms, (value) => value ? exactRationalToNumber(value) : Number.NaN),
@@ -2927,6 +2931,21 @@ function assembleDc(
           : null;
       });
       return exactCurrentScales;
+    },
+    get exactSearchCurrentScales() {
+      exactSearchCurrentScales ??= this.exactCurrentScales.map((scale, row) => {
+        if (!scale) { return null; }
+        const values = linearCurrentTerms[row]!.map((value) => typeof value === "number" ? numberToExactRational(value) : value);
+        if (!values.every((value): value is ExactRational => value !== null)) { return null; }
+        const linearScale = sumExactRationals(values.map((value) => absoluteExactRational(deferExactRationalReduction(value))));
+        // Preserve ordinary physical weighting unless exact cancellation
+        // leaves less than 1/16 of the linear flows in the current scale.
+        // This search-only margin avoids changing damping while a node still
+        // has a substantial linear imbalance; it is not a convergence limit.
+        return subtractExactRational(linearScale, multiplyExactRational(scale, numberToExactRational(16)!)).numerator > 0n
+          ? linearScale : scale;
+      });
+      return exactSearchCurrentScales;
     },
   };
 }
@@ -3073,6 +3092,7 @@ function exactRowTolerance(
   row: number,
   relative: ExactRational,
   absoluteTolerance: number,
+  includeLinearCurrents: boolean,
 ) {
   const exactAbsoluteTolerance = numberToExactRational(absoluteTolerance);
   const equationTerms: ExactRational[] = [];
@@ -3092,7 +3112,7 @@ function exactRowTolerance(
     equationTerms.push(deferExactRationalReduction(absoluteExactRational(term)));
   }
   const linearizedScale = sumExactRationals(equationTerms);
-  const currentScale = assembly.exactCurrentScales[row];
+  const currentScale = (includeLinearCurrents ? assembly.exactSearchCurrentScales : assembly.exactCurrentScales)[row];
   const equationScale = currentScale ?? linearizedScale;
   const absoluteResidual = absoluteExactRational(residual);
   const relativeEquationScale = multiplyExactRational(relative, equationScale);
@@ -3109,6 +3129,7 @@ function residualTolerances(
   currentTolerance = NEWTON_CURRENT_TOLERANCE_AMPS,
   voltageTolerance = NEWTON_VOLTAGE_TOLERANCE_VOLTS,
   relativeTolerance = NEWTON_RELATIVE_TOLERANCE,
+  includeLinearCurrents = false,
 ): ExactRational[] | null {
   if (!assembly.exactResidual) { return null; }
   const relative = numberToExactRational(relativeTolerance);
@@ -3118,7 +3139,7 @@ function residualTolerances(
     const absoluteTolerance = row < layout.topology.nodeUnknownCount
       ? currentTolerance
       : voltageTolerance;
-    const tolerance = exactRowTolerance(layout, assembly, state, row, relative, absoluteTolerance);
+    const tolerance = exactRowTolerance(layout, assembly, state, row, relative, absoluteTolerance, includeLinearCurrents);
     if (!tolerance) { return null; }
     tolerances.push(tolerance);
   }
@@ -3415,9 +3436,17 @@ function solveDcNewtonStep(
   state: Float64Array,
   assembly: DcAssembly,
   tolerances: ExactRational[] | null,
-  score: number,
   lineSearch: DcLineSearch,
 ) {
+  // A nearly balanced weak junction can have a much smaller physical current
+  // scale than the linear currents driving its node. Using only that scale
+  // for line search throttles corrections to other, strongly unbalanced nodes.
+  // Keep fixed weights that also include this iteration's linear currents.
+  // Actual branch currents preserve the voltage-reference invariance, while
+  // convergence and physical validation still use the strict current scales.
+  const searchTolerances = residualTolerances(layout, assembly, state,
+    NEWTON_CURRENT_TOLERANCE_AMPS, NEWTON_VOLTAGE_TOLERANCE_VOLTS, NEWTON_RELATIVE_TOLERANCE, true) ?? tolerances;
+  const searchScore = residualScore(layout, assembly, searchTolerances);
   // Keep this iteration's floating-node constraints fixed while comparing
   // line-search candidates. The next Newton iteration recalculates them from
   // its new bias point, so a cutoff MOS can turn on without its candidate KCL
@@ -3452,16 +3481,16 @@ function solveDcNewtonStep(
     );
     // Compare candidates using this iteration's scale so an exponential current cannot
     // increase its own tolerance and make a divergent step appear better.
-    const candidateScore = residualScore(layout, candidateAssembly, tolerances);
-    if (candidateScore < score || candidateScore <= 1) {
+    const candidateScore = residualScore(layout, candidateAssembly, searchTolerances);
+    if (candidateScore < searchScore || candidateScore <= 1) {
       nextState = candidate;
       break;
     }
     if (lineSearch === "bounded" && step <= 1 / 8192) {
-      nextState = opAmpInteriorNewtonState(document, layout, state, targetState, tolerances, score, channelConductingForReferences) ?? candidate;
+      nextState = opAmpInteriorNewtonState(document, layout, state, targetState, searchTolerances, searchScore, channelConductingForReferences) ?? candidate;
       break;
     }
-    if (lineSearch !== "bounded" && candidateScore === score) { break; }
+    if (lineSearch !== "bounded" && candidateScore === searchScore) { break; }
     // A previous transient state is only a local guess. Deep damping near an
     // exponential junction's old bias grows exact denominators while barely
     // moving the voltage; return to the ordinary voltage/current seeds.
@@ -3939,8 +3968,7 @@ function refinedReverseTailCandidate(document: CircuitDocument, layout: MnaLayou
   for (let iteration = 0; iteration < 8; iteration += 1) {
     const assembly = assembleDc(document, layout, state);
     const localTolerances = residualTolerances(layout, assembly, state);
-    const localScore = residualScore(layout, assembly, localTolerances);
-    const step = solveDcNewtonStep(document, layout, state, assembly, localTolerances, localScore, "bounded");
+    const step = solveDcNewtonStep(document, layout, state, assembly, localTolerances, "bounded");
     if (!step.nextState || nonlinearCentersMatch(nonlinearCenters(document, layout, state), nonlinearCenters(document, layout, step.nextState))) { return null; }
     state = step.nextState;
     const nextAssembly = assembleDc(document, layout, state);
@@ -4252,7 +4280,7 @@ function solveDcAtReference(
       const candidate = convergedDcCandidate(document, layout, state, tolerances, score, usedMosSeed);
       if (candidate) { return candidate; }
     }
-    const step = solveDcNewtonStep(document, layout, state, assembled, tolerances, score, lineSearch);
+    const step = solveDcNewtonStep(document, layout, state, assembled, tolerances, lineSearch);
     if (!step.nextState) {
       const seed = failedDcSeed(document, layout, state, usedLinearSeed, step.singular, iteration === 0 && retrySeeds);
       if (seed) {
