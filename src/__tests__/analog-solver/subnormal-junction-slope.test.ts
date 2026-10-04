@@ -53,7 +53,9 @@ function amplifierSpecs(input: string): CircuitSpec[] {
 }
 
 describe("subnormal junction derivatives before AC amplification", () => {
-  it.each(["npn-transistor", "pnp-transistor"] as const)("retains the open-base closed-form response for %s", (kind) => {
+  it.each((["npn-transistor", "pnp-transistor"] as const).flatMap((kind) =>
+    [false, true].map((amplified) => ({ kind, amplified })),
+  ))("retains the open-base closed-form response for $kind (amplified=$amplified)", ({ kind, amplified }) => {
     const beta = 1e-308;
     const sign = kind === "npn-transistor" ? 1 : -1;
     const collectorBias = 0.1;
@@ -65,21 +67,19 @@ describe("subnormal junction derivatives before AC amplification", () => {
     const response = divideRational(scaledReverse, addRational(rational(1n), scaledReverse));
     const expectedBase = multiplyRational(exactNumber(amplitude), response);
     const expectedOutput = multiplyRational(expectedBase, divideRational(exactNumber(gain), rational(2n)));
-    for (const amplified of [false, true]) {
-      const document = createCircuitFromSpecs([
-        ["source", "ac-source", ["collector", "0"], { voltageVolts: amplitude, offsetVolts: sign * collectorBias, frequencyHz: 1000 }],
-        ["device", kind, ["collector", "base", "0"], { currentGain: beta, saturationCurrentAmps: saturation }],
-        ...(amplified ? amplifierSpecs("base") : []),
-        ["ground", "ground", ["0"]],
-      ], "Open base with a subnormal reverse junction derivative");
-      const result = analyzeAnalogCircuit(document, { mode: "ac" });
-      expect(result.status, result.message).toBe("valid");
-      assertRelative(result.parts.device.terminalVoltages.b!.real, expectedBase);
-      expect(result.parts.device.terminalVoltages.b!.imaginary).toBe(0);
-      if (amplified) {
-        assertRelative(result.parts.amplifier.terminalVoltages.c!.real, expectedOutput);
-        assertRelative(result.parts.load.current.real, divideRational(expectedOutput, rational(20n)));
-      }
+    const document = createCircuitFromSpecs([
+      ["source", "ac-source", ["collector", "0"], { voltageVolts: amplitude, offsetVolts: sign * collectorBias, frequencyHz: 1000 }],
+      ["device", kind, ["collector", "base", "0"], { currentGain: beta, saturationCurrentAmps: saturation }],
+      ...(amplified ? amplifierSpecs("base") : []),
+      ["ground", "ground", ["0"]],
+    ], "Open base with a subnormal reverse junction derivative");
+    const result = analyzeAnalogCircuit(document, { mode: "ac" });
+    expect(result.status, result.message).toBe("valid");
+    assertRelative(result.parts.device.terminalVoltages.b!.real, expectedBase);
+    expect(result.parts.device.terminalVoltages.b!.imaginary).toBe(0);
+    if (amplified) {
+      assertRelative(result.parts.amplifier.terminalVoltages.c!.real, expectedOutput);
+      assertRelative(result.parts.load.current.real, divideRational(expectedOutput, rational(20n)));
     }
   });
 

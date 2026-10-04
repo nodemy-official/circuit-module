@@ -58,9 +58,9 @@ function gateNetwork(network: typeof networks[number], sign: number): CircuitSpe
 
 describe("MOS initial constraints through gate bias networks", () => {
   for (const kind of ["nmos", "pmos"] as const) {
-    it.each(networks)(`${kind}, %s`, (network) => {
-      const sign = kind === "nmos" ? 1 : -1;
-      for (const reversed of [false, true]) {
+    for (const reversed of [false, true]) {
+      it.each(networks)(`kind=${kind}, network=%s, reversed=${reversed}`, (network) => {
+        const sign = kind === "nmos" ? 1 : -1;
         const specs: CircuitSpec[] = [
           ["supply", "ac-source", ["supply", "0"], { voltageVolts: 0, offsetVolts: sign * 10 }],
           ["g1", "ac-source", ["bias", "0"], { voltageVolts: 0, offsetVolts: sign * 2.5 }],
@@ -105,7 +105,7 @@ describe("MOS initial constraints through gate bias networks", () => {
             expect(sample.parts.tie2!.voltageVolts).toBe(-sign * 0.125);
           }
         }
-      }
-    });
+      });
+    }
   }
 });

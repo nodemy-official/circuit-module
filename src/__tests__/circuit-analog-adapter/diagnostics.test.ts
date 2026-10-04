@@ -1,7 +1,27 @@
 import { expect, it } from "vitest";
 import { analyzeCircuit } from "../../circuit-solver.js";
+import { analyzeExtendedCircuit } from "../../circuit-analog-adapter.js";
 import { createCircuitFromSpecs, type CircuitSpec } from "../helpers/circuit-fixture.js";
 import { nextUp } from "../helpers/numeric-oracle.js";
+
+it("uses catalog labels for direct extended-analysis diagnostics when labels are omitted", () => {
+  for (const mode of ["dc", "ac"] as const) {
+    const specs: CircuitSpec[] = mode === "dc"
+      ? [["source", "battery", ["v", "0"], { voltageVolts: 1, internalResistanceOhms: 1 }]]
+      : [["source", "ac-source", ["v", "0"], { voltageVolts: 10 }],
+        ["bulb", "bulb", ["v", "0"], { resistanceOhms: 10, ratedPowerWatts: 1 }]];
+    const document = createCircuitFromSpecs(specs, "Diagnostics with omitted catalog labels");
+    if (mode === "dc") { document.wires.push({ id: "short", from: { partId: "source", terminal: "a" }, to: { partId: "source", terminal: "b" } }); }
+    for (const part of document.parts) { Reflect.deleteProperty(part, "label"); }
+    const options = { mode };
+    const actual = analyzeExtendedCircuit(document, {}, options);
+    const expected = analyzeCircuit(document, {}, options);
+    expect(actual.status).toBe(expected.status);
+    expect(actual.issues).toEqual(expected.issues);
+    expect(actual.message).toBe(expected.message);
+    expect(actual.issues[0]!.message).not.toContain("undefined");
+  }
+});
 
 it.each(["wire", "ammeter", "switch", "inductor", "pot-a", "pot-b", "grounds"])(
   "diagnoses an ideal external battery short through %s while preserving finite readings", (path) => {

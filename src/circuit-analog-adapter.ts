@@ -39,8 +39,8 @@ function shortedDcBattery(document: CircuitDocument, switchStates: Record<string
   });
 }
 
-function extendedAnalysisMessage(status: CircuitAnalysis["status"], analogMessage: string, shorted?: CircuitPart) {
-  if (shorted) { return `${shorted.label}が短絡しています。抵抗か電球を直列に入れてください。`; }
+function extendedAnalysisMessage(status: CircuitAnalysis["status"], analogMessage: string, shorted?: { label?: string }) {
+  if (shorted) { return `${shorted.label ?? circuitPartCatalog.battery.defaults.label}が短絡しています。抵抗か電球を直列に入れてください。`; }
   return status === "open"
     ? "回路が開いているため電流は流れていません。導線とスイッチを確認してください。"
     : analogMessage;

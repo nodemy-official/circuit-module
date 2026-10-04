@@ -1076,7 +1076,8 @@ function compareAcVoltageConstraints(left: Branch, right: Branch, partById: Read
   // Axis/diagonal waveforms have exact normalized coefficients. Prefer them
   // to independent trigonometric approximations of an equivalent source
   // loop. Order the remaining waveforms by their physical parameters so
-  // neither rearranging nor renaming parts changes the rounded basis.
+  // neither rearranging, renaming nor reversing an equivalent source
+  // changes the rounded basis. Polarity reversal adds 180 degrees.
   const exactPhase = (branch: Branch) => (partById.get(branch.partId)!.phaseDegrees ?? 0) % 45 === 0;
   const phaseOrder = Number(exactPhase(right)) - Number(exactPhase(left));
   if (phaseOrder !== 0) { return phaseOrder; }
@@ -1086,8 +1087,11 @@ function compareAcVoltageConstraints(left: Branch, right: Branch, partById: Read
     const phase = (part.phaseDegrees ?? 0) % 360;
     return phase < 0 ? phase + 360 : phase;
   };
-  const values = (part: CircuitPart) => [normalizedPhase(part), part.phaseDegrees ?? 0,
-    part.frequencyHz ?? 0, part.voltageVolts ?? 0, part.offsetVolts ?? 0, part.internalResistanceOhms ?? 0];
+  const values = (part: CircuitPart) => {
+    const phase = normalizedPhase(part);
+    return [phase % 180, part.frequencyHz ?? 0, part.voltageVolts ?? 0,
+      (phase >= 180 ? -1 : 1) * (part.offsetVolts ?? 0), part.internalResistanceOhms ?? 0];
+  };
   const leftValues = values(leftPart);
   const rightValues = values(rightPart);
   for (let index = 0; index < leftValues.length; index += 1) {
@@ -1369,7 +1373,33 @@ function linearizedDiodeValues(voltage: ExactRational, scale: ExactRational, sat
   };
 }
 
-function diodeCurrentAndSlope(controlVoltage: ResidualTerm, saturationCurrent: number, ideality: number): DiodeValues {
+function diodeExponentialCoefficient(exponent: number, exponential: number, saturation: number, scale: ExactRational, baseDivisor: number) {
+  const projected = numberToExactRational(exponential)!;
+  if (exponential >= 2 ** -1022 || !Number.isFinite(exponent)) { return { value: projected, rangeReduced: false }; }
+  // Preserve the existing open-path boundary when even the amplified
+  // derivative rounds to zero. Otherwise range-reduce exp before its
+  // binary64 boundary and apply its binary exponent exactly afterwards.
+  const amplifiedLogSlope = Math.log(saturation) - logPositiveExactRational(scale) - Math.log(Math.min(1, baseDivisor)) + exponent;
+  if (amplifiedLogSlope < Math.log(Number.MIN_VALUE) - Math.LN2) { return { value: projected, rangeReduced: false }; }
+  const shift = Math.floor(-exponent / Math.LN2);
+  const coefficient = numberToExactRational(Math.exp(exponent + shift * Math.LN2))!;
+  return { value: divideExactRational(coefficient, { numerator: 2n ** BigInt(shift), denominator: 1n })!, rangeReduced: true };
+}
+
+function diodeExponentialSlope(coefficient: ExactRational, exponent: number, saturation: number, ideality: number,
+  scale: ExactRational, rangeReduced: boolean) {
+  const exactExponentialSlope = divideExactRational(multiplyExactRational(numberToExactRational(saturation)!, coefficient), scale)!;
+  let slope = exactRationalToNumber(exactExponentialSlope);
+  let exactSlope = rangeReduced || (slope > 0 && slope < 2 ** -1022) ? exactExponentialSlope : undefined;
+  if (exponent < 0 && (!Number.isFinite(slope) || (coefficient.numerator === 0n && slope === 0))) {
+    // Retain the combined-exponent fallback at the open-path/overflow boundary.
+    slope = Math.exp(Math.log(saturation) - Math.log(ideality) - Math.log(THERMAL_VOLTAGE) + exponent);
+    exactSlope = undefined;
+  }
+  return { slope, exactSlope, exactExponentialSlope };
+}
+
+function diodeCurrentAndSlope(controlVoltage: ResidualTerm, saturationCurrent: number, ideality: number, baseDivisor = 1): DiodeValues {
   const modelControl = diodeControlAtModelBoundary(controlVoltage, ideality);
   const exactVoltage = typeof modelControl === "number" ? numberToExactRational(modelControl)! : modelControl;
   const exactScale = multiplyExactRational(numberToExactRational(ideality)!, numberToExactRational(THERMAL_VOLTAGE)!);
@@ -1389,21 +1419,13 @@ function diodeCurrentAndSlope(controlVoltage: ResidualTerm, saturationCurrent: n
     ? exactRationalToNumber(exactExponent)
     : subnormalScale ? (voltage / ideality) / THERMAL_VOLTAGE : voltage / scale;
   const exponential = Math.exp(Math.min(EXPONENT_MAX, rawExponent));
+  const { value: exponentialCoefficient, rangeReduced } = diodeExponentialCoefficient(rawExponent, exponential, saturationCurrent, exactScale, baseDivisor);
   // exp is the binary64 approximation boundary. Complete Is*exp/(n*Vt)
   // exactly after it: neither a rounded subnormal product nor Is/(n*Vt)
   // may lose bits that a later base/load ratio or amplifier makes visible.
-  const exactExponentialSlope = divideExactRational(
-    multiplyExactRational(numberToExactRational(saturationCurrent)!, numberToExactRational(exponential)!),
-    exactScale,
-  )!;
-  let slope = exactRationalToNumber(exactExponentialSlope);
-  let exactSlope = slope > 0 && slope < 2 ** -1022 ? exactExponentialSlope : undefined;
-  if (rawExponent < 0 && (exponential < 2 ** -1022 || !Number.isFinite(slope))) {
-    // Reverse bias has no conductance floor. Evaluate the combined exponent
-    // when exp(V/nVt) underflows before multiplication by Is or division by nVt.
-    slope = Math.exp(Math.log(saturationCurrent) - Math.log(ideality) - Math.log(THERMAL_VOLTAGE) + rawExponent);
-    exactSlope = undefined;
-  }
+  const { slope, exactSlope, exactExponentialSlope } = diodeExponentialSlope(
+    exponentialCoefficient, rawExponent, saturationCurrent, ideality, exactScale, rangeReduced,
+  );
   if (rawExponent > EXPONENT_MAX) {
     // Continue from exp(80) with one exact affine equation. Rounding its
     // current or slope separately can erase the knee voltage in I - g*V
@@ -1418,6 +1440,17 @@ function diodeCurrentAndSlope(controlVoltage: ResidualTerm, saturationCurrent: n
       slope, exactCurrent,
       ...(slope > 0 && Number.isFinite(slope) ? { exactSlope: exactExponentialSlope } : {}),
     };
+  }
+  if (rawExponent < -1) {
+    // expm1 rounds the reverse current close to -Is and erases its small
+    // positive tail. Keep Is*exp(V/nVt)-Is exact after the exp boundary so
+    // KCL still determines the bias and its small-signal conductance.
+    const exactCurrent = exactProductSumRatio([
+      { factors: [saturationCurrent, exponentialCoefficient] },
+      { factors: [saturationCurrent], sign: -1 },
+    ], 1)!;
+    return { current: exactRationalToNumber(exactCurrent), slope, exactCurrent,
+      ...(exactSlope ? { exactSlope } : {}) };
   }
   return diodeExponentialValues(voltage, rawExponent, saturationCurrent, slope, exactSlope);
 }
@@ -1500,7 +1533,7 @@ function bjtModel(
   // Express Ebers–Moll in transport and base currents. Computing 1 - alpha
   // loses the base current when beta / (beta + 1) rounds to one, and scaling
   // saturation by 1 / alpha can overflow before a zero bias is evaluated.
-  const forward = diodeCurrentAndSlope(vbe, saturation, 1);
+  const forward = diodeCurrentAndSlope(vbe, saturation, 1, beta);
   const reverse = diodeCurrentAndSlope(vbc, saturation, 1);
   const exactBeta = numberToExactRational(beta);
   const exactForward = exactDiodeCurrent(forward);
@@ -3566,7 +3599,7 @@ function flatMosInteriorShift(part: CircuitPart, layout: MnaLayout, state: Float
   return { shift, root: findRoot(parents, node) };
 }
 
-function flatMosInteriorState(document: CircuitDocument, layout: MnaLayout, state: Float64Array, assembly: DcAssembly) {
+function idealVoltageNodeGroups(document: CircuitDocument, layout: MnaLayout, state: Float64Array) {
   const parents = Array.from({ length: layout.topology.nodeCount }, (_, node) => node);
   for (const branch of [...layout.branches, ...layout.internalBranches]) {
     if (isIdealVoltageConstraint(branch)) { joinConductiveNodes(parents, branch.positiveNode, branch.negativeNode); }
@@ -3575,23 +3608,374 @@ function flatMosInteriorState(document: CircuitDocument, layout: MnaLayout, stat
   for (const reference of referenceConstraints(document, layout, "dc", mosChannelConductingByPartId(document, layout, state))) {
     if (reference.derivatives.length === 0) { anchored.add(findRoot(parents, reference.node)); }
   }
+  return { parents, anchored };
+}
+
+function shiftedVoltageGroup(layout: MnaLayout, state: Float64Array, parents: number[], root: number, shift: ExactRational) {
+  const candidate = cloneRealState(state);
+  for (let node = 0; node < parents.length; node += 1) {
+    const unknown = layout.topology.nodeUnknowns[node] ?? -1;
+    if (unknown >= 0 && findRoot(parents, node) === root) { addRealStateValue(candidate, unknown, shift); }
+  }
+  return candidate;
+}
+
+function movableMosZeroDrop(part: CircuitPart, layout: MnaLayout, state: Float64Array,
+  groups: ReturnType<typeof idealVoltageNodeGroups>, drop: ExactRational) {
+  const drain = nodeForTerminal(layout.topology, part, "a");
+  const source = nodeForTerminal(layout.topology, part, "c");
+  const drainRoot = findRoot(groups.parents, drain);
+  const sourceRoot = findRoot(groups.parents, source);
+  if (drainRoot === sourceRoot) { return null; }
+  const moveDrain = !groups.anchored.has(drainRoot);
+  if (!moveDrain && groups.anchored.has(sourceRoot)) { return null; }
+  return {
+    state: shiftedVoltageGroup(layout, state, groups.parents, moveDrain ? drainRoot : sourceRoot,
+      moveDrain ? exactProductSumRatio([{ factors: [-1, drop] }], 1)! : drop),
+    returnRow: layout.topology.nodeUnknowns[moveDrain ? source : drain] ?? -1,
+  };
+}
+
+function zeroDropVoltageGroups(document: CircuitDocument, layout: MnaLayout, state: Float64Array, excludedPart: CircuitPart) {
+  const conducting = mosChannelConductingByPartId(document, layout, state);
+  setRecordValue(conducting, excludedPart.id, false);
+  const parents = referenceConnectivityParents(document, layout, "dc", conducting);
+  // A gauge change may move an entire bias circuit. Preserve every other
+  // nonlinear control, including gates that carry no terminal current.
   for (const part of document.parts) {
-    const move = flatMosInteriorShift(part, layout, state, assembly, parents, anchored);
-    if (!move) { continue; }
-    const candidate = cloneRealState(state);
-    for (let other = 0; other < parents.length; other += 1) {
-      const otherUnknown = layout.topology.nodeUnknowns[other] ?? -1;
-      if (otherUnknown >= 0 && findRoot(parents, other) === move.root) { addRealStateValue(candidate, otherUnknown, move.shift); }
-    }
-    return candidate;
+    if (part.id === excludedPart.id || !isNonlinearPart(part)) { continue; }
+    const nodes = terminalsOf(part.kind).map((terminal) => nodeForTerminal(layout.topology, part, terminal));
+    for (const node of nodes.slice(1)) { joinConductiveNodes(parents, nodes[0]!, node); }
+  }
+  return { parents, anchored: new Set([findRoot(parents, layout.topology.referenceNode)]) };
+}
+
+function exactMosZeroDropState(document: CircuitDocument, layout: MnaLayout, state: Float64Array) {
+  let physical: DcAssembly | undefined;
+  for (const part of document.parts) {
+    if (part.kind !== "nmos" && part.kind !== "pmos") { continue; }
+    const voltages = nonlinearTerminalVoltages(part, layout, state);
+    const drop = residualTermDifference(voltages[0]!, voltages[2]!);
+    if (drop.numerator === 0n || exactRationalToNumber(drop) !== 0) { continue; }
+    const groups = zeroDropVoltageGroups(document, layout, state, part);
+    const candidate = movableMosZeroDrop(part, layout, state, groups, drop);
+    if (!candidate) { continue; }
+    physical ??= assembleDc(document, layout, state, false);
+    const assembly = assembleDc(document, layout, candidate.state, false);
+    // This is a candidate exact root, not an underflow-to-zero policy.
+    // Every changed physical equation must balance; tiny prescribed currents
+    // therefore reject the candidate even when their voltage is unrepresentable.
+    if (!preservesPhysicalResiduals(physical, assembly, candidate.returnRow)) { continue; }
+    return candidate.state;
   }
   return null;
 }
 
+function flatMosInteriorState(document: CircuitDocument, layout: MnaLayout, state: Float64Array, assembly: DcAssembly) {
+  const { parents, anchored } = idealVoltageNodeGroups(document, layout, state);
+  for (const part of document.parts) {
+    const move = flatMosInteriorShift(part, layout, state, assembly, parents, anchored);
+    if (!move) { continue; }
+    return shiftedVoltageGroup(layout, state, parents, move.root, move.shift);
+  }
+  return null;
+}
+
+function hasReverseJunctionTail(document: CircuitDocument, layout: MnaLayout, state: Float64Array) {
+  return document.parts.some((part) => {
+    if (part.kind === "diode" || part.kind === "led") {
+      const voltage = nonlinearTerminalVoltages(part, layout, state)[0]!;
+      const exponent = diodeExactExponent(voltage, part.emissionCoefficient ?? (part.kind === "led" ? 2 : 1));
+      return exponent.numerator < -exponent.denominator;
+    }
+    if (part.kind !== "npn-transistor" && part.kind !== "pnp-transistor") { return false; }
+    const voltages = nonlinearTerminalVoltages(part, layout, state);
+    const sign = part.kind === "pnp-transistor" ? -1 : 1;
+    return [0, 2].some((terminal) => {
+      const voltage = exactProductSumRatio([
+        { factors: [sign, voltages[1]!] }, { factors: [sign, voltages[terminal]!], sign: -1 },
+      ], 1)!;
+      const exponent = diodeExactExponent(voltage, 1);
+      return exponent.numerator < -exponent.denominator;
+    });
+  });
+}
+
+function passiveJunctionTailParameters(part: CircuitPart, layout: MnaLayout) {
+  const node = (terminal: CircuitTerminal) => nodeForTerminal(layout.topology, part, terminal);
+  if (part.kind === "diode" || part.kind === "led") {
+    return { positive: node("a"), negative: node("b"), sign: 1,
+      saturation: numberToExactRational(part.saturationCurrentAmps ?? (part.kind === "led" ? 1e-20 : 1e-12))!,
+      ideality: part.emissionCoefficient ?? (part.kind === "led" ? 2 : 1) };
+  }
+  if (part.kind !== "npn-transistor" && part.kind !== "pnp-transistor") { return null; }
+  const collector = node("a");
+  const base = node("b");
+  const emitter = node("c");
+  const adjacency = idealDcVoltageConstraints(layout);
+  const sameVoltage = (first: number, second: number) => {
+    if (first === second) { return true; }
+    const path = idealVoltageConstraintPath(adjacency, first, second);
+    const voltage = path && exactComplexValue(path.voltageDifference);
+    return voltage?.real.numerator === 0n && voltage.imaginary.numerator === 0n;
+  };
+  const baseEmitterTied = sameVoltage(base, emitter);
+  if (!baseEmitterTied && !sameVoltage(collector, base) && !sameVoltage(collector, emitter)) { return null; }
+  const coefficient = baseEmitterTied ? numberToExactRational(2)! : exactProductSumRatio([
+    { factors: [1] }, { factors: [part.currentGain ?? 100] },
+  ], part.currentGain ?? 100)!;
+  return { positive: base, negative: baseEmitterTied ? collector : emitter,
+    sign: part.kind === "pnp-transistor" ? -1 : 1,
+    saturation: multiplyExactRational(numberToExactRational(part.saturationCurrentAmps ?? 1e-14)!, coefficient), ideality: 1 };
+}
+
+function reverseTailVoltage(layout: MnaLayout, groups: ReturnType<typeof idealVoltageNodeGroups>, movingRoot: number,
+  junction: NonNullable<ReturnType<typeof passiveJunctionTailParameters>>, drop: ExactRational, desired: ExactRational, nonlinearLoad: boolean) {
+  if (desired.numerator >= desired.denominator) { return null; }
+  const extrapolated = desired.numerator <= 0n;
+  if (extrapolated) {
+    const loaded = nonlinearLoad || [...layout.branches, ...layout.internalBranches].some((branch) =>
+      !isIdealVoltageConstraint(branch) && !branch.initialDerivativeEquation &&
+      (findRoot(groups.parents, branch.positiveNode) === movingRoot) !==
+        (findRoot(groups.parents, branch.negativeNode) === movingRoot));
+    // A linear load can demand a negative tail at this trial voltage. Move
+    // deeper into reverse bias first; every seed is checked in the full model.
+    return loaded ? { voltage: exactProductSumRatio([{ factors: [2, drop] }], 1)!, extrapolated } : null;
+  }
+  const exponent = logPositiveExactRational(desired);
+  if (exponent >= -1) { return null; }
+  return { voltage: exactProductSumRatio([{ factors: [junction.sign, junction.ideality, THERMAL_VOLTAGE, exponent] }], 1)!, extrapolated };
+}
+
+function parallelReverseJunctions(document: CircuitDocument, layout: MnaLayout, state: Float64Array,
+  groups: ReturnType<typeof idealVoltageNodeGroups>, junction: NonNullable<ReturnType<typeof passiveJunctionTailParameters>>) {
+  const signedNodes = (value: typeof junction) => value.sign === 1
+    ? [value.positive, value.negative] : [value.negative, value.positive];
+  const [positive, negative] = signedNodes(junction);
+  const roots = [findRoot(groups.parents, positive!), findRoot(groups.parents, negative!)];
+  const voltage = (nodes: number[]) => residualTermDifference(exactStateValue(state, layout.topology.nodeUnknowns[nodes[0]!] ?? -1),
+    exactStateValue(state, layout.topology.nodeUnknowns[nodes[1]!] ?? -1));
+  const drop = voltage([positive!, negative!]);
+  const members = document.parts.flatMap((part) => {
+    const parameters = passiveJunctionTailParameters(part, layout);
+    if (!parameters) { return []; }
+    const nodes = signedNodes(parameters);
+    if (nodes.some((node, index) => findRoot(groups.parents, node) !== roots[index]) ||
+      subtractExactRational(voltage(nodes), drop).numerator !== 0n) { return []; }
+    return [{ part, parameters }];
+  });
+  return { members, junction: { ...junction, saturation: sumExactRationals(members.map((member) => member.parameters.saturation)),
+    ideality: Math.max(...members.map((member) => member.parameters.ideality)) } };
+}
+
+function reverseTailVoltageGroups(document: CircuitDocument, layout: MnaLayout, state: Float64Array,
+  junction: NonNullable<ReturnType<typeof passiveJunctionTailParameters>>) {
+  const groups = idealVoltageNodeGroups(document, layout, state);
+  const parallel = parallelReverseJunctions(document, layout, state, groups, junction);
+  const members = new Set(parallel.members.map(({ part }) => part.id));
+  // Preserve every other nonlinear control while moving this junction's
+  // voltage seed. In a series chain, this shifts the upstream junctions
+  // together instead of undoing the roots already found for them.
+  for (const part of document.parts) {
+    if (members.has(part.id) || !isNonlinearPart(part)) { continue; }
+    const nodes = terminalsOf(part.kind).map((terminal) => nodeForTerminal(layout.topology, part, terminal));
+    if (part.kind === "op-amp") { nodes.push(layout.physicalReferenceNode); }
+    const preserved = [...groups.parents];
+    for (const node of nodes.slice(1)) { joinConductiveNodes(preserved, nodes[0]!, node); }
+    // A nonlinear loop or a tied MOS channel can link both target ends.
+    // Its controls must then be allowed to respond to the voltage seed;
+    // preserving them would pin this junction and suppress every candidate.
+    if (findRoot(preserved, junction.positive) !== findRoot(preserved, junction.negative)) { groups.parents = preserved; }
+    else if (part.kind === "nmos" || part.kind === "pmos") {
+      // A gate-bias correction must change Vgs, but retain the channel's Vds
+      // in this seed. If the reference is on the gate side, moving the source
+      // alone would send the drain across its physical source and make the
+      // full Newton target reject an otherwise valid junction bias.
+      const channel = [...groups.parents];
+      joinConductiveNodes(channel, nodes[0]!, nodes[2]!);
+      if (findRoot(channel, junction.positive) !== findRoot(channel, junction.negative)) { groups.parents = channel; }
+    }
+  }
+  return { parallel: parallelReverseJunctions(document, layout, state, groups, junction), groups: { parents: groups.parents,
+    anchored: new Set([...groups.anchored].map((node) => findRoot(groups.parents, node))) } };
+}
+
+function reverseTailPolishState(part: CircuitPart, document: CircuitDocument, layout: MnaLayout,
+  state: Float64Array, assembly: DcAssembly) {
+  const junction = passiveJunctionTailParameters(part, layout);
+  if (!junction || junction.positive === junction.negative) { return null; }
+  const drop = residualTermDifference(exactStateValue(state, layout.topology.nodeUnknowns[junction.positive] ?? -1),
+    exactStateValue(state, layout.topology.nodeUnknowns[junction.negative] ?? -1));
+  const control = diodeExactExponent(exactProductSumRatio([{ factors: [junction.sign, drop] }], 1)!, junction.ideality);
+  if (control.numerator >= -control.denominator) { return null; }
+  const voltages = nonlinearTerminalVoltages(part, layout, state);
+  const model = nonlinearModel(part, voltages);
+  if (!model?.exactCurrents) { return null; }
+  const { groups, parallel } = reverseTailVoltageGroups(document, layout, state, junction);
+  const positiveRoot = findRoot(groups.parents, junction.positive);
+  const negativeRoot = findRoot(groups.parents, junction.negative);
+  if (positiveRoot === negativeRoot) { return null; }
+  const movePositive = !groups.anchored.has(positiveRoot);
+  if (!movePositive && groups.anchored.has(negativeRoot)) { return null; }
+  const movingRoot = movePositive ? positiveRoot : negativeRoot;
+  // Sum KCL over the whole ideal-voltage group: its internal source currents
+  // cancel, including when a BJT terminal tie uses a meter instead of a wire.
+  // Initial inductor gauge equations replace KCL rows, so use physical rows.
+  const physical = layout.initialInductorCurrents ? assembleDc(document, layout, state, false) : assembly;
+  if (!physical.exactResidual) { return null; }
+  const movingRows = groups.parents.flatMap((_, node) => {
+    const unknown = layout.topology.nodeUnknowns[node] ?? -1;
+    return unknown >= 0 && findRoot(groups.parents, node) === movingRoot ? [unknown] : [];
+  });
+  const residual = sumExactRationals(movingRows.map((row) => physical.exactResidual![row]!));
+  const terminalCurrent = sumExactRationals(parallel.members.flatMap(({ part: member }) => {
+    const memberModel = nonlinearModel(member, nonlinearTerminalVoltages(member, layout, state))!;
+    return terminalsOf(member.kind).flatMap((terminal, index) =>
+      findRoot(groups.parents, nodeForTerminal(layout.topology, member, terminal)) === movingRoot ? [nonlinearModelCurrent(memberModel, index)] : []);
+  }).map((value) => typeof value === "number" ? numberToExactRational(value)! : value));
+  const tailCurrent = exactProductSumRatio([
+    { factors: [movePositive ? junction.sign : -junction.sign, terminalCurrent] },
+    { factors: [movePositive ? junction.sign : -junction.sign, residual], sign: -1 },
+    { factors: [parallel.junction.saturation] },
+  ], 1)!;
+  const desired = divideExactRational(tailCurrent, parallel.junction.saturation)!;
+  const nonlinearLoad = document.parts.some((member) => {
+    if (!isNonlinearPart(member)) { return false; }
+    const nodes = terminalsOf(member.kind).map((terminal) => findRoot(groups.parents, nodeForTerminal(layout.topology, member, terminal)) === movingRoot);
+    return nodes.some(Boolean) && !nodes.every(Boolean) && !parallel.members.some((value) => value.part.id === member.id);
+  });
+  const next = reverseTailVoltage(layout, groups, movingRoot, parallel.junction, drop, desired, nonlinearLoad);
+  if (!next) { return null; }
+  const shift = movePositive ? subtractExactRational(next.voltage, drop) : subtractExactRational(drop, next.voltage);
+  return { state: shiftedVoltageGroup(layout, state, groups.parents, movingRoot, shift), extrapolated: next.extrapolated,
+    junction: parallel.junction, movingRows };
+}
+
+function refreshedDcBranchCurrents(layout: MnaLayout, state: Float64Array) {
+  const candidate = cloneRealState(state);
+  for (const branch of [...layout.branches, ...layout.internalBranches]) {
+    if (isIdealVoltageConstraint(branch) || branch.initialDerivativeEquation) { continue; }
+    const drop = residualTermDifference(exactStateValue(candidate, layout.topology.nodeUnknowns[branch.positiveNode] ?? -1),
+      exactStateValue(candidate, layout.topology.nodeUnknowns[branch.negativeNode] ?? -1));
+    const companion = branch.transientCompanion;
+    const current = companion ? exactProductSumRatio([
+      { factors: [companion.denominator, drop] },
+      { factors: [companion.kind === "capacitor" ? -companion.denominator : companion.numerator,
+        companion.exactHistoryValue ?? companion.historyValue] },
+    ], companion.numerator) : divideExactRational(exactProductSumRatio([
+      { factors: [drop] }, { factors: [exactComplexValue(branch.sourceVoltage)!.real], sign: -1 },
+    ], 1)!, branch.exactSeriesResistance ?? numberToExactRational(branch.seriesResistanceOhms)!);
+    if (current) { setRealStateValue(candidate, branch.unknownIndex, current); }
+  }
+  return candidate;
+}
+
+function reverseTailCandidate(document: CircuitDocument, layout: MnaLayout, state: Float64Array, assembly: DcAssembly,
+  candidate: NonNullable<ReturnType<typeof reverseTailPolishState>>, tolerances: ExactRational[], score: number) {
+  const seed = candidate.state;
+  // The inverse junction supplies a voltage seed. Re-solve its full Newton
+  // system before scoring it, updating finite-resistance and ideal-branch
+  // currents together with the surrounding network's voltage response.
+  const conducting = mosChannelConductingByPartId(document, layout, seed);
+  const seedAssembly = assembleDc(document, layout, seed, true, conducting);
+  const rhs = absoluteDcRhs(document, layout, seed, conducting);
+  const hasMos = document.parts.some((device) => device.kind === "nmos" || device.kind === "pmos");
+  let target = candidate.extrapolated ? refreshedDcBranchCurrents(layout, seed)
+    : rhs && dcPolishTarget(layout, seed, seedAssembly.matrix, rhs, hasMos);
+  if (!target) { return null; }
+  const references = mosChannelConductingByPartId(document, layout, state);
+  let candidateAssembly = assembleDc(document, layout, target, true, references);
+  let candidateScore = residualScore(layout, candidateAssembly, tolerances);
+  {
+    const ordinaryRhs = absoluteDcRhs(document, layout, state, references);
+    const ordinary = dcPolishTarget(layout, state, assembly.matrix, ordinaryRhs, hasMos);
+    if (ordinary) {
+      const ordinaryAssembly = assembleDc(document, layout, ordinary, true, references);
+      const ordinaryScore = residualScore(layout, ordinaryAssembly, tolerances);
+      const magnitude = (values: DcAssembly) => absoluteExactRational(sumExactRationals(candidate.movingRows.map((row) => values.exactResidual![row]!)));
+      // A strong shunt makes doubling overshoot once near its root. Keep
+      // the ordinary Newton step when its local KCL improves more, even if
+      // an unrelated junction dominates the global convergence score.
+      if (ordinaryAssembly.exactResidual && candidateAssembly.exactResidual &&
+        (ordinaryScore < score || ordinaryScore <= 1) && subtractExactRational(magnitude(ordinaryAssembly), magnitude(candidateAssembly)).numerator < 0n) {
+        target = ordinary;
+        candidateAssembly = ordinaryAssembly;
+        candidateScore = ordinaryScore;
+      }
+    }
+  }
+  const drop = (value: Float64Array) => residualTermDifference(
+    exactStateValue(value, layout.topology.nodeUnknowns[candidate.junction.positive] ?? -1),
+    exactStateValue(value, layout.topology.nodeUnknowns[candidate.junction.negative] ?? -1));
+  const correction = absoluteExactRational(diodeExactExponent(subtractExactRational(drop(target), drop(state)), candidate.junction.ideality));
+  if (candidateScore < score || candidateScore <= 1) { return { target, score: candidateScore, correction }; }
+  // Establishing a nonlinear gate bias can temporarily increase a stiff
+  // channel's Newton score. Keep a full-model KCL improvement as the next
+  // iterate; the remaining channel correction and final physical checks
+  // still use the original equations and convergence tolerances.
+  const baseline = reverseTailKclQuality(document, layout, state);
+  const quality = reverseTailKclQuality(document, layout, target);
+  if (baseline && quality && subtractExactRational(quality.squared, baseline.squared).numerator < 0n) {
+    return { target, score: candidateScore, correction };
+  }
+  const refined = hasMos && baseline && refinedReverseTailCandidate(document, layout, target, tolerances, score, baseline.squared);
+  return refined ? { ...refined, correction: absoluteExactRational(diodeExactExponent(
+    subtractExactRational(drop(refined.target), drop(state)), candidate.junction.ideality)) } : null;
+}
+
+function refinedReverseTailCandidate(document: CircuitDocument, layout: MnaLayout, seed: Float64Array,
+  tolerances: ExactRational[], score: number, baseline: ExactRational) {
+  let state = seed;
+  // A gate correction can turn an off channel on before its load balances.
+  // Resolve that coupled response using the original full equations before
+  // comparing KCL; one linearization at the old cutoff cannot do both jobs.
+  for (let iteration = 0; iteration < 8; iteration += 1) {
+    const assembly = assembleDc(document, layout, state);
+    const localTolerances = residualTolerances(layout, assembly, state);
+    const localScore = residualScore(layout, assembly, localTolerances);
+    const step = solveDcNewtonStep(document, layout, state, assembly, localTolerances, localScore, "bounded");
+    if (!step.nextState || nonlinearCentersMatch(nonlinearCenters(document, layout, state), nonlinearCenters(document, layout, step.nextState))) { return null; }
+    state = step.nextState;
+    const nextAssembly = assembleDc(document, layout, state);
+    const nextScore = residualScore(layout, nextAssembly, tolerances);
+    const quality = reverseTailKclQuality(document, layout, state);
+    if (nextScore < score || nextScore <= 1 ||
+      (quality && subtractExactRational(quality.squared, baseline).numerator < 0n)) { return { target: state, score: nextScore }; }
+  }
+  return null;
+}
+
+function acceptedReverseTailPolishState(document: CircuitDocument, layout: MnaLayout, state: Float64Array,
+  assembly: DcAssembly, tolerances: ExactRational[], score: number) {
+  let accepted: { target: Float64Array; score: number; correction: ExactRational } | null = null;
+  for (const part of document.parts) {
+    const candidate = reverseTailPolishState(part, document, layout, state, assembly);
+    if (!candidate) { continue; }
+    if (nonlinearCentersMatch(
+      [nonlinearLinearizationCenter(part, nonlinearTerminalVoltages(part, layout, state))],
+      [nonlinearLinearizationCenter(part, nonlinearTerminalVoltages(part, layout, candidate.state))],
+    )) { continue; }
+    const checked = reverseTailCandidate(document, layout, state, assembly, candidate, tolerances, score);
+    if (!checked) { continue; }
+    // A rounded exponential root must not repeatedly take precedence over
+    // another junction's large voltage error. Compare dimensionless control
+    // corrections across all candidates, independent of part order and Is.
+    if (!accepted || subtractExactRational(checked.correction, accepted.correction).numerator > 0n) {
+      accepted = checked;
+    }
+  }
+  return accepted;
+}
+
 function acceptedDcPolishTarget(document: CircuitDocument, layout: MnaLayout, state: Float64Array,
-  assembly: DcAssembly, tolerances: ExactRational[], score: number, floorQuality: number, hasMosChannels: boolean) {
+  assembly: DcAssembly, tolerances: ExactRational[], score: number, floorQuality: number, hasMosChannels: boolean, hasWeakSlope: boolean) {
+  const reverseTail = hasWeakSlope ? acceptedReverseTailPolishState(document, layout, state, assembly, tolerances, score) : null;
   const rhs = absoluteDcRhs(document, layout, state, mosChannelConductingByPartId(document, layout, state));
   const target = dcPolishTarget(layout, state, assembly.matrix, rhs, hasMosChannels);
+  const accelerated = target && hasReverseJunctionTail(document, layout, state)
+    ? acceleratedReverseTailPolish(document, layout, state, target, tolerances, score, reverseTail) : null;
+  if (accelerated) { return accelerated; }
+  if (reverseTail) { return reverseTail; }
   if (!target) { return null; }
   const candidateAssembly = assembleDc(document, layout, target, true, mosChannelConductingByPartId(document, layout, state));
   const candidateScore = residualScore(layout, candidateAssembly, tolerances);
@@ -3600,9 +3984,99 @@ function acceptedDcPolishTarget(document: CircuitDocument, layout: MnaLayout, st
   // approaching its unique voltage. Keep full Newton targets inside the
   // existing converged tolerance, and stop when the controls stabilize.
   const acceptsTarget = !hasNonzeroExactResidual(candidateAssembly) || candidateScore < score ||
-    (hasMosChannels && candidateScore <= 1) ||
+    (hasWeakSlope && candidateScore <= 1) ||
     (floorQuality > 1e-12 && candidateScore <= 1 && floorLimitedDcQuality(document, layout, target) < floorQuality);
   return acceptsTarget ? { target, score: candidateScore } : null;
+}
+
+function reverseTailKclQuality(document: CircuitDocument, layout: MnaLayout, state: Float64Array) {
+  const groups = idealVoltageNodeGroups(document, layout, state);
+  const byRoot = new Map<number, { linear: ExactRational[]; nonlinear: ExactRational[] }>();
+  for (const [node, currents] of dcKclContributions(document, layout, state, true).entries()) {
+    const values = currents.map((value) => exactComplexValue(value)?.real);
+    if (!values.every((value): value is ExactRational => value !== undefined)) { return null; }
+    const root = findRoot(groups.parents, node);
+    const terms = byRoot.get(root) ?? { linear: [], nonlinear: [] };
+    terms.linear.push(values[0]!);
+    terms.nonlinear.push(...values.slice(1));
+    byRoot.set(root, terms);
+  }
+  let maximum = numberToExactRational(0)!;
+  let squared = numberToExactRational(0)!;
+  for (const terms of byRoot.values()) {
+    // Cancel prescribed currents and the affine -Is contributions before
+    // measuring the remaining exponential tails. Internal ideal currents
+    // cancel over the voltage group too; no display rounding enters this ratio.
+    const values = [sumExactRationals(terms.linear), ...terms.nonlinear];
+    const scale = sumExactRationals(values.map(absoluteExactRational));
+    if (scale.numerator === 0n) { continue; }
+    const ratio = divideExactRational(absoluteExactRational(sumExactRationals(values)), scale)!;
+    if (subtractExactRational(ratio, maximum).numerator > 0n) { maximum = ratio; }
+    squared = addExactRational(squared, multiplyExactRational(ratio, ratio));
+  }
+  return { maximum, squared };
+}
+
+function acceleratedReverseTailPolish(document: CircuitDocument, layout: MnaLayout, state: Float64Array, target: Float64Array,
+  tolerances: ExactRational[], score: number, inverse: { target: Float64Array; score: number } | null) {
+  const baseline = reverseTailKclQuality(document, layout, state);
+  if (!baseline || subtractExactRational(baseline.maximum, numberToExactRational(NEWTON_RELATIVE_TOLERANCE)!).numerator <= 0n) { return null; }
+  let best = inverse;
+  let quality = inverse && reverseTailKclQuality(document, layout, inverse.target);
+  if (!quality || subtractExactRational(quality.squared, baseline.squared).numerator >= 0n) { best = null; quality = baseline; }
+  const references = mosChannelConductingByPartId(document, layout, state);
+  const initialStep = reverseTailNewtonStep(document, layout, state, target);
+  // Expand the full Newton direction, retaining KVL across nonlinear loops.
+  // Local inverse seeds alone cannot independently pin every loop voltage.
+  for (let step = 1; step <= 8192; step *= 2) {
+    const candidate = interpolatedNewtonState(state, target, multiplyExactRational(initialStep, numberToExactRational(step)!));
+    const assembly = assembleDc(document, layout, candidate, true, references);
+    const candidateScore = residualScore(layout, assembly, tolerances);
+    if (candidateScore >= score && candidateScore > 1) { continue; }
+    const candidateQuality = reverseTailKclQuality(document, layout, candidate);
+    // The largest relative KCL residual can stay fixed at its model boundary
+    // while another voltage group improves. Sum the squared, independently
+    // scaled residuals so that a weak junction cannot veto that progress.
+    if (!candidateQuality || subtractExactRational(candidateQuality.squared, quality.squared).numerator >= 0n) { continue; }
+    best = { target: candidate, score: candidateScore };
+    quality = candidateQuality;
+    if (quality.maximum.numerator === 0n) { break; }
+  }
+  return best;
+}
+
+function junctionExponents(part: CircuitPart, layout: MnaLayout, state: Float64Array) {
+  if (part.kind === "diode" || part.kind === "led") {
+    return [diodeExactExponent(nonlinearTerminalVoltages(part, layout, state)[0]!, part.emissionCoefficient ?? (part.kind === "led" ? 2 : 1))];
+  }
+  if (part.kind !== "npn-transistor" && part.kind !== "pnp-transistor") { return []; }
+  const voltages = nonlinearTerminalVoltages(part, layout, state);
+  const sign = part.kind === "pnp-transistor" ? -1 : 1;
+  return [0, 2].map((terminal) => diodeExactExponent(exactProductSumRatio([
+    { factors: [sign, voltages[1]!] }, { factors: [sign, voltages[terminal]!], sign: -1 },
+  ], 1)!, 1));
+}
+
+function reverseTailNewtonStep(document: CircuitDocument, layout: MnaLayout, state: Float64Array, target: Float64Array) {
+  let change = numberToExactRational(1)!;
+  for (const part of document.parts) {
+    const start = junctionExponents(part, layout, state);
+    const end = junctionExponents(part, layout, target);
+    for (const [index, exponent] of start.entries()) {
+      if (exponent.numerator >= -exponent.denominator) { continue; }
+      const delta = absoluteExactRational(subtractExactRational(end[index]!, exponent));
+      if (subtractExactRational(delta, change).numerator > 0n) { change = delta; }
+    }
+  }
+  // A reciprocal of the full rational correction folds its denominator back
+  // into the next state, doubling denominator sizes over repeated damping.
+  // Use the next exact power of two instead: it retains the same upper bound
+  // on exponent changes without rounding any voltage or physical current.
+  const exponent = Math.max(0, change.numerator.toString(2).length - change.denominator.toString(2).length);
+  const boundary = { numerator: 2n ** BigInt(exponent), denominator: 1n };
+  const divisor = subtractExactRational(change, boundary).numerator > 0n
+    ? multiplyExactRational(boundary, numberToExactRational(2)!) : boundary;
+  return divideExactRational(numberToExactRational(1)!, divisor)!;
 }
 
 function polishConvergedDcState(
@@ -3617,18 +4091,21 @@ function polishConvergedDcState(
   let polishedScore = score;
   const hasMosChannels = document.parts.some((part) =>
     part.kind === "nmos" || part.kind === "pmos");
+  const visitedCenters: ResidualTerm[][][] = [];
   for (let iteration = 0; iteration < MAX_NEWTON_ITERATIONS; iteration += 1) {
+    polished = (hasMosChannels ? exactMosZeroDropState(document, layout, polished) : null) ?? polished;
     // Use actual terminal currents for the extra polish, independent of the
     // coordinate-sensitive Jacobian scale. An unrelated high-common-mode
     // circuit must not hide a subnormal junction's remaining KCL error.
     const floorQuality = floorLimitedDcQuality(document, layout, polished);
+    const hasWeakSlope = hasMosChannels || hasReverseJunctionTail(document, layout, polished);
     // A small positive output slope can hide a large voltage error just as
     // a flat MOS knee does. Continue improving the physical equations until
     // the controls stabilize instead of stopping after three corrections.
-    if (iteration >= 3 && floorQuality <= 1e-12 && !hasMosChannels) { break; }
+    if (iteration >= 3 && floorQuality <= 1e-12 && !hasWeakSlope) { break; }
     const channelConducting = mosChannelConductingByPartId(document, layout, polished);
     const assembly = assembleDc(document, layout, polished, true, channelConducting);
-    const candidate = acceptedDcPolishTarget(document, layout, polished, assembly, tolerances, polishedScore, floorQuality, hasMosChannels);
+    const candidate = acceptedDcPolishTarget(document, layout, polished, assembly, tolerances, polishedScore, floorQuality, hasMosChannels, hasWeakSlope);
     if (!candidate) {
       // Unequal saturation currents can hide a large voltage error even
       // with a tiny positive output slope. Re-enter the triode region in
@@ -3640,13 +4117,14 @@ function polishConvergedDcState(
       continue;
     }
     const { target } = candidate;
-    const centersUnchanged = nonlinearCentersMatch(
-      nonlinearCenters(document, layout, polished),
-      nonlinearCenters(document, layout, target),
-    );
+    const currentCenters = nonlinearCenters(document, layout, polished);
+    visitedCenters.push(currentCenters);
+    const targetCenters = nonlinearCenters(document, layout, target);
     polished = target;
     polishedScore = candidate.score;
-    if (centersUnchanged) { break; }
+    // At the exponential approximation boundary, a few rounded controls
+    // can form a cycle. Further Newton passes repeat the same model states.
+    if (visitedCenters.some((centers) => nonlinearCentersMatch(centers, targetCenters))) { break; }
   }
   return polished;
 }
@@ -3665,7 +4143,8 @@ function initialDcState(document: CircuitDocument, layout: MnaLayout, initialSta
 function currentSeededDcState(document: CircuitDocument, layout: MnaLayout, initialState?: Float64Array, retrySeeds = true) {
   const initial = initialDcState(document, layout, initialState);
   if (!retrySeeds) { return { ...initial, usedMosSeed: false }; }
-  const currentSeed = currentDrivenMosSeed(document, layout, initial.state);
+  const currentSeed = currentDrivenMosSeed(document, layout, initial.state) ??
+    (initialState ? null : independentMosCurrentSeed(document, layout, initial.state));
   return { ...initial, state: currentSeed ?? initial.state, usedMosSeed: currentSeed !== null };
 }
 
@@ -3720,14 +4199,15 @@ function finishDcAtReference(
   usedLinearSeed: boolean,
   lineSearch: DcLineSearch,
 ): { state?: Float64Array; converged: boolean; singular: boolean; invalidPhysicalSolution?: boolean } {
-  const finalAssembly = assembleDc(document, layout, state);
-  const exactSolution = exactZeroPhysicalSolution(document, layout, state, finalAssembly) ??
-    exactMosCutoffPhysicalSolution(document, layout, state);
+  const finalState = exactMosZeroDropState(document, layout, state) ?? state;
+  const finalAssembly = assembleDc(document, layout, finalState);
+  const exactSolution = exactZeroPhysicalSolution(document, layout, finalState, finalAssembly) ??
+    exactMosCutoffPhysicalSolution(document, layout, finalState);
   if (exactSolution) { return exactSolution; }
-  const tolerances = residualTolerances(layout, finalAssembly, state);
+  const tolerances = residualTolerances(layout, finalAssembly, finalState);
   const score = residualScore(layout, finalAssembly, tolerances);
   if (score <= 1) {
-    return validatePolishedDcSolution(document, layout, state, tolerances, score);
+    return validatePolishedDcSolution(document, layout, finalState, tolerances, score);
   }
   // A nearly zero device slope can stall line search before an independent
   // bias is reached. Retry once with those linear voltage biases established.
@@ -3753,6 +4233,7 @@ function solveDcAtReference(
 
   const iterationLimit = lineSearch === "previous" ? MAX_PREVIOUS_STATE_ITERATIONS : MAX_NEWTON_ITERATIONS;
   for (let iteration = 0; iteration < iterationLimit; iteration += 1) {
+    state = exactMosZeroDropState(document, layout, state) ?? state;
     const assembled = assembleDc(document, layout, state);
     const exactSolution = exactZeroPhysicalSolution(document, layout, state, assembled);
     if (exactSolution) { return exactSolution; }
@@ -4004,11 +4485,106 @@ function currentDrivenMosSeed(document: CircuitDocument, layout: MnaLayout, stat
   return seed;
 }
 
+function independentMosPartSeed(part: CircuitPart, document: CircuitDocument, layout: MnaLayout,
+  state: Float64Array, current: ExactRational, gateHeadroom: number) {
+  if (current.numerator === 0n) { return null; }
+  const sign = part.kind === "nmos" ? 1 : -1;
+  const forward = sign === 1 ? current.numerator > 0n : current.numerator < 0n;
+  const drain = nodeForTerminal(layout.topology, part, forward ? "a" : "c");
+  const source = nodeForTerminal(layout.topology, part, forward ? "c" : "a");
+  const gate = nodeForTerminal(layout.topology, part, "b");
+  const groups = idealVoltageNodeGroups(document, layout, state);
+  const drainRoot = findRoot(groups.parents, drain);
+  const sourceRoot = findRoot(groups.parents, source);
+  const gateRoot = findRoot(groups.parents, gate);
+  if (drainRoot === sourceRoot || gateRoot === drainRoot || gateRoot === sourceRoot ||
+    groups.anchored.has(drainRoot) || groups.anchored.has(gateRoot)) { return null; }
+  const overdrive = currentDrivenMosOverdrive(part, absoluteExactRational(current));
+  if (!overdrive) { return null; }
+  let seed = state;
+  const at = (node: number) => exactStateValue(seed, layout.topology.nodeUnknowns[node] ?? -1);
+  // A gate biased by a nonlinear junction can still be off in the first
+  // guess. Enter the triode region with both control slopes nonzero; the
+  // prescribed gate bias and load remain in the original Newton equations.
+  const gateShift = exactProductSumRatio([
+    { factors: [at(source)] }, { factors: [sign, part.thresholdVolts ?? 2] },
+    { factors: [sign, gateHeadroom, overdrive] }, { factors: [at(gate)], sign: -1 },
+  ], 1)!;
+  seed = shiftedVoltageGroup(layout, seed, groups.parents, gateRoot, gateShift);
+  const drainShift = exactProductSumRatio([
+    { factors: [at(source)] }, { factors: [sign, 0.5, overdrive] }, { factors: [at(drain)], sign: -1 },
+  ], 1)!;
+  seed = shiftedVoltageGroup(layout, seed, groups.parents, drainRoot, drainShift);
+  return seed;
+}
+
+function linearChannelBiasSeed(document: CircuitDocument, layout: MnaLayout, state: Float64Array, parts: CircuitPart[]) {
+  if (document.parts.filter((part) => passiveJunctionTailParameters(part, layout)).length <= 1) { return null; }
+  const terminalNodes = new Map(layout.topology.terminalNodes);
+  const branchByPartId = new Map(layout.branchByPartId);
+  const replacements = new Map<string, CircuitPart>();
+  const branches: Branch[] = [];
+  for (const part of parts) {
+    const resistance = divideExactRational(numberToExactRational(1)!,
+      numberToExactRational(part.transconductanceAmpsPerVoltSquared ?? 0.02)!);
+    const projected = resistance && exactRationalToNumber(resistance);
+    if (!resistance || !projected || !Number.isFinite(projected)) { return null; }
+    const source = nodeForTerminal(layout.topology, part, "c");
+    terminalNodes.set(endpointKey(part.id, "b"), source);
+    replacements.set(part.id, { ...part, kind: "resistor", resistanceOhms: projected });
+    const branch: Branch = { partId: part.id, kind: "resistor", positiveNode: nodeForTerminal(layout.topology, part, "a"),
+      negativeNode: source, seriesResistanceOhms: projected, exactSeriesResistance: resistance,
+      sourceVoltage: complex(), unknownIndex: layout.size + branches.length };
+    branches.push(branch);
+    branchByPartId.set(part.id, branch);
+  }
+  // Decouple the passive gate-bias network from channel transconductance in
+  // this auxiliary solve only. Terminal node indexes and original ideal
+  // constraints stay fixed; each added resistor has its exact 1/beta value.
+  const auxiliaryDocument = { ...document, parts: document.parts.map((part) => replacements.get(part.id) ?? part) };
+  const auxiliaryLayout = { ...layout, topology: { ...layout.topology, terminalNodes }, branchByPartId,
+    branches: [...layout.branches, ...branches], size: layout.size + branches.length };
+  const initial = new Float64Array(auxiliaryLayout.size);
+  for (let index = 0; index < layout.size; index += 1) { setRealStateValue(initial, index, exactStateValue(state, index)); }
+  const solution = solveDcAtReference(auxiliaryDocument, auxiliaryLayout, initial, "bounded", false);
+  if (!solution.converged || !solution.state) { return null; }
+  const seed = cloneRealState(state);
+  for (let index = 0; index < layout.size; index += 1) { setRealStateValue(seed, index, exactStateValue(solution.state, index)); }
+  return seed;
+}
+
+function independentMosCurrentSeed(document: CircuitDocument, layout: MnaLayout, state: Float64Array) {
+  const parts = document.parts.filter((part) => (part.kind === "nmos" || part.kind === "pmos") && !diodeConnectedMosPhysicalNodes(part, layout));
+  if (parts.length === 0) { return null; }
+  const network = networkMosSeedCurrents(document, layout);
+  if (!network?.potentials) { return null; }
+  const linearBias = linearChannelBiasSeed(document, layout, state, parts);
+  if (linearBias) { return linearBias; }
+  let seed = state;
+  for (const part of parts) {
+    const current = network.currents.get(part.id);
+    if (current) { seed = independentMosPartSeed(part, document, layout, seed, current, 8) ?? seed; }
+  }
+  // For a single junction or a failed auxiliary solve, use its full-Newton
+  // inverse candidate before an unrelated load dominates line search.
+  if (seed !== state && hasReverseJunctionTail(document, layout, seed)) {
+    const assembly = assembleDc(document, layout, seed);
+    const tolerances = residualTolerances(layout, assembly, seed);
+    const score = residualScore(layout, assembly, tolerances);
+    if (tolerances) {
+      seed = acceptedReverseTailPolishState(document, layout, seed, assembly, tolerances, score)?.target ?? seed;
+    }
+  }
+  return seed !== state && !nonlinearCentersMatch(nonlinearCenters(document, layout, state), nonlinearCenters(document, layout, seed)) ? seed : null;
+}
+
 function failedDcSeed(document: CircuitDocument, layout: MnaLayout, state: Float64Array, usedLinearSeed: boolean, singular: boolean, retrySeeds = true) {
   if (!retrySeeds) { return null; }
   const linear = linearSeedAfterFailedStep(document, layout, state, usedLinearSeed, singular);
   if (linear) { return { state: linear, mos: false }; }
   if (!singular) { return null; }
+  const independent = independentMosCurrentSeed(document, layout, state);
+  if (independent) { return { state: independent, mos: true }; }
   const parts = document.parts.filter((part) => diodeConnectedMosNodes(part, layout));
   if (parts.length === 0) { return null; }
   const seed = cloneRealState(state);
@@ -4191,7 +4767,10 @@ function validatePhysicalDcSolution(
       PHYSICAL_RELATIVE_TOLERANCE,
     ),
   );
-  if (physicalScore > 1) {
+  const tailQuality = hasReverseJunctionTail(document, layout, validatedState)
+    ? reverseTailKclQuality(document, layout, validatedState) : null;
+  if (physicalScore > 1 || (tailQuality && subtractExactRational(
+    tailQuality.maximum, numberToExactRational(PHYSICAL_RELATIVE_TOLERANCE)!).numerator > 0n)) {
     return { converged: false, singular: false, invalidPhysicalSolution: true };
   }
   return { state: validatedState, converged: true, singular: false };
@@ -5296,7 +5875,46 @@ function dcCurrentContributions(model: NonlinearModel | null, currents: ComplexV
     : [currents[row] ?? complex()];
 }
 
-function dcKclContributions(document: CircuitDocument, layout: MnaLayout, state: Float64Array) {
+function reverseJunctionConstants(part: CircuitPart, layout: MnaLayout, state: Float64Array): ExactRational[][] | null {
+  const zero = numberToExactRational(0)!;
+  const voltages = nonlinearTerminalVoltages(part, layout, state);
+  const reverse = (voltage: ResidualTerm, ideality: number, junctionSaturation: number) => {
+    const exponent = diodeExactExponent(voltage, ideality);
+    return exponent.numerator < -exponent.denominator ? numberToExactRational(-junctionSaturation)! : zero;
+  };
+  if (part.kind === "diode" || part.kind === "led") {
+    const current = reverse(voltages[0]!, part.emissionCoefficient ?? (part.kind === "led" ? 2 : 1),
+      part.saturationCurrentAmps ?? (part.kind === "led" ? 1e-20 : 1e-12));
+    return [[current], [negativeExact(current)]];
+  }
+  if (part.kind !== "npn-transistor" && part.kind !== "pnp-transistor") { return null; }
+  const sign = part.kind === "pnp-transistor" ? -1 : 1;
+  const control = (terminal: number) => exactProductSumRatio([
+    { factors: [sign, voltages[1]!] }, { factors: [sign, voltages[terminal]!], sign: -1 },
+  ], 1)!;
+  const saturation = part.saturationCurrentAmps ?? 1e-14;
+  const forward = exactProductSumRatio([{ factors: [sign, reverse(control(2), 1, saturation)] }], 1)!;
+  const backward = exactProductSumRatio([{ factors: [sign, reverse(control(0), 1, saturation)] }], 1)!;
+  const base = divideExactRational(forward, numberToExactRational(part.currentGain ?? 100)!)!;
+  return [[forward, exactProductSumRatio([{ factors: [-2, backward] }], 1)!],
+    [base, backward], [negativeExact(forward), negativeExact(base), backward]];
+}
+
+function appendDcKclCurrents(part: CircuitPart, layout: MnaLayout, model: NonlinearModel | null, currents: ComplexValue[],
+  affine: ExactRational[][] | null, linear: ComplexValue[][], nonlinear: ComplexValue[][]) {
+  for (const [index, terminal] of terminalsOf(part.kind).entries()) {
+    const node = nodeForTerminal(layout.topology, part, terminal);
+    const contributions = dcCurrentContributions(model, currents, index);
+    const constants = affine?.[index];
+    if (constants) {
+      linear[node]?.push(...constants.map(complexFromScalar));
+      nonlinear[node]?.push(...contributions.map((current, contribution) =>
+        complexSubtract(current, complexFromScalar(constants[contribution] ?? 0))));
+    } else { (model ? nonlinear : linear)[node]?.push(...contributions); }
+  }
+}
+
+function dcKclContributions(document: CircuitDocument, layout: MnaLayout, state: Float64Array, separateReverseTails = false) {
   const values = Array.from({ length: layout.size }, (_, index) => complexFromRealState(state, index));
   const sources = independentSourceCurrents(document, layout);
   const linearCurrentsByNode = Array.from({ length: layout.topology.nodeCount }, (_, node) => {
@@ -5312,11 +5930,8 @@ function dcKclContributions(document: CircuitDocument, layout: MnaLayout, state:
     const currents = model
       ? terminalsOf(part.kind).map((_, row) => complexFromScalar(nonlinearModelCurrent(model, row)))
       : terminalCurrentsForPart(part, layout, layout, values, "dc", undefined, state);
-    const terminals = terminalsOf(part.kind);
-    for (let index = 0; index < terminals.length; index += 1) {
-      const node = nodeForTerminal(layout.topology, part, terminals[index] ?? "a");
-      (model ? currentsByNode : linearCurrentsByNode)[node]?.push(...dcCurrentContributions(model, currents, index));
-    }
+    const affine = separateReverseTails && model ? reverseJunctionConstants(part, layout, state) : null;
+    appendDcKclCurrents(part, layout, model, currents, affine, linearCurrentsByNode, currentsByNode);
     if (part.kind === "op-amp") {
       currentsByNode[layout.physicalReferenceNode]?.push(complexSubtract(complex(), currents[2] ?? complex()));
     }

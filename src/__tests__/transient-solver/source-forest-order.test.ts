@@ -89,3 +89,31 @@ it.each(permutations)("rejects an adjacent initial voltage in source order %j", 
     expect(result.samples).toHaveLength(0);
   }
 });
+
+it.each([17, 37, 73, 200, 330].flatMap((phase) =>
+  [2 ** -400, 1, 2 ** 400].map((amplitude) => ({ phase, amplitude })),
+))("preserves the waveform basis under equivalent source polarity reversals (phase=$phase, amplitude=$amplitude)", ({ phase, amplitude }) => {
+  const options = { durationSeconds: 0.25, timeStepSeconds: 0.125 };
+  const baseline = simulateTransient(sourceLoop(phase, amplitude, permutations[0]!, undefined, true), options);
+  expect(baseline.status, baseline.message).toBe("valid");
+  const initialVoltage = baseline.samples[0]!.parts.total!.voltageVolts;
+  for (let mask = 0; mask < 8; mask += 1) {
+    for (const order of permutations) {
+      const document = sourceLoop(phase, amplitude, order, initialVoltage, true);
+      const reversed = new Set(["first", "second", "total"].filter((_, index) => Math.floor(mask / 2 ** index) % 2 === 1));
+      document.parts = document.parts.map((part) => reversed.has(part.id)
+        ? { ...part, phaseDegrees: (part.phaseDegrees ?? 0) + 180, offsetVolts: -(part.offsetVolts ?? 0) }
+        : part);
+      document.wires = document.wires.map((wire) => ({ ...wire,
+        from: reversed.has(wire.from.partId) ? { ...wire.from, terminal: wire.from.terminal === "a" ? "b" : "a" } : wire.from,
+        to: reversed.has(wire.to.partId) ? { ...wire.to, terminal: wire.to.terminal === "a" ? "b" : "a" } : wire.to,
+      }));
+      const result = simulateTransient(document, options);
+      expect(result.status, `${mask}/${order}: ${result.message}`).toBe("valid");
+      expect(result.samples.map((sample) => sample.parts.cap!.voltageVolts))
+        .toEqual(baseline.samples.map((sample) => sample.parts.total!.voltageVolts));
+      const invalidDocument = { ...document, parts: document.parts.map((part) => part.id === "cap" ? { ...part, initialVoltageVolts: nextUp(initialVoltage) } : part) };
+      expect(simulateTransient(invalidDocument, options).status).toBe("invalid");
+    }
+  }
+});
