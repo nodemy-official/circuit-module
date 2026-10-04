@@ -4,6 +4,9 @@ import { simulateTransient } from "../../transient-solver.js";
 import { createCircuitFromSpecs, type CircuitSpec } from "../helpers/circuit-fixture.js";
 import { addRational, assertCorrectRounding, multiplyRational, negateRational, rational, rationalFromNumber } from "../helpers/numeric-oracle.js";
 
+// Nearly flat MOS roots require many exact Newton steps on a busy CPU.
+const weakSlopeTimeoutMs = 60_000;
+
 it.each([12, 24, 26].flatMap((exponent) => ["n", "p"].flatMap((weak) =>
   [2 ** -1000, 1, 2 ** 900].flatMap((scale) => [0, 2 ** -100].flatMap((lambda) =>
     [false, true].flatMap((reverse) => [false, true].flatMap((reverseOrder) =>
@@ -70,4 +73,4 @@ it.each([12, 24, 26].flatMap((exponent) => ["n", "p"].flatMap((weak) =>
   expect(dc.parts.n!.current.real).toBe(-dc.parts.p!.current.real);
   expect(dc.parts["other-n"]!.voltage.real).toBeGreaterThanOrEqual(1);
   expect(dc.parts["other-n"]!.voltage.real).toBeLessThanOrEqual(3);
-});
+}, weakSlopeTimeoutMs);

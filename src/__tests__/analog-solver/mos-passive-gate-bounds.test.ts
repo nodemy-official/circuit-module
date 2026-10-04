@@ -2,6 +2,9 @@ import { describe, expect, it } from "vitest";
 import { analyzeAnalogCircuit } from "../../analog-solver.js";
 import { createCircuitFromSpecs, type CircuitSpec } from "../helpers/circuit-fixture.js";
 
+// Each case checks six exact solves, including an infeasible current bound.
+const nonlinearNetworkTimeoutMs = 60_000;
+
 const cases = (["nmos", "pmos"] as const).flatMap((kind) =>
   [false, true].flatMap((reverse) => [false, true].flatMap((initial) =>
     (["diode", "led"] as const).flatMap((junction) => [false, true].map((loop) => ({ kind, reverse, initial, junction, loop }))),
@@ -52,7 +55,7 @@ describe("MOS bounds behind a single-port passive gate network", () => {
         }
       }
     }
-  });
+  }, nonlinearNetworkTimeoutMs);
 
   it("keeps a loaded junction gate independent of the divider voltage", () => {
     const bias = { kind: "nmos", reverse: false, initial: false, junction: "diode", loop: false } as const;

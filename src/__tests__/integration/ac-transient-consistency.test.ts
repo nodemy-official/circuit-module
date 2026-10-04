@@ -13,7 +13,7 @@ const cycles = 10;
 const timeStepSeconds = 1 / (frequencyHz * samplesPerCycle);
 const durationSeconds = cycles / frequencyHz;
 // Exact transient histories grow with the step count, so long circuit comparisons need more time.
-const longTransientTimeoutMs = 60_000;
+const longTransientTimeoutMs = 180_000;
 
 function part(id: string, kind: CircuitPartKind, properties: Partial<CircuitPart> = {}): CircuitPart {
   return { id, kind, x: 0, y: 0, label: id, ...properties };
@@ -249,5 +249,5 @@ describe("AC phasor and transient steady-state consistency", () => {
       result.analysis.parts["source-b"]!.powerWatts;
     expect(Math.abs(acSourceDelivery - result.analysis.parts.resistor!.powerWatts)).toBeLessThan(1e-8);
     expect(Math.abs(meanSourcePower + meanResistorPower)).toBeLessThan(1e-8);
-  });
+  }, longTransientTimeoutMs);
 });

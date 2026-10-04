@@ -13,6 +13,7 @@ import { exactRealStateInput, exactRealStateValue, realStateFromExact } from "./
 const MAX_CACHED_MATRIX_SIZE = 16;
 const MAX_INVERSE_CACHE_ENTRIES = 16;
 const LARGE_RATIONAL_THRESHOLD = 2n ** 1024n;
+const LARGE_HISTORY_THRESHOLD = 2n ** 8191n;
 const ZERO = numberToExactRational(0)!;
 const ONE = numberToExactRational(1)!;
 
@@ -22,10 +23,16 @@ type CachedSolveResult =
   | { status: "solved"; solution: Float64Array; cacheHit: boolean };
 
 const inverseCache = new Map<string, readonly ExactRational[]>();
+const recentMatrices = new Set<string>();
 
 function isLargeRational(value: ExactRational) {
   const numerator = value.numerator < 0n ? -value.numerator : value.numerator;
   return numerator >= LARGE_RATIONAL_THRESHOLD || value.denominator >= LARGE_RATIONAL_THRESHOLD;
+}
+
+function hasLargeHistory(value: ExactRational) {
+  const numerator = value.numerator < 0n ? -value.numerator : value.numerator;
+  return numerator >= LARGE_HISTORY_THRESHOLD || value.denominator >= LARGE_HISTORY_THRESHOLD;
 }
 
 function exactMatrixKey(size: number, matrix: Float64Array) {
@@ -47,6 +54,16 @@ function touchInverse(key: string, inverse: readonly ExactRational[]) {
     if (oldest === undefined) { break; }
     inverseCache.delete(oldest);
   }
+}
+
+function observeMatrix(key: string) {
+  const seenRecently = recentMatrices.delete(key);
+  recentMatrices.add(key);
+  if (recentMatrices.size > MAX_INVERSE_CACHE_ENTRIES) {
+    const oldest = recentMatrices.values().next().value;
+    if (oldest !== undefined) { recentMatrices.delete(oldest); }
+  }
+  return seenRecently;
 }
 
 function exactInverse(size: number, matrix: Float64Array): readonly ExactRational[] | null {
@@ -93,9 +110,16 @@ export function solveRealLinearSystemWithExactInverseCache(
   const key = exactMatrixKey(size, matrix);
   if (!key) { return { status: "not-applicable" }; }
 
+  const seenRecently = observeMatrix(key);
   let inverse = inverseCache.get(key);
   const cacheHit = inverse !== undefined;
   if (!inverse) {
+    // Building an inverse costs one exact solve per column. Wait for reuse
+    // within the bounded recent history so changing Newton matrices use the
+    // ordinary solve, while alternating transient matrices can still qualify.
+    // For 8192-bit histories, RHS reduction can dominate even a first solve;
+    // retain the inverse path and its deferred exact RHS arithmetic there.
+    if (!seenRecently && !rhs.some(hasLargeHistory)) { return { status: "not-applicable" }; }
     inverse = exactInverse(size, matrix) ?? undefined;
     if (!inverse) { return { status: "singular" }; }
   }
@@ -122,4 +146,5 @@ export function solveRealLinearSystemWithExactInverseCache(
 /** Clears the private cache between isolated unit tests. */
 export function clearExactLinearInverseCache() {
   inverseCache.clear();
+  recentMatrices.clear();
 }

@@ -3,6 +3,7 @@ import { analyzeExtendedCircuit } from "../../circuit-analog-adapter.js";
 import { analyzeAnalogCircuit, solveAnalogStep } from "../../analog-solver.js";
 import { analyzeCircuit } from "../../circuit-solver.js";
 import { circuitPartCatalog, type CircuitDocument } from "../../circuit-model.js";
+import { clearExactLinearInverseCache } from "../../exact-linear-cache.js";
 import { simulateTransient } from "../../transient-solver.js";
 
 const source: CircuitDocument = {
@@ -119,10 +120,14 @@ describe("simulation input accessor validation", () => {
 
     expect(analyzeAnalogCircuit(document, { mode: "ac" }).parts.load!.current.real).toBe(0.5);
     for (const [name, call] of calls) {
+      // Compare input snapshotting with the same solver cache state: cold and
+      // warm solves can capture different graphs for the same exact value.
+      clearExactLinearInverseCache();
       const expected = call([...document.parts]);
       expect(["closed", "valid"], name).toContain(expected.status);
       for (const parts of overriddenArrays) {
         let result: { status: string } | undefined;
+        clearExactLinearInverseCache();
         expect(() => { result = call(parts); }, name).not.toThrow();
         expect(result, name).toEqual(expected);
         expect(reads, name).toBe(0);
@@ -140,6 +145,7 @@ describe("simulation input accessor validation", () => {
     ];
 
     for (const [name, call] of calls) {
+      clearExactLinearInverseCache();
       const expected = call([...source.parts]);
       let mapReads = 0;
       const parts = new Proxy([...source.parts], {
@@ -154,6 +160,7 @@ describe("simulation input accessor validation", () => {
       });
 
       let result: { status: string } | undefined;
+      clearExactLinearInverseCache();
       expect(() => { result = call(parts); }, name).not.toThrow();
       expect(result, name).toEqual(expected);
       expect(mapReads, name).toBe(0);
