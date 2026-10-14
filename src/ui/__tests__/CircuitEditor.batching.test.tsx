@@ -105,6 +105,53 @@ describe("batched editor commands", () => {
     expect(ui.editor.canRedo).toBe(false);
   });
 
+  it.each([false, true])("preserves redo history when rotating only junctions or an empty selection (batched=%s)", (batched) => {
+    const ui = mount({
+      title: "initial",
+      parts: [{ id: "junction", kind: "junction", x: 0, y: 0, label: "接続点" }],
+      wires: [],
+    });
+    const initial = ui.editor.document;
+    act(() => ui.editor.setTitle("redo"));
+    const redoDocument = ui.editor.document;
+    act(() => ui.editor.undo());
+    const commands = [
+      () => ui.editor.selectPart("junction"),
+      () => ui.editor.rotateSelected(),
+      () => ui.editor.clearSelection(),
+      () => ui.editor.rotateSelected(),
+    ];
+    if (batched) { act(() => { for (const command of commands) { command(); } }); }
+    else { for (const command of commands) { act(command); } }
+
+    expect(ui.editor.document).toBe(initial);
+    expect(ui.editor.canUndo).toBe(false);
+    expect(ui.editor.canRedo).toBe(true);
+    act(() => ui.editor.redo());
+    expect(ui.editor.document).toBe(redoDocument);
+  });
+
+  it.each([false, true])("preserves undo and redo history when moving an unknown part (batched=%s)", (batched) => {
+    const ui = mount();
+    const initial = ui.editor.document;
+    act(() => ui.editor.setTitle("redo"));
+    const redoDocument = ui.editor.document;
+    act(() => ui.editor.undo());
+    const commands = [
+      () => ui.editor.movePart("missing", 1, 0),
+      () => ui.editor.movePart("missing", 0, 1),
+      () => ui.editor.endEdit(),
+    ];
+    if (batched) { act(() => { for (const command of commands) { command(); } }); }
+    else { for (const command of commands) { act(command); } }
+
+    expect(ui.editor.document).toBe(initial);
+    expect(ui.editor.canUndo).toBe(false);
+    expect(ui.editor.canRedo).toBe(true);
+    act(() => ui.editor.redo());
+    expect(ui.editor.document).toBe(redoDocument);
+  });
+
   it("uses the current selection and clipboard for a select, cut and paste sequence", () => {
     const ui = mount();
     act(() => {

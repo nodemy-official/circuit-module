@@ -2,6 +2,7 @@ import { useId, useState } from "react";
 import { frequencyMatches } from "../ac-reactive.js";
 import { circuitPartCatalog, type CircuitDocument, type CircuitPart } from "../circuit-model.js";
 import { analyzeCircuit, type CircuitAnalysis, type CircuitAnalysisOptions, type CircuitPartReading } from "../circuit-solver.js";
+import { exactRationalToNumber, numberToExactRational, subtractExactRational } from "../exact-linear-algebra.js";
 import { formatCircuitNumber } from "../number-format.js";
 import { copySimulationDocument, simulationRecordField } from "../simulation-input.js";
 import { NumericInput } from "./NumericInput.js";
@@ -41,7 +42,9 @@ function formatPeriod(frequencyHz: number): string {
 }
 
 function wrapDegrees(value: number): number {
-  return ((value + 180) % 360 + 360) % 360 - 180;
+  const wrapped = value % 360;
+  if (wrapped >= 180) { return wrapped - 360; }
+  return wrapped < -180 ? wrapped + 360 : wrapped;
 }
 
 interface SweepPoint {
@@ -176,7 +179,15 @@ function waveformPath(rms: number | null, phaseRadians: number | null, centerY: 
 function phaseDifference(reading: CircuitPartReading, voltageRms: number | null, currentRms: number | null): number | null {
   if ((voltageRms ?? 0) === 0 || (currentRms ?? 0) === 0 ||
     !finite(reading.voltagePhaseDegrees) || !finite(reading.currentPhaseDegrees)) { return null; }
-  return wrapDegrees(reading.currentPhaseDegrees - reading.voltagePhaseDegrees);
+  const difference = subtractExactRational(numberToExactRational(reading.currentPhaseDegrees)!, numberToExactRational(reading.voltagePhaseDegrees)!);
+  const turn = 360n * difference.denominator;
+  const halfTurn = 180n * difference.denominator;
+  let numerator = difference.numerator % turn;
+  if (numerator >= halfTurn) { numerator -= turn; }
+  else if (numerator < -halfTurn) { numerator += turn; }
+  // Reduce the exact difference before display rounding: normalizing each input
+  // first can cancel a tiny difference across the half-turn boundary.
+  return exactRationalToNumber({ numerator, denominator: difference.denominator });
 }
 
 function describePhaseDifference(difference: number | null): string {
@@ -215,8 +226,10 @@ function Waveform({ reading, frequencyHz, partLabel }: { reading: CircuitPartRea
   const currentRms = measured && finite(reading.currentAmps) ? Math.max(0, reading.currentAmps) : null;
   const voltagePeak = voltageRms === null ? null : Math.SQRT2 * voltageRms;
   const currentPeak = currentRms === null ? null : Math.SQRT2 * currentRms;
-  const voltagePhase = finite(reading.voltagePhaseDegrees) ? reading.voltagePhaseDegrees * Math.PI / 180 : null;
-  const currentPhase = finite(reading.currentPhaseDegrees) ? reading.currentPhaseDegrees * Math.PI / 180 : null;
+  // Normalize before the approximate trigonometric display boundary so finite
+  // input angles cannot overflow while being converted to radians.
+  const voltagePhase = finite(reading.voltagePhaseDegrees) ? wrapDegrees(reading.voltagePhaseDegrees) * Math.PI / 180 : null;
+  const currentPhase = finite(reading.currentPhaseDegrees) ? wrapDegrees(reading.currentPhaseDegrees) * Math.PI / 180 : null;
   const voltagePoints = waveformPath(voltageRms, voltagePhase, 104);
   const currentPoints = waveformPath(currentRms, currentPhase, 104);
   const difference = phaseDifference(reading, voltageRms, currentRms);

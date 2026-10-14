@@ -39,8 +39,10 @@ function mount(initial: CircuitDocument, segmentIndex: number) {
   const root = createRoot(container);
   const errors: string[] = [];
   let latest = initial;
+  let replaceDocument: ((next: CircuitDocument) => void) | undefined;
   function Harness() {
     const [circuit, setCircuit] = useState(initial);
+    replaceDocument = setCircuit;
     const svgRef = useRef<SVGSVGElement | null>(null);
     latest = circuit;
     const drag = useWireRouteDrag({
@@ -69,7 +71,11 @@ function mount(initial: CircuitDocument, segmentIndex: number) {
   mounted.push({ root, container });
   const surface = container.querySelector("svg")!;
   const handle = container.querySelector("g")!;
-  return { surface, handle, errors, get document() { return latest; } };
+  return {
+    surface, handle, errors,
+    replaceDocument(next: CircuitDocument) { act(() => replaceDocument?.(next)); },
+    get document() { return latest; },
+  };
 }
 
 function pointer(target: Element, type: string, point: Point) {
@@ -93,6 +99,32 @@ function movedRoute(document: CircuitDocument, index: number, delta: number) {
 }
 
 describe("manual route persistence", () => {
+  it("discards an old drag after an external document change without restoring old waypoints", () => {
+    const initial: CircuitDocument = {
+      title: "original",
+      parts: [
+        { id: "left", kind: "junction", x: 0, y: 0, label: "left" },
+        { id: "right", kind: "junction", x: 8, y: 0, label: "right" },
+      ],
+      wires: [{ id: "wire", from: { partId: "left", terminal: "a" }, to: { partId: "right", terminal: "a" }, waypoints: [{ x: 0, y: 1 }, { x: 8, y: 1 }] }],
+    };
+    const ui = mount(initial, 1);
+    pointer(ui.handle, "pointerdown", { x: 4, y: 1 });
+    pointer(ui.surface, "pointermove", { x: 4, y: 2 });
+    const replacement: CircuitDocument = {
+      ...initial,
+      title: "replacement",
+      parts: initial.parts.map((part) => ({ ...part, x: part.x + 20, y: part.y + 20 })),
+      wires: initial.wires.map((wire) => ({ ...wire, waypoints: [{ x: 20, y: 21 }, { x: 28, y: 21 }] })),
+    };
+    ui.replaceDocument(replacement);
+    pointer(ui.surface, "pointermove", { x: 4, y: 3 });
+    pointer(ui.surface, "pointerup", { x: 4, y: 3 });
+
+    expect(ui.document).toBe(replacement);
+    expect(ui.errors).toEqual([]);
+  });
+
   it("saves a pointer move on a maximum-size route and restores its original stored points on return", () => {
     const initial = largeDocument();
     const ui = mount(initial, 1000);

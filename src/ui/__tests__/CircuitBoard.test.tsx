@@ -150,7 +150,7 @@ function mountBoard(initialDocument: CircuitDocument, props: Omit<CircuitBoardPr
   };
 }
 
-function mountFunctionalBoard(rejectPositiveMovement = false) {
+function mountFunctionalBoard(rejectPositiveMovement = false, options?: { rejectNegativeMovement?: boolean; onMoveCancel?: (id: string) => void }) {
   const container = globalThis.document.createElement("div");
   globalThis.document.body.append(container);
   const root = createRoot(container);
@@ -163,12 +163,13 @@ function mountFunctionalBoard(rejectPositiveMovement = false) {
     latestDocument = current;
     onMovePart.mockImplementation((id, dx, dy) => {
       events.push(`move:${dx},${dy}`);
-      setDocument((previous) => rejectPositiveMovement && dx > 0 ? previous : {
+      const rejected = (rejectPositiveMovement && dx > 0) || (options?.rejectNegativeMovement && dx < 0);
+      setDocument((previous) => rejected ? previous : {
         ...previous,
         parts: previous.parts.map((part) => part.id === id ? { ...part, x: part.x + dx, y: part.y + dy } : part),
       });
     });
-    return <CircuitBoard document={current} renderControls={null} onMovePart={onMovePart} onMoveEnd={onMoveEnd} />;
+    return <CircuitBoard document={current} renderControls={null} onMovePart={onMovePart} onMoveEnd={onMoveEnd} onMoveCancel={options?.onMoveCancel} />;
   }
   act(() => root.render(<FunctionalBoard />));
   const viewport = requiredElement(container, ".circuit-board__viewport");
@@ -479,6 +480,66 @@ describe("CircuitBoard selection and board gestures", () => {
     });
     expect(ui.onMovePart.mock.calls).toEqual([["part-a", 1, 0], ["part-a", 1, 0]]);
     expect(ui.document.parts[0]?.x).toBe(2);
+    expect(ui.onMoveEnd).toHaveBeenCalledOnce();
+  });
+
+  it("keeps a rejected move from reversing a part when the pointer returns to its origin", () => {
+    const ui = mountFunctionalBoard(true);
+    const part = requiredElement(ui.container, '[data-part-id="part-a"]');
+    const surface = requiredElement(ui.container, ".circuit-board__surface");
+    const from = clientAtGrid(ui.container, { x: 0, y: 0 });
+    const rejected = clientAtGrid(ui.container, { x: 1, y: 0 });
+    dispatchPointer(part, "pointerdown", { ...from, button: 0 });
+    dispatchPointer(surface, "pointermove", { ...rejected, button: 0 });
+    expect(ui.document.parts[0]?.x).toBe(0);
+
+    dispatchPointer(surface, "pointermove", { ...from, button: 0 });
+    dispatchPointer(surface, "pointerup", { ...from, button: 0 });
+
+    expect(ui.document.parts[0]?.x).toBe(0);
+    expect(ui.onMovePart.mock.calls).toEqual([["part-a", 1, 0]]);
+    expect(ui.onMoveEnd).toHaveBeenCalledOnce();
+  });
+
+  it.each(["part", "wire"])("discards an active %s drag when a controlled document is replaced", (gesture) => {
+    const onMovePart = vi.fn();
+    const onWireRouteChange = vi.fn();
+    const ui = mountBoard(selectionDocument, { onMovePart, onWireRouteChange });
+    const selector = gesture === "part" ? '[data-part-id="part-a"]' : '[data-wire-id="wire-ab"]';
+    const origin = gesture === "part" ? { x: 0, y: 0 } : { x: 3, y: 0 };
+    const from = clientAtGrid(ui.container, origin);
+    const moved = clientAtGrid(ui.container, { x: origin.x, y: 2 });
+    dispatchPointer(requiredElement(ui.container, selector), "pointerdown", { ...from, button: 0 });
+    dispatchPointer(requiredElement(ui.container, ".circuit-board__surface"), "pointermove", { ...moved, button: 0 });
+    const calls = onMovePart.mock.calls.length + onWireRouteChange.mock.calls.length;
+    expect(calls).toBe(1);
+    ui.update({ document: { ...selectionDocument, parts: selectionDocument.parts.map((part) => ({ ...part, x: part.x + 20, y: part.y + 20 })) } });
+
+    const to = clientAtGrid(ui.container, { x: origin.x, y: 4 });
+    const surface = requiredElement(ui.container, ".circuit-board__surface");
+    dispatchPointer(surface, "pointermove", { ...to, button: 0 });
+    dispatchPointer(surface, "pointercancel", { ...to, button: 0 });
+    expect(onMovePart.mock.calls.length + onWireRouteChange.mock.calls.length).toBe(calls);
+  });
+
+  it.each([false, true])("commits an accepted move when the host rejects its return to the origin (batched=%s)", (batched) => {
+    const onMoveCancel = vi.fn();
+    const ui = mountFunctionalBoard(false, { rejectNegativeMovement: true, onMoveCancel });
+    const part = requiredElement(ui.container, '[data-part-id="part-a"]');
+    const surface = requiredElement(ui.container, ".circuit-board__surface");
+    const from = clientAtGrid(ui.container, { x: 0, y: 0 });
+    const moved = clientAtGrid(ui.container, { x: 1, y: 0 });
+    dispatchPointer(part, "pointerdown", { ...from, button: 0 });
+    const finishRoundTrip = () => {
+      dispatchPointer(surface, "pointermove", { ...moved, button: 0 });
+      dispatchPointer(surface, "pointermove", { ...from, button: 0 });
+      dispatchPointer(surface, "pointerup", { ...from, button: 0 });
+    };
+    if (batched) { act(finishRoundTrip); }
+    else { finishRoundTrip(); }
+
+    expect(ui.document.parts[0]?.x).toBe(1);
+    expect(onMoveCancel).not.toHaveBeenCalled();
     expect(ui.onMoveEnd).toHaveBeenCalledOnce();
   });
 

@@ -7,7 +7,46 @@ import { CircuitAcPanel } from "../CircuitAcPanel.js";
 import { CircuitInspector } from "../CircuitInspector.js";
 import { CircuitPreviewPanel } from "../CircuitPreviewPanel.js";
 
+function phasePanelMarkup(voltagePhaseDegrees: number, currentPhaseDegrees: number) {
+  const document: CircuitDocument = {
+    title: "位相の境界値",
+    parts: [{ id: "source", kind: "ac-source", label: "交流電源", x: 0, y: 0 }],
+    wires: [],
+  };
+  const analysis: CircuitAnalysis = {
+    status: "closed", mode: "ac", frequencyHz: 1000, currentAmps: 1, message: "解析完了",
+    bulbPowerWatts: {}, wireCurrents: {}, issues: [],
+    parts: { source: { voltageVolts: 1, currentAmps: 1, powerWatts: 0, voltagePhaseDegrees, currentPhaseDegrees } },
+  };
+  return renderToStaticMarkup(<CircuitAcPanel document={document} analysis={analysis} options={{ mode: "ac", frequencyHz: 1000 }} />);
+}
+
 describe("CircuitAcPanel tiny AC readings", () => {
+  it.each([1e-12, -1e-12, 1e-20, -1e-20])("preserves a small nonzero phase difference of %s degrees", (difference) => {
+    expect(phasePanelMarkup(0, difference)).toContain(`data-phase-difference-degrees="${difference}"`);
+  });
+
+  it.each([180, -180, 540, -540])("uses the same half-turn phase convention for %s degrees", (phase) => {
+    expect(phasePanelMarkup(0, phase)).toContain('data-phase-difference-degrees="-180"');
+  });
+
+  it.each([
+    [179.999_999_999_999_97, 180, 2 ** -45],
+    [-180, -180.000_000_000_000_03, -(2 ** -45)],
+    [1, 2 ** 60, 135],
+  ])("preserves the phase difference across turn reduction from %s to %s degrees", (voltage, current, difference) => {
+    expect(phasePanelMarkup(voltage, current)).toContain(`data-phase-difference-degrees="${difference}"`);
+  });
+
+  it("renders finite waveforms when finite phase angles need large turn reduction", () => {
+    const markup = phasePanelMarkup(-Number.MAX_VALUE, Number.MAX_VALUE);
+    // MAX_VALUE = (2^53-1)*2^971; its exact integer remainder is 128 degrees.
+    // Thus current-minus-voltage is 256 degrees, equivalent to -104 degrees.
+    expect(markup).toContain('data-phase-difference-degrees="-104"');
+    expect(markup.match(/<polyline /g)).toHaveLength(2);
+    expect(markup).not.toMatch(/NaN|Infinity/);
+  });
+
   it("hides readings calculated at the previous frequency until the new result arrives", () => {
     const source = { id: "source", kind: "ac-source" as const, label: "交流電源", x: 0, y: 0, ...circuitPartCatalog["ac-source"].defaults, frequencyHz: 50 };
     const resistor = { id: "resistor", kind: "resistor" as const, label: "抵抗", x: 4, y: 0, ...circuitPartCatalog.resistor.defaults, resistanceOhms: 100 };

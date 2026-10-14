@@ -217,6 +217,39 @@ describe("Circuit wire route editing", () => {
     expect(ui.editor.document).toEqual(redoDocument);
   });
 
+  it("preserves fractional route coordinates and redo history when a drag returns to its origin", () => {
+    const initial: CircuitDocument = {
+      ...fixture(),
+      parts: [{ ...firstJunction, y: 5.25 }, { ...secondJunction, y: 5.25 }],
+    };
+    const ui = mount(initial);
+    act(() => ui.editor.updatePart(firstJunction.id, { label: "接続点Aを編集" }));
+    const redoDocument = ui.editor.document;
+    click(required(ui.container, '[aria-label="元に戻す"]'));
+    expect(ui.editor.canRedo).toBe(true);
+
+    const wire = required(ui.container, '[data-wire-id="wire-1"]');
+    const surface = required(ui.container, ".circuit-board__surface");
+    const start = screenPointForCell(ui.container, { x: 10, y: 5.25 });
+    const moved = screenPointForCell(ui.container, { x: 10, y: 7.25 });
+    pointer(wire, "pointerdown", start, 64);
+    pointer(surface, "pointermove", moved, 64);
+    expect(routeFor(ui.editor.document)).toEqual([
+      { x: 5, y: 5.25 },
+      { x: 5, y: 7.25 },
+      { x: 15, y: 7.25 },
+      { x: 15, y: 5.25 },
+    ]);
+
+    pointer(surface, "pointermove", start, 64);
+    pointer(surface, "pointerup", start, 64);
+
+    expect(ui.editor.document).toEqual(initial);
+    expect(ui.editor.canRedo).toBe(true);
+    click(required(ui.container, '[aria-label="やり直す"]'));
+    expect(ui.editor.document).toEqual(redoDocument);
+  });
+
   it.each([
     ["horizontal", 1, { x: 10, y: 3 }, { x: 14, y: 2 }, "y", 2],
     ["vertical", 0, { x: 5, y: 4 }, { x: 4, y: 6 }, "x", 4],

@@ -388,11 +388,10 @@ export function CircuitTransientPanel({
   };
 
   const togglePart = (partId: string, checked: boolean) => {
-    const currentIds = selectionTouched ? selectedIds : selectedPartIds;
     setSelectionTouched(true);
     setSelectedIds(checked
-      ? [...currentIds.filter((selectedId) => selectedId !== partId), partId].slice(0, MAX_WAVEFORM_PARTS)
-      : currentIds.filter((selectedId) => selectedId !== partId));
+      ? [...selectedPartIds.filter((selectedId) => selectedId !== partId), partId].slice(0, MAX_WAVEFORM_PARTS)
+      : selectedPartIds.filter((selectedId) => selectedId !== partId));
   };
 
   const goToFirstSample = () => {

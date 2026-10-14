@@ -110,6 +110,34 @@ describe("CircuitTransientPanel synchronized waveforms", () => {
     expect(ui.container.querySelector(".circuit-transient__readings thead")?.textContent).not.toContain("変更後");
   });
 
+  it("allows selecting new waveform parts after previously selected parts are removed", () => {
+    const document = createCircuitExample("charging");
+    const ui = mount(document);
+    const options = () => [...ui.container.querySelectorAll<HTMLInputElement>('.circuit-transient__parts input[type="checkbox"]')];
+    const selected = options().filter((input) => input.checked);
+    expect(selected).toHaveLength(3);
+    // Mark the automatically chosen set as an explicit selection.
+    click(selected[0]!);
+    click(selected[0]!);
+
+    const replacement = {
+      ...document,
+      parts: document.parts.map((part) => ({ ...part, id: `new-${part.id}` })),
+      wires: document.wires.map((wire) => ({
+        ...wire,
+        from: { ...wire.from, partId: `new-${wire.from.partId}` },
+        to: { ...wire.to, partId: `new-${wire.to.partId}` },
+      })),
+    };
+    ui.render(replacement);
+    expect(options().filter((input) => input.checked)).toHaveLength(0);
+
+    click(options()[0]!);
+
+    expect(options()[0]!.checked).toBe(true);
+    expect(options().filter((input) => input.checked)).toHaveLength(1);
+  });
+
   it("plays, pauses, and returns all traces to the first sample", () => {
     vi.useFakeTimers();
     const ui = mount();

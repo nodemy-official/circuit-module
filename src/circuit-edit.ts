@@ -101,8 +101,9 @@ export function canPlace(document: CircuitDocument, candidates: readonly Circuit
 
 /** Nearest free cell for a new part, searching outwards in rings. */
 export function findFreeSpot(document: CircuitDocument, kind: CircuitPartKind, near: Point): Point {
+  const probeId = nextId("part", document.parts.map((part) => part.id));
   const probe = (x: number, y: number): CircuitPart => ({
-    id: "\u0000probe",
+    id: probeId,
     kind,
     x,
     y,
@@ -186,11 +187,15 @@ export function moveParts(
   const waypointIssue = wireWaypointError(next.wires);
   if (waypointIssue) { return { ok: false, reason: waypointIssue }; }
   if (!canPlace(next, moved)) { return { ok: false, reason: "その位置にはほかの部品があります。" }; }
+  if (moved.length === 0 || (dx === 0 && dy === 0)) { return { ok: true, document }; }
   return { ok: true, document: next };
 }
 
 export function rotateParts(document: CircuitDocument, ids: readonly string[]): EditResult {
   const rotating = new Set(ids);
+  if (!document.parts.some((part) => rotating.has(part.id) && part.kind !== "junction")) {
+    return { ok: true, document };
+  }
   const next = {
     ...document,
     parts: document.parts.map((part) =>
@@ -616,7 +621,7 @@ export function connectToPoint(
   if (!prepared.ok) { return prepared; }
   const { document: baseDocument, endpoint, crossedWires } = prepared;
   if (crossedWires.length === 0) { return connect(baseDocument, from, endpoint); }
-  if (from.partId === endpoint.partId) {
+  if (sameEndpoint(from, endpoint)) {
     return connect(document, from, endpoint);
   }
 

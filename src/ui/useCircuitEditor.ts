@@ -75,6 +75,7 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
     past: [], present: editableDocument(initialDocument ?? createExampleCircuit()), future: [],
   }));
   const renderedDocument = renderedHistory.present;
+  const [documentVersion, setDocumentVersion, documentVersionRef] = useCommandState(0);
   const [renderedSelection, setSelection, selectionRef] = useCommandState<CircuitSelection>(noSelection);
   const [renderedPendingEndpoint, setPendingEndpoint, pendingEndpointRef] = useCommandState<CircuitEndpoint | null>(null);
   const [renderedPendingWire, setPendingWire, pendingWireRef] = useCommandState<{ wireId: string; end: CircuitWireEnd } | null>(null);
@@ -86,10 +87,17 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
   const canCut = canCutSelection(renderedDocument, renderedSelection);
 
   function dispatch(action: HistoryAction) {
+    const previousDocument = historyRef.current.present;
     setHistory((current) => editorHistoryReducer(current, action));
+    if (action.type === "cancel-group" && historyRef.current.present !== previousDocument) {
+      setDocumentVersion((version) => version + 1);
+    }
   }
 
   function setDocument(next: CircuitDocument, group?: string) {
+    if (next !== historyRef.current.present && !group?.startsWith("move:") && !group?.startsWith("wire-route:")) {
+      setDocumentVersion((version) => version + 1);
+    }
     dispatch({ type: "edit", document: next, group });
   }
 
@@ -107,6 +115,9 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
   }
 
   function cancelConnection() {
+    if (pendingEndpointRef.current || pendingWireRef.current) {
+      setDocumentVersion((version) => version + 1);
+    }
     setPendingEndpoint(null);
     setPendingWire(null);
     setError(null);
@@ -333,14 +344,17 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
 
   function travel(type: "undo" | "redo") {
     const history = historyRef.current;
-    cancelConnection();
     if (type === "undo" ? history.past.length === 0 : history.future.length === 0) { return; }
+    cancelConnection();
+    setDocumentVersion((version) => version + 1);
     dispatch({ type });
     setSelection(noSelection());
   }
 
   return {
     document: renderedDocument,
+    documentVersion,
+    getDocumentVersion: () => documentVersionRef.current,
     selection: renderedSelection,
     pendingEndpoint: renderedPendingEndpoint,
     pendingWire: renderedPendingWire,

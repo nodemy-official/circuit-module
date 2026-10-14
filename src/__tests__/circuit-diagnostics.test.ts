@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { createExampleCircuit, type CircuitDocument, type CircuitEndpoint, type CircuitPart, type CircuitPartKind, type CircuitTerminal, type CircuitWire } from "../circuit-model.js";
 import { inspectCircuit } from "../circuit-diagnostics.js";
+import { analyzeAnalogCircuit } from "../analog-solver.js";
 
 const part = (id: string, kind: CircuitPartKind, label = id): CircuitPart => ({
   id,
@@ -153,6 +154,89 @@ describe("inspectCircuit", () => {
     expect(diagnostics.some(({ code, wireIds }) => code === "invalid-wire-terminal" && wireIds.includes("wire-4"))).toBe(true);
   });
 
+  it.each([
+    {
+      code: "missing-wire-part",
+      parts: [part("r", "resistor")],
+      wires: [
+        wire("shared", endpoint("missing", "a"), endpoint("missing", "b")),
+        wire("shared", endpoint("missing", "a"), endpoint("missing", "b")),
+      ],
+      count: 4,
+    },
+    {
+      code: "ambiguous-wire-part",
+      parts: [part("r", "resistor", "first"), part("r", "resistor", "second")],
+      wires: [
+        wire("shared", endpoint("r", "a"), endpoint("r", "b")),
+        wire("shared", endpoint("r", "a"), endpoint("r", "b")),
+      ],
+      count: 4,
+    },
+    {
+      code: "invalid-wire-terminal",
+      parts: [part("j", "junction")],
+      wires: [
+        wire("shared", endpoint("j", "b"), endpoint("j", "c")),
+        wire("shared", endpoint("j", "b"), endpoint("j", "c")),
+      ],
+      count: 4,
+    },
+    {
+      code: "same-terminal-wire",
+      parts: [part("r", "resistor")],
+      wires: [
+        wire("shared", endpoint("r", "a"), endpoint("r", "a")),
+        wire("shared", endpoint("r", "b"), endpoint("r", "b")),
+      ],
+      count: 2,
+    },
+  ])("keeps $code findings distinct when wire IDs repeat", ({ code, parts, wires, count }) => {
+    const input = document(parts, wires);
+    const diagnostics = inspectCircuit(input);
+
+    expect(diagnostics.filter((diagnostic) => diagnostic.code === code)).toHaveLength(count);
+    expect(new Set(diagnostics.map(({ id }) => id)).size).toBe(diagnostics.length);
+    expect(inspectCircuit(input)).toEqual(diagnostics);
+  });
+
+  it("keeps separate duplicate edges distinct when every wire shares one ID", () => {
+    const input = document(
+      [part("r1", "resistor"), part("r2", "resistor")],
+      [
+        wire("shared:1", endpoint("r1", "a"), endpoint("r2", "a")),
+        wire("shared:1", endpoint("r2", "a"), endpoint("r1", "a")),
+        wire("shared:1", endpoint("r1", "b"), endpoint("r2", "b")),
+        wire("shared:1", endpoint("r2", "b"), endpoint("r1", "b")),
+      ],
+    );
+    const diagnostics = inspectCircuit(input);
+
+    expect(diagnostics.filter(({ code }) => code === "duplicate-wire")).toHaveLength(2);
+    expect(new Set(diagnostics.map(({ id }) => id)).size).toBe(diagnostics.length);
+    expect(inspectCircuit(input)).toEqual(diagnostics);
+  });
+
+  it("preserves existing finding IDs when wire IDs are unique", () => {
+    const diagnostics = inspectCircuit(document(
+      [part("r1", "resistor"), part("r2", "resistor")],
+      [
+        wire("missing-wire", endpoint("missing", "a"), endpoint("r1", "a")),
+        wire("terminal-wire", endpoint("r1", "c"), endpoint("r2", "b")),
+        wire("self-wire", endpoint("r1", "b"), endpoint("r1", "b")),
+        wire("edge-1", endpoint("r1", "a"), endpoint("r2", "a")),
+        wire("edge-2", endpoint("r2", "a"), endpoint("r1", "a")),
+      ],
+    ));
+
+    expect(diagnostics.slice(0, 4).map(({ id }) => id)).toEqual([
+      "missing-wire-part:[[\"missing\"],[\"missing-wire\"],\"from\"]",
+      "invalid-wire-terminal:[[\"r1\"],[\"terminal-wire\"],\"from\"]",
+      "same-terminal-wire:[[\"r1\"],[\"self-wire\"],\"\"]",
+      "duplicate-wire:[[\"r1\",\"r2\"],[\"edge-1\",\"edge-2\"],\"\"]",
+    ]);
+  });
+
   it("reports duplicate display labels once with all affected parts", () => {
     const diagnostics = inspectCircuit(document([
       part("r1", "resistor", "抵抗"),
@@ -192,6 +276,28 @@ describe("inspectCircuit", () => {
       [wire("wire-1", endpoint("source", "b"), endpoint("r1", "a"))],
     ));
     expect(diagnostics.some(({ code }) => code === "unpowered-component")).toBe(false);
+  });
+
+  it("recognizes an op-amp's internal supply rails when it drives a load", () => {
+    const input = document(
+      [
+        { ...part("amp", "op-amp"), openLoopGain: 100_000, positiveRailVolts: 15, negativeRailVolts: 5 },
+        { ...part("load", "resistor"), resistanceOhms: 1000 },
+        part("gnd", "ground"),
+      ],
+      [
+        wire("input-plus", endpoint("amp", "a"), endpoint("gnd", "a")),
+        wire("input-minus", endpoint("amp", "b"), endpoint("gnd", "a")),
+        wire("output", endpoint("amp", "c"), endpoint("load", "a")),
+        wire("return", endpoint("load", "b"), endpoint("gnd", "a")),
+      ],
+    );
+    const analysis = analyzeAnalogCircuit(input, { mode: "dc" });
+
+    expect(analysis.status).toBe("valid");
+    expect(analysis.parts.load.power.real).toBeGreaterThan(0);
+    expect(analysis.parts.amp.power.real).toBeLessThan(0);
+    expect(inspectCircuit(input)).toEqual([]);
   });
 
   it("treats separate GND symbols as the same electrical node", () => {

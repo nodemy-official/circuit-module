@@ -1,9 +1,11 @@
-import { useCallback, useEffect, useRef, useState, type KeyboardEvent, type PointerEvent, type RefObject } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent, type PointerEvent, type RefObject } from "react";
 import { compactWireRouteWaypoints, moveWireSegment, routeEnd, type Point, type RouteEnd } from "../circuit-geometry.js";
 import type { CircuitDocument } from "../circuit-model.js";
+import { useDocumentGestureBoundary, type DocumentGestureVersion } from "./useDocumentGestureBoundary.js";
 
 interface WireRouteDragOptions {
   document: CircuitDocument;
+  documentVersion?: DocumentGestureVersion;
   routes: ReadonlyMap<string, readonly Point[]>;
   enabled: boolean;
   svgRef: RefObject<SVGSVGElement | null>;
@@ -25,6 +27,7 @@ interface RouteSnapshot {
 }
 
 interface SegmentDrag extends RouteSnapshot {
+  epoch: number;
   pointerId: number;
   segmentIndex: number;
   origin: Point;
@@ -73,15 +76,27 @@ function releasePointer(svg: SVGSVGElement | null, pointerId: number) {
 
 /** Keeps one drag tied to its original route even when moving a segment adds or removes bends. */
 export function useWireRouteDrag(options: WireRouteDragOptions) {
+  const { epoch, markEdit, isCurrent } = useDocumentGestureBoundary(options.document, options.documentVersion);
   const latest = useRef(options);
   latest.current = options;
   const dragRef = useRef<SegmentDrag | null>(null);
   const focusAtRef = useRef<{ id: string; point: Point } | null>(null);
   const [draggingWireId, setDraggingWireId] = useState<string | null>(null);
 
+  const discard = useCallback((pointerId?: number, release = true) => {
+    const drag = dragRef.current;
+    if (!drag || (pointerId !== undefined && drag.pointerId !== pointerId)) { return false; }
+    dragRef.current = null;
+    setDraggingWireId(null);
+    latest.current.onFinish(true);
+    if (release) { releasePointer(latest.current.svgRef.current, drag.pointerId); }
+    return true;
+  }, []);
+
   const cancel = useCallback((pointerId?: number, release = true) => {
     const drag = dragRef.current;
     if (!drag || (pointerId !== undefined && drag.pointerId !== pointerId)) { return false; }
+    if (!isCurrent(drag.epoch)) { return discard(pointerId, release); }
     dragRef.current = null;
     setDraggingWireId(null);
     const current = latest.current;
@@ -93,7 +108,12 @@ export function useWireRouteDrag(options: WireRouteDragOptions) {
     current.onFinish(true);
     if (release) { releasePointer(current.svgRef.current, drag.pointerId); }
     return true;
-  }, []);
+  }, [discard, isCurrent]);
+
+  useLayoutEffect(() => {
+    const drag = dragRef.current;
+    if (drag && (!isCurrent(drag.epoch) || !options.document.wires.some((wire) => wire.id === drag.id))) { discard(); }
+  }, [epoch, options.document, discard, isCurrent]);
 
   useEffect(() => {
     if (!options.enabled) { cancel(); }
@@ -128,34 +148,37 @@ export function useWireRouteDrag(options: WireRouteDragOptions) {
     current.onSelect?.(id);
     const axis = from.y === to.y ? "y" : "x";
     dragRef.current = {
-      ...initial, pointerId: event.pointerId, segmentIndex: index, origin,
+      ...initial, epoch, pointerId: event.pointerId, segmentIndex: index, origin,
       clientOrigin: { x: event.clientX, y: event.clientY },
       axis, coordinate: from[axis], lastCoordinate: from[axis], changed: false,
     };
     try { current.svgRef.current?.setPointerCapture(event.pointerId); } catch { /* Unsupported capture. */ }
-  }, []);
+  }, [epoch]);
 
   const move = useCallback((event: PointerEvent<SVGSVGElement>) => {
     const drag = dragRef.current;
     if (!drag || drag.pointerId !== event.pointerId) { return false; }
     const current = latest.current;
+    if (!isCurrent(drag.epoch)) { discard(); return true; }
     if (!current.enabled) { cancel(); return true; }
     if (Math.hypot(event.clientX - drag.clientOrigin.x, event.clientY - drag.clientOrigin.y) < 4 && !drag.changed) { return true; }
     current.onDrag();
     const point = current.pointAtPointer(event);
-    const coordinate = Math.round(drag.coordinate + point[drag.axis] - drag.origin[drag.axis]);
+    const coordinate = drag.coordinate + Math.round(point[drag.axis] - drag.origin[drag.axis]);
     if (coordinate === drag.lastCoordinate) { return true; }
     drag.lastCoordinate = coordinate;
     drag.changed = true;
     setDraggingWireId(drag.id);
     const next = moveWireSegment(drag.route, drag.segmentIndex, coordinate, drag.start, drag.end);
+    markEdit();
     current.onChange?.(drag.id, coordinate === drag.coordinate ? drag.originalWaypoints : compactWireRouteWaypoints(next, drag.start, drag.end));
     return true;
-  }, [cancel]);
+  }, [cancel, discard, isCurrent, markEdit]);
 
   const finish = useCallback((event?: PointerEvent<SVGSVGElement>) => {
     const drag = dragRef.current;
     if (!drag || (event && drag.pointerId !== event.pointerId)) { return false; }
+    if (!isCurrent(drag.epoch)) { return discard(); }
     if (event?.type === "pointercancel" || (drag.changed && drag.coordinate === drag.lastCoordinate)) { return cancel(); }
     dragRef.current = null;
     setDraggingWireId(null);
@@ -164,7 +187,7 @@ export function useWireRouteDrag(options: WireRouteDragOptions) {
     current.onFinish(false);
     releasePointer(current.svgRef.current, drag.pointerId);
     return true;
-  }, [cancel]);
+  }, [cancel, discard, isCurrent]);
 
   const keyDown = useCallback((event: KeyboardEvent<SVGGElement>, id: string, index: number) => {
     const current = latest.current;

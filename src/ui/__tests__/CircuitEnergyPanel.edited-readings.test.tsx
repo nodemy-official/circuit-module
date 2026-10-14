@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { act } from "react";
 import { createRoot } from "react-dom/client";
+import { renderToStaticMarkup } from "react-dom/server";
 import { expect, it } from "vitest";
 import type { CircuitDocument } from "../../circuit-model.js";
 import { analyzeCircuit } from "../../circuit-solver.js";
@@ -228,4 +229,21 @@ it("uses indexed samples for the stored-energy scale when flatMap is overridden"
     assertCorrectRounding(scale(), rational(25n, 162n), "maximum stored energy after overriding samples.flatMap");
     expect(calls).toBe(0);
   } finally { act(() => root.unmount()); }
+});
+
+it("uses indexed document parts for the stored-energy scale when their iterator is overridden", () => {
+  const circuit = rc();
+  const transient = simulateTransient(circuit, { durationSeconds: 1, timeStepSeconds: 0.5 });
+  const analysis = analyzeCircuit(circuit);
+  const container = document.createElement("div");
+  let calls = 0;
+  Reflect.set(circuit.parts, Symbol.iterator, function* () {
+    calls += 1;
+    yield circuit.parts[0]!;
+  });
+  container.innerHTML = renderToStaticMarkup(<CircuitEnergyPanel document={circuit} analysis={analysis} frame={{ analysis: transient, sampleIndex: 2 }} />);
+  const scale = Number(container.querySelector('[data-part-id="c"] [data-scale-max]')?.getAttribute("data-scale-max"));
+  // V_C=5/9 V at the final sample, so Emax=(1/2)*(5/9)^2 J.
+  assertCorrectRounding(scale, rational(25n, 162n), "maximum stored energy with a custom parts iterator");
+  expect(calls).toBe(0);
 });

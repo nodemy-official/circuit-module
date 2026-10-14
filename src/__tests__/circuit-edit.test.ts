@@ -17,7 +17,7 @@ import {
 } from "../circuit-edit.js";
 import { routeDocumentWires, routeEnd, routeWire, snapToGrid, terminalPoint } from "../circuit-geometry.js";
 import { createExampleCircuit, type CircuitDocument } from "../circuit-model.js";
-import { MAX_CIRCUIT_DOCUMENT_COORDINATE } from "../circuit-serialization.js";
+import { MAX_CIRCUIT_DOCUMENT_COORDINATE, parseCircuitDocument } from "../circuit-serialization.js";
 
 const empty: CircuitDocument = { title: "", parts: [], wires: [] };
 
@@ -80,9 +80,58 @@ describe("placing parts", () => {
     const placed = addPart(document, "resistor", spot);
     expect(placed.ok).toBe(true);
   });
+
+  it("finds a free spot when an existing part uses the former probe ID", () => {
+    const document: CircuitDocument = {
+      title: "",
+      parts: [{ id: "\u0000probe", kind: "resistor", x: 0, y: 0, label: "抵抗", resistanceOhms: 10 }],
+      wires: [],
+    };
+    const parsed = parseCircuitDocument(JSON.stringify(document));
+    if (!parsed.ok) { throw new Error(parsed.reason); }
+    expect(parsed.document.parts[0]?.id).toBe("\u0000probe");
+
+    for (const source of [document, parsed.document]) {
+      const spot = findFreeSpot(source, "resistor", { x: 0, y: 0 });
+      expect(spot).not.toEqual({ x: 0, y: 0 });
+      expect(addPart(source, "resistor", spot).ok).toBe(true);
+      expect(source.parts).toHaveLength(1);
+      expect(source.parts[0]).toMatchObject({ x: 0, y: 0 });
+    }
+  });
 });
 
 describe("moving and rotating", () => {
+  it("preserves the document when no part moves", () => {
+    const document = createExampleCircuit();
+    for (const { ids, dx, dy } of [
+      { ids: [], dx: 1, dy: 0 },
+      { ids: ["missing"], dx: 1, dy: 0 },
+      { ids: ["part-1"], dx: 0, dy: 0 },
+    ]) {
+      const result = moveParts(document, ids, dx, dy);
+      if (!result.ok) { throw new Error(result.reason); }
+      expect(result.document).toBe(document);
+    }
+  });
+
+  it("still rejects invalid offsets, positions, and waypoints for unchanged moves", () => {
+    const document = createExampleCircuit();
+    expect(moveParts(document, [], Number.NaN, 0).ok).toBe(false);
+    expect(moveParts(document, ["missing"], 0, Number.POSITIVE_INFINITY).ok).toBe(false);
+    const invalidPosition = {
+      ...document,
+      parts: document.parts.map((part) => part.id === "part-1" ? { ...part, x: Number.NaN } : part),
+    };
+    expect(moveParts(invalidPosition, ["part-1"], 0, 0).ok).toBe(false);
+    const invalidWaypoints = {
+      ...document,
+      wires: document.wires.map((wire) => ({ ...wire, waypoints: [{ x: Number.NaN, y: 0 }] })),
+    };
+    expect(moveParts(invalidWaypoints, [], 0, 0).ok).toBe(false);
+    expect(moveParts(invalidWaypoints, ["missing"], 1, 0).ok).toBe(false);
+  });
+
   it("moves a selection together and rejects collisions", () => {
     const document = createExampleCircuit();
     const moved = moveParts(document, ["part-1", "part-4"], 0, 2);
@@ -151,6 +200,22 @@ describe("moving and rotating", () => {
     expect(resistor.rotation).toBe(90);
     expect(terminalPoint(resistor, "a")).toEqual({ x: 20, y: 3 });
     expect(terminalPoint(resistor, "b")).toEqual({ x: 20, y: 7 });
+  });
+
+  it("preserves the document when no selected part can rotate", () => {
+    const document: CircuitDocument = {
+      title: "",
+      parts: [
+        { id: "junction", kind: "junction", x: 0, y: 0, label: "接続点" },
+        { id: "resistor", kind: "resistor", x: 10, y: 0, label: "抵抗", resistanceOhms: 10 },
+      ],
+      wires: [],
+    };
+    for (const ids of [["junction"], ["missing"], [], ["junction", "missing"]]) {
+      const result = rotateParts(document, ids);
+      if (!result.ok) { throw new Error(result.reason); }
+      expect(result.document).toBe(document);
+    }
   });
 
   it("checks that every candidate fits", () => {

@@ -23,6 +23,35 @@ function crossingDocument(): CircuitDocument {
 }
 
 describe("wire split invariants", () => {
+  it("splits a crossed wire when connecting another terminal of the same part", () => {
+    const document: CircuitDocument = {
+      title: "同一部品への接続と分岐",
+      parts: [
+        { id: "r", kind: "resistor", x: 0, y: 0, label: "R" },
+        { id: "top", kind: "junction", x: 2, y: -10, label: "上" },
+        { id: "bottom", kind: "junction", x: 2, y: 10, label: "下" },
+      ],
+      wires: [{ id: "crossed", from: { partId: "top", terminal: "a" }, to: { partId: "bottom", terminal: "a" } }],
+    };
+    expect(routeDocumentWires(document).get("crossed")).toEqual([{ x: 2, y: -10 }, { x: 2, y: 10 }]);
+
+    const result = connectToPoint(document, { partId: "r", terminal: "a" }, { x: 2, y: 0 });
+    if (!result.ok) { throw new Error(result.reason); }
+
+    expect(result.document.wires).toHaveLength(3);
+    expect(result.document.wires).toContainEqual(expect.objectContaining({
+      id: "crossed", from: { partId: "top", terminal: "a" }, to: { partId: "r", terminal: "b" },
+    }));
+    expect(result.document.wires).toContainEqual(expect.objectContaining({
+      from: { partId: "r", terminal: "b" }, to: { partId: "bottom", terminal: "a" },
+    }));
+    expect(result.document.wires.find((wire) => wire.id === result.id)).toMatchObject({
+      from: { partId: "r", terminal: "a" }, to: { partId: "r", terminal: "b" },
+    });
+    expect(() => serializeCircuitDocument(result.document)).not.toThrow();
+    expect(document.wires).toHaveLength(1);
+  });
+
   it.each(["junction", "resistor"] as const)("pins a straight first split segment after reserving an edited connection (%s)", (kind) => {
     const document: CircuitDocument = {
       title: "直線区間を保持",

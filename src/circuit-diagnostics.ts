@@ -416,7 +416,7 @@ function reportUnpoweredComponents(
     if (
       wires.length === 0 ||
       entries.some(({ part }) =>
-        part.kind === "battery" || part.kind === "ac-source" || part.kind === "current-source",
+        part.kind === "battery" || part.kind === "ac-source" || part.kind === "current-source" || part.kind === "op-amp",
       ) ||
       !entries.some(({ part }) => part.kind !== "junction")
     ) { continue; }
@@ -461,7 +461,8 @@ function reportWireBypasses(
 
 /**
  * Finds structural circuit problems without invoking the electrical solver.
- * The result is deterministic for a given document and can be used for editor feedback.
+ * The result has unique finding IDs, is deterministic for a given document,
+ * and can be used for editor feedback.
  */
 export function inspectCircuit(document: CircuitDocument): CircuitDiagnostic[] {
   const diagnostics: CircuitDiagnostic[] = [];
@@ -474,5 +475,12 @@ export function inspectCircuit(document: CircuitDocument): CircuitDiagnostic[] {
   reportTerminalConnections(indexedParts, validWires, terminalWireCounts, diagnostics);
   reportUnpoweredComponents(indexedParts, validWires, partConnections, diagnostics);
   reportWireBypasses(indexedParts, validWires, wireConnections, diagnostics);
-  return diagnostics;
+  // Repeated wire IDs can make separate findings share an identity. Keep every
+  // original ID unless it collides; the suffix is outside the generated JSON.
+  const occurrences = new Map<string, number>();
+  return diagnostics.map((diagnostic) => {
+    const occurrence = occurrences.get(diagnostic.id) ?? 0;
+    occurrences.set(diagnostic.id, occurrence + 1);
+    return occurrence === 0 ? diagnostic : { ...diagnostic, id: `${diagnostic.id}:${occurrence}` };
+  });
 }

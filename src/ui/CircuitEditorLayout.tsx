@@ -450,6 +450,7 @@ function EditorCenter({
           onViewportCenterChange={onViewportCenterChange}
           {...boardProps}
           document={previewDocument ?? editor.document}
+          documentVersion={editor.getDocumentVersion}
           analysis={boardAnalysis}
           showFlow={boardProps?.showFlow ?? preview}
           showPotentials={boardProps?.showPotentials ?? true}

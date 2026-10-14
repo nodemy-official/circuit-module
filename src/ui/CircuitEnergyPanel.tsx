@@ -162,15 +162,20 @@ function energyEntries(
 
 function maximumStoredEnergy(document: CircuitDocument, transient: CircuitTransientFrame["analysis"] | null, precomputed: Map<string, readonly TransientEnergySample[]>, expressions?: readonly ExactExpressionNode[]): number {
   if (!transient) { return 0; }
-  return Math.max(0, ...Array.from({ length: transient.samples.length }, (_, index) => transient.samples[index]!)
-    .flatMap((sample, sampleIndex) => document.parts.flatMap((part) => {
-    if (!reactiveKinds.has(part.kind)) { return []; }
-    const reading = sample.parts[part.id];
-    if (!reading || !finite(reading.voltageVolts) || !finite(reading.currentAmps)) { return []; }
-    const cached = precomputed.get(part.id)?.[sampleIndex];
-    const joules = cached ? cached.storedJoules : storedEnergy(part, reading, false, expressions);
-    return finite(joules) ? [joules] : [];
-  })));
+  const parts = Array.from({ length: document.parts.length }, (_, index) => document.parts[index]!)
+    .filter((part) => reactiveKinds.has(part.kind));
+  let maximum = 0;
+  for (let sampleIndex = 0; sampleIndex < transient.samples.length; sampleIndex += 1) {
+    const sample = transient.samples[sampleIndex]!;
+    for (const part of parts) {
+      const reading = sample.parts[part.id];
+      if (!reading || !finite(reading.voltageVolts) || !finite(reading.currentAmps)) { continue; }
+      const cached = precomputed.get(part.id)?.[sampleIndex];
+      const joules = cached ? cached.storedJoules : storedEnergy(part, reading, false, expressions);
+      if (finite(joules)) { maximum = Math.max(maximum, joules); }
+    }
+  }
+  return maximum;
 }
 
 function powerGroupMaximum(entries: PowerEntry[]): number {
