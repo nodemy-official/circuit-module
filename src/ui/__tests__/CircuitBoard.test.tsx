@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { renderToStaticMarkup } from "react-dom/server";
-import { act } from "react";
+import { act, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { GRID } from "../../circuit-geometry.js";
@@ -123,8 +123,8 @@ function mountBoard(initialDocument: CircuitDocument, props: Omit<CircuitBoardPr
   const container = globalThis.document.createElement("div");
   globalThis.document.body.append(container);
   const root = createRoot(container);
-  const currentProps = { ...props };
-  const render = () => root.render(<CircuitBoard document={initialDocument} renderControls={null} {...currentProps} />);
+  const currentProps: CircuitBoardProps = { document: initialDocument, renderControls: null, ...props };
+  const render = () => root.render(<CircuitBoard {...currentProps} />);
   act(() => render());
   const viewport = container.querySelector<HTMLElement>(".circuit-board__viewport");
   if (!viewport) { throw new Error("CircuitBoard viewport is missing"); }
@@ -143,11 +143,48 @@ function mountBoard(initialDocument: CircuitDocument, props: Omit<CircuitBoardPr
   return {
     container,
     viewport,
-    update(nextProps: Partial<Omit<CircuitBoardProps, "document">>) {
+    update(nextProps: Partial<CircuitBoardProps>) {
       Object.assign(currentProps, nextProps);
       act(() => render());
     },
   };
+}
+
+function mountFunctionalBoard(rejectPositiveMovement = false) {
+  const container = globalThis.document.createElement("div");
+  globalThis.document.body.append(container);
+  const root = createRoot(container);
+  let latestDocument = selectionDocument;
+  const events: string[] = [];
+  const onMoveEnd = vi.fn(() => events.push("end"));
+  const onMovePart = vi.fn<(id: string, dx: number, dy: number) => void>();
+  function FunctionalBoard() {
+    const [current, setDocument] = useState(selectionDocument);
+    latestDocument = current;
+    onMovePart.mockImplementation((id, dx, dy) => {
+      events.push(`move:${dx},${dy}`);
+      setDocument((previous) => rejectPositiveMovement && dx > 0 ? previous : {
+        ...previous,
+        parts: previous.parts.map((part) => part.id === id ? { ...part, x: part.x + dx, y: part.y + dy } : part),
+      });
+    });
+    return <CircuitBoard document={current} renderControls={null} onMovePart={onMovePart} onMoveEnd={onMoveEnd} />;
+  }
+  act(() => root.render(<FunctionalBoard />));
+  const viewport = requiredElement(container, ".circuit-board__viewport");
+  Object.defineProperties(viewport, {
+    clientWidth: { configurable: true, value: 200 },
+    clientHeight: { configurable: true, value: 200 },
+    getBoundingClientRect: {
+      configurable: true,
+      value: () => ({ x: 40, y: 30, left: 40, top: 30, right: 240, bottom: 230, width: 200, height: 200, toJSON() {} }),
+    },
+  });
+  const observer = MockResizeObserver.observers.at(-1);
+  if (!observer) { throw new Error("Missing resize observer"); }
+  act(() => observer.trigger());
+  mountedBoards.push({ root, container });
+  return { container, onMovePart, onMoveEnd, events, get document() { return latestDocument; } };
 }
 
 function requiredElement(container: ParentNode, selector: string): Element {
@@ -343,6 +380,181 @@ describe("CircuitBoard fitOnResize", () => {
 });
 
 describe("CircuitBoard selection and board gestures", () => {
+  it.each(["editable", "toggle disabled", "inspection disabled", "part replaced"])("discards a pending switch toggle when its context becomes %s", (context) => {
+    try {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      const initial: CircuitDocument = {
+        title: "pending switch",
+        parts: [{ id: "switch", kind: "switch", label: "switch", x: 0, y: 0 }],
+        wires: [],
+      };
+      const onSwitchToggle = vi.fn();
+      const onInspectPart = vi.fn();
+      const ui = mountBoard(initial, { readOnly: true, onSwitchToggle, onInspectPart });
+      dispatchClick(requiredElement(ui.container, '[data-part-id="switch"]'), { detail: 1 });
+      if (context === "editable") { ui.update({ readOnly: false }); }
+      else if (context === "toggle disabled") { ui.update({ onSwitchToggle: undefined }); }
+      else if (context === "inspection disabled") { ui.update({ onInspectPart: undefined }); }
+      else { ui.update({ document: { ...initial, parts: [{ ...initial.parts[0]!, kind: "resistor" }] } }); }
+      act(() => vi.advanceTimersByTime(400));
+      expect(onSwitchToggle).not.toHaveBeenCalled();
+      ui.update({ document: initial, readOnly: true, onSwitchToggle, onInspectPart });
+      dispatchClick(requiredElement(ui.container, '[data-part-id="switch"]'), { detail: 1 });
+      act(() => vi.advanceTimersByTime(400));
+      expect(onSwitchToggle).toHaveBeenCalledExactlyOnceWith("switch");
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each([
+    ["part", true], ["part", false],
+    ["range", true], ["range", false],
+    ["wire", true], ["wire", false],
+  ] as const)("suppresses a delayed release click after cancelling a %s drag and accepts the next gesture (releaseClick=%s)", async (kind, releaseClick) => {
+    const onBoardClick = vi.fn();
+    const ui = mountBoard(selectionDocument, {
+      selection: { parts: ["part-a"], wires: ["wire-ab"] },
+      onMovePart: vi.fn(),
+      onMoveCancel: vi.fn(),
+      onSelectRange: vi.fn(),
+      onWireRouteChange: vi.fn(),
+      onWireRouteCancel: vi.fn(),
+      onBoardClick,
+    });
+    const background = requiredElement(ui.container, "[data-circuit-board-background]");
+    const surface = requiredElement(ui.container, ".circuit-board__surface");
+    const origin = kind === "range" ? { x: -1, y: -1 } : kind === "wire" ? { x: 3, y: 0 } : { x: 0, y: 0 };
+    const from = clientAtGrid(ui.container, origin);
+    const to = clientAtGrid(ui.container, { x: 3, y: 2 });
+    const target = kind === "range" ? background : requiredElement(ui.container, kind === "wire"
+      ? '.circuit-board__wire-segment-handle[data-wire-id="wire-ab"]'
+      : '.circuit-board__part[data-part-id="part-a"]');
+    dispatchPointer(target, "pointerdown", { ...from, button: 0, shiftKey: kind === "range" });
+    dispatchPointer(surface, "pointermove", { ...to, button: 0 });
+    act(() => surface.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    dispatchPointer(background, "pointerup", { ...to, button: 0 });
+    if (releaseClick) { dispatchClick(background, to); }
+    expect(onBoardClick).not.toHaveBeenCalled();
+
+    dispatchPointer(background, "pointerdown", { ...to, button: 0 });
+    dispatchPointer(background, "pointerup", { ...to, button: 0 });
+    dispatchClick(background, to);
+    expect(onBoardClick).toHaveBeenCalledOnce();
+  });
+
+  it.each(["Escape", "lostpointercapture", "pointercancel", "read-only", "pan"])("cancels a range selection on %s and ignores its remaining pointer events", (action) => {
+    const onSelectRange = vi.fn();
+    const ui = mountBoard(selectionDocument, { onSelectRange });
+    const background = requiredElement(ui.container, "[data-circuit-board-background]");
+    const surface = requiredElement(ui.container, ".circuit-board__surface");
+    const from = clientAtGrid(ui.container, { x: -1, y: -1 });
+    const to = clientAtGrid(ui.container, { x: 7, y: 1 });
+    dispatchPointer(background, "pointerdown", { ...from, button: 0, shiftKey: true });
+    dispatchPointer(surface, "pointermove", { ...to, button: 0, shiftKey: true });
+    expect(ui.container.querySelector("[data-selection-rect]")).not.toBeNull();
+    if (action === "Escape") {
+      act(() => surface.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })));
+    } else if (action === "read-only") { ui.update({ readOnly: true }); }
+    else if (action === "pan") { ui.update({ panMode: true }); }
+    else { dispatchPointer(surface, action, { ...to, button: 0 }); }
+
+    expect(ui.container.querySelector("[data-selection-rect]")).toBeNull();
+    dispatchPointer(surface, "pointermove", { ...to, button: 0 });
+    dispatchPointer(surface, "pointerup", { ...to, button: 0 });
+    expect(onSelectRange).not.toHaveBeenCalled();
+  });
+
+  it("reports actual event deltas to a functional host before React renders", () => {
+    const ui = mountFunctionalBoard();
+    const part = requiredElement(ui.container, '[data-part-id="part-a"]');
+    const surface = requiredElement(ui.container, ".circuit-board__surface");
+    const from = clientAtGrid(ui.container, { x: 0, y: 0 });
+    const middle = clientAtGrid(ui.container, { x: 1, y: 0 });
+    const to = clientAtGrid(ui.container, { x: 2, y: 0 });
+    dispatchPointer(part, "pointerdown", { ...from, button: 0 });
+    act(() => {
+      dispatchPointer(surface, "pointermove", { ...middle, button: 0 });
+      dispatchPointer(surface, "pointermove", { ...to, button: 0 });
+      dispatchPointer(surface, "pointerup", { ...to, button: 0 });
+    });
+    expect(ui.onMovePart.mock.calls).toEqual([["part-a", 1, 0], ["part-a", 1, 0]]);
+    expect(ui.document.parts[0]?.x).toBe(2);
+    expect(ui.onMoveEnd).toHaveBeenCalledOnce();
+  });
+
+  it.each([false, true])("restores the committed position after a batched cancel without a cancellation callback (reject=%s)", (reject) => {
+    const ui = mountFunctionalBoard(reject);
+    const part = requiredElement(ui.container, '[data-part-id="part-a"]');
+    const surface = requiredElement(ui.container, ".circuit-board__surface");
+    const from = clientAtGrid(ui.container, { x: 0, y: 0 });
+    const to = clientAtGrid(ui.container, { x: 1, y: 0 });
+    dispatchPointer(part, "pointerdown", { ...from, button: 0 });
+    act(() => {
+      dispatchPointer(surface, "pointermove", { ...to, button: 0 });
+      dispatchPointer(surface, "pointercancel", { ...to, button: 0 });
+    });
+    expect(ui.document.parts[0]?.x).toBe(0);
+    expect(ui.events).toEqual(reject ? ["move:1,0", "end"] : ["move:1,0", "move:-1,0", "end"]);
+    expect(ui.onMoveEnd).toHaveBeenCalledOnce();
+    dispatchPointer(surface, "pointerup", { ...to, button: 0 });
+    expect(ui.onMoveEnd).toHaveBeenCalledOnce();
+  });
+
+  it.each(["pointerup", "pointercancel", "Escape"])("finishes a part drag once when %s releases pointer capture synchronously", (action) => {
+    const onMoveCancel = vi.fn();
+    const onMoveEnd = vi.fn();
+    const ui = mountBoard(selectionDocument, { onMovePart: vi.fn(), onMoveCancel, onMoveEnd });
+    const part = requiredElement(ui.container, '[data-part-id="part-a"]');
+    const surface = requiredElement(ui.container, ".circuit-board__surface");
+    const releasePointerCapture = vi.fn((pointerId: number) => {
+      const lost = new Event("lostpointercapture", { bubbles: true });
+      Object.defineProperty(lost, "pointerId", { value: pointerId });
+      surface.dispatchEvent(lost);
+    });
+    Object.defineProperties(surface, {
+      hasPointerCapture: { configurable: true, value: () => true },
+      releasePointerCapture: { configurable: true, value: releasePointerCapture },
+    });
+    const from = clientAtGrid(ui.container, { x: 0, y: 0 });
+    const to = clientAtGrid(ui.container, { x: 0, y: 2 });
+    dispatchPointer(part, "pointerdown", { ...from, button: 0 });
+    dispatchPointer(surface, "pointermove", { ...to, button: 0 });
+    if (action === "Escape") {
+      act(() => surface.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })));
+    } else { dispatchPointer(surface, action, { ...to, button: 0 }); }
+
+    expect(onMoveCancel).toHaveBeenCalledTimes(action === "pointerup" ? 0 : 1);
+    expect(onMoveEnd).toHaveBeenCalledOnce();
+    expect(releasePointerCapture).toHaveBeenCalledOnce();
+    dispatchPointer(surface, "pointerup", { ...to, button: 0 });
+    expect(onMoveEnd).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["read-only", { readOnly: true }],
+    ["pan", { panMode: true }],
+  ] as const)("cancels a part drag when the board enters %s mode", (_mode, nextProps) => {
+    const onMovePart = vi.fn();
+    const onMoveCancel = vi.fn();
+    const onMoveEnd = vi.fn();
+    const ui = mountBoard(selectionDocument, { onMovePart, onMoveCancel, onMoveEnd });
+    const part = requiredElement(ui.container, '[data-part-id="part-a"]');
+    const surface = requiredElement(ui.container, ".circuit-board__surface");
+    const from = clientAtGrid(ui.container, { x: 0, y: 0 });
+    const to = clientAtGrid(ui.container, { x: 0, y: 2 });
+
+    dispatchPointer(part, "pointerdown", { ...from, button: 0 });
+    dispatchPointer(surface, "pointermove", { ...to, button: 0 });
+    expect(onMovePart).toHaveBeenCalledOnce();
+    ui.update(nextProps);
+    expect(onMoveCancel).toHaveBeenCalledExactlyOnceWith("part-a");
+    expect(onMoveEnd).toHaveBeenCalledOnce();
+    dispatchPointer(surface, "pointermove", { ...from, button: 0 });
+    dispatchPointer(surface, "pointerup", { ...from, button: 0 });
+    expect(onMovePart).toHaveBeenCalledOnce();
+    expect(onMoveEnd).toHaveBeenCalledOnce();
+  });
+
   it("opens read-only part details with a click, Enter, or Space while preserving edit selection", () => {
     const onInspectPart = vi.fn();
     const onSelectPart = vi.fn();

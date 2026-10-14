@@ -252,6 +252,13 @@ export function moveWireSegment(
   const moveToLane = (point: Point): Point => horizontal
     ? { x: point.x, y: coordinate }
     : { x: coordinate, y: point.y };
+  const laneConnector = (point: Point, neighbor: Point | undefined): Point[] => {
+    const shifted = moveToLane(point);
+    // Fold-backs leave adjacent segments on the same line. Retain their original corner
+    // and add a perpendicular connector instead of joining the shifted corner diagonally.
+    const collinear = neighbor && (horizontal ? neighbor.y === point.y : neighbor.x === point.x);
+    return collinear ? [{ ...point }, shifted] : [shifted];
+  };
   const isFirstSegment = segmentIndex === 0;
   const isLastSegment = segmentIndex + 1 === route.length - 1;
   const moved: Point[] = route.slice(0, segmentIndex).map((point) => ({ ...point }));
@@ -265,7 +272,7 @@ export function moveWireSegment(
       moved.push(moveToLane(first));
     }
   } else {
-    moved.push(moveToLane(first));
+    moved.push(...laneConnector(first, route[segmentIndex - 1]));
   }
 
   if (isLastSegment) {
@@ -276,7 +283,7 @@ export function moveWireSegment(
       moved.push(moveToLane(last), { ...last });
     }
   } else {
-    moved.push(moveToLane(last));
+    moved.push(...laneConnector(last, route[segmentIndex + 2]).reverse());
   }
 
   moved.push(...route.slice(segmentIndex + 2).map((point) => ({ ...point })));
@@ -769,6 +776,49 @@ function routeThroughWaypoints(start: RouteEnd, end: RouteEnd, waypoints: readon
     ).slice(1));
   }
   return simplifyManualRoute(route);
+}
+
+/** Stores a rendered route with implicit orthogonal bends, preserving its exact geometry. */
+export function compactWireRouteWaypoints(route: readonly Point[], start: RouteEnd, end: RouteEnd): Point[] {
+  const original = route.slice(1, -1).map((point) => ({ ...point }));
+  if (route.length === 2) {
+    // An empty list selects automatic routing, which may detour around a wire added before this
+    // split segment. Keep one anchor even for a straight segment; use the outward stub where a
+    // component terminal needs it, and the endpoint itself where a junction has no fixed lead.
+    const anchor = stub(start);
+    const restored = routeThroughWaypoints(start, end, [anchor]);
+    return restored.length === 2 && restored.every((point, index) =>
+      point.x === route[index].x && point.y === route[index].y,
+    ) ? [anchor] : original;
+  }
+  if (route.length < 4) { return original; }
+  // Keep the first and last internal points so terminalLead preserves each outward lead.
+  const counts = Array.from({ length: route.length }, () => Number.POSITIVE_INFINITY);
+  const previous = Array.from({ length: route.length }, () => -1);
+  counts[1] = 1;
+  for (let index = 1; index < route.length - 2; index += 1) {
+    // An implicit dog-leg has at most three segments, hence at most two removable bends.
+    for (let candidate = index + 1; candidate <= Math.min(index + 3, route.length - 2); candidate += 1) {
+      if (counts[index] + 1 >= counts[candidate]) { continue; }
+      const implicit = routeWire(
+        { point: route[index], direction: null },
+        { point: route[candidate], direction: null },
+      );
+      if (implicit.length === candidate - index + 1 && implicit.every((point, offset) =>
+        point.x === route[index + offset].x && point.y === route[index + offset].y,
+      )) {
+        counts[candidate] = counts[index] + 1;
+        previous[candidate] = index;
+      }
+    }
+  }
+  const waypoints: Point[] = [];
+  for (let index = route.length - 2; index >= 1; index = previous[index]) { waypoints.push({ ...route[index] }); }
+  waypoints.reverse();
+  const restored = routeThroughWaypoints(start, end, waypoints);
+  return restored.length === route.length && restored.every((point, offset) =>
+    point.x === route[offset].x && point.y === route[offset].y,
+  ) ? waypoints : original;
 }
 
 /** Routes each wire around the preceding wires in document order. */

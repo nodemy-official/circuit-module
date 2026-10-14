@@ -262,12 +262,17 @@ export function restoreExactExpression(table: readonly ExactExpressionNode[] | u
     const previous = restoredRoots.get(table);
     const immutable = immutableTables.has(table);
     const cached = previous && (immutable || matchingExactExpressions(table, previous.snapshot)) ? previous : undefined;
+    // Evaluate the same immutable evidence used to validate a future cache
+    // hit. Editable metadata may contain accessors that change dependencies
+    // while being read; taking the snapshot afterward could pair an old
+    // result with the new equations and then incorrectly keep reusing it.
+    const snapshot = cached?.snapshot ?? (immutable ? table : snapshotExactExpressions(table));
     const roots = cached?.roots ?? new Map<number, ExactRational>();
     const known = roots.get(reference);
     if (known) { return known; }
-    const result = evaluateDependencies(table, reference, operations, roots);
+    const result = evaluateDependencies(snapshot, reference, operations, roots);
     if (!result) { return; }
-    restoredRoots.set(table, { roots, snapshot: cached?.snapshot ?? (immutable ? table : snapshotExactExpressions(table)) });
+    restoredRoots.set(table, { roots, snapshot });
     return result;
   } catch {
     // Malformed optional result metadata falls back to scalar readings.

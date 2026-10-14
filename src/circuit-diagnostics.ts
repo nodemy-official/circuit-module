@@ -122,7 +122,7 @@ function makeDiagnostic(
   const parts = [...new Set(partIds)].sort();
   const wires = [...new Set(wireIds)].sort();
   return {
-    id: `${code}:${parts.join(",")}:${wires.join(",")}:${identity}`,
+    id: `${code}:${JSON.stringify([parts, wires, identity])}`,
     code,
     severity,
     message,

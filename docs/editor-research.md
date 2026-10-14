@@ -1,14 +1,14 @@
 # 回路エディター調査と機能範囲
 
-調査基準日: **2026-09-25**。各製品の公式ユーザーガイド、公式リファレンス、公式プロジェクト文書を確認した。現在の実装範囲は[アナログ解析ガイド](analog-simulation.md)にまとめている。20種類の部品を使った直流動作点・単一周波数の小信号交流・過渡解析を備える学習向けアナログ回路エディターとして、編集と解析の基本操作を採用し、ネット名、周波数 sweep、PCB、デジタル論理などは別の機能領域として扱う。
+調査基準日: **2026-09-25**。各製品の公式ユーザーガイド、公式リファレンス、公式プロジェクト文書を確認した。実装状況は **2026-10-14** に現行コードと照合した。現在の実装範囲は[アナログ解析ガイド](analog-simulation.md)にまとめている。20種類の部品を使った直流動作点・単一周波数の小信号交流・過渡解析を備える学習向けアナログ回路エディターとして、手動配線経路の編集・保存とUIの対数周波数スイープも提供する。ネット名、DC sweep、PCB、デジタル論理などは別の機能領域として扱う。
 
 ## 公式資料で確認した機能
 
 | 製品 | 一次資料で確認した点 | 本モジュールへの示唆 |
 | --- | --- | --- |
 | KiCad Schematic Editor 10.0 | 選択、配線、ネットラベル、電源シンボル、未接続マーカー、階層シート、ネット強調表示、Electrical Rules Checker、PDF / SVG / netlist 出力まで扱う。[公式マニュアル](https://docs.kicad.org/10.0/en/eeschema/eeschema.pdf) | 編集・保存・検査・出力を一続きにするのが成熟した回路図ツールの基準。現行はJSONファイル往復、診断、選択対象への移動を備える。シートや電気ルール、ネット名は将来候補にする。 |
-| EasyEDA Std | 端子クリックや W キーで配線を始め、配線上のノードや端点・頂点の編集、ネットラベル、GND / VCC、No Connect Flag を提供する。[配線ツール](https://docs.easyeda.com/en/Schematic/Wiring-Tools/) 回路図の PDF / PNG / SVG 出力ではシートの統合・分割も選べる。[回路図の出力](https://docs.easyeda.com/en/Export/Export-Schematic/) | 配線対象へ直接入れる操作、接続先の編集、未接続を意図的に表す方法、共有しやすい画像出力が参考になる。現行データモデルに「線の頂点」「ネット名」「意図的未接続」はないため、これらは未実装のまま将来候補にする。 |
-| CircuitLab | Ctrl / Cmd + S、Z、A、C、X、V、部品回転などを揃え、ビルドとシミュレーションを切り替える。[公式ショートカット](https://www.circuitlab.com/docs/keyboard-shortcuts/) Smart Wires は既存接続を保った線の移動や L 字配線を扱う。[Smart Wires](https://www.circuitlab.com/docs/smart-wires/) 公式ドキュメントは DC、DC sweep、時間領域、周波数領域の解析を案内している。[公式ドキュメント目次](https://www.circuitlab.com/docs/) | キーボード編集と配線の接続維持は実装機能の参考。現行は直流動作点・単一周波数の小信号交流・時間領域の過渡解析を備え、sweep は将来候補にする。 |
+| EasyEDA Std | 端子クリックや W キーで配線を始め、配線上のノードや端点・頂点の編集、ネットラベル、GND / VCC、No Connect Flag を提供する。[配線ツール](https://docs.easyeda.com/en/Schematic/Wiring-Tools/) 回路図の PDF / PNG / SVG 出力ではシートの統合・分割も選べる。[回路図の出力](https://docs.easyeda.com/en/Export/Export-Schematic/) | 配線対象へ直接入れる操作、接続先の編集、未接続を意図的に表す方法、共有しやすい画像出力が参考になる。現行モデルは手動経由点を保持できる。ネット名と意図的未接続マーカーは将来候補にする。 |
+| CircuitLab | Ctrl / Cmd + S、Z、A、C、X、V、部品回転などを揃え、ビルドとシミュレーションを切り替える。[公式ショートカット](https://www.circuitlab.com/docs/keyboard-shortcuts/) Smart Wires は既存接続を保った線の移動や L 字配線を扱う。[Smart Wires](https://www.circuitlab.com/docs/smart-wires/) 公式ドキュメントは DC、DC sweep、時間領域、周波数領域の解析を案内している。[公式ドキュメント目次](https://www.circuitlab.com/docs/) | キーボード編集と配線の接続維持は実装機能の参考。現行は直流動作点・単一周波数の小信号交流・時間領域の過渡解析と、UIの対数周波数スイープを備える。DC sweepは将来候補にする。 |
 | Falstad CircuitJS | 公式 JavaScript interface は同一オリジンの iframe にシミュレーターを置き、実行状態・時刻・刻み幅を読み書きするAPIと更新・解析コールバックを説明している。[CircuitJS JavaScript Interface](https://www.falstad.com/circuit/doc/js-interface.html) | シミュレーターを画面と分離したAPIとして公開する設計が headless solver の参考になる。現行は CircuitJS を組み込まず、独自の DC / AC / 過渡solverを利用する。 |
 | Logisim-evolution | 公式ユーザーガイドは教育用デジタル論理設計と構築中のシミュレーション、サブ回路、複数配線を扱う。[User Guide](https://github.com/logisim-evolution/logisim-evolution/blob/main/src/main/resources/doc/en/html/guide/index.html) Edit menu には Undo / Redo、Cut / Copy / Paste、Duplicate、Select All がある。[Edit menu guide](https://github.com/logisim-evolution/logisim-evolution/blob/main/src/main/resources/doc/en/html/guide/menu/edit.html) | 学習用ツールに必要な復元・複製・選択の手触りが参考になる。論理ゲートや HDL を加えるのではなく、アナログ回路を編集する学習フローへ範囲を絞る。 |
 
@@ -34,9 +34,9 @@
 | 将来候補 P1 | ネット強調表示 | 回路全体の診断を使って対象の部品・導線を選べるようになった。次に接続ネットを視覚的に追える表示を加えると、分岐や電流経路を学習しやすい。 |
 | 将来候補 P1 | 意図的な未接続マーカー | 「接続忘れ」と「使わない端子」を区別する。診断がマーカーを尊重し、保存・Undo・視覚表示で同じ意味を保つことを受け入れ条件とする。 |
 | 将来候補 P1 | SVG / PNG / PDF 出力 | 教材やレポートに回路を貼り、印刷するために推奨する。表示倍率、出力範囲、文字の可読性を確認する。 |
-| 将来候補 P2 | 手動配線頂点・ルート保持 | 回路の見た目を整え、部品移動後も選んだ配線形状を保つために推奨する。ルート点の保存・履歴・交差表現をデータモデルへ追加する必要がある。 |
+| 実装済み | 手動配線経由点・ルート保持 | `CircuitWire.waypoints` に手動経路を保存する。線上や区間ハンドルのドラッグ、区間ハンドルでの矢印キー操作、Escによる取消、JSON往復、Undo/Redo、自動配線への復帰を扱う。分岐や再接続で分割する際も表示経路を保持する。 |
 | 将来候補 P2 | ネット名の結合、VCC / 電源ネット | GNDは共通の0 V基準として実装済み。ネット名やVCCなどの電源シンボルを別の線どうしでも同一ノードとして扱うには、現在の端点接続グラフとsolverの接続規則を拡張する必要がある。 |
-| 将来候補 P2 | 周波数 sweep | 現行の交流解析は単一周波数を指定して計算する。周波数範囲を掃引する機能や応答グラフは別途必要。 |
+| 実装済み | UI の対数周波数スイープ | `CircuitAcPanel` は解析周波数を中心に0.5〜6桁、3〜81点の電圧応答を計算・表示する。中心周波数に一致する交流源を同時に掃引し、異なる周波数の交流源は励振から外す。solverの各呼び出しは単一周波数の小信号解析で、DC sweepは未実装。 |
 | 対象外 | PCB・フットプリント・製造データ、ERC規則セット、複数シート/階層回路、HDL/VHDL | PCB / ERC と HDL は別の設計領域。複数シートも、単一 `CircuitDocument` の中で端点を接続する現在のsolverにはシート参照・階層ネットの仕組みがないため、現行範囲外とする。 |
 
 ## 実装済み機能の受け入れ条件

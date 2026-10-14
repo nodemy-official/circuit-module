@@ -1,5 +1,5 @@
-import { useMemo, useReducer, useState } from "react";
-import { editorHistoryReducer, type EditorHistory } from "./editor-history.js";
+import { useCallback, useMemo, useRef, useState, type SetStateAction } from "react";
+import { editorHistoryReducer, type EditorHistory, type HistoryAction } from "./editor-history.js";
 import {
   addPart,
   connect,
@@ -50,24 +50,44 @@ function editableDocument(document: CircuitDocument) {
   return circuitDocumentShapeIssue(document) ? document : copySimulationDocument(document);
 }
 
-/** State and commands for the optional editor UI. The circuit functions remain usable on their own. */
-export function useCircuitEditor(initialDocument?: CircuitDocument) {
-  const [history, dispatch] = useReducer(editorHistoryReducer, initialDocument, (initial): EditorHistory => ({
-    past: [], present: editableDocument(initial ?? createExampleCircuit()), future: [],
-  }));
-  const document = history.present;
-  const [selection, setSelection] = useState<CircuitSelection>(noSelection);
-  const [pendingEndpoint, setPendingEndpoint] = useState<CircuitEndpoint | null>(null);
-  const [pendingWire, setPendingWire] = useState<{ wireId: string; end: CircuitWireEnd } | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [clipboard, setClipboard] = useState<CircuitFragment | null>(null);
-  const [analysisOptions, setAnalysisOptions] = useState<CircuitAnalysisOptions>({ mode: "auto" });
-  const analysis = useMemo(() => analyzeCircuit(document, {}, analysisOptions), [document, analysisOptions]);
-  const diagnostics = useMemo(() => inspectCircuit(document), [document]);
+/** Commands can compose synchronously while React batches their rendered state. */
+function useCommandState<T>(initial: T | (() => T)) {
+  const [state, commit] = useState(initial);
+  const current = useRef(state);
+  const setState = useCallback((action: SetStateAction<T>) => {
+    const next = typeof action === "function" ? (action as (previous: T) => T)(current.current) : action;
+    current.current = next;
+    commit(next);
+  }, []);
+  return [state, setState, current] as const;
+}
+
+function canCutSelection(document: CircuitDocument, selection: CircuitSelection) {
   const selectedPartIds = new Set(selection.parts);
-  const canCut = selection.parts.length > 0 && document.wires.every((wire) =>
+  return selection.parts.length > 0 && document.wires.every((wire) =>
     !selection.wires.includes(wire.id) || (selectedPartIds.has(wire.from.partId) && selectedPartIds.has(wire.to.partId)),
   );
+}
+
+/** State and commands for the optional editor UI. The circuit functions remain usable on their own. */
+export function useCircuitEditor(initialDocument?: CircuitDocument) {
+  const [renderedHistory, setHistory, historyRef] = useCommandState<EditorHistory>(() => ({
+    past: [], present: editableDocument(initialDocument ?? createExampleCircuit()), future: [],
+  }));
+  const renderedDocument = renderedHistory.present;
+  const [renderedSelection, setSelection, selectionRef] = useCommandState<CircuitSelection>(noSelection);
+  const [renderedPendingEndpoint, setPendingEndpoint, pendingEndpointRef] = useCommandState<CircuitEndpoint | null>(null);
+  const [renderedPendingWire, setPendingWire, pendingWireRef] = useCommandState<{ wireId: string; end: CircuitWireEnd } | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [clipboard, setClipboard, clipboardRef] = useCommandState<CircuitFragment | null>(null);
+  const [analysisOptions, setAnalysisOptions] = useState<CircuitAnalysisOptions>({ mode: "auto" });
+  const analysis = useMemo(() => analyzeCircuit(renderedDocument, {}, analysisOptions), [renderedDocument, analysisOptions]);
+  const diagnostics = useMemo(() => inspectCircuit(renderedDocument), [renderedDocument]);
+  const canCut = canCutSelection(renderedDocument, renderedSelection);
+
+  function dispatch(action: HistoryAction) {
+    setHistory((current) => editorHistoryReducer(current, action));
+  }
 
   function setDocument(next: CircuitDocument, group?: string) {
     dispatch({ type: "edit", document: next, group });
@@ -93,6 +113,7 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
   }
 
   function add(kind: CircuitPartKind, near: Point = { x: 25, y: 10 }) {
+    const document = historyRef.current.present;
     const spot = findFreeSpot(document, kind, near);
     const result = addPart(document, kind, spot);
     if (!result.ok) { return setError(result.reason); }
@@ -102,6 +123,7 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
   }
 
   function selectPart(id: string, additive = false) {
+    const document = historyRef.current.present;
     if (!document.parts.some((part) => part.id === id)) { return; }
     endEdit();
     setSelection((current) => additive ? { ...current, parts: toggleId(current.parts, id) } : { parts: [id], wires: [] });
@@ -109,6 +131,7 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
   }
 
   function selectWire(id: string, additive = false) {
+    const document = historyRef.current.present;
     if (!document.wires.some((wire) => wire.id === id)) { return; }
     endEdit();
     setSelection((current) => additive ? { ...current, wires: toggleId(current.wires, id) } : { parts: [], wires: [id] });
@@ -116,6 +139,7 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
   }
 
   function selectRange(next: CircuitSelection, additive = false) {
+    const document = historyRef.current.present;
     endEdit();
     setSelection((current) => ({
       parts: [...new Set([...(additive ? current.parts : []), ...next.parts])]
@@ -127,10 +151,13 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
   }
 
   function selectAll() {
+    const document = historyRef.current.present;
     selectRange({ parts: document.parts.map((part) => part.id), wires: document.wires.map((wire) => wire.id) });
   }
 
   function copySelected() {
+    const document = historyRef.current.present;
+    const selection = selectionRef.current;
     const fragment = copyFragment(document, selection);
     if (fragment.parts.length === 0) { return false; }
     endEdit();
@@ -140,7 +167,8 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
   }
 
   function cutSelected() {
-    if (!canCut) {
+    const selection = selectionRef.current;
+    if (!canCutSelection(historyRef.current.present, selection)) {
       if (selection.wires.length > 0) { setError("導線を切り取るには、両端の部品も選択してください。"); }
       return;
     }
@@ -149,6 +177,7 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
 
   function insertFragment(fragment: CircuitFragment | null) {
     if (!fragment) { return; }
+    const document = historyRef.current.present;
     const result = pasteFragment(document, fragment);
     if (!result.ok) { setError(result.reason); return; }
     setDocument(result.document);
@@ -157,6 +186,7 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
   }
 
   function startConnection(endpoint: CircuitEndpoint) {
+    const document = historyRef.current.present;
     endEdit();
     setPendingWire(null);
     // A junction's terminal covers its body, so also select it for editing or deletion.
@@ -168,6 +198,7 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
   }
 
   function startReconnect(wireId: string, end: CircuitWireEnd) {
+    const document = historyRef.current.present;
     const wire = document.wires.find((item) => item.id === wireId);
     if (!wire) { return; }
     selectWire(wireId);
@@ -186,6 +217,9 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
   }
 
   function chooseTerminal(endpoint: CircuitEndpoint) {
+    const document = historyRef.current.present;
+    const pendingEndpoint = pendingEndpointRef.current;
+    const pendingWire = pendingWireRef.current;
     if (!pendingEndpoint) {
       startConnection(endpoint);
       return;
@@ -202,6 +236,9 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
   }
 
   function choosePoint(point: Point) {
+    const document = historyRef.current.present;
+    const pendingEndpoint = pendingEndpointRef.current;
+    const pendingWire = pendingWireRef.current;
     if (!pendingEndpoint) {
       setSelection(noSelection());
       return;
@@ -213,12 +250,15 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
 
   function movePart(id: string, dx: number, dy: number) {
     if (!dx && !dy) { return; }
+    const document = historyRef.current.present;
+    const selection = selectionRef.current;
     const moving = selection.parts.includes(id) ? selection.parts : [id];
     const result = moveParts(document, moving, dx, dy);
     applyEditResult(result, `move:${id}`);
   }
 
   function updateWireRoute(id: string, waypoints?: readonly Point[]) {
+    const document = historyRef.current.present;
     const result = setWireWaypoints(document, id, waypoints);
     applyEditResult(result, `wire-route:${id}`);
   }
@@ -229,6 +269,7 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
   }
 
   function resetWireRoute(id: string) {
+    const document = historyRef.current.present;
     const wire = document.wires.find((item) => item.id === id);
     if (!wire || wire.waypoints === undefined) { return; }
     endEdit();
@@ -237,12 +278,16 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
   }
 
   function rotateSelected() {
+    const document = historyRef.current.present;
+    const selection = selectionRef.current;
     if (selection.parts.length === 0) { return; }
     const result = rotateParts(document, selection.parts);
     applyEditResult(result);
   }
 
   function removeSelected() {
+    const document = historyRef.current.present;
+    const selection = selectionRef.current;
     if (selection.parts.length === 0 && selection.wires.length === 0) { return; }
     setDocument(removeSelection(document, selection));
     setSelection(noSelection());
@@ -250,6 +295,7 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
   }
 
   function updatePart(id: string, patch: Partial<CircuitPart>) {
+    const document = historyRef.current.present;
     const part = document.parts.find((item) => item.id === id);
     if (!part || Object.entries(patch).every(([key, value]) => part[key as keyof CircuitPart] === value)) { return; }
     setDocument({
@@ -260,6 +306,7 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
   }
 
   function setTitle(title: string) {
+    const document = historyRef.current.present;
     if (title !== document.title) { setDocument({ ...document, title }, "title"); }
   }
 
@@ -285,6 +332,7 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
   }
 
   function travel(type: "undo" | "redo") {
+    const history = historyRef.current;
     cancelConnection();
     if (type === "undo" ? history.past.length === 0 : history.future.length === 0) { return; }
     dispatch({ type });
@@ -292,10 +340,10 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
   }
 
   return {
-    document,
-    selection,
-    pendingEndpoint,
-    pendingWire,
+    document: renderedDocument,
+    selection: renderedSelection,
+    pendingEndpoint: renderedPendingEndpoint,
+    pendingWire: renderedPendingWire,
     analysis,
     analysisOptions,
     setAnalysisOptions,
@@ -306,13 +354,13 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
     selectWire,
     selectRange,
     selectAll,
-    canCopy: selection.parts.length > 0,
+    canCopy: renderedSelection.parts.length > 0,
     canCut,
     canPaste: clipboard !== null && clipboard.parts.length > 0,
     copySelected,
     cutSelected,
-    paste: () => insertFragment(clipboard),
-    duplicateSelected: () => insertFragment(copyFragment(document, selection)),
+    paste: () => insertFragment(clipboardRef.current),
+    duplicateSelected: () => insertFragment(copyFragment(historyRef.current.present, selectionRef.current)),
     startConnection,
     startReconnect,
     chooseTerminal,
@@ -332,9 +380,9 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
     },
     newDocument: () => replaceDocument(createEmptyCircuit()),
     importDocument,
-    exportDocument: () => serializeCircuitDocument(document),
-    canUndo: history.past.length > 0,
-    canRedo: history.future.length > 0,
+    exportDocument: () => serializeCircuitDocument(historyRef.current.present),
+    canUndo: renderedHistory.past.length > 0,
+    canRedo: renderedHistory.future.length > 0,
     undo: () => travel("undo"),
     redo: () => travel("redo"),
     endEdit,

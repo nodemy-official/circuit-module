@@ -80,7 +80,7 @@ function clickTerminal(container: ParentNode, partId: string, terminalName: "a" 
 
 function pointer(
   target: Element,
-  type: "pointerdown" | "pointermove" | "pointerup" | "pointercancel",
+  type: "pointerdown" | "pointermove" | "pointerup" | "pointercancel" | "lostpointercapture",
   point: { x: number; y: number },
   pointerId = 1,
   pointerType = "mouse",
@@ -152,6 +152,49 @@ function pointerDrag(
 }
 
 describe("Circuit wiring interactions", () => {
+  it("preserves the full movement when pointer updates arrive before the next render", () => {
+    const ui = mount(fixture());
+    const surface = required(ui.container, ".circuit-board__surface");
+    const from = screenPointForWorld(ui.container, { x: battery.x * GRID, y: battery.y * GRID });
+    const middle = screenPointForWorld(ui.container, { x: battery.x * GRID, y: (battery.y + 1) * GRID });
+    const to = screenPointForWorld(ui.container, { x: battery.x * GRID, y: (battery.y + 2) * GRID });
+    pointer(required(ui.container, '.circuit-board__part[data-part-id="battery"]'), "pointerdown", from, 62);
+    act(() => {
+      pointer(surface, "pointermove", middle, 62);
+      pointer(surface, "pointermove", to, 62);
+    });
+    pointer(surface, "pointerup", to, 62);
+    expect(ui.editor.document.parts.find((part) => part.id === battery.id)?.y).toBe(battery.y + 2);
+  });
+
+  it.each(["pointercancel", "lostpointercapture", "Escape"])("restores every selected part and the redo history when a part drag is cancelled (%s)", (action) => {
+    const initial = fixture(true);
+    const ui = mount(initial);
+    act(() => ui.editor.setTitle("やり直せる編集"));
+    act(() => ui.editor.undo());
+    act(() => ui.editor.selectRange({ parts: [battery.id, resistor.id], wires: [] }));
+    const surface = required(ui.container, ".circuit-board__surface");
+    const from = screenPointForWorld(ui.container, { x: battery.x * GRID, y: battery.y * GRID });
+    const to = screenPointForWorld(ui.container, { x: battery.x * GRID, y: (battery.y + 2) * GRID });
+
+    pointer(required(ui.container, '.circuit-board__part[data-part-id="battery"]'), "pointerdown", from, 61);
+    pointer(surface, "pointermove", to, 61);
+    expect(ui.editor.document.parts.find((part) => part.id === battery.id)?.y).toBe(battery.y + 2);
+    expect(ui.editor.document.parts.find((part) => part.id === resistor.id)?.y).toBe(resistor.y + 2);
+    if (action === "pointercancel" || action === "lostpointercapture") { pointer(surface, action, to, 61); }
+    else {
+      keyDown(surface, "Escape");
+      pointer(surface, "pointermove", from, 61);
+      pointer(surface, "pointerup", from, 61);
+    }
+
+    expect(ui.editor.document).toEqual(initial);
+    expect(ui.editor.canUndo).toBe(false);
+    expect(ui.editor.canRedo).toBe(true);
+    act(() => ui.editor.redo());
+    expect(ui.editor.document.title).toBe("やり直せる編集");
+  });
+
   it("shows keyboard-accessible wire handles and reconnects one end as one undoable edit", () => {
     const initial = fixture(true);
     const ui = mount(initial);

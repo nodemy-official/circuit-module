@@ -220,7 +220,7 @@ function EditorHeader({
         {!previewOnly && <button ref={previewToggleRef} type="button" className="circuit-button circuit-editor__preview-toggle" aria-pressed={preview} onClick={onTogglePreview} title={preview ? "編集に戻る (Esc)" : "回路をプレビュー"}>
           {preview && <CircuitIcon name="arrowLeft" size={16} />}{preview ? "編集に戻る" : "プレビュー"}{preview && <kbd>Esc</kbd>}
         </button>}
-        {!preview && <button type="button" className="circuit-button" onClick={onOpenSample} title="サンプルを開く" aria-label="サンプルを開く"><CircuitIcon name="sample" /><span>サンプルを開く</span></button>}
+        {!preview && <button type="button" className="circuit-button" disabled={files.loading} onClick={onOpenSample} title="サンプルを開く" aria-label="サンプルを開く"><CircuitIcon name="sample" /><span>サンプルを開く</span></button>}
       </div>
     </header>
   );
@@ -520,11 +520,13 @@ function EditorDialogs({
   id,
   resetDialogRef,
   helpDialogRef,
+  loading,
   onReset,
 }: {
   id: string;
   resetDialogRef: RefObject<HTMLDialogElement | null>;
   helpDialogRef: RefObject<HTMLDialogElement | null>;
+  loading: boolean;
   onReset: (kind: CircuitExampleKind) => void;
 }) {
   const [sample, setSample] = useState<CircuitExampleKind>("dc");
@@ -538,7 +540,7 @@ function EditorDialogs({
         </select>
         <p>{circuitExampleCatalog[sample].description}</p>
         <p>今の編集内容は「元に戻す」で復元できます。</p>
-        <div className="circuit-dialog__actions"><button type="button" className="circuit-button" autoFocus onClick={() => resetDialogRef.current?.close()}>キャンセル</button><button type="button" className="circuit-button circuit-button--primary" onClick={() => onReset(sample)}>サンプルを開く</button></div>
+        <div className="circuit-dialog__actions"><button type="button" className="circuit-button" autoFocus onClick={() => resetDialogRef.current?.close()}>キャンセル</button><button type="button" className="circuit-button circuit-button--primary" disabled={loading} onClick={() => onReset(sample)}>サンプルを開く</button></div>
       </div>
     </dialog>
     <dialog ref={helpDialogRef} className="circuit-dialog circuit-dialog--help" aria-labelledby={`${id}-help-title`} onClick={closeDialogOnBackdrop}>
@@ -568,6 +570,8 @@ export function CircuitEditorLayout({
   const [previewDocument, setPreviewDocument] = useState<CircuitDocument | null>(() => previewOnly
     ? { ...editor.document, parts: editor.document.parts.map((item) => ({ ...item })) }
     : null);
+  const previewGenerationRef = useRef(0);
+  const previewGeneration = previewGenerationRef.current;
   const [previewPanelOpen, setPreviewPanelOpen] = useState(false);
   const [previewPartId, setPreviewPartId] = useState<string | null>(null);
   const previewReturnFocus = useRef<HTMLElement | SVGElement | null>(null);
@@ -607,6 +611,7 @@ export function CircuitEditorLayout({
   }, [features.dialog, features.parts]);
 
   function resetPreview(partId?: string) {
+    previewGenerationRef.current += 1;
     setPreviewDocument((current) => !partId || !current
       ? { ...editor.document, parts: editor.document.parts.map((item) => ({ ...item })) }
       : { ...current, parts: current.parts.map((item) => item.id === partId
@@ -630,6 +635,7 @@ export function CircuitEditorLayout({
 
   function stopPreview() {
     if (previewOnly) { return; }
+    previewGenerationRef.current += 1;
     setPreviewPanelOpen(false);
     setPreviewPartId(null);
     setPreviewDocument(null);
@@ -704,6 +710,8 @@ export function CircuitEditorLayout({
   }
 
   function togglePreviewSwitch(partId: string) {
+    // A delayed board click belongs to the preview in which it was scheduled.
+    if (previewGeneration !== previewGenerationRef.current) { return; }
     setPreviewDocument((current) => current && {
       ...current,
       parts: current.parts.map((item) => item.id === partId && item.kind === "switch"
@@ -712,6 +720,7 @@ export function CircuitEditorLayout({
   }
 
   function resetSample(kind: CircuitExampleKind) {
+    if (files.loading) { return; }
     editor.openExample(kind);
     setBoardVersion((version) => version + 1);
     setSidebarTab("properties");
@@ -797,7 +806,7 @@ export function CircuitEditorLayout({
         onOptionsChange={editor.setAnalysisOptions}
         onReset={resetPreview}
       />}
-      {!previewOnly && <EditorDialogs id={id} resetDialogRef={resetDialogRef} helpDialogRef={helpDialogRef} onReset={resetSample} />}
+      {!previewOnly && <EditorDialogs id={id} resetDialogRef={resetDialogRef} helpDialogRef={helpDialogRef} loading={files.loading} onReset={resetSample} />}
     </Root>
   );
 }

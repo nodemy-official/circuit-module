@@ -3,6 +3,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createExampleCircuit, type CircuitDocument } from "../../circuit-model.js";
+import { createCircuitExample } from "../../circuit-examples.js";
 import { parseCircuitDocument, serializeCircuitDocument } from "../../circuit-serialization.js";
 import { CircuitEditor } from "../CircuitEditor.js";
 import { CircuitEditorLayout } from "../CircuitEditorLayout.js";
@@ -165,6 +166,49 @@ describe("selection and reuse", () => {
 });
 
 describe("documents and diagnostics", () => {
+  it.each([false, true])("blocks sample replacement while a file is loading and enables it afterward (dialogOpen=%s)", async (dialogOpen) => {
+    const ui = mount();
+    const original = ui.editor.document;
+    const openSample = button(ui.container, "サンプルを開く") as HTMLButtonElement;
+    const sampleSelect = required(ui.container, ".circuit-sample-select") as HTMLSelectElement;
+    const dialog = sampleSelect.closest("dialog");
+    if (!dialog) { throw new Error("Missing sample dialog"); }
+    const showModal = vi.fn(() => { dialog.open = true; });
+    Object.defineProperties(dialog, {
+      showModal: { configurable: true, value: showModal },
+      close: { configurable: true, value: () => { dialog.open = false; } },
+    });
+    const confirm = required(dialog, ".circuit-button--primary") as HTMLButtonElement;
+    if (dialogOpen) { click(openSample); }
+    showModal.mockClear();
+    let finishRead: (value: string) => void = () => {};
+    const input = required(ui.container, 'input[type="file"]');
+    Object.defineProperty(input, "files", { configurable: true, value: [{ size: 100,
+      text: () => new Promise<string>((resolve) => { finishRead = resolve; }),
+    }] });
+    act(() => input.dispatchEvent(new Event("change", { bubbles: true })));
+    expect(openSample.disabled).toBe(true);
+    expect(confirm.disabled).toBe(true);
+    click(openSample);
+    click(confirm);
+    expect(showModal).not.toHaveBeenCalled();
+    expect(ui.editor.document).toBe(original);
+
+    const imported: CircuitDocument = { title: "loaded file", parts: [], wires: [] };
+    await act(async () => finishRead(serializeCircuitDocument(imported)));
+    expect(ui.editor.document).toEqual(imported);
+    expect(openSample.disabled).toBe(false);
+    expect(confirm.disabled).toBe(false);
+    click(openSample);
+    expect(showModal).toHaveBeenCalledOnce();
+    act(() => { sampleSelect.value = "charging"; sampleSelect.dispatchEvent(new Event("change", { bubbles: true })); });
+    click(confirm);
+    expect(ui.editor.document).toEqual(createCircuitExample("charging"));
+    expect(dialog.open).toBe(false);
+    command(ui.container, "z");
+    expect(ui.editor.document).toEqual(imported);
+  });
+
   it("creates an empty document from the menu and restores the original with undo", () => {
     const ui = mount();
     const create = [...ui.container.querySelectorAll("button")].find((item) => item.textContent === "新しい回路");

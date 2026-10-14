@@ -1,8 +1,10 @@
 import {
+  compactWireRouteWaypoints,
   MAX_WIRE_COORDINATE,
   nextRotation,
   partsConflict,
   routeDocumentWires,
+  routeEnd,
   terminalPoint,
   type Point,
 } from "./circuit-geometry.js";
@@ -78,6 +80,13 @@ function wireWaypointError(wires: readonly CircuitWire[]): string | null {
   return null;
 }
 
+function wireConnectionKey(wire: Pick<CircuitWire, "from" | "to">) {
+  return JSON.stringify([
+    JSON.stringify([wire.from.partId, wire.from.terminal]),
+    JSON.stringify([wire.to.partId, wire.to.terminal]),
+  ].sort());
+}
+
 /** Whether the candidates fit among the document's other parts. */
 export function canPlace(document: CircuitDocument, candidates: readonly CircuitPart[]) {
   const moving = new Set(candidates.map((part) => part.id));
@@ -124,7 +133,8 @@ export function addPart(
   const part: CircuitPart = {
     id,
     kind,
-    ...at,
+    x: at.x,
+    y: at.y,
     ...circuitPartCatalog[kind].defaults,
     label: nextLabel(document, kind),
   };
@@ -302,6 +312,17 @@ export function pasteFragment(
   if (fragment.wires.some((wire) => !validEndpoint(wire.from) || !validEndpoint(wire.to))) {
     return { ok: false, reason: "コピーした導線の接続先がコピー内に見つかりません。" };
   }
+  const connections = new Set<string>();
+  for (const wire of fragment.wires) {
+    if (sameEndpoint(wire.from, wire.to)) {
+      return { ok: false, reason: "コピーした導線は同じ端子同士を接続しています。" };
+    }
+    const key = wireConnectionKey(wire);
+    if (connections.has(key)) {
+      return { ok: false, reason: "コピーした導線に同じ端子間の接続が重複しています。" };
+    }
+    connections.add(key);
+  }
   for (let step = 1; step <= 12; step += 1) {
     const copy = renumber(document, fragment, step * 2, step * 2);
     if (wireWaypointError(copy.wires)) { continue; }
@@ -400,34 +421,49 @@ function splitWiresAtJunction(
   document: CircuitDocument,
   crossed: readonly CircuitWire[],
   junction: CircuitEndpoint,
+  routes = routeDocumentWires(document),
 ) {
   const crossedIds = new Set(crossed.map((wire) => wire.id));
   const wireIds = document.wires.map((wire) => wire.id);
   const junctionPart = document.parts.find((part) => part.id === junction.partId);
   const junctionPoint = junctionPart ? terminalPoint(junctionPart, junction.terminal) : undefined;
-  const routes = routeDocumentWires(document);
+  const wires = document.wires.filter((wire) => !crossedIds.has(wire.id));
+  const connections = new Map(wires.map((wire) => [wireConnectionKey(wire), wire]));
+  const parts = new Map(document.parts.map((part) => [part.id, part]));
+  const storedWaypoints = (route: readonly Point[], wire: CircuitWire) => {
+    const waypoints = routeWaypoints(route);
+    const from = parts.get(wire.from.partId);
+    const to = parts.get(wire.to.partId);
+    return from && to
+      ? compactWireRouteWaypoints(route, routeEnd(from, wire.from.terminal), routeEnd(to, wire.to.terminal))
+      : waypoints;
+  };
+  const keepUnique = (wire: CircuitWire) => {
+    const key = wireConnectionKey(wire);
+    const existing = connections.get(key);
+    if (existing) { return existing; }
+    connections.set(key, wire);
+    wires.push(wire);
+    return wire;
+  };
   const splitWires = crossed.flatMap((wire) => {
     const id = nextId("wire", wireIds);
     wireIds.push(id);
     const route = routes.get(wire.id);
     const divided = route && junctionPoint ? splitRouteAtPoint(route, junctionPoint) : undefined;
-    const first = withWireWaypoints(
-      { ...wire, to: junction },
-      divided ? routeWaypoints(divided[0]) : undefined,
-    );
-    const second = withWireWaypoints(
-      { id, from: junction, to: wire.to },
-      divided ? routeWaypoints(divided[1]) : undefined,
-    );
+    const firstWire = { ...wire, to: junction };
+    const secondWire = { id, from: junction, to: wire.to };
+    const first = withWireWaypoints(firstWire, divided ? storedWaypoints(divided[0], firstWire) : undefined);
+    const second = withWireWaypoints(secondWire, divided ? storedWaypoints(divided[1], secondWire) : undefined);
     return [
-      first,
-      second,
+      keepUnique(first),
+      keepUnique(second),
     ];
   });
   return {
     document: {
       ...document,
-      wires: [...document.wires.filter((wire) => !crossedIds.has(wire.id)), ...splitWires],
+      wires,
     },
     splitWires,
   };
@@ -585,6 +621,8 @@ export function connectToPoint(
   }
 
   const { document: splitDocument, splitWires } = splitWiresAtJunction(baseDocument, crossedWires, endpoint);
+  const splitIssue = wireWaypointError(splitWires);
+  if (splitIssue) { return { ok: false, reason: splitIssue }; }
   const attached = splitWires.find(
     (wire) => sameEndpoint(wire.from, from) || sameEndpoint(wire.to, from),
   );
@@ -609,10 +647,14 @@ export function reconnectWireToPoint(
   const prepared = preparePointConnection(document, point, existing, wireId);
   if (!prepared.ok) { return prepared; }
   const { document: baseDocument, endpoint, crossedWires } = prepared;
-  const splitDocument = crossedWires.length === 0
-    ? baseDocument
-    : splitWiresAtJunction(baseDocument, crossedWires, endpoint).document;
-  return reconnectWire(splitDocument, wireId, end, endpoint);
+  const reconnected = reconnectWire(baseDocument, wireId, end, endpoint);
+  if (!reconnected.ok || crossedWires.length === 0) { return reconnected; }
+  // Reserve the edited connection before splitting so an identical new segment reuses it.
+  // Routes still come from the displayed document, before the reconnect can reroute anything.
+  const split = splitWiresAtJunction(reconnected.document, crossedWires, endpoint, routeDocumentWires(baseDocument));
+  const splitIssue = wireWaypointError(split.splitWires);
+  if (splitIssue) { return { ok: false, reason: splitIssue }; }
+  return { ...reconnected, document: split.document };
 }
 
 /** Number of wires attached to a terminal. */

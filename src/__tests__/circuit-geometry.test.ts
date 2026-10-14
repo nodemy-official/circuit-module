@@ -1,12 +1,15 @@
 import { describe, expect, it } from "vitest";
 
+import { setWireWaypoints } from "../circuit-edit.js";
 import {
+  compactWireRouteWaypoints,
   contentBounds,
   footprint,
   localTerminalOffset,
   moveWireSegment,
   routeWire,
   routeDocumentWires,
+  routeEnd,
   terminalDirection,
   terminalPoint,
   type Point,
@@ -222,6 +225,49 @@ describe("manual wire routing", () => {
   const isOrthogonal = (route: readonly Point[]) => route.every((first, index) => {
     const second = route[index + 1];
     return !second || first.x === second.x || first.y === second.y;
+  });
+
+  it.each([
+    {
+      label: "vertical, fold-back after the moved segment", horizontal: false, index: 2,
+      expected: [{ x: 0, y: 0 }, { x: 0, y: 2 }, { x: 3, y: 2 }, { x: 3, y: 4 }, { x: 2, y: 4 }, { x: 2, y: 2 }, { x: 4, y: 2 }],
+    },
+    {
+      label: "vertical, fold-back before the moved segment", horizontal: false, index: 3,
+      expected: [{ x: 0, y: 0 }, { x: 0, y: 2 }, { x: 2, y: 2 }, { x: 2, y: 4 }, { x: 3, y: 4 }, { x: 3, y: 2 }, { x: 4, y: 2 }],
+    },
+    {
+      label: "horizontal, fold-back after the moved segment", horizontal: true, index: 2,
+      expected: [{ x: 0, y: 0 }, { x: 2, y: 0 }, { x: 2, y: 3 }, { x: 4, y: 3 }, { x: 4, y: 2 }, { x: 2, y: 2 }, { x: 2, y: 4 }],
+    },
+    {
+      label: "horizontal, fold-back before the moved segment", horizontal: true, index: 3,
+      expected: [{ x: 0, y: 0 }, { x: 2, y: 0 }, { x: 2, y: 2 }, { x: 4, y: 2 }, { x: 4, y: 3 }, { x: 2, y: 3 }, { x: 2, y: 4 }],
+    },
+  ])("keeps $label orthogonal and identical after saving", ({ horizontal, index, expected }) => {
+    const document: CircuitDocument = {
+      title: "fold-back route",
+      parts: [
+        { id: "left", kind: "junction", x: 0, y: 0, label: "left" },
+        { id: "right", kind: "junction", x: horizontal ? 2 : 4, y: horizontal ? 4 : 2, label: "right" },
+      ],
+      wires: [{
+        id: "wire", from: { partId: "left", terminal: "a" }, to: { partId: "right", terminal: "a" },
+        waypoints: horizontal ? [{ x: 4, y: 2 }, { x: 2, y: 2 }] : [{ x: 2, y: 4 }, { x: 2, y: 2 }],
+      }],
+    };
+    const start = routeEnd(document.parts[0]!, "a");
+    const end = routeEnd(document.parts[1]!, "a");
+    const route = routeDocumentWires(document).get("wire")!;
+    const moved = moveWireSegment(route, index, 3, start, end);
+
+    expect(moved).toEqual(expected);
+    expect(isOrthogonal(moved)).toBe(true);
+    const stored = setWireWaypoints(document, "wire", compactWireRouteWaypoints(moved, start, end));
+    if (!stored.ok) { throw new Error(stored.reason); }
+    const restored = parseCircuitDocument(serializeCircuitDocument(stored.document));
+    if (!restored.ok) { throw new Error(restored.reason); }
+    expect(routeDocumentWires(restored.document).get("wire")).toEqual(expected);
   });
 
   it("moves a middle segment perpendicular to its orientation", () => {

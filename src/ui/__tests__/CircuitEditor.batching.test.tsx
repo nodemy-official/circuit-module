@@ -1,0 +1,174 @@
+// @vitest-environment jsdom
+import { StrictMode, act } from "react";
+import { createRoot, type Root } from "react-dom/client";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { CircuitDocument } from "../../circuit-model.js";
+import { parseCircuitDocument } from "../../circuit-serialization.js";
+import { CircuitEditor } from "../CircuitEditor.js";
+import type { CircuitEditorController } from "../useCircuitEditor.js";
+
+const mounted: Array<{ root: Root; container: HTMLElement }> = [];
+beforeEach(() => { vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true); });
+afterEach(() => {
+  for (const { root, container } of mounted.splice(0)) {
+    act(() => root.unmount());
+    container.remove();
+  }
+  vi.unstubAllGlobals();
+});
+
+function fixture(): CircuitDocument {
+  return {
+    title: "initial",
+    parts: [
+      { id: "a", kind: "resistor", label: "A", x: 0, y: 0, resistanceOhms: 10 },
+      { id: "b", kind: "resistor", label: "B", x: 10, y: 0, resistanceOhms: 10 },
+    ],
+    wires: [{ id: "wire", from: { partId: "a", terminal: "b" }, to: { partId: "b", terminal: "a" } }],
+  };
+}
+
+function mount(initialDocument = fixture()) {
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  let latest: CircuitEditorController | undefined;
+  act(() => root.render(<StrictMode><CircuitEditor initialDocument={initialDocument}>{(editor) => {
+    latest = editor;
+    return null;
+  }}</CircuitEditor></StrictMode>));
+  mounted.push({ root, container });
+  return {
+    get editor() {
+      if (!latest) { throw new Error("Missing editor"); }
+      return latest;
+    },
+  };
+}
+
+describe("batched editor commands", () => {
+  it.each([true, false])("composes document, property, selection and movement commands (batched=%s)", (batched) => {
+    const ui = mount();
+    const commands = [
+      () => ui.editor.setTitle("changed"),
+      () => ui.editor.updatePart("a", { resistanceOhms: 22 }),
+      () => ui.editor.updatePart("a", { label: "edited" }),
+      () => ui.editor.selectPart("a"),
+      () => ui.editor.selectPart("b", true),
+      () => ui.editor.movePart("a", 0, 1),
+      () => ui.editor.movePart("a", 0, 1),
+      () => ui.editor.endEdit(),
+    ];
+    if (batched) { act(() => { for (const command of commands) { command(); } }); }
+    else { for (const command of commands) { act(command); } }
+
+    expect(ui.editor.document.title).toBe("changed");
+    expect(ui.editor.document.parts[0]).toMatchObject({ resistanceOhms: 22, label: "edited", y: 2 });
+    expect(ui.editor.document.parts[1]?.y).toBe(2);
+    expect(ui.editor.selection.parts).toEqual(["a", "b"]);
+    act(() => ui.editor.undo());
+    expect(ui.editor.document.parts.map((part) => part.y)).toEqual([0, 0]);
+    expect(ui.editor.document.title).toBe("changed");
+  });
+
+  it("keeps both additions, assigns unique IDs, and exports the latest document within one batch", () => {
+    const ui = mount({ title: "empty", parts: [], wires: [] });
+    let serialized = "";
+    act(() => {
+      ui.editor.add("resistor", { x: 0, y: 0 });
+      ui.editor.add("battery", { x: 10, y: 0 });
+      ui.editor.selectAll();
+      ui.editor.movePart("part-1", 0, 1);
+      ui.editor.endEdit();
+      serialized = ui.editor.exportDocument();
+    });
+    expect(ui.editor.document.parts.map((part) => part.kind)).toEqual(["resistor", "battery"]);
+    expect(ui.editor.document.parts.map((part) => part.id)).toEqual(["part-1", "part-2"]);
+    expect(ui.editor.document.parts.map((part) => part.y)).toEqual([1, 1]);
+    expect(parseCircuitDocument(serialized)).toEqual({ ok: true, document: ui.editor.document });
+  });
+
+  it("composes repeated undo and redo commands using the latest history", () => {
+    const ui = mount();
+    act(() => {
+      ui.editor.setTitle("changed");
+      ui.editor.updatePart("a", { resistanceOhms: 22 });
+      ui.editor.undo();
+      ui.editor.undo();
+    });
+    expect(ui.editor.document).toEqual(fixture());
+    expect(ui.editor.canUndo).toBe(false);
+    expect(ui.editor.canRedo).toBe(true);
+    act(() => { ui.editor.redo(); ui.editor.redo(); });
+    expect(ui.editor.document.title).toBe("changed");
+    expect(ui.editor.document.parts[0]?.resistanceOhms).toBe(22);
+    expect(ui.editor.canRedo).toBe(false);
+  });
+
+  it("uses the current selection and clipboard for a select, cut and paste sequence", () => {
+    const ui = mount();
+    act(() => {
+      ui.editor.selectAll();
+      ui.editor.cutSelected();
+      ui.editor.paste();
+    });
+    expect(ui.editor.document.parts).toHaveLength(2);
+    expect(ui.editor.document.wires).toHaveLength(1);
+    expect(ui.editor.selection.parts).toHaveLength(2);
+    expect(ui.editor.canPaste).toBe(true);
+    act(() => { ui.editor.undo(); ui.editor.undo(); });
+    expect(ui.editor.document).toEqual(fixture());
+  });
+
+  it("connects and reconnects terminals without requiring a render between commands", () => {
+    const ui = mount();
+    act(() => {
+      ui.editor.chooseTerminal({ partId: "a", terminal: "a" });
+      ui.editor.chooseTerminal({ partId: "b", terminal: "b" });
+    });
+    expect(ui.editor.document.wires).toHaveLength(2);
+    expect(ui.editor.pendingEndpoint).toBeNull();
+    const added = ui.editor.document.wires[1]!;
+    act(() => {
+      ui.editor.startReconnect(added.id, "to");
+      ui.editor.chooseTerminal({ partId: "b", terminal: "a" });
+    });
+    expect(ui.editor.document.wires[1]?.to).toEqual({ partId: "b", terminal: "a" });
+    expect(ui.editor.pendingWire).toBeNull();
+    act(() => {
+      ui.editor.chooseTerminal({ partId: "a", terminal: "a" });
+      ui.editor.chooseTerminal({ partId: "a", terminal: "a" });
+    });
+    expect(ui.editor.document.wires).toHaveLength(2);
+    expect(ui.editor.pendingEndpoint).toBeNull();
+  });
+
+  it("restores a cancelled batched move and its preexisting redo history", () => {
+    const ui = mount();
+    act(() => ui.editor.setTitle("redo"));
+    act(() => ui.editor.undo());
+    act(() => {
+      ui.editor.selectAll();
+      ui.editor.movePart("a", 0, 1);
+      ui.editor.movePart("a", 0, 1);
+      ui.editor.cancelMove("a");
+    });
+    expect(ui.editor.document).toEqual(fixture());
+    expect(ui.editor.canUndo).toBe(false);
+    expect(ui.editor.canRedo).toBe(true);
+    act(() => ui.editor.redo());
+    expect(ui.editor.document.title).toBe("redo");
+  });
+
+  it("uses current data when a caller retains commands from an earlier render", () => {
+    const ui = mount();
+    const retained = ui.editor;
+    act(() => retained.setTitle("changed"));
+    act(() => retained.updatePart("a", { resistanceOhms: 22 }));
+    act(() => retained.selectPart("b"));
+    act(() => retained.movePart("b", 0, 2));
+    expect(ui.editor.document.title).toBe("changed");
+    expect(ui.editor.document.parts[0]?.resistanceOhms).toBe(22);
+    expect(ui.editor.document.parts[1]?.y).toBe(2);
+  });
+});

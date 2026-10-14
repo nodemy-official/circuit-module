@@ -549,6 +549,45 @@ describe("CircuitEditor interactions", () => {
     expect(switchPart.getAttribute("aria-pressed")).toBe("false");
   });
 
+  it("discards a pending switch click when leaving preview before entering a new preview session", async () => {
+    const ui = mount(createExampleCircuit());
+    click(previewToggle(ui.container));
+    vi.useFakeTimers();
+    try {
+      clickWithDetail(previewPart(ui.container, "part-4"), 1);
+      keyDown(required(ui.container, ".circuit-editor"), "Escape");
+      click(previewToggle(ui.container));
+      expect(previewPart(ui.container, "part-4").getAttribute("aria-pressed")).toBe("true");
+      await act(async () => { await vi.advanceTimersByTimeAsync(400); });
+      expect(previewPart(ui.container, "part-4").getAttribute("aria-pressed")).toBe("true");
+      expect(ui.editor.document.parts.find((part) => part.id === "part-4")?.initiallyClosed).toBe(true);
+
+      clickWithDetail(previewPart(ui.container, "part-4"), 1);
+      await act(async () => { await vi.advanceTimersByTimeAsync(400); });
+      expect(previewPart(ui.container, "part-4").getAttribute("aria-pressed")).toBe("false");
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("discards a pending switch click when preview values are reset", async () => {
+    const ui = mount(createExampleCircuit());
+    click(previewToggle(ui.container));
+    keyDown(previewPart(ui.container, "part-4"), "Enter");
+    expect(previewPart(ui.container, "part-4").getAttribute("aria-pressed")).toBe("false");
+    vi.useFakeTimers();
+    try {
+      clickWithDetail(previewPart(ui.container, "part-4"), 1);
+      click(required(ui.container, ".circuit-preview-parts__reset"));
+      expect(previewPart(ui.container, "part-4").getAttribute("aria-pressed")).toBe("true");
+      await act(async () => { await vi.advanceTimersByTimeAsync(400); });
+      expect(previewPart(ui.container, "part-4").getAttribute("aria-pressed")).toBe("true");
+      expect(ui.editor.document.parts.find((part) => part.id === "part-4")?.initiallyClosed).toBe(true);
+
+      clickWithDetail(previewPart(ui.container, "part-4"), 1);
+      await act(async () => { await vi.advanceTimersByTimeAsync(400); });
+      expect(previewPart(ui.container, "part-4").getAttribute("aria-pressed")).toBe("false");
+    } finally { vi.useRealTimers(); }
+  });
+
   it("keeps the board read-only during preview and ignores edit shortcuts", () => {
     const ui = mount(fixture());
     click(previewToggle(ui.container));

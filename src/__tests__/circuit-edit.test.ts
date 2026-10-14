@@ -460,11 +460,13 @@ describe("wiring", () => {
       id: "wire-1",
       from: { partId: "left", terminal: "b" },
       to: { partId: junction?.id, terminal: "a" },
+      waypoints: [{ x: 8, y: 5 }],
     });
     expect(result.document.wires).toContainEqual({
       id: "wire-2",
       from: { partId: junction?.id, terminal: "a" },
       to: { partId: "right", terminal: "a" },
+      waypoints: [{ x: 10, y: 5 }],
     });
     expect(result.document.wires).toContainEqual({
       id: result.id,

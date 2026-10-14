@@ -91,6 +91,24 @@ describe("inspectCircuit", () => {
     }));
   });
 
+  it("keeps findings distinct when part and wire IDs contain separators", () => {
+    const input = document(
+      [part("a", "resistor"), part("b,c,d", "resistor"), part("a,b", "resistor"), part("c,d", "resistor")],
+      [
+        wire("w", endpoint("a", "a"), endpoint("b,c,d", "a")),
+        wire("x,y", endpoint("a", "b"), endpoint("b,c,d", "b")),
+        wire("w,x", endpoint("a,b", "a"), endpoint("c,d", "a")),
+        wire("y", endpoint("a,b", "b"), endpoint("c,d", "b")),
+      ],
+    );
+    const diagnostics = inspectCircuit(input);
+
+    expect(diagnostics).toHaveLength(2);
+    expect(diagnostics.every(({ code }) => code === "unpowered-component")).toBe(true);
+    expect(new Set(diagnostics.map(({ id }) => id)).size).toBe(2);
+    expect(inspectCircuit(input)).toEqual(diagnostics);
+  });
+
   it("distinguishes a wire bypass across a battery from a bypass across another part", () => {
     const diagnostics = inspectCircuit(document(
       [part("battery", "battery"), part("resistor", "resistor")],

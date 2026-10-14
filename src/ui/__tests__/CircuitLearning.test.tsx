@@ -3,6 +3,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createCircuitExample } from "../../circuit-examples.js";
+import type { CircuitDocument } from "../../circuit-model.js";
 import { CircuitEditor } from "../CircuitEditor.js";
 import { CircuitEditorLayout } from "../CircuitEditorLayout.js";
 import type { CircuitEditorController } from "../useCircuitEditor.js";
@@ -49,6 +50,25 @@ function setRange(input: HTMLInputElement, value: number) {
 }
 
 describe("learning visualization integration", () => {
+  it.each([1e308, Number.MIN_VALUE])("keeps current arrows at the same visible width for a finite %s A circuit", (currentAmps) => {
+    const initial: CircuitDocument = {
+      title: "電流矢印の尺度",
+      parts: [
+        { id: "source", kind: "current-source", label: "電流源", x: 0, y: 0, currentAmps },
+        { id: "load", kind: "resistor", label: "抵抗", x: 10, y: 0, resistanceOhms: currentAmps > 1 ? 1e-308 : 1 },
+      ],
+      wires: [
+        { id: "a", from: { partId: "source", terminal: "a" }, to: { partId: "load", terminal: "a" } },
+        { id: "b", from: { partId: "source", terminal: "b" }, to: { partId: "load", terminal: "b" } },
+      ],
+    };
+    const ui = mount(initial);
+    expect(ui.editor.analysis.status, ui.editor.analysis.message).toBe("closed");
+    const arrows = ui.container.querySelectorAll(".circuit-potential__currents svg path");
+    expect(arrows).toHaveLength(2);
+    for (const arrow of arrows) { expect(arrow.getAttribute("stroke-width")).toBe("5"); }
+  });
+
   it("moves board potentials and energy together, then drops stale sample values after edits", () => {
     const ui = mount();
     click(required(ui.container, '.circuit-potential__toggle input'));

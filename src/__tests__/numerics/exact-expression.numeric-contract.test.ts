@@ -53,6 +53,24 @@ it("invalidates restored expression values when a mutable dependency or operatio
   assertValue(1n, 25n);
 });
 
+it("keeps replayed values paired with the dependency snapshot actually evaluated", () => {
+  const literal = {
+    operation: "literal" as const,
+    numerator: "1",
+    get denominator() {
+      // Reading a transported metadata accessor can edit another field. The
+      // first replay observes 1/1, and the next replay must observe 2/1.
+      literal.numerator = "2";
+      return "1";
+    },
+  };
+  const table: ExactExpressionNode[] = [literal];
+  const reading = { real: { expression: 0, sign: 1 as const }, imaginary: { numerator: "0", denominator: "1" } };
+  expect(restoredComplex(reading, table)?.real).toBe(1);
+  expect(restoredComplex(reading, table)?.real).toBe(2);
+  expect(restoredComplex(reading, table)?.real).toBe(2);
+});
+
 it.each(["node", "argument"])("rejects sparse expression tables after a %s is deleted", (field) => {
   const table: ExactExpressionNode[] = [
     { operation: "literal", numerator: "5", denominator: "9" },

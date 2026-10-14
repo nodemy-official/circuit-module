@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type KeyboardEvent, type PointerEvent, type RefObject } from "react";
-import { moveWireSegment, routeEnd, type Point, type RouteEnd } from "../circuit-geometry.js";
+import { compactWireRouteWaypoints, moveWireSegment, routeEnd, type Point, type RouteEnd } from "../circuit-geometry.js";
 import type { CircuitDocument } from "../circuit-model.js";
 
 interface WireRouteDragOptions {
@@ -13,7 +13,7 @@ interface WireRouteDragOptions {
   onCancel?: (id: string) => void;
   onEnd?: () => void;
   onDrag: () => void;
-  onFinish: () => void;
+  onFinish: (cancelled: boolean) => void;
 }
 
 interface RouteSnapshot {
@@ -90,7 +90,7 @@ export function useWireRouteDrag(options: WireRouteDragOptions) {
       else { current.onChange?.(drag.id, drag.originalWaypoints); }
     }
     current.onEnd?.();
-    current.onFinish();
+    current.onFinish(true);
     if (release) { releasePointer(current.svgRef.current, drag.pointerId); }
     return true;
   }, []);
@@ -149,7 +149,7 @@ export function useWireRouteDrag(options: WireRouteDragOptions) {
     drag.changed = true;
     setDraggingWireId(drag.id);
     const next = moveWireSegment(drag.route, drag.segmentIndex, coordinate, drag.start, drag.end);
-    current.onChange?.(drag.id, coordinate === drag.coordinate ? drag.originalWaypoints : next.slice(1, -1));
+    current.onChange?.(drag.id, coordinate === drag.coordinate ? drag.originalWaypoints : compactWireRouteWaypoints(next, drag.start, drag.end));
     return true;
   }, [cancel]);
 
@@ -161,7 +161,7 @@ export function useWireRouteDrag(options: WireRouteDragOptions) {
     setDraggingWireId(null);
     const current = latest.current;
     current.onEnd?.();
-    current.onFinish();
+    current.onFinish(false);
     releasePointer(current.svgRef.current, drag.pointerId);
     return true;
   }, [cancel]);
@@ -183,7 +183,7 @@ export function useWireRouteDrag(options: WireRouteDragOptions) {
     const delta = direction * (event.shiftKey ? 5 : 1);
     const next = moveWireSegment(initial.route, index, from[axis] + delta, initial.start, initial.end);
     focusAtRef.current = { id, point: { x: (from.x + to.x) / 2, y: (from.y + to.y) / 2, [axis]: from[axis] + delta } };
-    current.onChange(id, next.slice(1, -1));
+    current.onChange(id, compactWireRouteWaypoints(next, initial.start, initial.end));
     current.onEnd?.();
   }, []);
 

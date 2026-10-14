@@ -1,4 +1,5 @@
 import { useId, useMemo, useState } from "react";
+import { exactProductSumQuotient } from "../analog-math.js";
 import { GRID, pathData, terminalPoint, type Point } from "../circuit-geometry.js";
 import type { CircuitDocument } from "../circuit-model.js";
 import type { CircuitAnalysis } from "../circuit-solver.js";
@@ -26,9 +27,12 @@ function CurrentRow({ entry, ac, scale }: { entry: CircuitNodeCurrent; ac: boole
   const path = ac ? "M6 10H58M6 10l6 -5M6 10l6 5M58 10l-6 -5M58 10l-6 5"
     : entry.amps < 0 ? "M58 10H6l7 -5M6 10l7 5" : "M6 10H58l-7 -5M58 10l-7 5";
   const direction = ac || entry.amps === 0 ? "" : entry.amps < 0 ? "← " : "→ ";
+  // Round only the finished SVG width; large and subnormal currents share the same relative scale.
+  const width = entry.amps === 0 ? 0
+    : exactProductSumQuotient([{ factors: [scale] }, { factors: [4, Math.abs(entry.amps)] }], scale);
   return <li>
     <span>{entry.label}</span>
-    <svg viewBox="0 0 64 20" aria-hidden="true"><path d={path} fill="none" stroke="currentColor" strokeWidth={entry.amps === 0 ? 0 : 1 + 4 * Math.abs(entry.amps) / scale} /></svg>
+    <svg viewBox="0 0 64 20" aria-hidden="true"><path d={path} fill="none" stroke="currentColor" strokeWidth={width} /></svg>
     <strong>{direction}{formatCircuitQuantity(Math.abs(entry.amps), "A")}{ac && entry.amps !== 0 ? ` ∠${Number((entry.phaseDegrees ?? 0).toFixed(1))}°` : ""}</strong>
   </li>;
 }
@@ -36,7 +40,7 @@ function CurrentRow({ entry, ac, scale }: { entry: CircuitNodeCurrent; ac: boole
 function PotentialDetails({ view }: { view: PotentialView }) {
   const id = useId();
   const { nodes, reference, selected, potential, ac } = view;
-  const currentScale = Math.max(1e-12, ...(selected?.currents.map((entry) => Math.abs(entry.amps)) ?? []));
+  const currentScale = Math.max(0, ...(selected?.currents.map((entry) => Math.abs(entry.amps)) ?? [])) || 1;
   if (nodes.length === 0) { return <p>回路を接続して解析できる状態にすると表示されます。</p>; }
   return <>
     <p>{ac ? "交流の色と数値は実効値です。位相を含めて2点の差を計算します。" : "同じ導線でつながる点は同じ電位です。基準点を0 Vとして表示します。"}</p>
