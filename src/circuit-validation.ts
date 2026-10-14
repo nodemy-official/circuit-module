@@ -46,13 +46,13 @@ export const transientAnalysisOptionsSchema = z.object({
 });
 
 /** The catalog is the shared source of numeric domains for forms and files. */
-export function circuitNumericValueSchema(field: Pick<CircuitPartNumericField, "min" | "max" | "exclusiveMin"> & { integer?: boolean }) {
+export function circuitNumericValueSchema(field: Pick<CircuitPartNumericField, "min" | "max" | "exclusiveMin"> & { integer?: boolean; exclusiveMax?: boolean }) {
   let schema = z.number();
   if (field.integer) { schema = schema.refine(Number.isInteger); }
   if (field.min !== undefined) {
     schema = field.exclusiveMin ? schema.gt(field.min) : schema.gte(field.min);
   }
-  if (field.max !== undefined) { schema = schema.lte(field.max); }
+  if (field.max !== undefined) { schema = field.exclusiveMax ? schema.lt(field.max) : schema.lte(field.max); }
   return schema;
 }
 

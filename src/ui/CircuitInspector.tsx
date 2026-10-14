@@ -7,6 +7,7 @@ import { CircuitIcon } from "./CircuitIcon.js";
 import { measurementLabels } from "./measurement-labels.js";
 import { CircuitMeterReadout, getMeterDisplay } from "./CircuitMeterReadout.js";
 import { NumericInput } from "./NumericInput.js";
+import { partNumericField } from "./part-numeric-field.js";
 import { useId, type ComponentPropsWithoutRef, type ReactNode } from "react";
 
 export type CircuitInspectorSlot =
@@ -218,8 +219,8 @@ function InspectorFields({
   const inputId = useId();
   const defaults = circuitPartCatalog[part.kind].defaults;
   const initiallyClosed = (simulationRecordField(part, "initiallyClosed") as boolean | undefined) ?? defaults.initiallyClosed ?? false;
-  const numericFields = circuitPartNumericFields(part.kind);
-  const numeric = (key: CircuitPartNumericKey, label: string, unit: string, min?: number, max?: number, step?: number, exclusiveMin?: boolean) => {
+  const numericFields = circuitPartNumericFields(part.kind).map((field) => partNumericField(part, field));
+  const numeric = (key: CircuitPartNumericKey, label: string, unit: string, min?: number, max?: number, step?: number, exclusiveMin?: boolean, exclusiveMax?: boolean) => {
     const value = (simulationRecordField(part, key) as number | undefined) ?? defaults[key] ?? 0;
     return (
       <label {...circuitSlot("circuit-field", slotProps?.field)} key={key} data-field={key} htmlFor={`${inputId}-${key}`}>
@@ -233,6 +234,7 @@ function InspectorFields({
             min={min}
             max={max}
             exclusiveMin={exclusiveMin}
+            exclusiveMax={exclusiveMax}
             value={value}
             onValueChange={(nextValue) => change({ [key]: nextValue })}
             disabled={!onChange}
@@ -257,8 +259,8 @@ function InspectorFields({
           data-field="label"
         />
       </label>
-      {numericFields.map(({ key, label, unit, min, max, step, exclusiveMin }) =>
-        numeric(key, label, key === "wiperPosition" ? "0–1" : unit, min, max, step, exclusiveMin))}
+      {numericFields.map(({ key, label, unit, min, max, step, exclusiveMin, exclusiveMax }) =>
+        numeric(key, label, key === "wiperPosition" ? "0–1" : unit, min, max, step, exclusiveMin, exclusiveMax))}
       {part.kind === "switch" && (
         <label {...circuitSlot("circuit-switch", slotProps?.switch)} data-field="initiallyClosed">
           <span {...circuitSlot(undefined, slotProps?.switchText)}>

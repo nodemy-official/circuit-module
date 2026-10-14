@@ -5,6 +5,7 @@ export interface EditorHistory {
   present: CircuitDocument;
   future: CircuitDocument[];
   group?: string;
+  groupPast?: CircuitDocument[];
   groupFuture?: CircuitDocument[];
 }
 
@@ -22,6 +23,7 @@ function editHistory(state: EditorHistory, action: Extract<HistoryAction, { type
     present: action.document,
     future: [],
     group: action.group,
+    groupPast: action.group ? (action.group === state.group ? state.groupPast : state.past) : undefined,
     groupFuture: action.group ? (action.group === state.group ? state.groupFuture : state.future) : undefined,
   };
 }
@@ -29,7 +31,7 @@ function editHistory(state: EditorHistory, action: Extract<HistoryAction, { type
 function cancelHistoryGroup(state: EditorHistory, group: string): EditorHistory {
   const original = state.past.at(-1);
   if (!original || state.group !== group) { return state; }
-  return { past: state.past.slice(0, -1), present: original, future: state.groupFuture ?? [] };
+  return { past: state.groupPast ?? state.past.slice(0, -1), present: original, future: state.groupFuture ?? [] };
 }
 
 function undoHistory(state: EditorHistory): EditorHistory {
@@ -56,6 +58,6 @@ export function editorHistoryReducer(state: EditorHistory, action: HistoryAction
     case "redo":
       return redoHistory(state);
     case "end-group":
-      return state.group ? { ...state, group: undefined, groupFuture: undefined } : state;
+      return state.group ? { ...state, group: undefined, groupPast: undefined, groupFuture: undefined } : state;
   }
 }

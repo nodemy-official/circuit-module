@@ -1780,6 +1780,21 @@ export function CircuitBoard({
         tabIndex={0}
         aria-label="回路基板。余白またはスペースキーを押しながらドラッグして移動し、Shiftを押しながら余白をドラッグして範囲選択できます"
         onKeyDownCapture={(event) => {
+          if ((event.ctrlKey || event.metaKey) && !event.altKey && !event.repeat && ["z", "y"].includes(event.key.toLowerCase())) {
+            // Finish the pointer edit before the host travels through history.
+            // Keeping the edit committed lets Redo restore it after Undo.
+            const wireFinished = wireRouteDrag.finish();
+            const partDrag = dragRef.current;
+            if (partDrag) {
+              updatePartDrag(null);
+              modifierPartClickRef.current = null;
+              onMoveEnd?.();
+              releaseConnectionPointer(partDrag.pointerId);
+            }
+            if (wireFinished || partDrag) { finishWireRoutePointer(true); }
+            cancelRange();
+            cancelConnectionDrag();
+          }
           if (event.key !== "Escape") { return; }
           if (wireRouteDrag.cancel() || cancelPartDrag() || cancelRange()) {
             event.preventDefault();

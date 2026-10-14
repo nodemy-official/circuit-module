@@ -6,6 +6,7 @@ import { CircuitPartIcon } from "./CircuitPalette.js";
 import { getMeterDisplay, CircuitMeterReadout } from "./CircuitMeterReadout.js";
 import { measurementLabels } from "./measurement-labels.js";
 import { Button, Input, Switch, Tabs, TabsContent, TabsList, TabsTrigger } from "./primitives.js";
+import { partNumericField } from "./part-numeric-field.js";
 
 type AdjustableValue = CircuitPartNumericKey | "initiallyClosed";
 
@@ -33,10 +34,11 @@ function comparableValue(part: CircuitPart, key: AdjustableValue): number | bool
 }
 
 function isValidNumericValue(key: CircuitPartNumericKey, value: number, part: CircuitPart) {
-  const field = circuitPartNumericFields(part.kind).find(({ key: fieldKey }) => fieldKey === key);
+  const catalogField = circuitPartNumericFields(part.kind).find(({ key: fieldKey }) => fieldKey === key);
+  const field = catalogField && partNumericField(part, catalogField);
   if (!Number.isFinite(value)) { return false; }
   if (field?.min !== undefined && (field.exclusiveMin ? value <= field.min : value < field.min)) { return false; }
-  if (field?.max !== undefined && value > field.max) { return false; }
+  if (field?.max !== undefined && (field.exclusiveMax ? value >= field.max : value > field.max)) { return false; }
   return true;
 }
 
@@ -45,12 +47,13 @@ function numericError(key: CircuitPartNumericKey, draft: string | undefined, par
   if (draft.trim() === "") { return "値を入力してください。現在の値は維持されます。"; }
   const value = Number(draft);
   if (!Number.isFinite(value)) { return "有限の数値を入力してください。"; }
-  const field = circuitPartNumericFields(part.kind).find(({ key: fieldKey }) => fieldKey === key);
+  const catalogField = circuitPartNumericFields(part.kind).find(({ key: fieldKey }) => fieldKey === key);
+  const field = catalogField && partNumericField(part, catalogField);
   if (!isValidNumericValue(key, value, part)) {
     if (field?.min !== undefined && (field.exclusiveMin ? value <= field.min : value < field.min)) {
       return `${field.min}${field.exclusiveMin ? "より大きい" : "以上の"}数値を入力してください。`;
     }
-    if (field?.max !== undefined) { return `${field.max}以下の数値を入力してください。`; }
+    if (field?.max !== undefined) { return `${field.max}${field.exclusiveMax ? "より小さい" : "以下の"}数値を入力してください。`; }
     return "有効な数値を入力してください。";
   }
 }
@@ -218,7 +221,7 @@ export function CircuitPreviewPanel({
                     <strong>{(part.initiallyClosed ?? circuitPartCatalog.switch.defaults.initiallyClosed ?? false) ? "ON" : "OFF"}</strong>
                   </label>
                 )}
-                {circuitPartNumericFields(part.kind).map(({ key, label, unit, min, max, step }) =>
+                {circuitPartNumericFields(part.kind).map((field) => partNumericField(part, field)).map(({ key, label, unit, min, max, step }) =>
                   numeric(part, key, label, key === "wiperPosition" ? "0–1" : unit, min, max, step))}
               </section>
             ))}

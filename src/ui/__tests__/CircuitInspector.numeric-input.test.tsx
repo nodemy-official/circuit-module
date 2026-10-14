@@ -2,11 +2,13 @@
 import { act, useState, type Dispatch, type SetStateAction } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { circuitPartCatalog, type CircuitPart, type CircuitPartNumericKey } from "../../circuit-model.js";
+import { circuitPartCatalog, circuitPartNumericFields, type CircuitPart, type CircuitPartNumericKey } from "../../circuit-model.js";
 import { analyzeAnalogCircuit } from "../../analog-solver.js";
 import { analyzeCircuit } from "../../circuit-solver.js";
 import { createCircuitFromSpecs } from "../../__tests__/helpers/circuit-fixture.js";
 import { CircuitInspector } from "../CircuitInspector.js";
+import { CircuitPreviewPanel } from "../CircuitPreviewPanel.js";
+import { serializeCircuitDocument } from "../../circuit-serialization.js";
 
 const mounted: Array<{ root: Root; container: HTMLElement }> = [];
 beforeEach(() => vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true));
@@ -18,7 +20,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-function mount(kind: CircuitPart["kind"]) {
+function mount(kind: CircuitPart["kind"], view: "inspector" | "preview" = "inspector") {
   const initial: CircuitPart = { id: "part", kind, x: 0, y: 0, ...circuitPartCatalog[kind].defaults };
   const container = document.createElement("div");
   document.body.append(container);
@@ -29,7 +31,10 @@ function mount(kind: CircuitPart["kind"]) {
     const [part, setPart] = useState(initial);
     latest = part;
     replacePart = setPart;
-    return <CircuitInspector part={part} onChange={(_id, patch) => setPart((current) => ({ ...current, ...patch }))} />;
+    const onChange = (_id: string, patch: Partial<CircuitPart>) => setPart((current) => ({ ...current, ...patch }));
+    if (view === "inspector") { return <CircuitInspector part={part} onChange={onChange} />; }
+    const document = { title: "", parts: [part], wires: [] };
+    return <CircuitPreviewPanel document={document} analysis={analyzeCircuit(document)} onChange={onChange} onReset={() => setPart(initial)} showReadings={false} />;
   }
   act(() => root.render(<Harness />));
   mounted.push({ root, container });
@@ -37,7 +42,10 @@ function mount(kind: CircuitPart["kind"]) {
     container,
     get part() { return latest; },
     field(key: CircuitPartNumericKey) {
-      const input = container.querySelector<HTMLInputElement>(`input[data-field="${key}"]`);
+      const label = circuitPartNumericFields(kind).find((field) => field.key === key)?.label;
+      const input = container.querySelector<HTMLInputElement>(view === "inspector"
+        ? `input[data-field="${key}"]`
+        : `input[aria-label="${latest.label}の${label}"]`);
       if (!input) { throw new Error(`Missing field ${key}`); }
       act(() => input.focus());
       return input;
@@ -60,6 +68,59 @@ function inputValue(input: HTMLInputElement, value: string) {
 }
 
 describe("Inspector numeric drafts", () => {
+  describe.each(["inspector", "preview"] as const)("%s op-amp supply rails", (view) => {
+    it.each([
+      ["positiveRailVolts", -15], ["positiveRailVolts", -16],
+      ["negativeRailVolts", 15], ["negativeRailVolts", 16],
+    ] as const)("keeps %s=%s as a draft without corrupting the supply range", (key, value) => {
+      const ui = mount("op-amp", view);
+      const input = ui.field(key);
+      const previous = ui.part[key];
+      inputValue(input, String(value));
+
+      expect(input.value).toBe(String(value));
+      expect(ui.part[key]).toBe(previous);
+      expect(() => serializeCircuitDocument({ title: "", parts: [ui.part], wires: [] })).not.toThrow();
+      act(() => input.blur());
+      expect(input.value).toBe(String(previous));
+    });
+
+    it("allows both rails to move across zero in a valid order", () => {
+      const ui = mount("op-amp", view);
+      inputValue(ui.field("negativeRailVolts"), "-10");
+      inputValue(ui.field("positiveRailVolts"), "-5");
+      expect(ui.part).toMatchObject({ negativeRailVolts: -10, positiveRailVolts: -5 });
+      inputValue(ui.field("positiveRailVolts"), "20");
+      inputValue(ui.field("negativeRailVolts"), "10");
+      expect(ui.part).toMatchObject({ negativeRailVolts: 10, positiveRailVolts: 20 });
+      expect(() => serializeCircuitDocument({ title: "", parts: [ui.part], wires: [] })).not.toThrow();
+    });
+
+    it("uses default bounds when the opposite supply rail is omitted", () => {
+      const ui = mount("op-amp", view);
+      const part = { ...ui.part };
+      Reflect.deleteProperty(part, "positiveRailVolts");
+      Reflect.deleteProperty(part, "negativeRailVolts");
+      ui.replace(part);
+      inputValue(ui.field("positiveRailVolts"), "-15");
+      inputValue(ui.field("negativeRailVolts"), "15");
+      expect(ui.part.positiveRailVolts).toBeUndefined();
+      expect(ui.part.negativeRailVolts).toBeUndefined();
+      expect(() => serializeCircuitDocument({ title: "", parts: [ui.part], wires: [] })).not.toThrow();
+    });
+
+    it("accepts distinct subnormal rails without treating their separation as zero", () => {
+      const ui = mount("op-amp", view);
+      inputValue(ui.field("negativeRailVolts"), String(-Number.MIN_VALUE));
+      inputValue(ui.field("positiveRailVolts"), "0");
+      expect(ui.part).toMatchObject({ negativeRailVolts: -Number.MIN_VALUE, positiveRailVolts: 0 });
+      inputValue(ui.field("positiveRailVolts"), String(Number.MIN_VALUE));
+      inputValue(ui.field("negativeRailVolts"), "0");
+      expect(ui.part).toMatchObject({ negativeRailVolts: 0, positiveRailVolts: Number.MIN_VALUE });
+      expect(() => serializeCircuitDocument({ title: "", parts: [ui.part], wires: [] })).not.toThrow();
+    });
+  });
+
   it("shows the analyzed default switch state instead of a phantom Proxy value", () => {
     const document = createCircuitFromSpecs([
       ["source", "battery", ["s", "0"], { voltageVolts: 9 }],

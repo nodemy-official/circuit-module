@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { GRID } from "../../circuit-geometry.js";
 import type { CircuitDocument } from "../../circuit-model.js";
-import { closestWirePoint, connectionTargetAt } from "../connection-target.js";
+import { closestWirePoint, connectionTargetAt, wireMidpoint } from "../connection-target.js";
 
 const empty: CircuitDocument = { title: "", parts: [], wires: [] };
 
@@ -62,5 +62,13 @@ describe("connection target snapping", () => {
     const target = connectionTargetAt(empty, new Map(), { x: 7.2, y: -2.7 }, 0.5);
 
     expect(target).toEqual({ point: { x: 7, y: -3 } });
+  });
+
+  it.each([
+    { route: [{ x: 0.25, y: 0.25 }, { x: 6.25, y: 0.25 }], expected: { x: 3, y: 0.25 } },
+    { route: [{ x: -0.25, y: -6.25 }, { x: -0.25, y: -0.25 }], expected: { x: -0.25, y: -3 } },
+    { route: [{ x: 0.1, y: 0.25 }, { x: 0.2, y: 0.25 }], expected: { x: 0.1, y: 0.25 } },
+  ])("keeps a keyboard landing point on a fractional wire ($route)", ({ route, expected }) => {
+    expect(wireMidpoint(route)).toEqual(expected);
   });
 });

@@ -7,11 +7,12 @@ interface NumericInputOptions {
   min?: number;
   max?: number;
   exclusiveMin?: boolean;
+  exclusiveMax?: boolean;
   integer?: boolean;
 }
 
 /** Keep incomplete native number input text without putting invalid values into the model. */
-export function useNumericDraft({ value, onValueChange, min, max, exclusiveMin, integer }: NumericInputOptions) {
+export function useNumericDraft({ value, onValueChange, min, max, exclusiveMin, exclusiveMax, integer }: NumericInputOptions) {
   const [text, setText] = useState(String(value));
   const emittedValue = useRef(value);
   useEffect(() => {
@@ -24,7 +25,7 @@ export function useNumericDraft({ value, onValueChange, min, max, exclusiveMin, 
   const change = (nextText: string) => {
     setText(nextText);
     const next = nextText.trim() === "" ? Number.NaN : Number(nextText);
-    const parsed = circuitNumericValueSchema({ min, max, exclusiveMin, integer }).safeParse(next);
+    const parsed = circuitNumericValueSchema({ min, max, exclusiveMin, exclusiveMax, integer }).safeParse(next);
     if (!parsed.success) { return; }
     emittedValue.current = parsed.data;
     if (!Object.is(parsed.data, value)) { onValueChange(parsed.data); }
@@ -44,9 +45,9 @@ type NumericInputProps = Omit<ComponentPropsWithoutRef<"input">,
   "type" | "value" | "defaultValue" | "onChange" | "min" | "max"> & NumericInputOptions;
 
 export function NumericInput({
-  value, onValueChange, min, max, exclusiveMin, integer, onBlur, onKeyDown, ...props
+  value, onValueChange, min, max, exclusiveMin, exclusiveMax, integer, onBlur, onKeyDown, ...props
 }: NumericInputProps) {
-  const draft = useNumericDraft({ value, onValueChange, min, max, exclusiveMin, integer });
+  const draft = useNumericDraft({ value, onValueChange, min, max, exclusiveMin, exclusiveMax, integer });
   return <input {...props} type="number" min={min} max={max} value={draft.text}
     onChange={(event) => draft.change(event.currentTarget.value)}
     onBlur={(event) => { draft.restore(); onBlur?.(event); }}

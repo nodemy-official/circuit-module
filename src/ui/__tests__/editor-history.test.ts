@@ -54,6 +54,26 @@ describe("editorHistoryReducer", () => {
     expect(editorHistoryReducer(state, { type: "cancel-group", group: "drag:part-2" })).toBe(state);
   });
 
+  it("restores all 100 undo steps when canceling a drag at the history limit", () => {
+    let state = history(document("doc-0"));
+    for (let index = 1; index <= 102; index += 1) {
+      state = editorHistoryReducer(state, { type: "edit", document: document(`doc-${index}`) });
+    }
+    const original = state;
+
+    state = editorHistoryReducer(state, { type: "edit", document: document("drag-1"), group: "drag:part-1" });
+    state = editorHistoryReducer(state, { type: "edit", document: document("drag-2"), group: "drag:part-1" });
+    state = editorHistoryReducer(state, { type: "cancel-group", group: "drag:part-1" });
+
+    expect(state.past).toEqual(original.past);
+    expect(state.present).toBe(original.present);
+    expect(state.future).toEqual(original.future);
+    for (let index = 0; index < 100; index += 1) {
+      state = editorHistoryReducer(state, { type: "undo" });
+    }
+    expect(state.present.title).toBe("doc-2");
+  });
+
   it("keeps a completed drag as one undo step", () => {
     const start = document("start");
     const firstMove = document("first move");

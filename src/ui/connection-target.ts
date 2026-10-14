@@ -70,7 +70,7 @@ export function wireMidpoint(route: readonly Point[]): Point {
     const length = Math.hypot(to.x - from.x, to.y - from.y);
     if (length > longest) {
       longest = length;
-      point = { x: Math.round((from.x + to.x) / 2), y: Math.round((from.y + to.y) / 2) };
+      point = closestWirePoint([from, to], { x: (from.x + to.x) / 2, y: (from.y + to.y) / 2 }) ?? from;
     }
   }
   return point;

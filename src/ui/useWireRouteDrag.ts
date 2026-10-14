@@ -153,10 +153,10 @@ export function useWireRouteDrag(options: WireRouteDragOptions) {
     return true;
   }, [cancel]);
 
-  const finish = useCallback((event: PointerEvent<SVGSVGElement>) => {
+  const finish = useCallback((event?: PointerEvent<SVGSVGElement>) => {
     const drag = dragRef.current;
-    if (!drag || drag.pointerId !== event.pointerId) { return false; }
-    if (event.type === "pointercancel" || (drag.changed && drag.coordinate === drag.lastCoordinate)) { return cancel(); }
+    if (!drag || (event && drag.pointerId !== event.pointerId)) { return false; }
+    if (event?.type === "pointercancel" || (drag.changed && drag.coordinate === drag.lastCoordinate)) { return cancel(); }
     dragRef.current = null;
     setDraggingWireId(null);
     const current = latest.current;

@@ -152,6 +152,53 @@ function pointerDrag(
 }
 
 describe("Circuit wiring interactions", () => {
+  it.each(["part", "wire"])("ends the active %s drag before Undo and ignores its later pointer events", (kind) => {
+    const initial = fixture(true);
+    const ui = mount(initial);
+    const surface = required(ui.container, ".circuit-board__surface");
+    if (kind === "wire") { click(required(ui.container, '[data-wire-id="wire-1"]')); }
+    const world = kind === "part" ? battery : longestRouteMidpoint(initial, "wire-1");
+    const from = screenPointForWorld(ui.container, { x: world.x * GRID, y: world.y * GRID });
+    const to = screenPointForWorld(ui.container, { x: world.x * GRID, y: (world.y + 2) * GRID });
+    const later = screenPointForWorld(ui.container, { x: world.x * GRID, y: (world.y + 3) * GRID });
+    const target = required(ui.container, kind === "part"
+      ? '.circuit-board__part[data-part-id="battery"]'
+      : '[data-wire-id="wire-1"][data-segment-index="0"]');
+    pointer(target, "pointerdown", from, 91);
+    pointer(surface, "pointermove", to, 91);
+    const moved = ui.editor.document;
+    expect(moved).not.toEqual(initial);
+    act(() => surface.dispatchEvent(new KeyboardEvent("keydown", { key: "z", ctrlKey: true, bubbles: true, cancelable: true })));
+    expect(ui.editor.document).toEqual(initial);
+
+    pointer(surface, "pointermove", later, 91);
+    pointer(surface, "pointerup", later, 91);
+    expect(ui.editor.document).toEqual(initial);
+    act(() => ui.editor.redo());
+    expect(ui.editor.document).toEqual(moved);
+  });
+
+  it("splits a fractional wire when connecting to it with the keyboard", () => {
+    const initial: CircuitDocument = {
+      title: "",
+      parts: [
+        { id: "left", kind: "junction", x: 0.25, y: 0.25, label: "左" },
+        { id: "right", kind: "junction", x: 6.25, y: 0.25, label: "右" },
+        { id: "source", kind: "junction", x: 3, y: 4, label: "分岐元" },
+      ],
+      wires: [{ id: "wire-1", from: { partId: "left", terminal: "a" }, to: { partId: "right", terminal: "a" } }],
+    };
+    const ui = mount(initial);
+    clickTerminal(ui.container, "source");
+    keyDown(required(ui.container, '[data-wire-id="wire-1"]'), "Enter");
+
+    expect(ui.editor.document.wires).toHaveLength(3);
+    expect(ui.editor.document.parts.at(-1)).toMatchObject({ kind: "junction", x: 3, y: 0.25 });
+    expect(ui.editor.document.wires.filter((wire) => wire.from.partId === "left" || wire.to.partId === "right")).toHaveLength(2);
+    act(() => ui.editor.undo());
+    expect(ui.editor.document).toEqual(initial);
+  });
+
   it("preserves the full movement when pointer updates arrive before the next render", () => {
     const ui = mount(fixture());
     const surface = required(ui.container, ".circuit-board__surface");
