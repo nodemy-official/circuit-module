@@ -287,7 +287,20 @@ export function moveWireSegment(
   }
 
   moved.push(...route.slice(segmentIndex + 2).map((point) => ({ ...point })));
-  return simplify(moved);
+  return restoreMovedTerminalLeads(moved, start, end);
+}
+
+function restoreMovedTerminalLeads(route: readonly Point[], start?: RouteEnd, end?: RouteEnd): Point[] {
+  const simplified = simplifyManualRoute(route);
+  if (!start?.direction && !end?.direction) { return simplified; }
+  // Moving the bend next to a simplified terminal lead can pull that lead backwards. Use the
+  // same terminal-aware routing as persisted waypoints so the preview keeps its outward stubs
+  // and does not change shape when the edited route is saved.
+  return routeThroughWaypoints(
+    start ?? { point: route[0] as Point, direction: null },
+    end ?? { point: route.at(-1) as Point, direction: null },
+    simplified.slice(1, -1),
+  );
 }
 
 interface RouteNode {
@@ -676,6 +689,16 @@ function appendRoute(target: Point[], points: readonly Point[]) {
   }
 }
 
+function approachStubWaypoint(firstStub: Point, target: Point, continuation: Point, offset: Point): Point[] {
+  const sign = (continuation.x - target.x) * offset.x + (continuation.y - target.y) * offset.y > 0 ? -1 : 1;
+  const approachOffset = { x: sign * offset.x, y: sign * offset.y };
+  return [
+    { x: firstStub.x + approachOffset.x, y: firstStub.y + approachOffset.y },
+    { x: target.x + approachOffset.x, y: target.y + approachOffset.y },
+    target,
+  ];
+}
+
 function terminalLead(start: RouteEnd, target: Point, continuation: Point): Point[] {
   if (!start.direction) { return routeWire(start, { point: target, direction: null }); }
   const firstStub = stub(start);
@@ -695,6 +718,13 @@ function terminalLead(start: RouteEnd, target: Point, continuation: Point): Poin
       { point: firstStub, direction: null },
       { point: target, direction: null },
     ).slice(1));
+    return simplifyManualRoute(lead);
+  }
+
+  if (progress > 0 && perpendicularDistance === 0) {
+    // Fractional waypoints may lie within the outward stub. Approach them perpendicular to
+    // the stub so the lead is not retraced on the way back to the waypoint.
+    appendRoute(lead, approachStubWaypoint(firstStub, target, continuation, offset));
     return simplifyManualRoute(lead);
   }
 
@@ -876,12 +906,18 @@ export function contentBounds(document: CircuitDocument): GridRect | null {
   };
 }
 
-/** Board size in cells: the minimum sheet, grown to keep room around the content. */
+/**
+ * Sheet dimensions in cells, enclosing the origin and content bounds with the existing
+ * total padding of 8 columns and 6 rows, and at least MIN_BOARD. These dimensions do
+ * not set a viewport origin; use contentBounds to position content at negative coordinates.
+ */
 export function boardSize(document: CircuitDocument) {
   const bounds = contentBounds(document);
+  const width = bounds ? Math.max(0, bounds.maxX) - Math.min(0, bounds.minX) : 0;
+  const height = bounds ? Math.max(0, bounds.maxY) - Math.min(0, bounds.minY) : 0;
   return {
-    columns: Math.max(MIN_BOARD.columns, (bounds?.maxX ?? 0) + 8),
-    rows: Math.max(MIN_BOARD.rows, (bounds?.maxY ?? 0) + 6),
+    columns: Math.max(MIN_BOARD.columns, width + 8),
+    rows: Math.max(MIN_BOARD.rows, height + 6),
   };
 }
 

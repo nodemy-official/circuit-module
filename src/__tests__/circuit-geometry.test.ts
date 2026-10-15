@@ -2,11 +2,13 @@ import { describe, expect, it } from "vitest";
 
 import { setWireWaypoints } from "../circuit-edit.js";
 import {
+  boardSize,
   compactWireRouteWaypoints,
   contentBounds,
   footprint,
   localTerminalOffset,
   moveWireSegment,
+  rotate,
   routeWire,
   routeDocumentWires,
   routeEnd,
@@ -225,6 +227,46 @@ describe("manual wire routing", () => {
   const isOrthogonal = (route: readonly Point[]) => route.every((first, index) => {
     const second = route[index + 1];
     return !second || first.x === second.x || first.y === second.y;
+  });
+
+  it.each(([0, 90, 180, 270] as CircuitRotation[]).flatMap((rotation) =>
+    [false, true].flatMap((reversed) => [-1, 0, 0.5, 1].map((progress) => ({ rotation, reversed, progress }))),
+  ))("preserves outward terminal leads when moving adjacent segments at $rotation degrees (reversed=$reversed, progress=$progress)", ({ rotation, reversed, progress }) => {
+    const sourcePosition = rotate({ x: -2, y: 0 }, rotation);
+    const targetPosition = rotate({ x: 10, y: 5 }, rotation);
+    const source: CircuitPart = { id: "source", kind: "resistor", x: sourcePosition.x + 10, y: sourcePosition.y + 10, rotation, label: "source" };
+    const target: CircuitPart = { id: "target", kind: "junction", x: targetPosition.x + 10, y: targetPosition.y + 10, label: "target" };
+    const sourceEndpoint = { partId: source.id, terminal: "b" as const };
+    const targetEndpoint = { partId: target.id, terminal: "a" as const };
+    const document: CircuitDocument = { title: "shortened terminal lead", parts: [source, target], wires: [{
+      id: "wire",
+      from: reversed ? targetEndpoint : sourceEndpoint,
+      to: reversed ? sourceEndpoint : targetEndpoint,
+    }] };
+    const start = routeEnd(reversed ? target : source, reversed ? "a" : "b");
+    const end = routeEnd(reversed ? source : target, reversed ? "b" : "a");
+    const route = routeDocumentWires(document).get("wire")!;
+    const direction = terminalDirection(source, "b")!;
+    const terminal = terminalPoint(source, "b");
+    const coordinate = direction.x ? terminal.x + progress * direction.x : terminal.y + progress * direction.y;
+    const segmentIndex = reversed ? route.length - 3 : 1;
+    const moved = moveWireSegment(route, segmentIndex, coordinate, start, end);
+    const neighbor = (reversed ? moved.at(-2) : moved[1])!;
+
+    expect(moved[0]).toEqual(start.point);
+    expect(moved.at(-1)).toEqual(end.point);
+    expect(isOrthogonal(moved)).toBe(true);
+    expect((neighbor.x - terminal.x) * direction.x + (neighbor.y - terminal.y) * direction.y).toBeGreaterThan(0);
+    expect(segmentsOverlap(reversed ? moved.slice(0, -1) : moved.slice(1), [
+      terminal,
+      { x: terminal.x + direction.x, y: terminal.y + direction.y },
+    ])).toBe(false);
+
+    const stored = setWireWaypoints(document, "wire", compactWireRouteWaypoints(moved, start, end));
+    if (!stored.ok) { throw new Error(stored.reason); }
+    const restored = parseCircuitDocument(serializeCircuitDocument(stored.document));
+    if (!restored.ok) { throw new Error(restored.reason); }
+    expect(routeDocumentWires(restored.document).get("wire")).toEqual(moved);
   });
 
   it.each([
@@ -477,5 +519,52 @@ describe("multi-terminal part geometry", () => {
     expect(footprint(part("op-amp", 90))).toEqual({ minX: 8, minY: 8, maxX: 12, maxY: 12 });
     expect(footprint(part("ground"))).toEqual({ minX: 9, minY: 8, maxX: 11, maxY: 11 });
     expect(footprint(part("ground", 90))).toEqual({ minX: 9, minY: 9, maxX: 12, maxY: 11 });
+  });
+});
+
+describe("board dimensions", () => {
+  it.each([
+    { name: "empty document", points: [], expected: { columns: 48, rows: 28 } },
+    { name: "content within the minimum sheet", points: [{ x: 0, y: 0 }, { x: 10, y: 5 }], expected: { columns: 48, rows: 28 } },
+    { name: "positive coordinates", points: [{ x: 20, y: 10 }, { x: 100, y: 80 }], expected: { columns: 108, rows: 86 } },
+    { name: "negative coordinates", points: [{ x: -100, y: -80 }, { x: -1, y: -1 }], expected: { columns: 108, rows: 86 } },
+    { name: "coordinates across the origin", points: [{ x: -100, y: -80 }, { x: 100, y: 80 }], expected: { columns: 208, rows: 166 } },
+    { name: "wide mixed coordinates", points: [{ x: -1_000_000, y: -1_000_000 }, { x: 1_000_000, y: 1_000_000 }], expected: { columns: 2_000_008, rows: 2_000_006 } },
+  ])("fits $name with the existing minimum and cell padding", ({ points, expected }) => {
+    const document: CircuitDocument = {
+      title: "board dimensions",
+      parts: points.map((point, index) => ({ id: `part-${index}`, kind: "junction", label: "", ...point })),
+      wires: [],
+    };
+    expect(boardSize(document)).toEqual(expected);
+  });
+
+  it("includes the full part footprints across the origin", () => {
+    const document: CircuitDocument = {
+      title: "part footprints",
+      parts: [
+        { id: "left", kind: "resistor", label: "", x: -100, y: -80 },
+        { id: "right", kind: "resistor", label: "", x: 100, y: 80 },
+      ],
+      wires: [],
+    };
+    expect(boardSize(document)).toEqual({ columns: 212, rows: 168 });
+  });
+
+  it("includes manual route points outside the part footprints", () => {
+    const document: CircuitDocument = {
+      title: "manual route dimensions",
+      parts: [
+        { id: "left", kind: "junction", label: "", x: 0, y: 0 },
+        { id: "right", kind: "junction", label: "", x: 10, y: 0 },
+      ],
+      wires: [{
+        id: "wire",
+        from: { partId: "left", terminal: "a" },
+        to: { partId: "right", terminal: "a" },
+        waypoints: [{ x: -100, y: 0 }, { x: -100, y: -80 }, { x: 100, y: -80 }, { x: 100, y: 80 }, { x: 10, y: 80 }],
+      }],
+    };
+    expect(boardSize(document)).toEqual({ columns: 208, rows: 166 });
   });
 });

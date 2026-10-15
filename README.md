@@ -147,6 +147,8 @@ export function Workbench() {
 
 選択した導線は線上、または四角い区間ハンドルをドラッグして経路を調整できます。水平区間は上下、垂直区間は左右へ動き、区間ハンドルを選ぶと矢印キーでも調整できます。Shift + 矢印キーは5マス移動し、Escで経路ドラッグを取り消せます。手動経路はJSON保存に含まれ、Inspectorの「自動配線に戻す」で自動ルートへ戻せます。導線を選ぶとInspectorにも操作方法が表示されます。
 
+部品や導線のドラッグ中に選択・コピー・切り取り・貼り付け・複製・Undo/Redoのショートカットを使うと、その時点の移動を確定してからコマンドを実行します。押下を続けたままポインターを動かしても、新しい選択へ移動を適用しません。
+
 独自UIで導線経路を管理する場合、`CircuitBoard` の `onWireRouteChange(id, waypoints?)` で更新を保存し、`onWireRouteCancel(id)` で取消時に変更を戻し、`onWireRouteEnd()` でドラッグを確定します。`useCircuitEditor` controller の `updateWireRoute`、`cancelWireRoute`、`resetWireRoute` はこの流れを扱います。`CircuitInspector` の `onResetWireRoute` は選択中の手動経路を自動配線へ戻し、`onReconnect` と `wireEndpoints` は再接続操作とボタンの端子名を設定します。`onBlur={editor.endEdit}` は値の連続編集を一操作にまとめます。解析は `editor.analysis` から参照し、失敗理由は `editor.error` に表示できます。
 
 `CircuitEditor` の `children` は通常の `ReactNode` でも、`(editor) => ReactNode` の render prop でも構いません。render prop を使わず子孫から状態を読む場合は `useCircuitEditorContext()` を使えます。`initialDocument` は初期値、`onDocumentChange` は変更通知です。controller が持つ `document`、`selection`、`pendingEndpoint`、`pendingWire`、`analysis`、`error` と、追加・選択・接続・つなぎ替え・移動・回転・削除・Undo/Redo などの操作を組み合わせてください。provider を使わず hook を直接使いたい場合は、従来どおり `useCircuitEditor(initialDocument?)` を利用できます。
@@ -283,6 +285,8 @@ npm run storybook
 ### 回路ファイル、診断、複数選択
 
 コア API から回路を版付き JSON に保存し、読み込めます。読み込みは JSON の形・部品種別・数値・端子参照を検証して新しい `CircuitDocument` を返します。以前の `CircuitDocument` をそのまま JSON 化した形式も読み込めます。外部データを使うときは `parseCircuitDocument` の結果を確認してから利用してください。
+
+保存は解析と同じ own data property の値を使い、非列挙の属性や配列要素も保持します。Proxy の `get` や配列の iterator が返す見かけの値は保存しません。保存対象の属性や配列要素に getter/setter がある場合は実行せず拒否し、保存対象外の属性は getter を含めて無視します。
 
 ```ts
 import {

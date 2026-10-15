@@ -72,6 +72,39 @@ function button(container: ParentNode, label: string) {
 }
 
 describe("selection and reuse", () => {
+  it.each(["a", "c", "x", "v", "d", "z", "y"].flatMap((key) =>
+    ["ctrlKey", "metaKey"].map((modifier) => ({ key, modifier })),
+  ))("prevents the native action for a held $modifier+$key without repeating the command", ({ key, modifier }) => {
+    const ui = mount();
+    act(() => {
+      ui.editor.setTitle("changed");
+      ui.editor.endEdit();
+      ui.editor.setTitle("redo");
+      ui.editor.undo();
+      ui.editor.selectPart("part-2");
+      ui.editor.copySelected();
+    });
+    const document = ui.editor.document;
+    const selection = ui.editor.selection;
+    const event = command(ui.container, key, { ctrlKey: false, [modifier]: true, repeat: true });
+
+    expect(event.defaultPrevented).toBe(true);
+    expect(ui.editor.document).toBe(document);
+    expect(ui.editor.selection).toEqual(selection);
+    expect(ui.editor.canUndo).toBe(true);
+    expect(ui.editor.canRedo).toBe(true);
+  });
+
+  it("preserves native repeated text, browser, and Alt-modified shortcuts", () => {
+    const ui = mount();
+    const title = required(ui.container, 'input[aria-label="回路名"]');
+    const document = ui.editor.document;
+    expect(command(title, "z", { repeat: true }).defaultPrevented).toBe(false);
+    expect(command(ui.container, "l", { repeat: true }).defaultPrevented).toBe(false);
+    expect(command(ui.container, "d", { altKey: true, repeat: true }).defaultPrevented).toBe(false);
+    expect(ui.editor.document).toBe(document);
+  });
+
   it("copies a multi-selection with its internal wires, assigns fresh IDs and labels, and undoes the paste", () => {
     const ui = mount();
     click(part(ui.container, "part-2"));

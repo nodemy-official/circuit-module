@@ -4,6 +4,7 @@ import { GRID, pathData, terminalPoint, type Point } from "../circuit-geometry.j
 import type { CircuitDocument } from "../circuit-model.js";
 import type { CircuitAnalysis } from "../circuit-solver.js";
 import { circuitEndpointKey, circuitNodes, circuitPotential, circuitPotentialColor, defaultReferenceNode, formatCircuitQuantity, type CircuitNodeCurrent } from "../circuit-visualization.js";
+import { NumericInput } from "./NumericInput.js";
 
 export function useCircuitPotentialView(document: CircuitDocument, analysis?: CircuitAnalysis, available = true) {
   const [enabled, setEnabled] = useState(false);
@@ -50,11 +51,14 @@ function PotentialDetails({ view }: { view: PotentialView }) {
       <label htmlFor={`${id}-selected`}>測定点（赤プローブ）</label>
       <select id={`${id}-selected`} value={selected?.id ?? ""} onChange={(event) => view.setSelectedId(event.target.value)}>{nodes.map((node) => <option key={node.id} value={node.id}>{node.label}</option>)}</select>
       <label htmlFor={`${id}-scale`}>色の上限 (V)</label>
-      <input id={`${id}-scale`} type="number" min="0.000001" step="any" value={view.scale} onChange={(event) => { if (event.target.valueAsNumber > 0 && Number.isFinite(event.target.valueAsNumber)) { view.setScale(event.target.valueAsNumber); } }} />
+      <NumericInput id={`${id}-scale`} min={0} exclusiveMin step="any" value={view.scale} onValueChange={view.setScale} />
     </div>
     <output className="circuit-potential__difference" aria-live="polite">測定点 − 基準点：{potential ? `${formatCircuitQuantity(potential.volts, "V")}${ac && potential.volts !== 0 ? ` ∠${Number(potential.phaseDegrees.toFixed(1))}°` : ""}` : "基準を共有しないため測定できません"}</output>
     <section className="circuit-potential__legend" aria-label="電位の色の凡例">
-      {(ac ? [0, view.scale / 2, view.scale] : [-view.scale, 0, view.scale]).map((value) => <span key={value}><i style={{ backgroundColor: circuitPotentialColor(value, view.scale) }} />{formatCircuitQuantity(value, "V")}</span>)}
+      {(ac ? [0, 0.5, 1] : [-1, 0, 1]).map((fraction) => {
+        const value = fraction * view.scale;
+        return <span key={fraction}><i style={{ backgroundColor: circuitPotentialColor(value, view.scale) }} />{formatCircuitQuantity(value, "V")}</span>;
+      })}
     </section>
     <p>色の尺度は固定です。上限を超えた値は同じ色になり、数値で確認できます。基準を共有しない部分は着色しません。</p>
     <h3>測定点につながる電流</h3>

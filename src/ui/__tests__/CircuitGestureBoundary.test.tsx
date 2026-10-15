@@ -66,6 +66,27 @@ function finish(ui: EditorHarness, origin: Point) {
 }
 
 describe("document gesture boundaries", () => {
+  it.each(["part", "wire"] as const)("finishes %s before a selection or clipboard shortcut", (gesture) => {
+    for (const key of ["a", "c"] as const) {
+      const ui = mount(fixture());
+      const origin = start(ui, gesture, true);
+      const committed = ui.editor.exportDocument();
+      act(() => required(ui.container, ".circuit-board__surface").dispatchEvent(new KeyboardEvent("keydown", {
+        key, ctrlKey: true, bubbles: true, cancelable: true,
+      })));
+      const selection = ui.editor.selection;
+      finish(ui, origin);
+
+      expect(ui.editor.exportDocument()).toBe(committed);
+      expect(ui.editor.selection).toEqual(selection);
+      act(() => ui.editor.undo());
+      expect(ui.editor.document).toEqual(fixture());
+      expect(ui.editor.canUndo).toBe(false);
+      act(() => ui.editor.redo());
+      expect(ui.editor.exportDocument()).toBe(committed);
+    }
+  });
+
   it.each(gestures.flatMap((gesture) => [false, true].flatMap((moved) => [false, true].map((batched) => ({ gesture, moved, batched })))))
   ("discards $gesture after import (moved=$moved, batched=$batched)", ({ gesture, moved, batched }) => {
     const ui = mount(fixture());

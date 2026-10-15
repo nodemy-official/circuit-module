@@ -95,7 +95,7 @@ function handleFileKeyDown(event: KeyboardEvent<HTMLElement>, files: ReturnType<
 
 function handleCommandKeyDown(event: KeyboardEvent<HTMLElement>, editor: EditorContext) {
   if (!event.ctrlKey && !event.metaKey) { return false; }
-  if (event.altKey || event.repeat) { return true; }
+  if (event.altKey) { return true; }
   const key = event.key.toLowerCase();
   const commands: Record<string, () => void> = {
     a: editor.selectAll,
@@ -109,7 +109,7 @@ function handleCommandKeyDown(event: KeyboardEvent<HTMLElement>, editor: EditorC
   const command = commands[key];
   if (command) {
     event.preventDefault();
-    command();
+    if (!event.repeat) { command(); }
   }
   return true;
 }

@@ -1,5 +1,5 @@
 import { circuitPartCatalog, endpointName, terminalsOf, type CircuitDocument, type CircuitEndpoint, type CircuitPart, type CircuitTerminal } from "./circuit-model.js";
-import { complex, complexAdd, complexDivide, complexFromPolar, complexMagnitude, complexMultiply, complexPhaseDegrees, complexSubtract } from "./analog-math.js";
+import { complex, complexAdd, complexDivide, complexFromPolar, complexMagnitude, complexMultiply, complexPhaseDegrees, complexSubtract, exactProductQuotient } from "./analog-math.js";
 import {
   circuitEndpointsConnected,
   connectCircuitEndpoints,
@@ -920,7 +920,13 @@ export function circuitPotential(
 }
 
 export function circuitPotentialColor(volts: number, scale: number) {
-  const amount = Math.min(1, Math.abs(volts) / Math.max(scale, 1e-12));
+  const upper = scale > 0 ? scale : Math.max(scale, 1e-12);
+  const magnitude = Math.abs(volts);
+  const ratio = finite(magnitude) && finite(upper)
+    ? exactProductQuotient([magnitude], upper)
+    : magnitude / upper;
+  // Color percentages are the display boundary; every positive finite scale uses the same ratio.
+  const amount = Math.min(1, ratio);
   return `hsl(${volts < 0 ? 218 : 18} ${Math.round(amount * 80)}% ${Math.round(55 - amount * 12)}%)`;
 }
 

@@ -11,6 +11,12 @@ interface Snapshot {
 }
 type BaselineOverride = Snapshot | null | undefined;
 
+interface SnapshotFailure {
+  document: CircuitDocument;
+  analysis: CircuitAnalysis;
+  message: string;
+}
+
 export interface CircuitComparisonPanelProps {
   document: CircuitDocument;
   analysis: CircuitAnalysis;
@@ -53,6 +59,33 @@ function cloneAnalysis(analysis: CircuitAnalysis): CircuitAnalysis {
 
 function snapshot(document: CircuitDocument, analysis: CircuitAnalysis): Snapshot {
   return { document: cloneDocument(document), analysis: cloneAnalysis(analysis) };
+}
+
+function useBaselineSnapshot(document: CircuitDocument, analysis: CircuitAnalysis) {
+  const [baselineOverride, setBaselineOverride] = useState<BaselineOverride>(undefined);
+  const [failure, setFailure] = useState<SnapshotFailure | null>(null);
+  if (failure && (failure.document !== document || failure.analysis !== analysis)) {
+    setFailure(null);
+  }
+  const capture = () => {
+    try {
+      const next = snapshot(document, analysis);
+      setBaselineOverride(next);
+      setFailure(null);
+    } catch (error) {
+      const detail = error instanceof Error ? ` ${error.message}` : "";
+      setFailure({ document, analysis, message: `比較の基準を保存できませんでした。${detail}` });
+    }
+  };
+  const clear = () => {
+    setBaselineOverride(null);
+    setFailure(null);
+  };
+  return { baselineOverride, capture, clear, error: failure?.message };
+}
+
+function SnapshotErrorNotice({ message }: { message?: string }) {
+  return message ? <p className="circuit-comparison__notice" role="alert">{message}</p> : null;
 }
 
 function isFiniteValue(value: unknown): value is number {
@@ -319,7 +352,7 @@ export function CircuitComparisonPanel({
   baselineAnalysis,
 }: CircuitComparisonPanelProps) {
   const id = useId();
-  const [baselineOverride, setBaselineOverride] = useState<BaselineOverride>(undefined);
+  const { baselineOverride, capture, clear, error } = useBaselineSnapshot(document, analysis);
   const externalBaseline = baselineDocument && baselineAnalysis
     ? { document: baselineDocument, analysis: baselineAnalysis }
     : undefined;
@@ -339,10 +372,11 @@ export function CircuitComparisonPanel({
     <details className="circuit-comparison" data-comparison-state={!baseline ? "no-baseline" : reason ? "unavailable" : "ready"}>
       <summary>部品値変更の影響を比較</summary>
       <div className="circuit-comparison__content">
+        <SnapshotErrorNotice message={error} />
         {!baseline ? (
           <div className="circuit-comparison__empty">
             <p>変更前の回路と解析を基準として保存すると、部品ごとの差分を表示できます。</p>
-            <button type="button" onClick={() => setBaselineOverride(snapshot(document, analysis))}>
+            <button type="button" onClick={capture}>
               現在を比較の基準にする
             </button>
           </div>
@@ -351,10 +385,10 @@ export function CircuitComparisonPanel({
             <div className="circuit-comparison__toolbar">
               <p className="circuit-comparison__baseline">基準: {baselineLabel(baseline)}</p>
               <div className="circuit-comparison__actions">
-                <button type="button" onClick={() => setBaselineOverride(snapshot(document, analysis))}>
+                <button type="button" onClick={capture}>
                   基準を現在に更新
                 </button>
-                <button type="button" onClick={() => setBaselineOverride(null)}>
+                <button type="button" onClick={clear}>
                   基準を解除
                 </button>
               </div>

@@ -54,6 +54,45 @@ function checkString(value: unknown, description: string, allowEmpty: boolean): 
 const allNumericKeys = new Set<CircuitPartNumericKey>(
   circuitPartKinds.flatMap((kind) => circuitPartNumericFields(kind).map(({ key }) => key)),
 );
+const savedPartKeys = ["id", "kind", "x", "y", "label", "rotation", "initiallyClosed", ...allNumericKeys];
+
+/** Capture only persisted own data fields; unknown getters and Proxy get traps never run. */
+function snapshotSavedRecord(value: unknown, keys: readonly string[]): Record<string, unknown> | null {
+  try {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) { return null; }
+    const entries: [string, unknown][] = [];
+    for (const key of keys) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (descriptor && !Object.hasOwn(descriptor, "value")) { return null; }
+      // Include missing fields as undefined so inherited values cannot fill them.
+      entries.push([key, descriptor?.value]);
+    }
+    return Object.fromEntries(entries);
+  } catch {
+    return null;
+  }
+}
+
+/** Read array length and indexes directly so caller iterators and indexed accessors cannot run. */
+function snapshotSavedArray(value: unknown, max: number, arrayError: string, limitError: string): { values?: unknown[]; reason?: string } {
+  try {
+    if (!Array.isArray(value)) { return { reason: arrayError }; }
+    const lengthDescriptor = Object.getOwnPropertyDescriptor(value, "length");
+    const length: unknown = lengthDescriptor && Object.hasOwn(lengthDescriptor, "value") ? lengthDescriptor.value : undefined;
+    if (typeof length !== "number" || !Number.isInteger(length) || length < 0) { return { reason: arrayError }; }
+    if (length > max) { return { reason: limitError }; }
+    const values: unknown[] = [];
+    for (let index = 0; index < length; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+      if (!descriptor || !Object.hasOwn(descriptor, "value")) { return { reason: arrayError }; }
+      values.push(descriptor.value);
+    }
+    return { values };
+  } catch {
+    return { reason: arrayError };
+  }
+}
+
 const fallbackNumericFields = new Map<CircuitPartNumericKey, ReturnType<typeof circuitPartNumericFields>[number]>();
 for (const kind of circuitPartKinds) {
   for (const field of circuitPartNumericFields(kind)) {
@@ -95,8 +134,9 @@ function validateEndpoint(
   side: string,
   partsById: ReadonlyMap<string, CircuitPart>,
 ): { endpoint?: CircuitEndpoint; reason?: string } {
-  if (!isRecord(value)) { return { reason: `${side}の接続先の形式が正しくありません。` }; }
-  const { partId, terminal } = value;
+  const candidate = snapshotSavedRecord(value, ["partId", "terminal"]);
+  if (!candidate) { return { reason: `${side}の接続先の形式が正しくありません。` }; }
+  const { partId, terminal } = candidate;
   const id = simulationIdentifierSchema.safeParse(partId);
   if (!id.success) {
     return { reason: `${side}の接続先部品 ID が正しくありません。` };
@@ -162,12 +202,13 @@ function validatePartShape(candidate: Record<string, unknown>, label: string): s
 }
 
 function normalizePart(
-  candidate: unknown,
+  value: unknown,
   index: number,
   ids: Set<string>,
 ): { part?: CircuitPart; reason?: string } {
   const label = `部品${index + 1}`;
-  if (!isRecord(candidate)) { return { reason: `${label}の形式が正しくありません。` }; }
+  const candidate = snapshotSavedRecord(value, savedPartKeys);
+  if (!candidate) { return { reason: `${label}の形式が正しくありません。` }; }
   const idIssue = checkString(candidate.id, `${label}の ID`, false);
   if (idIssue) { return { reason: idIssue }; }
   const id = candidate.id as string;
@@ -193,13 +234,12 @@ function normalizePart(
 }
 
 function normalizeParts(value: unknown): { parts?: CircuitPart[]; reason?: string } {
-  const parsed = z.array(z.unknown(), { error: "部品一覧は配列で指定してください。" })
-    .max(MAX_CIRCUIT_DOCUMENT_PARTS, { error: `部品数は${MAX_CIRCUIT_DOCUMENT_PARTS}個以下にしてください。` })
-    .safeParse(value);
-  if (!parsed.success) { return { reason: parsed.error.issues[0]!.message }; }
+  const captured = snapshotSavedArray(value, MAX_CIRCUIT_DOCUMENT_PARTS,
+    "部品一覧は配列で指定してください。", `部品数は${MAX_CIRCUIT_DOCUMENT_PARTS}個以下にしてください。`);
+  if (!captured.values) { return { reason: captured.reason }; }
   const ids = new Set<string>();
   const parts: CircuitPart[] = [];
-  for (const [index, candidate] of parsed.data.entries()) {
+  for (const [index, candidate] of captured.values.entries()) {
     const result = normalizePart(candidate, index, ids);
     if (result.reason) { return { reason: result.reason }; }
     if (result.part) { parts.push(result.part); }
@@ -209,14 +249,14 @@ function normalizeParts(value: unknown): { parts?: CircuitPart[]; reason?: strin
 
 function normalizeWireWaypoints(value: unknown, label: string): { waypoints?: { x: number; y: number }[]; reason?: string } {
   if (value === undefined) { return {}; }
-  const parsed = z.array(z.unknown(), { error: `${label}の経由点は配列で指定してください。` })
-    .max(MAX_CIRCUIT_DOCUMENT_WIRE_WAYPOINTS, { error: `${label}の経由点は${MAX_CIRCUIT_DOCUMENT_WIRE_WAYPOINTS}個以下にしてください。` })
-    .safeParse(value);
-  if (!parsed.success) { return { reason: parsed.error.issues[0]!.message }; }
+  const captured = snapshotSavedArray(value, MAX_CIRCUIT_DOCUMENT_WIRE_WAYPOINTS,
+    `${label}の経由点は配列で指定してください。`, `${label}の経由点は${MAX_CIRCUIT_DOCUMENT_WIRE_WAYPOINTS}個以下にしてください。`);
+  if (!captured.values) { return { reason: captured.reason }; }
   const waypoints: { x: number; y: number }[] = [];
-  for (const [index, candidate] of parsed.data.entries()) {
+  for (const [index, pointValue] of captured.values.entries()) {
     const waypointLabel = `${label}の経由点${index + 1}`;
-    if (!isRecord(candidate)) { return { reason: `${waypointLabel}の形式が正しくありません。` }; }
+    const candidate = snapshotSavedRecord(pointValue, ["x", "y"]);
+    if (!candidate) { return { reason: `${waypointLabel}の形式が正しくありません。` }; }
     const point = z.object({
       x: coordinateSchema(`${waypointLabel}のx座標`),
       y: coordinateSchema(`${waypointLabel}のy座標`),
@@ -228,14 +268,15 @@ function normalizeWireWaypoints(value: unknown, label: string): { waypoints?: { 
 }
 
 function normalizeWire(
-  candidate: unknown,
+  value: unknown,
   index: number,
   partsById: ReadonlyMap<string, CircuitPart>,
   wireIds: Set<string>,
   seenWireKeys: Set<string>,
 ): { wire?: CircuitWire; reason?: string } {
   const label = `導線${index + 1}`;
-  if (!isRecord(candidate)) { return { reason: `${label}の形式が正しくありません。` }; }
+  const candidate = snapshotSavedRecord(value, ["id", "from", "to", "waypoints"]);
+  if (!candidate) { return { reason: `${label}の形式が正しくありません。` }; }
   const idIssue = checkString(candidate.id, `${label}の ID`, false);
   if (idIssue) { return { reason: idIssue }; }
   const id = candidate.id as string;
@@ -266,15 +307,14 @@ function normalizeWire(
 }
 
 function normalizeWires(value: unknown, parts: readonly CircuitPart[]): { wires?: CircuitWire[]; reason?: string } {
-  const parsed = z.array(z.unknown(), { error: "導線一覧は配列で指定してください。" })
-    .max(MAX_CIRCUIT_DOCUMENT_WIRES, { error: `導線数は${MAX_CIRCUIT_DOCUMENT_WIRES}本以下にしてください。` })
-    .safeParse(value);
-  if (!parsed.success) { return { reason: parsed.error.issues[0]!.message }; }
+  const captured = snapshotSavedArray(value, MAX_CIRCUIT_DOCUMENT_WIRES,
+    "導線一覧は配列で指定してください。", `導線数は${MAX_CIRCUIT_DOCUMENT_WIRES}本以下にしてください。`);
+  if (!captured.values) { return { reason: captured.reason }; }
   const partsById = new Map(parts.map((part) => [part.id, part]));
   const ids = new Set<string>();
   const seenWireKeys = new Set<string>();
   const wires: CircuitWire[] = [];
-  for (const [index, candidate] of parsed.data.entries()) {
+  for (const [index, candidate] of captured.values.entries()) {
     const result = normalizeWire(candidate, index, partsById, ids, seenWireKeys);
     if (result.reason) { return { reason: result.reason }; }
     if (result.wire) { wires.push(result.wire); }
@@ -282,8 +322,9 @@ function normalizeWires(value: unknown, parts: readonly CircuitPart[]): { wires?
   return { wires };
 }
 
-function validateDocument(value: unknown): ValidationResult {
-  if (!isRecord(value)) { return fail("回路データはオブジェクトで指定してください。"); }
+function validateDocument(input: unknown): ValidationResult {
+  const value = snapshotSavedRecord(input, ["title", "parts", "wires"]);
+  if (!value) { return fail("回路データはオブジェクトで指定してください。"); }
   const titleIssue = checkString(value.title, "回路名", true);
   if (titleIssue) { return fail(titleIssue); }
   const partsResult = normalizeParts(value.parts);
@@ -294,7 +335,7 @@ function validateDocument(value: unknown): ValidationResult {
 }
 
 /**
- * Encodes a validated circuit as a versioned JSON document. Unknown object properties are dropped.
+ * Encodes own data fields as a versioned JSON document. Unknown properties are dropped; known accessors are invalid.
  * Throws when the input is invalid or the encoded document exceeds the public text limit.
  */
 export function serializeCircuitDocument(document: CircuitDocument): string {

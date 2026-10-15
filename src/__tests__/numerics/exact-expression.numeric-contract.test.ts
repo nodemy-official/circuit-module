@@ -1,8 +1,83 @@
 import { expect, it } from "vitest";
 import { retainedComplex, restoredComplex } from "../../circuit-reading.js";
-import { createExactExpressionCapture, freezeCapturedExactExpressions, matchingExactExpressions, snapshotExactExpressions, withExactExpressionCapture, type ExactExpressionNode } from "../../exact-expression.js";
-import { solveExactComplexLinearSystem, solveExactRealLinearSystem } from "../../exact-linear-algebra.js";
+import { capturedExactReference, combineExactExpressionHandles, createExactExpressionCapture, exactExpressionHandle, freezeCapturedExactExpressions, matchingExactExpressions, retainExactExpressionHandle, snapshotExactExpressions, withExactExpressionCapture, type ExactExpressionNode } from "../../exact-expression.js";
+import { addExactRational, deferExactRationalReduction, divideExactRational, multiplyExactRational, numberToExactRational, solveExactComplexLinearSystem, solveExactRealLinearSystem, sumExactRationals, type ExactRational } from "../../exact-linear-algebra.js";
 import { complexFromExact, exactComplexValue } from "../../exact-numeric-state.js";
+
+it.each(["divide", "sum", "alias", "retained"].flatMap((source) => [-1, 1].map((unitSign) => ({ source, unitSign }))))(
+  "keeps a canonical unit from $source ($unitSign) independent of previous captures",
+  ({ source, unitSign }) => {
+    const firstNumerator = 2n ** 5000n + 17n;
+    const firstDenominator = 2n ** 4900n;
+    const firstCapture = createExactExpressionCapture();
+    let unit: ExactRational = numberToExactRational(unitSign)!;
+    withExactExpressionCapture(firstCapture, () => {
+      const large = addExactRational(deferExactRationalReduction({ numerator: firstNumerator, denominator: firstDenominator }), numberToExactRational(1)!);
+      const signedLarge = unitSign === 1 ? large : multiplyExactRational(large, numberToExactRational(-1)!);
+      capturedExactReference(large);
+      if (source === "divide") { unit = divideExactRational(signedLarge, large)!; }
+      else if (source === "sum") {
+        unit = sumExactRationals([large, {
+          numerator: BigInt(unitSign) * large.denominator - large.numerator,
+          denominator: large.denominator,
+        }]);
+      } else {
+        const expression = combineExactExpressionHandles("divide", exactExpressionHandle(signedLarge), exactExpressionHandle(large));
+        if (source === "alias") {
+          // A large unreduced unit still needs compact expression evidence.
+          const scale = 2n ** 5000n;
+          const noncanonical = retainExactExpressionHandle({ numerator: BigInt(unitSign) * scale, denominator: scale }, expression);
+          const reference = capturedExactReference(noncanonical)!;
+          expect(firstCapture.nodes[reference.expression]?.operation).toBe("divide");
+          unit = deferExactRationalReduction(noncanonical);
+        } else {
+          unit = retainExactExpressionHandle(unit, expression);
+        }
+      }
+    });
+    freezeCapturedExactExpressions(firstCapture);
+    expect(unit.numerator).toBe(BigInt(unitSign) * unit.denominator);
+
+    const numerator = 2n ** 5200n + 101n;
+    const denominator = 2n ** 5100n;
+    const capture = createExactExpressionCapture();
+    const reading = withExactExpressionCapture(capture, () => retainedComplex(complexFromExact({
+      real: addExactRational(unit, { numerator, denominator }),
+      imaginary: { numerator: 0n, denominator: 1n },
+    }))!);
+    const original = { reading, table: freezeCapturedExactExpressions(capture) };
+    expect(original.table.some((node) => node.operation === "literal" && node.numerator === `0x${firstNumerator.toString(16)}`)).toBe(false);
+    for (const result of [original, JSON.parse(JSON.stringify(original)) as typeof original, structuredClone(original)]) {
+      const restored = exactComplexValue(restoredComplex(result.reading, result.table)!)!;
+      // Independent integer arithmetic checks the transported fraction.
+      expect(restored.real.numerator * denominator).toBe((numerator + BigInt(unitSign) * denominator) * restored.real.denominator);
+      expect(restored.imaginary.numerator).toBe(0n);
+    }
+  },
+);
+
+it.each([-1, 1])("keeps expression evidence bounded across captures that return %s", (unitSign) => {
+  let unit = numberToExactRational(unitSign)!;
+  let firstTableSize: number | undefined;
+  for (let iteration = 0; iteration < 8; iteration += 1) {
+    const numerator = 2n ** 5200n + BigInt(101 + iteration);
+    const denominator = 2n ** 5100n;
+    const capture = createExactExpressionCapture();
+    const reading = withExactExpressionCapture(capture, () => {
+      const large = addExactRational(unit, deferExactRationalReduction({ numerator, denominator }));
+      const result = retainedComplex(complexFromExact({ real: large, imaginary: { numerator: 0n, denominator: 1n } }))!;
+      unit = divideExactRational(multiplyExactRational(large, numberToExactRational(unitSign)!), large)!;
+      return result;
+    });
+    const original = { reading, table: freezeCapturedExactExpressions(capture) };
+    firstTableSize ??= original.table.length;
+    expect(original.table.length).toBe(firstTableSize);
+    for (const result of [original, JSON.parse(JSON.stringify(original)) as typeof original, structuredClone(original)]) {
+      const restored = exactComplexValue(restoredComplex(result.reading, result.table)!)!.real;
+      expect(restored.numerator * denominator).toBe((numerator + BigInt(unitSign) * denominator) * restored.denominator);
+    }
+  }
+});
 
 it.each(["real", "complex"] as const)("preserves the exact %s solution's transport across dense pivot swaps and JSON cloning", (mode) => {
   const matrix = [0, 1, 1, 2, 3, 4, 3, 2, 5];

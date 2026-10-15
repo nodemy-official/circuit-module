@@ -409,13 +409,13 @@ function isTextEntryTarget(target: EventTarget | null) {
   return target instanceof HTMLElement && (target.isContentEditable || /^(INPUT|TEXTAREA|BUTTON|SELECT)$/.test(target.tagName));
 }
 
-function shouldStartSpacePan(event: globalThis.KeyboardEvent, pointerInside: boolean, viewport: HTMLDivElement | null) {
-  if (event.code !== "Space" || event.repeat) { return false; }
+function shouldHandleSpacePan(event: globalThis.KeyboardEvent, pointerInside: boolean, viewport: HTMLDivElement | null, panning: boolean) {
+  if (event.code !== "Space") { return false; }
   const target = event.target;
   if (isTextEntryTarget(target)) { return false; }
   if (target instanceof SVGElement && target.closest('[role="button"]')) { return false; }
   const targetIsInViewport = target instanceof Node && viewport?.contains(target);
-  return pointerInside || Boolean(targetIsInViewport);
+  return panning || pointerInside || Boolean(targetIsInViewport);
 }
 
 function isPreviewPartGesture(event: PointerEvent<SVGSVGElement>, readOnly: boolean, onInspectPart: CircuitBoardProps["onInspectPart"], onSwitchToggle: CircuitBoardProps["onSwitchToggle"], spacePressed: boolean) {
@@ -1154,9 +1154,10 @@ export function CircuitBoard({
 
   useEffect(() => {
     const onKeyDown = (event: globalThis.KeyboardEvent) => {
-      if (!shouldStartSpacePan(event, pointerInsideRef.current, viewportRef.current)) { return; }
+      if (event.repeat && !spacePressedRef.current) { return; }
+      if (!shouldHandleSpacePan(event, pointerInsideRef.current, viewportRef.current, spacePressedRef.current)) { return; }
       // Space activates focused SVG controls; it only starts panning on the canvas itself.
-      if (pointerInsideRef.current) { event.preventDefault(); }
+      event.preventDefault();
       spacePressedRef.current = true;
       setSpacePressed(true);
     };
@@ -1890,9 +1891,9 @@ export function CircuitBoard({
         tabIndex={0}
         aria-label="回路基板。余白またはスペースキーを押しながらドラッグして移動し、Shiftを押しながら余白をドラッグして範囲選択できます"
         onKeyDownCapture={(event) => {
-          if ((event.ctrlKey || event.metaKey) && !event.altKey && !event.repeat && ["z", "y"].includes(event.key.toLowerCase())) {
-            // Finish the pointer edit before the host travels through history.
-            // Keeping the edit committed lets Redo restore it after Undo.
+          if ((event.ctrlKey || event.metaKey) && !event.altKey && !event.repeat && ["a", "c", "x", "v", "d", "z", "y"].includes(event.key.toLowerCase())) {
+            // Finish the pointer edit before a host command changes its selection or history.
+            // Later pointer events must not edit the command's new selection.
             const wireFinished = wireRouteDrag.finish();
             const partDrag = dragRef.current;
             if (partDrag) {

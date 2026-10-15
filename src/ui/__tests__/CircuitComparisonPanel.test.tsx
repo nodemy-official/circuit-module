@@ -28,6 +28,18 @@ function documentOf(parts: CircuitPart[], title = "テスト回路"): CircuitDoc
   return { title, parts, wires: [] };
 }
 
+function documentWithDanglingWire(): CircuitDocument {
+  return {
+    title: "接続先がない回路",
+    parts: [part("source", "battery", "電池"), part("r1", "resistor", "抵抗")],
+    wires: [{
+      id: "dangling",
+      from: { partId: "source", terminal: "a" },
+      to: { partId: "missing", terminal: "a" },
+    }],
+  };
+}
+
 function reading(voltageVolts: number, currentAmps: number, powerWatts: number): CircuitPartReading {
   return { voltageVolts, currentAmps, powerWatts };
 }
@@ -72,6 +84,12 @@ function chooseMetric(container: ParentNode, metric: "voltageVolts" | "currentAm
   act(() => required<HTMLInputElement>(container, `input[value="${metric}"]`).click());
 }
 
+function clickButton(container: ParentNode, label: string) {
+  const button = [...container.querySelectorAll("button")].find((item) => item.textContent === label);
+  if (!button) { throw new Error(`Missing button: ${label}`); }
+  act(() => button.click());
+}
+
 describe("CircuitComparisonPanel", () => {
   it.each(["id", "kind"] as const)("preserves a non-enumerable %s in a local comparison snapshot", (field) => {
     const load = part("load", "resistor", "抵抗");
@@ -111,6 +129,101 @@ describe("CircuitComparisonPanel", () => {
   const afterAnalysis = analysis({
     source: reading(9, 0.045, 0.405),
     r1: reading(9, 0.045, 0.405),
+  });
+
+  it.each([false, true])("does not leak snapshot errors for dangling wire endpoints (existing baseline=%s)", (existingBaseline) => {
+    const circuit = documentWithDanglingWire();
+    const invalid = analyzeCircuit(circuit);
+    expect(invalid.status).toBe("invalid");
+    const { container } = mount({
+      document: circuit,
+      analysis: invalid,
+      ...(existingBaseline ? { baselineDocument: beforeDocument, baselineAnalysis: beforeAnalysis } : {}),
+    });
+    const label = existingBaseline ? "基準を現在に更新" : "現在を比較の基準にする";
+    const button = [...container.querySelectorAll("button")].find((item) => item.textContent === label);
+    expect(button).toBeDefined();
+    const errors: unknown[] = [];
+    const captureError = (event: ErrorEvent) => {
+      errors.push(event.error);
+      event.preventDefault();
+    };
+    window.addEventListener("error", captureError);
+    try {
+      act(() => button!.click());
+    } finally {
+      window.removeEventListener("error", captureError);
+    }
+    expect(errors).toEqual([]);
+    expect(required(container, '[role="alert"]').textContent).toContain("比較の基準を保存できませんでした。");
+    expect(required(container, '[role="alert"]').textContent).toContain("missing");
+    expect(required(container, ".circuit-comparison").getAttribute("data-comparison-state")).toBe(existingBaseline ? "unavailable" : "no-baseline");
+    if (existingBaseline) {
+      expect(required(container, ".circuit-comparison__baseline").textContent).toContain(beforeDocument.title);
+    }
+  });
+
+  it("keeps a local baseline after a failed update and clears errors on release and successful retry", () => {
+    const ui = mount({ document: beforeDocument, analysis: beforeAnalysis });
+    clickButton(ui.container, "現在を比較の基準にする");
+    const circuit = documentWithDanglingWire();
+    const invalid = analyzeCircuit(circuit);
+    ui.rerender({ document: circuit, analysis: invalid });
+
+    clickButton(ui.container, "基準を現在に更新");
+
+    expect(required(ui.container, '[role="alert"]').textContent).toContain("missing");
+    expect(required(ui.container, ".circuit-comparison__baseline").textContent).toContain(beforeDocument.title);
+    const row = required(ui.container, 'tr[data-part-id="r1"]');
+    expect(Array.from(row.querySelectorAll("td")).slice(0, 3).map((cell) => cell.textContent)).toEqual(["9", "—", "比較不可"]);
+
+    clickButton(ui.container, "基準を解除");
+    expect(ui.container.querySelector('[role="alert"]')).toBeNull();
+    expect(required(ui.container, ".circuit-comparison").getAttribute("data-comparison-state")).toBe("no-baseline");
+    clickButton(ui.container, "現在を比較の基準にする");
+    expect(ui.container.querySelector('[role="alert"]')).not.toBeNull();
+
+    // Repair the referenced document in place so only a successful retry can clear the error.
+    circuit.wires.splice(0);
+    clickButton(ui.container, "現在を比較の基準にする");
+
+    expect(ui.container.querySelector('[role="alert"]')).toBeNull();
+    expect(required(ui.container, ".circuit-comparison__baseline").textContent).toContain(circuit.title);
+    expect(required(ui.container, ".circuit-comparison").getAttribute("data-comparison-state")).toBe("unavailable");
+    expect(ui.container.textContent).toContain("基準側の解析状態が「無効」");
+  });
+
+  it.each(["document", "analysis"] as const)("clears snapshot errors when the current %s changes", (field) => {
+    const circuit = documentWithDanglingWire();
+    const invalid = analyzeCircuit(circuit);
+    const ui = mount({ document: circuit, analysis: invalid });
+    clickButton(ui.container, "現在を比較の基準にする");
+    expect(ui.container.querySelector('[role="alert"]')).not.toBeNull();
+
+    ui.rerender(field === "document"
+      ? { document: { ...circuit, title: "別の回路" }, analysis: invalid }
+      : { document: circuit, analysis: { ...invalid, message: "別の解析" } });
+
+    expect(ui.container.querySelector('[role="alert"]')).toBeNull();
+    ui.rerender({ document: circuit, analysis: invalid });
+    expect(ui.container.querySelector('[role="alert"]')).toBeNull();
+  });
+
+  it("still captures structurally valid circuits with invalid numeric values", () => {
+    const circuit = documentOf([
+      part("source", "battery", "電池"),
+      { ...part("r1", "resistor", "抵抗"), resistanceOhms: Number.NaN },
+    ], "数値が無効な回路");
+    const invalid = analyzeCircuit(circuit);
+    expect(invalid.status).toBe("invalid");
+    const { container } = mount({ document: circuit, analysis: invalid });
+
+    clickButton(container, "現在を比較の基準にする");
+
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+    expect(required(container, ".circuit-comparison__baseline").textContent).toContain(circuit.title);
+    expect(required(container, ".circuit-comparison").getAttribute("data-comparison-state")).toBe("unavailable");
+    expect(container.textContent).toContain("基準側の解析状態が「無効」");
   });
 
   it("captures the current circuit as a local baseline and highlights changed readings", () => {

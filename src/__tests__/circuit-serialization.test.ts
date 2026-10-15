@@ -34,6 +34,12 @@ function parseRaw(document: unknown) {
   return parseCircuitDocument(JSON.stringify(document));
 }
 
+function documentWithWaypoints() {
+  const document = structuredClone(simpleDocument);
+  document.wires[0]!.waypoints = [{ x: 3, y: 4 }];
+  return document;
+}
+
 describe("circuit document serialization", () => {
   it("counts UTF-16 units at the JSON input length boundary", () => {
     const prefix = '{"title":"';
@@ -172,6 +178,164 @@ describe("circuit document serialization", () => {
       });
     }
     expect(parseCircuitDocument(serializeCircuitDocument(document))).toEqual({ ok: true, document: simpleDocument });
+  });
+
+  it.each([undefined, 20])("preserves the analyzed resistance %s when a Proxy supplies a different value", (resistanceOhms) => {
+    const resistor: CircuitPart = part("resistor");
+    if (resistanceOhms !== undefined) { resistor.resistanceOhms = resistanceOhms; }
+    let reads = 0;
+    const trapped = new Proxy(resistor, {
+      get(target, key, receiver) {
+        if (key === "resistanceOhms") { reads += 1; return 100; }
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    const document: CircuitDocument = {
+      title: "抵抗値の保持",
+      parts: [part("battery", "battery", { voltageVolts: 9, internalResistanceOhms: 0 }), trapped],
+      wires: [
+        { id: "a", from: { partId: "battery", terminal: "a" }, to: { partId: "resistor", terminal: "a" } },
+        { id: "b", from: { partId: "battery", terminal: "b" }, to: { partId: "resistor", terminal: "b" } },
+      ],
+    };
+    const before = analyzeCircuit(document);
+    const restored = parseCircuitDocument(serializeCircuitDocument(document));
+    expect(restored.ok).toBe(true);
+    if (!restored.ok) { throw new Error(restored.reason); }
+    expect(restored.document.parts[1]).toEqual(resistor);
+    expect(analyzeCircuit(restored.document).parts.resistor!.currentAmps).toBe(before.parts.resistor!.currentAmps);
+    expect(reads).toBe(0);
+  });
+
+  it.each([undefined, false])("preserves the analyzed switch state %s when a Proxy supplies a different value", (initiallyClosed) => {
+    const switchPart: CircuitPart = part("switch", "switch");
+    if (initiallyClosed !== undefined) { switchPart.initiallyClosed = initiallyClosed; }
+    let reads = 0;
+    const trapped = new Proxy(switchPart, {
+      get(target, key, receiver) {
+        if (key === "initiallyClosed") { reads += 1; return initiallyClosed !== undefined; }
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    const document: CircuitDocument = {
+      title: "スイッチ状態の保持",
+      parts: [part("battery", "battery", { voltageVolts: 9, internalResistanceOhms: 0 }),
+        part("resistor", "resistor", { resistanceOhms: 10 }), trapped],
+      wires: [
+        { id: "a", from: { partId: "battery", terminal: "a" }, to: { partId: "resistor", terminal: "a" } },
+        { id: "b", from: { partId: "resistor", terminal: "b" }, to: { partId: "switch", terminal: "a" } },
+        { id: "c", from: { partId: "switch", terminal: "b" }, to: { partId: "battery", terminal: "b" } },
+      ],
+    };
+    const before = analyzeCircuit(document);
+    const restored = parseCircuitDocument(serializeCircuitDocument(document));
+    expect(restored.ok).toBe(true);
+    if (!restored.ok) { throw new Error(restored.reason); }
+    expect(restored.document.parts[2]).toEqual(switchPart);
+    const after = analyzeCircuit(restored.document);
+    expect(after.status).toBe(before.status);
+    expect(after.parts.resistor!.currentAmps).toBe(before.parts.resistor!.currentAmps);
+    expect(reads).toBe(0);
+  });
+
+  it("snapshots all saved records and array entries without invoking Proxy get traps", () => {
+    const expected = documentWithWaypoints();
+    let reads = 0;
+    function trap<T extends object>(value: T): T {
+      return new Proxy(value, {
+        get() { reads += 1; throw new Error("Property read must not run"); },
+      });
+    }
+    const document = trap({
+      title: expected.title,
+      parts: trap(expected.parts.map((item) => trap(item))),
+      wires: trap(expected.wires.map((wire) => trap({
+        ...wire,
+        from: trap(wire.from),
+        to: trap(wire.to),
+        ...(wire.waypoints ? { waypoints: trap(wire.waypoints.map((point) => trap(point))) } : {}),
+      }))),
+    });
+    expect(parseCircuitDocument(serializeCircuitDocument(document))).toEqual({ ok: true, document: expected });
+    expect(reads).toBe(0);
+  });
+
+  it("preserves array entries when a Proxy supplies a different length, index, or iterator", () => {
+    const document = documentWithWaypoints();
+    const expected = structuredClone(document);
+    let reads = 0;
+    document.parts = new Proxy(document.parts, {
+      get(target, key, receiver) {
+        reads += 1;
+        if (key === "length") { return 0; }
+        if (key === "0") { return part("replacement"); }
+        if (key === Symbol.iterator) {
+          return function* replacement() { yield part("replacement"); };
+        }
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    expect(parseCircuitDocument(serializeCircuitDocument(document))).toEqual({ ok: true, document: expected });
+    expect(reads).toBe(0);
+  });
+
+  it.each([
+    ["document title", (document: CircuitDocument) => [document, "title"]],
+    ["part array index", (document: CircuitDocument) => [document.parts, "0"]],
+    ["part coordinate", (document: CircuitDocument) => [document.parts[0]!, "x"]],
+    ["numeric part value", (document: CircuitDocument) => [document.parts[1]!, "resistanceOhms"]],
+    ["optional switch state", (document: CircuitDocument) => [document.parts[1]!, "initiallyClosed"]],
+    ["wire array index", (document: CircuitDocument) => [document.wires, "0"]],
+    ["wire endpoint", (document: CircuitDocument) => [document.wires[0]!, "from"]],
+    ["endpoint part ID", (document: CircuitDocument) => [document.wires[0]!.from, "partId"]],
+    ["endpoint terminal", (document: CircuitDocument) => [document.wires[0]!.to, "terminal"]],
+    ["wire waypoints", (document: CircuitDocument) => [document.wires[0]!, "waypoints"]],
+    ["waypoint array index", (document: CircuitDocument) => [document.wires[0]!.waypoints!, "0"]],
+    ["waypoint coordinate", (document: CircuitDocument) => [document.wires[0]!.waypoints![0]!, "x"]],
+  ] as const)("rejects a saved %s accessor without invoking it", (_name, target) => {
+    const document = documentWithWaypoints();
+    const [record, key] = target(document);
+    let reads = 0;
+    Object.defineProperty(record, key, {
+      configurable: true,
+      get() { reads += 1; throw new Error("Known getter must not run"); },
+    });
+    expect(() => serializeCircuitDocument(document)).toThrow(TypeError);
+    expect(reads).toBe(0);
+  });
+
+  it("preserves non-enumerable own values and ignores unknown getters throughout a saved graph", () => {
+    const document = documentWithWaypoints();
+    const expected = structuredClone(document);
+    const records = [document, document.parts, document.wires, ...document.parts, ...document.wires,
+      ...document.wires.flatMap((wire) => [wire.from, wire.to, ...(wire.waypoints ?? []),
+        ...(wire.waypoints ? [wire.waypoints] : [])])];
+    for (const record of records) {
+      for (const key of Object.keys(record)) {
+        Object.defineProperty(record, key, { enumerable: false });
+      }
+      Object.defineProperty(record, "futureProperty", {
+        get() { throw new Error("Unknown getter must not run"); },
+      });
+    }
+    expect(parseCircuitDocument(serializeCircuitDocument(document))).toEqual({ ok: true, document: expected });
+  });
+
+  it("captures each saved descriptor once before numeric validation and normalization", () => {
+    let captures = 0;
+    const resistor = new Proxy(part("resistor", "resistor", { resistanceOhms: 20 }), {
+      getOwnPropertyDescriptor(target, key) {
+        const descriptor = Reflect.getOwnPropertyDescriptor(target, key);
+        if (key === "resistanceOhms" && descriptor) {
+          captures += 1;
+          return { ...descriptor, value: captures === 1 ? 20 : 100 };
+        }
+        return descriptor;
+      },
+    });
+    const restored = parseCircuitDocument(serializeCircuitDocument({ title: "", parts: [resistor], wires: [] }));
+    expect(restored.ok && restored.document.parts[0]!.resistanceOhms).toBe(20);
+    expect(captures).toBe(1);
   });
 
   it("preserves omitted model properties and allows empty, incomplete, and unpowered circuits", () => {

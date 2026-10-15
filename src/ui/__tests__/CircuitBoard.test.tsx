@@ -230,6 +230,12 @@ function dispatchClick(target: EventTarget, options: MouseEventInit = {}) {
   act(() => target.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, detail: 1, ...options })));
 }
 
+function dispatchSpace(target: EventTarget, repeat = false) {
+  const event = new KeyboardEvent("keydown", { code: "Space", key: " ", repeat, bubbles: true, cancelable: true });
+  act(() => target.dispatchEvent(event));
+  return event;
+}
+
 function flushFrame() {
   const callback = pendingFrame;
   pendingFrame = null;
@@ -381,6 +387,46 @@ describe("CircuitBoard fitOnResize", () => {
 });
 
 describe("CircuitBoard selection and board gestures", () => {
+  it("prevents page scrolling for held Space during panning and preserves native control keys", () => {
+    const onSelectPart = vi.fn();
+    const ui = mountBoard(selectionDocument, { onSelectPart });
+    const surface = requiredElement(ui.container, ".circuit-board__surface");
+    dispatchPointer(surface, "pointerover", { relatedTarget: globalThis.document.body });
+    expect(dispatchSpace(globalThis.document.body).defaultPrevented).toBe(true);
+    expect(dispatchSpace(globalThis.document.body, true).defaultPrevented).toBe(true);
+    expect(surface.classList.contains("circuit-board__surface--pan-ready")).toBe(true);
+    for (const tag of ["input", "textarea", "button", "select"]) {
+      const control = globalThis.document.createElement(tag);
+      ui.container.append(control);
+      expect(dispatchSpace(control, true).defaultPrevented).toBe(false);
+    }
+    act(() => window.dispatchEvent(new KeyboardEvent("keyup", { code: "Space", key: " " })));
+    dispatchSpace(requiredElement(ui.container, '[data-part-id="part-a"]'));
+    expect(onSelectPart).toHaveBeenCalledWith("part-a", false);
+    expect(surface.classList.contains("circuit-board__surface--pan-ready")).toBe(false);
+
+    expect(dispatchSpace(globalThis.document.body).defaultPrevented).toBe(true);
+    act(() => window.dispatchEvent(new Event("blur")));
+    expect(dispatchSpace(globalThis.document.body, true).defaultPrevented).toBe(false);
+    expect(surface.classList.contains("circuit-board__surface--pan-ready")).toBe(false);
+  });
+
+  it.each(["focused viewport", "pointer leaves"])("prevents held Space from scrolling with %s", (context) => {
+    const ui = mountBoard(selectionDocument);
+    const surface = requiredElement(ui.container, ".circuit-board__surface");
+    const target = context === "focused viewport" ? ui.viewport : globalThis.document.body;
+    if (context === "focused viewport") { act(() => ui.viewport.focus()); }
+    else { dispatchPointer(surface, "pointerover", { relatedTarget: globalThis.document.body }); }
+    expect(dispatchSpace(target).defaultPrevented).toBe(true);
+    if (context === "pointer leaves") { dispatchPointer(surface, "pointerout", { relatedTarget: globalThis.document.body }); }
+
+    expect(dispatchSpace(target, true).defaultPrevented).toBe(true);
+    expect(surface.classList.contains("circuit-board__surface--pan-ready")).toBe(true);
+    act(() => window.dispatchEvent(new KeyboardEvent("keyup", { code: "Space", key: " " })));
+    expect(dispatchSpace(target, true).defaultPrevented).toBe(false);
+    expect(surface.classList.contains("circuit-board__surface--pan-ready")).toBe(false);
+  });
+
   it.each(["editable", "toggle disabled", "inspection disabled", "part replaced"])("discards a pending switch toggle when its context becomes %s", (context) => {
     try {
       vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });

@@ -27,6 +27,13 @@ const immutableTables = new WeakSet<readonly ExactExpressionNode[]>();
 
 function sign(value: ExactRational): -1 | 0 | 1 { return value.numerator < 0n ? -1 : value.numerator > 0n ? 1 : 0; }
 
+function canRetainExpression(value: ExactRational) {
+  // Canonical units can be shared across captures. Their literal is already
+  // compact; attaching history would keep unrelated expression graphs alive.
+  return value.numerator !== 0n &&
+    (value.denominator !== 1n || (value.numerator !== 1n && value.numerator !== -1n));
+}
+
 export function createExactExpressionCapture(): ExactExpressionCapture {
   return { nodes: [], indexes: new WeakMap(), literals: new Map(), signs: [] };
 }
@@ -70,19 +77,19 @@ export function combineExactExpressionHandles(operation: BinaryOperation, first:
 }
 
 export function retainExactExpressionHandle(value: ExactRational, expression: ExactExpressionHandle): ExactRational {
-  if (activeCapture && value.numerator !== 0n) { expressions.set(value, expression); }
+  if (activeCapture && canRetainExpression(value)) { expressions.set(value, expression); }
   return value;
 }
 
 export function recordExactAlias(original: ExactRational, result: ExactRational): ExactRational {
   const expression = expressions.get(original);
-  if (activeCapture && expression && result !== original) { expressions.set(result, expression); }
+  if (activeCapture && expression && result !== original && canRetainExpression(result)) { expressions.set(result, expression); }
   return result;
 }
 
 /** Records provenance during sampling; arithmetic results are never changed. */
 export function recordExactExpression(operation: BinaryOperation, first: ExactRational, second: ExactRational, result: ExactRational | null) {
-  if (!activeCapture || !result || result.numerator === 0n || result === first || result === second) { return result; }
+  if (!activeCapture || !result || !canRetainExpression(result) || result === first || result === second) { return result; }
   if (large(result) || expressions.has(first) || expressions.has(second)) {
     expressions.set(result, { operation, arguments: [expressionFor(first), expressionFor(second)], sign: sign(result) });
   }
@@ -90,7 +97,7 @@ export function recordExactExpression(operation: BinaryOperation, first: ExactRa
 }
 
 export function recordExactSum(values: readonly ExactRational[], result: ExactRational): ExactRational {
-  if (activeCapture && result.numerator !== 0n && (large(result) || values.some((value) => expressions.has(value)))) {
+  if (activeCapture && canRetainExpression(result) && (large(result) || values.some((value) => expressions.has(value)))) {
     expressions.set(result, { operation: "sum", arguments: values.map(expressionFor), sign: sign(result) });
   }
   return result;
