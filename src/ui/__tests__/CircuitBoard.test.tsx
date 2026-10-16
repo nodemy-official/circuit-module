@@ -344,6 +344,118 @@ describe("CircuitBoard appearance and composition", () => {
   });
 });
 
+describe("CircuitBoard mutable inputs", () => {
+  it.each([false, true])("updates terminal geometry after an in-place move and rotation (replaceDocument=%s)", (replaceDocument) => {
+    const circuit = structuredClone(selectionDocument);
+    const ui = mountBoard(circuit);
+    circuit.parts[1]!.x = 8;
+    circuit.parts[1]!.y = 3;
+    circuit.parts[1]!.rotation = 90;
+
+    ui.update({ document: replaceDocument ? { ...circuit } : circuit });
+
+    expect(requiredElement(ui.container, '.circuit-board__part[data-part-id="part-b"]').getAttribute("transform")).toBe("translate(160 60)");
+    expect(requiredElement(ui.container, '[data-part-id="part-b"][data-terminal="a"]').getAttribute("transform")).toBe("translate(160 20)");
+    expect(requiredElement(ui.container, '[data-wire-id="wire-ab"] .circuit-board__wire-line').getAttribute("d")).toMatch(/L 160 20$/);
+  });
+
+  it("refreshes connected terminals and routes after editing a wire endpoint in a shared array", () => {
+    const circuit = structuredClone(selectionDocument);
+    const ui = mountBoard(circuit);
+    circuit.wires[0]!.to.partId = "part-c";
+    circuit.wires[0]!.to.terminal = "b";
+
+    ui.update({ document: { ...circuit } });
+
+    expect(requiredElement(ui.container, '[data-part-id="part-b"][data-terminal="a"]').getAttribute("data-connected")).toBe("false");
+    expect(requiredElement(ui.container, '[data-part-id="part-c"][data-terminal="b"]').getAttribute("data-connected")).toBe("true");
+    expect(requiredElement(ui.container, '[data-wire-id="wire-ab"] .circuit-board__wire-line').getAttribute("d")).toMatch(/L 280 0$/);
+  });
+
+  it("refreshes a manually routed wire after its existing waypoint is edited", () => {
+    const circuit = structuredClone(selectionDocument);
+    const waypoints = [{ x: 3, y: 3 }];
+    circuit.wires[0]!.waypoints = waypoints;
+    const ui = mountBoard(circuit);
+    waypoints[0]!.y = 5;
+
+    ui.update({ document: { ...circuit } });
+
+    expect(requiredElement(ui.container, '[data-wire-id="wire-ab"] .circuit-board__wire-line').getAttribute("d")).toContain("L 60 100");
+  });
+
+  it("looks up replacement part objects in a shared parts array", () => {
+    const circuit = structuredClone(selectionDocument);
+    const ui = mountBoard(circuit);
+    circuit.parts[1] = { ...circuit.parts[1]!, label: "差し替えた抵抗" };
+
+    ui.update({ document: { ...circuit } });
+
+    expect(requiredElement(ui.container, '[data-wire-id="wire-ab"]').getAttribute("aria-label")).toContain("差し替えた抵抗の端子A");
+  });
+
+  it("refreshes selected parts and wires after editing the selection arrays in place", () => {
+    const selection = { parts: ["part-a"], wires: ["wire-ab"] };
+    const ui = mountBoard(selectionDocument, { selection });
+    selection.parts[0] = "part-b";
+    selection.wires[0] = "wire-bc";
+
+    ui.update({ selection: { ...selection } });
+
+    expect(requiredElement(ui.container, '.circuit-board__part[data-part-id="part-a"]').getAttribute("data-selected")).toBe("false");
+    expect(requiredElement(ui.container, '.circuit-board__part[data-part-id="part-b"]').getAttribute("data-selected")).toBe("true");
+    expect(requiredElement(ui.container, '[data-wire-id="wire-ab"]').getAttribute("data-selected")).toBe("false");
+    expect(requiredElement(ui.container, '[data-wire-id="wire-bc"]').getAttribute("data-selected")).toBe("true");
+  });
+
+  it("refreshes meter artwork when its existing analysis reading changes", () => {
+    const circuit: CircuitDocument = {
+      ...cameraDocument,
+      parts: [...cameraDocument.parts, { id: "meter", kind: "voltmeter", label: "電圧計", x: 8, y: 0 }],
+      wires: [
+        { id: "positive", from: { partId: "battery", terminal: "a" }, to: { partId: "meter", terminal: "a" } },
+        { id: "negative", from: { partId: "battery", terminal: "b" }, to: { partId: "meter", terminal: "b" } },
+      ],
+    };
+    const analysis = analyzeCircuit(circuit);
+    const ui = mountBoard(circuit, { analysis });
+    const reading = requiredElement(ui.container, '[data-part-id="meter"] [data-measurement="voltage"]');
+    expect(reading.textContent).toBe("+9 V");
+    analysis.parts.meter!.voltageVolts = 12;
+
+    ui.update({ analysis });
+
+    expect(reading.textContent).toBe("+12 V");
+    analysis.status = "invalid";
+    ui.update({ analysis });
+    expect(reading.textContent).toContain("解析不能");
+  });
+
+  it("retains routing and artwork during camera changes and only rerenders artwork for a label edit", async () => {
+    const geometry = await import("../../circuit-geometry.js");
+    const route = vi.spyOn(geometry, "routeDocumentWires");
+    try {
+      const circuit = structuredClone(selectionDocument);
+      const renderPart = vi.fn((part: CircuitPart) => <text>{part.label}</text>);
+      let controls: CircuitBoardControls | undefined;
+      const ui = mountBoard(circuit, { renderPart, renderControls: (nextControls) => { controls = nextControls; return null; } });
+      route.mockClear();
+      renderPart.mockClear();
+
+      panRight(ui.container);
+      act(() => controls!.zoomIn());
+
+      expect(route).not.toHaveBeenCalled();
+      expect(renderPart).not.toHaveBeenCalled();
+      circuit.parts[0]!.label = "変更した名前";
+      ui.update({ document: { ...circuit } });
+      expect(ui.container.textContent).toContain("変更した名前");
+      expect(renderPart).toHaveBeenCalled();
+      expect(route).not.toHaveBeenCalled();
+    } finally { route.mockRestore(); }
+  });
+});
+
 describe("CircuitBoard fitOnResize", () => {
   it("refits to the latest circuit on resize while preserving manual camera changes until then", () => {
     const ui = mountCameraBoard(cameraDocument, true);

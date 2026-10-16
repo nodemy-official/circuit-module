@@ -5,9 +5,11 @@ import { formatCircuitNumber } from "../number-format.js";
 import { copySimulationDocument } from "../simulation-input.js";
 
 type ComparisonMetric = "voltageVolts" | "currentAmps" | "powerWatts";
+type ComparisonDocument = Pick<CircuitDocument, "title" | "parts">;
+type ComparisonAnalysis = Pick<CircuitAnalysis, "status" | "mode" | "frequencyHz" | "timeSeconds" | "parts">;
 interface Snapshot {
-  document: CircuitDocument;
-  analysis: CircuitAnalysis;
+  document: ComparisonDocument;
+  analysis: ComparisonAnalysis;
 }
 type BaselineOverride = Snapshot | null | undefined;
 
@@ -32,28 +34,30 @@ const metrics: Array<{ key: ComparisonMetric; label: string; unit: string }> = [
 
 const sourceKinds = new Set<CircuitPart["kind"]>(["battery", "ac-source", "current-source"]);
 
-function cloneDocument(document: CircuitDocument): CircuitDocument {
+function cloneDocument(document: CircuitDocument): ComparisonDocument {
   const copiedDocument = copySimulationDocument(document);
-  return {
-    ...copiedDocument,
-    wires: copiedDocument.wires.map((wire) => ({
-      ...wire,
-      waypoints: wire.waypoints?.map((point) => ({ ...point })),
-    })),
-  };
+  // Layout is not part of a measurement comparison. Retain only the fields
+  // needed for labels and matching parts, without reading optional wire routes.
+  return { title: copiedDocument.title, parts: copiedDocument.parts };
 }
 
-function cloneAnalysis(analysis: CircuitAnalysis): CircuitAnalysis {
+function cloneAnalysis(analysis: CircuitAnalysis): ComparisonAnalysis {
+  // Comparisons use scalar measurements only. Copy those values explicitly
+  // so optional precision metadata cannot prevent a usable baseline capture.
   return {
-    ...analysis,
-    bulbPowerWatts: { ...analysis.bulbPowerWatts },
-    parts: Object.fromEntries(Object.entries(analysis.parts).map(([id, reading]) => [id, {
-      ...reading,
-      terminalVoltages: reading.terminalVoltages ? { ...reading.terminalVoltages } : undefined,
-      terminalCurrents: reading.terminalCurrents ? { ...reading.terminalCurrents } : undefined,
-    }])),
-    wireCurrents: { ...analysis.wireCurrents },
-    issues: analysis.issues.map((issue) => ({ ...issue })),
+    status: analysis.status,
+    mode: analysis.mode,
+    frequencyHz: analysis.frequencyHz,
+    timeSeconds: analysis.timeSeconds,
+    parts: Object.fromEntries(Object.getOwnPropertyNames(analysis.parts).map((id) => {
+      const reading = analysis.parts[id]!;
+      return [id, {
+        voltageVolts: reading.voltageVolts,
+        currentAmps: reading.currentAmps,
+        powerWatts: reading.powerWatts,
+        meterStatus: reading.meterStatus,
+      }];
+    })),
   };
 }
 
@@ -92,29 +96,28 @@ function isFiniteValue(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value);
 }
 
-function measurement(analysis: CircuitAnalysis | undefined, partId: string, metric: ComparisonMetric): number | undefined {
+function measurement(analysis: ComparisonAnalysis | undefined, partId: string, metric: ComparisonMetric): number | undefined {
   const reading = analysis?.parts[partId];
   if (reading?.meterStatus === "unconnected" || reading?.meterStatus === "floating") { return undefined; }
   const value = reading?.[metric];
   return isFiniteValue(value) ? value : undefined;
 }
 
-function isInstantAnalysis(analysis: CircuitAnalysis): boolean {
-  const timeSeconds = (analysis as CircuitAnalysis & { timeSeconds?: number }).timeSeconds;
-  return isFiniteValue(timeSeconds);
+function isInstantAnalysis(analysis: ComparisonAnalysis): boolean {
+  return isFiniteValue(analysis.timeSeconds);
 }
 
-function analysisMode(analysis: CircuitAnalysis): "dc" | "ac" {
+function analysisMode(analysis: ComparisonAnalysis): "dc" | "ac" {
   return analysis.mode ?? "dc";
 }
 
-function analysisFrequency(document: CircuitDocument, analysis: CircuitAnalysis): number {
+function analysisFrequency(document: ComparisonDocument, analysis: ComparisonAnalysis): number {
   if (isFiniteValue(analysis.frequencyHz)) { return analysis.frequencyHz; }
   const sourceFrequency = document.parts.find((part) => part.kind === "ac-source")?.frequencyHz;
   return isFiniteValue(sourceFrequency) ? sourceFrequency : 1000;
 }
 
-function readingsUnavailable(analysis: CircuitAnalysis): boolean {
+function readingsUnavailable(analysis: ComparisonAnalysis): boolean {
   return analysis.status === "invalid" || analysis.status === "short" || analysis.status === "empty";
 }
 

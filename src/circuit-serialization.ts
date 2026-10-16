@@ -322,16 +322,31 @@ function normalizeWires(value: unknown, parts: readonly CircuitPart[]): { wires?
   return { wires };
 }
 
+/** Validates and snapshots a detached fragment using the same saved-data rules as documents. */
+export function validateCircuitFragment(input: unknown):
+  | { ok: true; fragment: Pick<CircuitDocument, "parts" | "wires"> }
+  | { ok: false; reason: string } {
+  const value = snapshotSavedRecord(input, ["parts", "wires"]);
+  if (!value) { return { ok: false, reason: "コピーした回路データの形式が正しくありません。" }; }
+  const partsResult = normalizeParts(value.parts);
+  if (partsResult.reason || !partsResult.parts) {
+    return { ok: false, reason: partsResult.reason ?? "部品一覧が不正です。" };
+  }
+  const wiresResult = normalizeWires(value.wires, partsResult.parts);
+  if (wiresResult.reason || !wiresResult.wires) {
+    return { ok: false, reason: wiresResult.reason ?? "導線一覧が不正です。" };
+  }
+  return { ok: true, fragment: { parts: partsResult.parts, wires: wiresResult.wires } };
+}
+
 function validateDocument(input: unknown): ValidationResult {
   const value = snapshotSavedRecord(input, ["title", "parts", "wires"]);
   if (!value) { return fail("回路データはオブジェクトで指定してください。"); }
   const titleIssue = checkString(value.title, "回路名", true);
   if (titleIssue) { return fail(titleIssue); }
-  const partsResult = normalizeParts(value.parts);
-  if (partsResult.reason || !partsResult.parts) { return fail(partsResult.reason ?? "部品一覧が不正です。"); }
-  const wiresResult = normalizeWires(value.wires, partsResult.parts);
-  if (wiresResult.reason || !wiresResult.wires) { return fail(wiresResult.reason ?? "導線一覧が不正です。"); }
-  return { ok: true, document: { title: value.title as string, parts: partsResult.parts, wires: wiresResult.wires } };
+  const fragmentResult = validateCircuitFragment(value);
+  if (!fragmentResult.ok) { return fragmentResult; }
+  return { ok: true, document: { title: value.title as string, ...fragmentResult.fragment } };
 }
 
 /**

@@ -51,6 +51,133 @@ function sweepFrequencies(container: HTMLElement) {
 }
 
 describe("CircuitAcPanel frequency sweep boundaries", () => {
+  it("hides a saved sweep when its switch snapshot becomes unreadable and recovers on retry", () => {
+    const document: CircuitDocument = {
+      title: "読み取りできないスイッチ状態",
+      parts: [
+        { id: "source", kind: "ac-source", label: "交流電源", x: 0, y: 0, voltageVolts: 1, frequencyHz: 50 },
+        { id: "load", kind: "resistor", label: "負荷", x: 8, y: 0, resistanceOhms: 20 },
+        { id: "toggle", kind: "switch", label: "スイッチ", x: 16, y: 0, initiallyClosed: true },
+      ],
+      wires: [
+        { id: "a", from: { partId: "source", terminal: "a" }, to: { partId: "load", terminal: "a" } },
+        { id: "b", from: { partId: "load", terminal: "b" }, to: { partId: "toggle", terminal: "a" } },
+        { id: "c", from: { partId: "toggle", terminal: "b" }, to: { partId: "source", terminal: "b" } },
+      ],
+    };
+    const options = { mode: "ac" as const, frequencyHz: 50 };
+    const analysis = analyzeCircuit(document, {}, options);
+    let readSwitch = () => true;
+    Object.defineProperty(analysis.parts.toggle!, "switchClosed", {
+      get: () => readSwitch(),
+    });
+    const container = globalThis.document.createElement("div");
+    const root = createRoot(container);
+    mounted.push({ root, container });
+    const render = () => act(() => root.render(<CircuitAcPanel document={document} analysis={analysis} options={options} />));
+    render();
+    expect(sweepFrequencies(container)).toHaveLength(41);
+
+    readSwitch = () => { throw new Error("スイッチ状態が利用できません"); };
+    expect(render).not.toThrow();
+    expect(container.querySelector(".circuit-ac__response")).toBeNull();
+    sweepFrequencies(container);
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain("スイッチ状態が利用できません");
+
+    readSwitch = () => true;
+    expect(sweepFrequencies(container)).toHaveLength(41);
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+  });
+
+  it.each([false, true])("reports a rejected document snapshot and recovers on retry (previous sweep=%s)", (previousSweep) => {
+    const document: CircuitDocument = {
+      title: "接続先の更新中",
+      parts: [
+        { id: "source", kind: "ac-source", label: "交流電源", x: 0, y: 0, voltageVolts: 1, frequencyHz: 50 },
+        { id: "load", kind: "resistor", label: "負荷", x: 8, y: 0, resistanceOhms: 20 },
+      ],
+      wires: [
+        { id: "a", from: { partId: "source", terminal: "a" }, to: { partId: "load", terminal: "a" } },
+        { id: "b", from: { partId: "load", terminal: "b" }, to: { partId: "source", terminal: "b" } },
+      ],
+    };
+    const options = { mode: "ac" as const, frequencyHz: 50 };
+    const analysis = analyzeCircuit(document, {}, options);
+    const container = globalThis.document.createElement("div");
+    const root = createRoot(container);
+    mounted.push({ root, container });
+    act(() => root.render(<CircuitAcPanel document={document} analysis={analysis} options={options} />));
+    if (previousSweep) { sweepFrequencies(container); }
+    // The host can update inputs while an earlier analysis is still displayed.
+    document.wires[0]!.to.partId = "missing";
+    const errors: unknown[] = [];
+    const captureError = (event: ErrorEvent) => {
+      errors.push(event.error);
+      event.preventDefault();
+    };
+    window.addEventListener("error", captureError);
+    try {
+      sweepFrequencies(container);
+    } finally {
+      window.removeEventListener("error", captureError);
+    }
+
+    expect(errors).toEqual([]);
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain("missing");
+    expect(container.querySelector(".circuit-ac__response")).toBeNull();
+
+    document.wires[0]!.to.partId = "load";
+    expect(sweepFrequencies(container)).toHaveLength(41);
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+  });
+
+  it.each(["source", "switch", "wire", "switch accessor"] as const)("hides an earlier sweep after %s inputs and analysis are updated in place", (changed) => {
+    const document: CircuitDocument = {
+      title: "電源振幅を変更した後の掃引",
+      parts: [
+        { id: "load", kind: "resistor", label: "負荷", x: 4, y: 0, resistanceOhms: 20 },
+        { id: "source", kind: "ac-source", label: "交流電源", x: 0, y: 0, voltageVolts: 1, frequencyHz: 50 },
+        { id: "toggle", kind: "switch", label: "スイッチ", x: 8, y: 0, initiallyClosed: true },
+      ],
+      wires: [
+        { id: "a", from: { partId: "source", terminal: "a" }, to: { partId: "load", terminal: "a" } },
+        { id: "b", from: { partId: "load", terminal: "b" }, to: { partId: "toggle", terminal: "a" } },
+        { id: "c", from: { partId: "toggle", terminal: "b" }, to: { partId: "source", terminal: "b" } },
+      ],
+    };
+    const options = { mode: "ac" as const, frequencyHz: 50 };
+    const analysis = analyzeCircuit(document, {}, options);
+    let closed = true;
+    const installSwitchAccessor = () => {
+      if (changed === "switch accessor") {
+        Object.defineProperty(analysis.parts.toggle, "switchClosed", { get: () => closed, configurable: true });
+      }
+    };
+    installSwitchAccessor();
+    const container = globalThis.document.createElement("div");
+    const root = createRoot(container);
+    mounted.push({ root, container });
+    const render = () => act(() => root.render(<CircuitAcPanel document={document} analysis={analysis} options={options} />));
+    render();
+    sweepFrequencies(container);
+    expect(container.querySelector(".circuit-ac__response-dot")?.getAttribute("data-voltage-rms")).toBe("1");
+
+    if (changed === "source") { document.parts[1]!.voltageVolts = 2; }
+    if (changed === "wire") { document.wires[0]!.from.terminal = "b"; }
+    Object.assign(analysis, analyzeCircuit(document, changed === "switch" || changed === "switch accessor" ? { toggle: false } : {}, options));
+    closed = false;
+    installSwitchAccessor();
+    render();
+
+    const expectedVoltage = changed === "source" ? "2" : "0";
+    expect(container.querySelector(".circuit-ac__waveform")?.getAttribute("data-voltage-rms")).toBe(expectedVoltage);
+    expect(container.querySelector(".circuit-ac__response")).toBeNull();
+    sweepFrequencies(container);
+    const points = [...container.querySelectorAll(".circuit-ac__response-dot")];
+    expect(points).toHaveLength(41);
+    for (const point of points) { expect(point.getAttribute("data-voltage-rms")).toBe(expectedVoltage); }
+  });
+
   it.each([false, true])("preserves non-enumerable source fields when sweeping (document fields: %s)", (hideDocumentFields) => {
     const source: CircuitDocument["parts"][number] = {
       id: "source", kind: "ac-source", label: "交流電源", x: 0, y: 0, frequencyHz: 1000,

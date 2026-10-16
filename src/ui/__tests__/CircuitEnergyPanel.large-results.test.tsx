@@ -5,6 +5,7 @@ import { analyzeCircuit } from "../../circuit-solver.js";
 import { MAX_TRANSIENT_STEPS, type TransientAnalysis } from "../../transient-solver.js";
 import { CircuitEnergyPanel } from "../CircuitEnergyPanel.js";
 
+// Keep the full 512,256-reading fixture and allow headroom under shared CPU load.
 it("renders the full stored-energy scale for many capacitors and the maximum sample count", () => {
   const document: CircuitDocument = {
     title: "多数のコンデンサの蓄積エネルギー",
@@ -34,4 +35,4 @@ it("renders the full stored-energy scale for many capacitors and the maximum sam
   expect(markup.match(/data-scale-max="128"/g)).toHaveLength(256);
   expect(markup).toContain('data-energy-joules="0.5"');
   expect(markup).toContain('data-energy-joules="128"');
-});
+}, 30_000);

@@ -21,6 +21,7 @@ afterEach(() => {
     act(() => root.unmount());
     container.remove();
   }
+  vi.useRealTimers();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
@@ -49,6 +50,38 @@ function panelProps(
 }
 
 describe("CircuitSimulationPanel learning feature visibility", () => {
+  it("pauses playback when returning to the steady display and allows playback to resume", () => {
+    vi.useFakeTimers();
+    const onFrameChange = vi.fn();
+    const props = panelProps(undefined, undefined, { onFrameChange });
+    const { container } = mount(<CircuitSimulationPanel {...props} />);
+    const click = (text: string) => {
+      const button = [...container.querySelectorAll("button")].find((item) => item.textContent === text);
+      if (!button) { throw new Error(`Missing button ${text}`); }
+      act(() => button.click());
+    };
+    click("波形を計算");
+    click("再生");
+    act(() => vi.advanceTimersByTime(100));
+    const slider = container.querySelector<HTMLInputElement>('.circuit-transient__time-controls input[type="range"]')!;
+    const pausedIndex = slider.value;
+    expect(Number(pausedIndex)).toBeGreaterThan(0);
+
+    click("回路図を定常表示に戻す");
+    expect(onFrameChange.mock.calls.at(-1)?.[0]).toBeNull();
+    act(() => vi.advanceTimersByTime(100));
+
+    expect(onFrameChange.mock.calls.at(-1)?.[0] === null).toBe(true);
+    expect(container.querySelector(".circuit-energy__time")).toBeNull();
+    expect(slider.value).toBe(pausedIndex);
+    expect(container.querySelector(".circuit-waveform")).not.toBeNull();
+    click("再生");
+    act(() => vi.advanceTimersByTime(100));
+    expect(Number(slider.value)).toBeGreaterThan(Number(pausedIndex));
+    expect(onFrameChange.mock.calls.at(-1)?.[0]).not.toBeNull();
+    expect(container.querySelector(".circuit-energy__time")).not.toBeNull();
+  });
+
   it("keeps standalone AC tools active when a Proxy supplies an absent mode", () => {
     const document = createCircuitExample("ac");
     const options = new Proxy<CircuitAnalysisOptions>({}, {

@@ -11,12 +11,16 @@ export function useCircuitPotentialView(document: CircuitDocument, analysis?: Ci
   const [referenceId, setReferenceId] = useState("");
   const [selectedId, setSelectedId] = useState("");
   const [scale, setScale] = useState(10);
-  const nodes = useMemo(() => available && analysis ? circuitNodes(document, analysis) : [], [document, analysis, available]);
+  // Documents and transported analyses can be edited in place. Refresh their
+  // derived readings and connectivity even when their object identities match.
+  const nodes = available && analysis ? circuitNodes(document, analysis) : [];
   const defaultReference = defaultReferenceNode(document, nodes);
   const reference = nodes.find((node) => node.id === referenceId) ?? defaultReference;
   const selected = nodes.find((node) => node.id === selectedId) ?? nodes.find((node) => node.currents.length > 2 && node.id !== defaultReference?.id) ?? nodes.find((node) => node.id !== defaultReference?.id) ?? defaultReference;
   const ac = analysis?.mode === "ac";
-  const potentialContext = useMemo(() => analysis ? { document, analysis, nodes } : undefined, [document, analysis, nodes]);
+  // Keep the context stable so precise path caches survive view-only changes.
+  // Their input snapshots rebuild connectivity when mutable input data changes.
+  const potentialContext = useMemo(() => analysis ? { document, analysis } : undefined, [document, analysis]);
   const potential = circuitPotential(selected, reference, ac, potentialContext);
   const byEndpoint = new Map(nodes.flatMap((node) => node.endpoints.map((endpoint) => [circuitEndpointKey(endpoint), node] as const)));
   return { enabled, setEnabled, scale, setScale, nodes, reference, selected, setReferenceId, setSelectedId, ac, potential, potentialContext, byEndpoint };

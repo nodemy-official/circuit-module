@@ -65,8 +65,13 @@ it.each([
   }
 });
 
-it.each([200, 500].flatMap((exponent) => [false, true].map((extra) => ({ exponent, extra }))))(
-  "resolves a triangular reverse-junction loop independently of a separate circuit (2^-$exponent, extra=$extra)", ({ exponent, extra }) => {
+// Each order/mode verifies an independent result. Separate cases identify the
+// failing analysis and apply the existing timeout to each analysis call.
+it.each([200, 500].flatMap((exponent) => [false, true].flatMap((extra) =>
+  [false, true].flatMap((reversed) => (["dc", "transient", "ac"] as const).map((mode) =>
+    ({ exponent, extra, reversed, mode }))),
+)))(
+  "resolves a triangular reverse-junction loop independently of a separate circuit ($mode, 2^-$exponent, extra=$extra, reversed=$reversed)", ({ exponent, extra, reversed, mode }) => {
     const saturation = 2 ** -20;
     const firstTail = saturation * 2 ** -exponent;
     const directTail = saturation * 2 ** (-2 * exponent);
@@ -85,27 +90,38 @@ it.each([200, 500].flatMap((exponent) => [false, true].map((extra) => ({ exponen
         ["other-junction", "diode", ["z", "0"]] as CircuitSpec,
       ] : []),
     ];
-    for (const ordered of [specs, specs.toReversed()]) {
-      const document = createCircuitFromSpecs(ordered, "A direct junction in parallel with two series junctions");
+    const ordered = reversed ? specs.toReversed() : specs;
+    const document = createCircuitFromSpecs(ordered, "A direct junction in parallel with two series junctions");
+    if (mode === "dc") {
       const dc = analyzeAnalogCircuit(document);
       expect(dc.status, dc.message).toBe("valid");
-      const transient = simulateTransient(document, { durationSeconds: 0.25, timeStepSeconds: 0.125 });
-      expect(transient.status, transient.message).toBe("valid");
-      const ac = analyzeAnalogCircuit(createCircuitFromSpecs([
-        ...ordered,
-        ["drive", "ac-source", ["u", "0"], { voltageVolts: 1e-6, offsetVolts: 0, frequencyHz: 1 }],
-        ["cap", "capacitor", ["u", "x"], { capacitanceFarads: (firstTail / (2 * thermalVoltage) + directTail / thermalVoltage) / (2 * Math.PI) }],
-      ], "Triangular reverse-junction AC transfer"), { mode: "ac", frequencyHz: 1 });
-      expect(ac.status, ac.message).toBe("valid");
       for (const id of ["first", "second", "direct"]) {
         const factor = id === "direct" ? 2 : 1;
         expect(Math.abs(dc.parts[id]!.voltage.real / (expected * factor) - 1)).toBeLessThan(2e-13);
+      }
+      return;
+    }
+    if (mode === "transient") {
+      const transient = simulateTransient(document, { durationSeconds: 0.25, timeStepSeconds: 0.125 });
+      expect(transient.status, transient.message).toBe("valid");
+      for (const id of ["first", "second", "direct"]) {
+        const factor = id === "direct" ? 2 : 1;
         for (const sample of transient.samples) {
           expect(Math.abs(sample.parts[id]!.voltageVolts / (expected * factor) - 1)).toBeLessThan(2e-13);
         }
-        expect(Math.abs(ac.parts[id]!.voltage.real / (2.5e-7 * factor) - 1)).toBeLessThan(2e-12);
-        expect(Math.abs(ac.parts[id]!.voltage.imaginary / (2.5e-7 * factor) - 1)).toBeLessThan(2e-12);
       }
+      return;
+    }
+    const ac = analyzeAnalogCircuit(createCircuitFromSpecs([
+      ...ordered,
+      ["drive", "ac-source", ["u", "0"], { voltageVolts: 1e-6, offsetVolts: 0, frequencyHz: 1 }],
+      ["cap", "capacitor", ["u", "x"], { capacitanceFarads: (firstTail / (2 * thermalVoltage) + directTail / thermalVoltage) / (2 * Math.PI) }],
+    ], "Triangular reverse-junction AC transfer"), { mode: "ac", frequencyHz: 1 });
+    expect(ac.status, ac.message).toBe("valid");
+    for (const id of ["first", "second", "direct"]) {
+      const factor = id === "direct" ? 2 : 1;
+      expect(Math.abs(ac.parts[id]!.voltage.real / (2.5e-7 * factor) - 1)).toBeLessThan(2e-12);
+      expect(Math.abs(ac.parts[id]!.voltage.imaginary / (2.5e-7 * factor) - 1)).toBeLessThan(2e-12);
     }
   },
 );

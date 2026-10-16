@@ -6,6 +6,8 @@ import { exactRationalToNumber, numberToExactRational, subtractExactRational } f
 import { formatCircuitNumber } from "../number-format.js";
 import { copySimulationDocument, simulationRecordField } from "../simulation-input.js";
 import { NumericInput } from "./NumericInput.js";
+import { useSimulationDocumentKey } from "./simulation-document-context.js";
+import { simulationDocumentKey } from "./simulation-document-key.js";
 
 const MIN_SWEEP_POINTS = 3;
 const MAX_SWEEP_POINTS = 81;
@@ -55,11 +57,26 @@ interface SweepPoint {
 interface StoredSweep {
   document: CircuitDocument;
   analysis: CircuitAnalysis;
+  documentKey: string | null;
+  switchStatesKey: string;
   selectedPartId: string;
   centerFrequencyHz: number;
   decades: number;
   pointCount: number;
   points: SweepPoint[];
+}
+
+interface SweepFailure {
+  document: CircuitDocument;
+  analysis: CircuitAnalysis;
+  message: string;
+}
+
+function analyzedSwitchStatesKey(analysis: CircuitAnalysis): string {
+  return JSON.stringify(Object.getOwnPropertyNames(analysis.parts).flatMap((id) => {
+    const closed = analysis.parts[id]?.switchClosed;
+    return typeof closed === "boolean" ? [[id, closed]] : [];
+  }));
 }
 
 function usableAcAnalysis(
@@ -86,11 +103,14 @@ function createFrequencySweep(
   decades: number,
   pointCount: number,
 ): StoredSweep {
+  const copiedDocument = copySimulationDocument(document);
+  const documentKey = simulationDocumentKey(copiedDocument);
+  const switchStatesKey = analyzedSwitchStatesKey(analysis);
   const span = 10 ** (decades / 2);
   const minFrequency = Math.max(Number.MIN_VALUE, centerFrequencyHz / span);
   const maxFrequency = Math.min(Number.MAX_VALUE, centerFrequencyHz * span);
   if (!Number.isFinite(minFrequency) || !Number.isFinite(maxFrequency) || minFrequency <= 0 || maxFrequency <= minFrequency) {
-    return { document, analysis, selectedPartId: partId, centerFrequencyHz, decades, pointCount, points: [] };
+    return { document, analysis, documentKey, switchStatesKey, selectedPartId: partId, centerFrequencyHz, decades, pointCount, points: [] };
   }
   const lowerSteps = Math.floor((pointCount - 1) / 2);
   const upperSteps = pointCount - 1 - lowerSteps;
@@ -106,11 +126,11 @@ function createFrequencySweep(
   for (let index = 1; index <= upperSteps; index += 1) {
     frequencies.add(logFrequency(centerFrequencyHz, maxFrequency, index, upperSteps));
   }
-  const switchStates = Object.fromEntries(document.parts.flatMap((part) => {
-    const closed = analysis.parts[part.id]?.switchClosed;
+  const capturedSwitchStates = new Map<string, boolean>(JSON.parse(switchStatesKey));
+  const switchStates = Object.fromEntries(copiedDocument.parts.flatMap((part) => {
+    const closed = capturedSwitchStates.get(part.id);
     return part.kind === "switch" && closed !== undefined ? [[part.id, closed]] : [];
   }));
-  const copiedDocument = copySimulationDocument(document);
   const points: SweepPoint[] = [...frequencies].sort((first, second) => first - second).map((frequencyHz) => {
     // Keep the same excitation set as the displayed analysis. Sources at other
     // frequencies are out of band there, so they must stay out of the whole sweep.
@@ -131,12 +151,13 @@ function createFrequencySweep(
       : undefined;
     return { frequencyHz, voltageVolts: finite(voltage) ? voltage : null };
   });
-  return { document, analysis, selectedPartId: partId, centerFrequencyHz, decades, pointCount, points };
+  return { document, analysis, documentKey, switchStatesKey, selectedPartId: partId, centerFrequencyHz, decades, pointCount, points };
 }
 
 function matchingSweep(
   sweep: StoredSweep | null,
   document: CircuitDocument,
+  documentKey: string | null,
   analysis: CircuitAnalysis,
   partId: string | undefined,
   centerFrequencyHz: number,
@@ -145,7 +166,14 @@ function matchingSweep(
 ): StoredSweep | null {
   if (!sweep || sweep.document !== document || sweep.analysis !== analysis || sweep.selectedPartId !== partId ||
     sweep.centerFrequencyHz !== centerFrequencyHz || sweep.decades !== decades || sweep.pointCount !== pointCount) { return null; }
-  return sweep;
+  // A host can change circuit values or switch overrides in place.
+  try {
+    return sweep.documentKey !== null && documentKey === sweep.documentKey &&
+      analyzedSwitchStatesKey(analysis) === sweep.switchStatesKey ? sweep : null;
+  } catch {
+    // If the current inputs cannot be read, the stored response is unverified.
+    return null;
+  }
 }
 
 function emptyMessage(options: CircuitAnalysisOptions, analysis: CircuitAnalysis, hasAcSource: boolean, requestedFrequencyHz: number): string {
@@ -340,6 +368,10 @@ export function CircuitAcPanel({ document, analysis, options: inputOptions }: Ci
   const [decades, setDecades] = useState(2);
   const [pointCount, setPointCount] = useState(41);
   const [sweep, setSweep] = useState<StoredSweep | null>(null);
+  const [failure, setFailure] = useState<SweepFailure | null>(null);
+  if (failure && (failure.document !== document || failure.analysis !== analysis)) {
+    setFailure(null);
+  }
   const choices: CircuitPart[] = document.parts.filter((part) => part.kind !== "ground" && part.kind !== "junction");
   const selectedPart = choices.find((part) => part.id === selectedPartId) ??
     choices.find((part) => part.kind === "capacitor" || part.kind === "inductor") ??
@@ -347,11 +379,19 @@ export function CircuitAcPanel({ document, analysis, options: inputOptions }: Ci
   const reading = selectedPart ? analysis.parts[selectedPart.id] : undefined;
   const hasAcSource = document.parts.some((part) => part.kind === "ac-source");
   const active = usableAcAnalysis(document, analysis, options, centerFrequencyHz, requestedFrequencyHz, selectedPart, reading);
-  const visibleSweep = matchingSweep(sweep, document, analysis, selectedPart?.id, centerFrequencyHz, decades, pointCount);
+  const documentKey = useSimulationDocumentKey(document, active && sweep !== null);
+  const visibleSweep = matchingSweep(sweep, document, documentKey, analysis, selectedPart?.id, centerFrequencyHz, decades, pointCount);
 
   const runSweep = () => {
     if (active && selectedPart) {
-      setSweep(createFrequencySweep(document, analysis, selectedPart.id, centerFrequencyHz, decades, pointCount));
+      try {
+        setSweep(createFrequencySweep(document, analysis, selectedPart.id, centerFrequencyHz, decades, pointCount));
+        setFailure(null);
+      } catch (error) {
+        const detail = error instanceof Error ? ` ${error.message}` : "";
+        setSweep(null);
+        setFailure({ document, analysis, message: `周波数スイープを計算できませんでした。${detail}` });
+      }
     }
   };
 
@@ -381,6 +421,7 @@ export function CircuitAcPanel({ document, analysis, options: inputOptions }: Ci
       <button type="button" className="circuit-button" onClick={runSweep} disabled={!active}>対数スイープを計算</button>
       <p className="circuit-ac__sweep-note">解析周波数に一致する交流電源を同時にスイープします。実効値と位相は保ち、異なる周波数の電源は解析対象外にします。</p>
     </div>
+    {failure && <p className="circuit-ac__empty" role="alert">{failure.message}</p>}
     {showSweepMessage && <p className="circuit-ac__empty" role="status">周波数範囲を解析できませんでした。解析周波数を確認してください。</p>}
     {visibleSweep && visibleSweep.points.length > 0 && <FrequencyResponse points={visibleSweep.points} partLabel={selectedPart.label} />}
   </section>;

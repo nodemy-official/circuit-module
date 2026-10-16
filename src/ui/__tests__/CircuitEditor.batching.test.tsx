@@ -2,7 +2,7 @@
 import { StrictMode, act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { CircuitDocument } from "../../circuit-model.js";
+import type { CircuitDocument, CircuitPart } from "../../circuit-model.js";
 import { parseCircuitDocument } from "../../circuit-serialization.js";
 import { CircuitEditor } from "../CircuitEditor.js";
 import type { CircuitEditorController } from "../useCircuitEditor.js";
@@ -45,6 +45,91 @@ function mount(initialDocument = fixture()) {
     },
   };
 }
+
+describe("part property updates", () => {
+  it.each([
+    { field: "id", patch: { id: "renamed", label: "rejected" } },
+    { field: "kind", patch: { kind: "ground", label: "rejected" } },
+  ] as const)("rejects a changed $field without altering references, editor state, or history", ({ patch }) => {
+    const ui = mount();
+    const initial = ui.editor.document;
+    act(() => {
+      ui.editor.setTitle("before");
+      ui.editor.endEdit();
+      ui.editor.setTitle("redo");
+      ui.editor.undo();
+      ui.editor.startConnection({ partId: "a", terminal: "a" });
+      ui.editor.selectPart("a");
+    });
+    const before = ui.editor;
+
+    act(() => ui.editor.updatePart("a", patch));
+
+    expect(ui.editor.error).toContain("変更できません");
+    expect(ui.editor.document).toBe(before.document);
+    expect(ui.editor.selection).toBe(before.selection);
+    expect(ui.editor.pendingEndpoint).toBe(before.pendingEndpoint);
+    expect(ui.editor.pendingWire).toBe(before.pendingWire);
+    expect(ui.editor.documentVersion).toBe(before.documentVersion);
+    expect(ui.editor.canUndo).toBe(true);
+    expect(ui.editor.canRedo).toBe(true);
+    expect(parseCircuitDocument(ui.editor.exportDocument())).toEqual({ ok: true, document: before.document });
+    act(() => ui.editor.redo());
+    expect(ui.editor.document.title).toBe("redo");
+    act(() => { ui.editor.undo(); ui.editor.undo(); });
+    expect(ui.editor.document).toBe(initial);
+    expect(ui.editor.canUndo).toBe(false);
+  });
+
+  it("keeps a pending reconnect when a structural patch is rejected", () => {
+    const ui = mount();
+    act(() => ui.editor.startReconnect("wire", "from"));
+    const before = ui.editor;
+    const patch: Partial<CircuitPart> = { id: "renamed" };
+
+    act(() => ui.editor.updatePart("a", patch));
+
+    expect(ui.editor.error).toContain("変更できません");
+    expect(ui.editor.document).toBe(before.document);
+    expect(ui.editor.selection).toBe(before.selection);
+    expect(ui.editor.pendingEndpoint).toBe(before.pendingEndpoint);
+    expect(ui.editor.pendingWire).toBe(before.pendingWire);
+    expect(ui.editor.documentVersion).toBe(before.documentVersion);
+    expect(ui.editor.canUndo).toBe(false);
+    expect(ui.editor.canRedo).toBe(false);
+  });
+
+  it("accepts a full property patch when ID and kind are unchanged", () => {
+    const ui = mount();
+    const initial = ui.editor.document;
+    const patch = { ...initial.parts[0]!, label: "updated", resistanceOhms: 22 };
+
+    act(() => ui.editor.updatePart("a", patch));
+
+    expect(ui.editor.error).toBeNull();
+    expect(ui.editor.document.parts[0]).toEqual(patch);
+    expect(ui.editor.document.wires).toBe(initial.wires);
+    expect(parseCircuitDocument(ui.editor.exportDocument())).toEqual({ ok: true, document: ui.editor.document });
+    act(() => ui.editor.undo());
+    expect(ui.editor.document).toBe(initial);
+    act(() => ui.editor.redo());
+    expect(ui.editor.document.parts[0]).toEqual(patch);
+  });
+
+  it("keeps redo history for an unchanged ID and kind patch", () => {
+    const ui = mount();
+    const initial = ui.editor.document;
+    act(() => { ui.editor.setTitle("redo"); ui.editor.undo(); });
+    const patch: Partial<CircuitPart> = { id: "a", kind: "resistor" };
+
+    act(() => ui.editor.updatePart("a", patch));
+
+    expect(ui.editor.error).toBeNull();
+    expect(ui.editor.document).toBe(initial);
+    expect(ui.editor.canUndo).toBe(false);
+    expect(ui.editor.canRedo).toBe(true);
+  });
+});
 
 describe("batched editor commands", () => {
   it.each([true, false])("composes document, property, selection and movement commands (batched=%s)", (batched) => {

@@ -52,7 +52,14 @@ export function freezeCapturedExactExpressions(capture: ExactExpressionCapture):
 }
 
 export function capturedExactExpressionSign(table: readonly ExactExpressionNode[] | undefined, reference: number) {
-  return table && capturedSigns.get(table)?.[reference];
+  const signs = table && capturedSigns.get(table);
+  return signs && Number.isSafeInteger(reference) && reference >= 0 && reference < signs.length
+    ? signs[reference] : undefined;
+}
+
+/** Only internally captured or snapshotted tables have immutable nested nodes. */
+export function exactExpressionsAreImmutable(table: readonly ExactExpressionNode[] | undefined): boolean {
+  return table !== undefined && immutableTables.has(table);
 }
 
 export function withExactExpressionCapture<T>(capture: ExactExpressionCapture, callback: () => T): T {
@@ -224,8 +231,13 @@ function expressionDependencies(table: readonly ExactExpressionNode[], reference
 
 function evaluateExpression(node: ExactExpressionNode, live: ReadonlyMap<number, ExactRational>, operations: ExpressionOperations) {
   if (node.operation === "literal") {
-    const numerator = node.numerator.startsWith("-") ? -BigInt(node.numerator.slice(1)) : BigInt(node.numerator);
-    const denominator = BigInt(node.denominator);
+    const { numerator: serializedNumerator, denominator: serializedDenominator } = node;
+    // Match the direct rational metadata grammar; BigInt alone also accepts
+    // booleans, numbers, whitespace, and other unintended coercions.
+    if (typeof serializedNumerator !== "string" || typeof serializedDenominator !== "string" ||
+      !/^-?(?:\d+|0x[\da-f]+)$/i.test(serializedNumerator) || !/^(?:\d+|0x[\da-f]+)$/i.test(serializedDenominator)) { return; }
+    const numerator = serializedNumerator.startsWith("-") ? -BigInt(serializedNumerator.slice(1)) : BigInt(serializedNumerator);
+    const denominator = BigInt(serializedDenominator);
     return denominator > 0n ? operations.literal({ numerator, denominator }) : undefined;
   }
   const arguments_ = Array.from({ length: node.arguments.length }, (_, index) => live.get(node.arguments[index]!));

@@ -20,7 +20,7 @@ export interface CircuitExactComplex {
   /** Algebraic terms, retained so cancellation remains exact after transport. */
   normalizedFraction?: { numerator: readonly CircuitExactNormalizedTerm[]; denominator: readonly CircuitExactNormalizedTerm[] };
   /** Original scalar projections, used to detect later scalar-only edits. */
-  projection?: { real: number; magnitude: number; phaseDegrees: number };
+  projection?: { real: number; magnitude: number | null; phaseDegrees: number };
 }
 
 const serializedRationals = new WeakMap<ExactRational, CircuitExactComplex["real"]>();
@@ -42,6 +42,16 @@ export interface CircuitReadingPrecision {
   exactVoltage?: CircuitExactComplex;
   exactTerminalVoltages?: Partial<Record<CircuitTerminal, CircuitExactComplex>>;
   exactTerminalCurrents?: Partial<Record<CircuitTerminal, CircuitExactComplex>>;
+}
+
+let optionalPrecisionFailure: object = {};
+
+/** A derived cache must not retain a fallback paired with an earlier valid snapshot. */
+export function optionalPrecisionFailureToken() { return optionalPrecisionFailure; }
+
+/** Keep failures in optional precision fields separate from ordinary readings. */
+export function readOptionalPrecision<T>(read: () => T): T | undefined {
+  try { return read(); } catch { optionalPrecisionFailure = {}; return undefined; }
 }
 
 export function retainedComplex(value: ComplexValue): CircuitExactComplex | undefined {
@@ -133,14 +143,16 @@ export function restoredComplex(value: CircuitExactComplex | undefined, expressi
     const imaginary = restoredRational(value.imaginary, expressions);
     if (!real || !imaginary) { return; }
     let result = complexFromExact({ real, imaginary });
-    if (value.magnitudeNormalizationSquared) {
-      const normalization = restoredRational(value.magnitudeNormalizationSquared, expressions);
+    const squared = value.magnitudeNormalizationSquared;
+    if (squared !== undefined) {
+      const normalization = restoredRational(squared, expressions);
       if (!normalization || normalization.numerator <= 0n) { return; }
       result = withComplexMagnitudeNormalization(result, normalization);
     }
-    if (value.normalizedFraction) {
-      const numerator = restoredNormalizedTerms(value.normalizedFraction.numerator, expressions);
-      const denominator = restoredNormalizedTerms(value.normalizedFraction.denominator, expressions);
+    const fraction = value.normalizedFraction;
+    if (fraction !== undefined) {
+      const numerator = restoredNormalizedTerms(fraction.numerator, expressions);
+      const denominator = restoredNormalizedTerms(fraction.denominator, expressions);
       if (!numerator || !denominator || denominator.length === 0) { return; }
       result = complexFromNormalizedFraction({ numerator, denominator }, complexMagnitudeNormalization(result));
     }
@@ -150,27 +162,60 @@ export function restoredComplex(value: CircuitExactComplex | undefined, expressi
   }
 }
 
+function validProjection(projection: CircuitExactComplex["projection"]) {
+  return projection === undefined || (typeof projection === "object" && projection !== null &&
+    typeof projection.real === "number" && !Number.isNaN(projection.real) &&
+    // JSON transport turns an overflowing magnitude into null while both
+    // rectangular components may remain finite and usable for exact sums.
+    (projection.magnitude === null || (typeof projection.magnitude === "number" && projection.magnitude >= 0)) &&
+    Number.isFinite(projection.phaseDegrees));
+}
+
 export function restoredReadingComplex(value: CircuitExactComplex | undefined, scalar: number, degrees: number | undefined, ac: boolean, expressions?: readonly ExactExpressionNode[]) {
-  const projection = value?.projection;
-  if (projection && (scalar !== (ac ? projection.magnitude : projection.real) ||
-    (ac && degrees !== projection.phaseDegrees))) { return; }
-  return restoredComplex(value, expressions);
+  try {
+    const projection = value?.projection;
+    if (!validProjection(projection)) { optionalPrecisionFailure = {}; return; }
+    if (projection && (scalar !== (ac ? projection.magnitude ?? Number.POSITIVE_INFINITY : projection.real) ||
+      (ac && degrees !== projection.phaseDegrees))) { return; }
+    const restored = restoredComplex(value, expressions);
+    if (value && !restored) { optionalPrecisionFailure = {}; }
+    return restored;
+  } catch {
+    optionalPrecisionFailure = {};
+    // Projection metadata is optional too; unreadable data uses the scalar fallback.
+  }
 }
 
 /** A nonzero expression retains its sign even if every displayed value underflows. */
 export function retainedComplexIsNonzero(value: CircuitExactComplex | undefined, expressions?: readonly ExactExpressionNode[]) {
   if (!value) { return false; }
-  return [value.real, value.imaginary].some((component) => {
-    if (typeof component !== "object" || component === null) { return false; }
-    if ("expression" in component) {
-      const known = capturedExactExpressionSign(expressions, component.expression);
-      if (known !== undefined) { return known !== 0; }
+  try {
+    if (!validProjection(value.projection)) { return false; }
+    // Normalized fractions can cancel even when their rectangular fallback is
+    // nonzero. Validate the complete algebraic value before using its sign.
+    if (value.normalizedFraction !== undefined) {
+      const restored = restoredComplex(value, expressions);
+      const exact = restored && exactComplexValue(restored);
+      return !!exact && (exact.real.numerator !== 0n || exact.imaginary.numerator !== 0n);
     }
-    try {
+    const squared = value.magnitudeNormalizationSquared;
+    if (squared !== undefined) {
+      const normalization = restoredRational(squared, expressions);
+      if (!normalization || normalization.numerator <= 0n) { return false; }
+    }
+    const components = [value.real, value.imaginary].map((component) => {
+      if (typeof component !== "object" || component === null) { return null; }
+      if ("expression" in component) {
+        const known = capturedExactExpressionSign(expressions, component.expression);
+        if (known !== undefined) { return known !== 0; }
+      }
       const restored = restoredRational(component, expressions);
-      return restored !== undefined && restored.numerator !== 0n;
-    } catch { return false; }
-  });
+      return restored === undefined ? null : restored.numerator !== 0n;
+    });
+    return components.every((component) => component !== null) && components.some(Boolean);
+  } catch {
+    return false;
+  }
 }
 
 export function readingPrecision(reading: {

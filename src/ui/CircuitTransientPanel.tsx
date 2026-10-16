@@ -1,23 +1,54 @@
 import { useEffect, useId, useRef, useState, type ComponentPropsWithoutRef, type Dispatch, type SetStateAction } from "react";
+import { exactProductSumQuotient, scaledProduct } from "../analog-math.js";
 import type { CircuitDocument } from "../circuit-model.js";
 import { formatCircuitNumber } from "../number-format.js";
 import type { CircuitTransientFrame } from "../circuit-visualization.js";
 import { simulateTransient, type TransientAnalysis, type TransientSample } from "../transient-solver.js";
 import { measurementLabels } from "./measurement-labels.js";
 import { NumericInput } from "./NumericInput.js";
+import { useSimulationDocumentKey } from "./simulation-document-context.js";
+import { simulationDocumentKey } from "./simulation-document-key.js";
 
 const format = (value: number | undefined) => value === undefined ? "—" : formatCircuitNumber(value);
 const MAX_WAVEFORM_PARTS = 3;
 const PLAYBACK_INTERVAL_MS = 50;
 type ValidTransientAnalysis = TransientAnalysis & { status: "valid" };
 
+function timeStepForPartitions(duration: number, steps: number): number | null {
+  let step = exactProductSumQuotient([{ factors: [duration] }], steps);
+  if (step === 0) { return null; }
+  // The UI specifies a count, while the solver schedules represented times
+  // from a step length. Advance a rounded-down quotient by one binary64 ULP
+  // so that it cannot create an extra, almost-zero final interval. The solver
+  // still receives the exact requested endpoint and keeps its strict limit.
+  if (scaledProduct([step, steps]) < duration) {
+    const bits = new DataView(new ArrayBuffer(8));
+    bits.setFloat64(0, step);
+    bits.setBigUint64(0, bits.getBigUint64(0) + 1n);
+    step = bits.getFloat64(0);
+  }
+  // At subnormal scales no fixed represented step may yield this count.
+  // Do not silently replace the requested count with fewer intervals.
+  return scaledProduct([step, steps - 1]) < duration ? step : null;
+}
+
 type Quantity = "voltageVolts" | "currentAmps";
 type WaveformPart = CircuitDocument["parts"][number];
 interface TransientResult {
   document: CircuitDocument;
+  documentKey: string | null;
   baselineDocument?: CircuitDocument;
+  baselineDocumentKey: string | null;
   analysis: TransientAnalysis;
   baselineAnalysis?: TransientAnalysis;
+}
+
+function matchesTransientInputs(result: TransientResult | null, document: CircuitDocument,
+  baselineDocument: CircuitDocument | undefined, documentKey: string | null, baselineDocumentKey: string | null) {
+  return result?.document === document && result.baselineDocument === baselineDocument &&
+    result.documentKey === documentKey && result.baselineDocumentKey === baselineDocumentKey &&
+    (result.analysis.status !== "valid" || documentKey !== null) &&
+    (result.baselineAnalysis?.status !== "valid" || baselineDocumentKey !== null);
 }
 
 function defaultPartIds(parts: readonly WaveformPart[]) {
@@ -303,10 +334,20 @@ function TransientVisualizations({
   </>;
 }
 
+function ReturnToSteadyStateButton({ onReturn, onPause }: { onReturn?: () => void; onPause: () => void }) {
+  if (!onReturn) { return null; }
+  return <button className="circuit-button" type="button" onClick={() => {
+    onPause();
+    onReturn();
+  }}>回路図を定常表示に戻す</button>;
+}
+
 export interface CircuitTransientPanelProps extends Omit<ComponentPropsWithoutRef<"details">, "children"> {
   document: CircuitDocument;
   baselineDocument?: CircuitDocument;
   onFrameChange?: (frame: CircuitTransientFrame | null) => void;
+  /** Show a control that pauses playback and returns the host to its steady-state display. */
+  onReturnToSteadyState?: () => void;
   /** Pause playback while a containing tab is inactive, retaining the current result and cursor. */
   active?: boolean;
   /** Initial open state used when this panel is shown without its surrounding settings. */
@@ -318,6 +359,7 @@ export function CircuitTransientPanel({
   document,
   baselineDocument,
   onFrameChange,
+  onReturnToSteadyState,
   active = true,
   defaultOpen = false,
   open: openProp = defaultOpen,
@@ -334,6 +376,7 @@ export function CircuitTransientPanel({
   const [requestedSampleIndex, setRequestedSampleIndex] = useState(0);
   const sampleIndexRef = useRef(0);
   const [playing, setPlaying] = useState(false);
+  const [showTransientFrame, setShowTransientFrame] = useState(true);
   const onFrameChangeRef = useRef(onFrameChange);
   onFrameChangeRef.current = onFrameChange;
 
@@ -345,7 +388,9 @@ export function CircuitTransientPanel({
     const part = choices.find((candidate) => candidate.id === partId);
     return part ? [part] : [];
   });
-  const resultMatches = result?.document === document && result.baselineDocument === baselineDocument;
+  const documentKey = useSimulationDocumentKey(document, result !== null);
+  const baselineDocumentKey = useSimulationDocumentKey(baselineDocument, result !== null);
+  const resultMatches = matchesTransientInputs(result, document, baselineDocument, documentKey, baselineDocumentKey);
   const current = resultMatches && result ? result.analysis : null;
   const baseline = current ? result?.baselineAnalysis : undefined;
   const sampleIndex = current?.status === "valid" && current.samples.length > 0
@@ -360,23 +405,38 @@ export function CircuitTransientPanel({
 
   const setSampleIndex = (nextIndex: number) => {
     const boundedIndex = Math.min(maxSampleIndex, Math.max(0, nextIndex));
+    setShowTransientFrame(true);
     sampleIndexRef.current = boundedIndex;
     setRequestedSampleIndex(boundedIndex);
   };
 
   const run = () => {
+    setShowTransientFrame(true);
+    sampleIndexRef.current = 0;
+    setRequestedSampleIndex(0);
+    setPlaying(false);
+    const inputs = {
+      document, documentKey: simulationDocumentKey(document),
+      baselineDocument, baselineDocumentKey: simulationDocumentKey(baselineDocument),
+    };
+    const timeStepSeconds = timeStepForPartitions(duration, steps);
+    if (timeStepSeconds === null) {
+      setResult({ ...inputs, analysis: {
+        status: "invalid",
+        message: "この解析時間では指定した時間分割数を数値精度の範囲内で表せません。解析時間または時間分割数を調整してください。",
+        issues: [], samples: [],
+      } });
+      return;
+    }
     const options = {
       durationSeconds: duration,
-      timeStepSeconds: duration / steps,
+      timeStepSeconds,
       startFromOperatingPoint,
     };
     const analysis = simulateTransient(document, options);
     const compareDocument = baselineDocument && baselineDocument !== document ? baselineDocument : undefined;
     const baselineAnalysis = compareDocument ? simulateTransient(compareDocument, options) : undefined;
-    sampleIndexRef.current = 0;
-    setRequestedSampleIndex(0);
-    setPlaying(false);
-    setResult({ document, baselineDocument, analysis, baselineAnalysis });
+    setResult({ ...inputs, analysis, baselineAnalysis });
   };
 
   const numberChange = (value: number, change: (value: number) => void) => {
@@ -400,6 +460,7 @@ export function CircuitTransientPanel({
   };
 
   const togglePlayback = () => {
+    setShowTransientFrame(true);
     if (sampleIndex >= maxSampleIndex) { setSampleIndex(0); }
     setPlaying((value) => !value);
   };
@@ -412,12 +473,12 @@ export function CircuitTransientPanel({
   useStopPlaybackWhenInactive(active, current, setPlaying);
 
   useEffect(() => {
-    if (current?.status !== "valid" || !cursorSample) {
+    if (!showTransientFrame || current?.status !== "valid" || !cursorSample) {
       onFrameChangeRef.current?.(null);
       return;
     }
     onFrameChangeRef.current?.({ analysis: current, sampleIndex });
-  }, [current, cursorSample, sampleIndex]);
+  }, [current, cursorSample, sampleIndex, showTransientFrame]);
 
   useEffect(() => () => { onFrameChangeRef.current?.(null); }, []);
 
@@ -435,7 +496,7 @@ export function CircuitTransientPanel({
   }, [active, playing, current]);
 
   const stale = Boolean(result && !resultMatches);
-  return <details {...props} open={openProp} className={`circuit-transient ${className}`}>
+  return <><details {...props} open={openProp} className={`circuit-transient ${className}`}>
     <summary>時間波形・過渡解析</summary>
     <label htmlFor={`${id}-duration`}>解析時間 (s)</label>
     <NumericInput id={`${id}-duration`} min={0} exclusiveMin step="any" value={duration} onValueChange={(value) => numberChange(value, setDuration)} />
@@ -467,5 +528,12 @@ export function CircuitTransientPanel({
       onSeek={seek}
     />}
     {current?.status === "valid" && current.issues.length > 0 && <ul>{current.issues.map((issue) => <li key={`${issue.partId ?? "circuit"}:${issue.message}`}>{issue.message}</li>)}</ul>}
-  </details>;
+  </details>
+    <ReturnToSteadyStateButton onReturn={onReturnToSteadyState} onPause={() => {
+      setPlaying(false);
+      // A playback tick may already be queued when the return button is clicked.
+      // Keep its cursor update from restoring the host's transient display.
+      setShowTransientFrame(false);
+    }} />
+  </>;
 }

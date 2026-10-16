@@ -432,7 +432,7 @@ function EditorCenter({
           selection={editor.selection}
           pendingEndpoint={editor.pendingEndpoint}
           pendingWire={editor.pendingWire}
-          panMode={preview || tool === "pan"}
+          panMode={!preview && tool === "pan"}
           onSelectPart={(partId, additive) => { editor.selectPart(partId, additive); onEditSelection(); }}
           onSelectWire={(wireId, additive) => { editor.selectWire(wireId, additive); onEditSelection(); }}
           onSelectRange={(selection, additive) => { editor.selectRange(selection, additive); onEditSelection(); }}

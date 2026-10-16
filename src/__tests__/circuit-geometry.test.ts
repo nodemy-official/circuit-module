@@ -121,6 +121,24 @@ function hasInteriorCrossing(first: readonly Point[], second: readonly Point[], 
 }
 
 describe("routeWire", () => {
+  it.each(([0, 90, 180, 270] as CircuitRotation[]).flatMap((rotation) =>
+    [false, true].flatMap((reversed) => [0.5, 1, 1.5].map((gap) => ({ rotation, reversed, gap }))),
+  ))("connects nearby facing terminals without retracing (rotation=$rotation, reversed=$reversed, gap=$gap)", ({ rotation, reversed, gap }) => {
+    const left = { point: rotate({ x: 0, y: 0 }, rotation), direction: rotate({ x: 1, y: 0 }, rotation) };
+    const right = { point: rotate({ x: gap, y: 0 }, rotation), direction: rotate({ x: -1, y: 0 }, rotation) };
+    const start = reversed ? right : left;
+    const end = reversed ? left : right;
+    expect(routeWire(start, end)).toEqual([start.point, end.point]);
+  });
+
+  it.each([false, true])("ends a short outward terminal lead at its nearby junction (reversed=%s)", (reversed) => {
+    const terminal = { point: { x: 0, y: 0 }, direction: { x: 1, y: 0 } };
+    const junction = { point: { x: 0.5, y: 0 }, direction: null };
+    const start = reversed ? junction : terminal;
+    const end = reversed ? terminal : junction;
+    expect(routeWire(start, end)).toEqual([start.point, end.point]);
+  });
+
   it("routes a valid billion-cell wire alongside another wire without expanding every cell", () => {
     const document: CircuitDocument = { title: "large coordinates", parts: [
       { id: "a", kind: "junction", x: 0, y: 0, label: "A" },
@@ -227,6 +245,78 @@ describe("manual wire routing", () => {
   const isOrthogonal = (route: readonly Point[]) => route.every((first, index) => {
     const second = route[index + 1];
     return !second || first.x === second.x || first.y === second.y;
+  });
+
+  it("preserves an explicit return through a pin when compacting a moved route", () => {
+    const source: CircuitPart = { id: "source", kind: "resistor", x: 0, y: 0, rotation: 180, label: "source" };
+    const target: CircuitPart = { id: "target", kind: "resistor", x: 20, y: 20, label: "target" };
+    const document: CircuitDocument = {
+      title: "明示された端子経由点を保持",
+      parts: [source, target],
+      wires: [{ id: "wire", from: { partId: source.id, terminal: "b" }, to: { partId: target.id, terminal: "a" }, waypoints: [{ x: -2, y: 0 }] }],
+    };
+    const start = routeEnd(source, "b");
+    const end = routeEnd(target, "a");
+    const moved = moveWireSegment(routeDocumentWires(document).get("wire")!, 3, -5, start, end);
+    const waypoints = compactWireRouteWaypoints(moved, start, end);
+    const saved = { ...document, wires: [{ ...document.wires[0], waypoints }] };
+    const restored = parseCircuitDocument(serializeCircuitDocument(saved));
+    if (!restored.ok) { throw new Error(restored.reason); }
+    expect(routeDocumentWires(restored.document).get("wire")).toEqual(moved);
+  });
+
+  it.each(([0, 90, 180, 270] as CircuitRotation[]).flatMap((rotation) =>
+    [false, true].flatMap((reversed) => [false, true].map((close) => ({ rotation, reversed, close }))),
+  ))("does not reenter a terminal while approaching a waypoint (rotation=$rotation, reversed=$reversed, close=$close)", ({ rotation, reversed, close }) => {
+    const position = (point: Point) => {
+      const rotated = rotate(point, rotation);
+      return { x: rotated.x || 0, y: rotated.y || 0 };
+    };
+    const source: CircuitPart = { id: "source", kind: "resistor", x: 0, y: 0, rotation, label: "source" };
+    const target: CircuitPart = { id: "target", kind: "resistor", ...position(close ? { x: 4.5, y: 0 } : { x: -8, y: -8 }), rotation, label: "target" };
+    const sourceEndpoint = { partId: source.id, terminal: "b" as const };
+    const targetEndpoint = { partId: target.id, terminal: "a" as const };
+    const waypoint = position(close ? { x: 10, y: 10 } : { x: 2, y: -1 });
+    const document: CircuitDocument = {
+      title: "端子を再通過しない手動経路",
+      parts: [source, target],
+      wires: [{ id: "wire", from: reversed ? targetEndpoint : sourceEndpoint, to: reversed ? sourceEndpoint : targetEndpoint, waypoints: [waypoint] }],
+    };
+    const route = routeDocumentWires(document).get("wire")!;
+    const onSegment = (point: Point, from: Point, to: Point) =>
+      from.x === to.x ? point.x === from.x && Math.min(from.y, to.y) <= point.y && point.y <= Math.max(from.y, to.y)
+        : point.y === from.y && Math.min(from.x, to.x) <= point.x && point.x <= Math.max(from.x, to.x);
+    expect(route.some((point, index) => route[index + 1] && onSegment(waypoint, point, route[index + 1]))).toBe(true);
+    for (let index = 0; index < route.length - 1; index += 1) {
+      if (index > 0) { expect(onSegment(route[0], route[index], route[index + 1])).toBe(false); }
+      if (index < route.length - 2) { expect(onSegment(route.at(-1)!, route[index], route[index + 1])).toBe(false); }
+    }
+    expect(isOrthogonal(route)).toBe(true);
+    const restored = parseCircuitDocument(serializeCircuitDocument(document));
+    if (!restored.ok) { throw new Error(restored.reason); }
+    expect(routeDocumentWires(restored.document).get("wire")).toEqual(route);
+  });
+
+  it.each([false, true].flatMap((reversed) => [
+    { reversed, waypoint: { x: 25, y: 20 }, leadAtSource: false },
+    { reversed, waypoint: { x: -1, y: 1 }, leadAtSource: true },
+  ]))("keeps terminal leads clear while approaching $waypoint (reversed=$reversed)", ({ reversed, waypoint, leadAtSource }) => {
+    const source: CircuitPart = { id: "source", kind: "resistor", x: 0, y: 0, label: "source" };
+    const target: CircuitPart = { id: "target", kind: "resistor", x: 20, y: 20, rotation: 180, label: "target" };
+    const sourceEndpoint = { partId: source.id, terminal: "b" as const };
+    const targetEndpoint = { partId: target.id, terminal: "a" as const };
+    const document: CircuitDocument = {
+      title: "相手端子のリードを避ける",
+      parts: [source, target],
+      wires: [{
+        id: "wire", from: reversed ? targetEndpoint : sourceEndpoint, to: reversed ? sourceEndpoint : targetEndpoint,
+        waypoints: [waypoint],
+      }],
+    };
+    const route = routeDocumentWires(document).get("wire")!;
+    const lead = leadAtSource ? [{ x: 2, y: 0 }, { x: 3, y: 0 }] : [{ x: 22, y: 20 }, { x: 23, y: 20 }];
+    expect(segmentsOverlap(reversed !== leadAtSource ? route.slice(1) : route.slice(0, -1), lead)).toBe(false);
+    expect(isOrthogonal(route)).toBe(true);
   });
 
   it.each(([0, 90, 180, 270] as CircuitRotation[]).flatMap((rotation) =>

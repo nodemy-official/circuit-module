@@ -121,7 +121,7 @@ describe("Inspector numeric drafts", () => {
     });
   });
 
-  it("shows the analyzed default switch state instead of a phantom Proxy value", () => {
+  it.each(["inspector", "preview"] as const)("shows the analyzed default switch state instead of a phantom Proxy value in %s", (view) => {
     const document = createCircuitFromSpecs([
       ["source", "battery", ["s", "0"], { voltageVolts: 9 }],
       ["load", "resistor", ["s", "return"], { resistanceOhms: 100 }],
@@ -136,16 +136,20 @@ describe("Inspector numeric drafts", () => {
     });
     document.parts[2] = proxy;
     const analysis = analyzeCircuit(document);
-    const ui = mount("switch");
+    const ui = mount("switch", view);
     ui.replace(proxy);
 
     expect(analysis.status, analysis.message).toBe("closed");
     expect(analysis.parts.switch!.switchClosed).toBe(true);
-    expect(ui.container.querySelector<HTMLInputElement>('input[role="switch"]')!.checked).toBe(true);
-    expect(ui.container.querySelector('input[role="switch"]')!.getAttribute("aria-checked")).toBe("true");
+    expect(ui.container.querySelector('[role="switch"]')!.getAttribute("aria-checked")).toBe("true");
   });
 
-  it.each([undefined, 100])("shows the analyzed own resistance or its default instead of a Proxy get value (%s)", (resistanceOhms) => {
+  it.each([
+    { view: "inspector", resistanceOhms: undefined },
+    { view: "inspector", resistanceOhms: 100 },
+    { view: "preview", resistanceOhms: undefined },
+    { view: "preview", resistanceOhms: 100 },
+  ] as const)("shows the analyzed own resistance or its default in $view ($resistanceOhms)", ({ view, resistanceOhms }) => {
     const document = createCircuitFromSpecs([
       ["source", "battery", ["s", "0"], { voltageVolts: 9 }],
       ["load", "resistor", ["s", "0"]],
@@ -156,12 +160,12 @@ describe("Inspector numeric drafts", () => {
     else { Object.defineProperty(part, "resistanceOhms", { value: resistanceOhms, enumerable: false }); }
     const proxy = new Proxy(part, {
       get(target, key, receiver) {
-        return key === "resistanceOhms" && resistanceOhms === undefined ? 1000 : Reflect.get(target, key, receiver);
+        return key === "resistanceOhms" ? 1000 : Reflect.get(target, key, receiver);
       },
     });
     document.parts[1] = proxy;
     const analysis = analyzeAnalogCircuit(document);
-    const ui = mount("resistor");
+    const ui = mount("resistor", view);
     ui.replace(proxy);
 
     expect(analysis.status).toBe("valid");

@@ -9,6 +9,6 @@
 }
 
 .storybook-theme {
-  color: var(--circuit-ink);
-  background: var(--circuit-surface);
+  color: var(--circuit-ink, var(--_circuit-ink));
+  background: var(--circuit-surface, var(--_circuit-surface));
 }

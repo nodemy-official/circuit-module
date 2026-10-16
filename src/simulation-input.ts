@@ -1,25 +1,32 @@
 import { circuitPartCatalog, type CircuitDocument, type CircuitPartKind, type CircuitTerminal } from "./circuit-model.js";
 import { simulationDocumentCollectionsSchema, simulationEndpointSchema, simulationPartShapeSchema, simulationWireIdSchema } from "./circuit-validation.js";
 
-const simulationRecordFields = new Set([
+const simulationRecordFields = [...new Set([
   ...Object.values(circuitPartCatalog).flatMap(({ defaults }) => Object.keys(defaults)),
   "id", "kind", "label", "x", "y", "rotation", "title", "parts", "wires",
   "from", "to", "waypoints", "partId", "terminal", "mode", "frequencyHz",
   "switchStates", "voltageOverrides", "initialInductorCurrents", "durationSeconds",
   "timeStepSeconds", "startFromOperatingPoint",
-]);
+])];
 
 interface CapturedSimulationProperties {
   source: object;
   prototype: unknown;
   descriptors: PropertyDescriptorMap;
-  expectedFields: readonly PropertyKey[];
+  keys: readonly PropertyKey[];
+  missingFields: readonly PropertyKey[];
 }
 
-function expectedFieldsAreListed(source: object, descriptors: PropertyDescriptorMap, expectedFields: readonly PropertyKey[]) {
+function missingExpectedFields(source: object, descriptors: PropertyDescriptorMap, expectedFields: readonly PropertyKey[]) {
   // ownKeys may omit configurable fields. Inspect descriptors without using
   // property reads, which could execute a getter installed by this very trap.
-  return expectedFields.every((key) => Object.hasOwn(descriptors, key) || !Object.getOwnPropertyDescriptor(source, key));
+  const missing: PropertyKey[] = [];
+  for (const key of expectedFields) {
+    if (Object.hasOwn(descriptors, key)) { continue; }
+    if (Object.getOwnPropertyDescriptor(source, key)) { return null; }
+    missing.push(key);
+  }
+  return missing;
 }
 
 function sameDataDescriptor(first: PropertyDescriptor, second: PropertyDescriptor | undefined) {
@@ -29,26 +36,34 @@ function sameDataDescriptor(first: PropertyDescriptor, second: PropertyDescripto
 }
 
 function capturedPropertiesStillMatch(capture: CapturedSimulationProperties) {
-  const { source, prototype, descriptors, expectedFields } = capture;
+  const { source, prototype, descriptors, keys, missingFields } = capture;
   if (Object.getPrototypeOf(source) !== prototype) { return false; }
   const current = Object.getOwnPropertyDescriptors(source);
-  const keys = Reflect.ownKeys(descriptors);
-  if (keys.length !== Reflect.ownKeys(current).length ||
-      !expectedFieldsAreListed(source, current, expectedFields)) { return false; }
-  return keys.every((key) => sameDataDescriptor(Reflect.get(descriptors, key), Reflect.get(current, key)));
+  if (keys.length !== Reflect.ownKeys(current).length) { return false; }
+  for (const key of keys) {
+    if (!sameDataDescriptor(Reflect.get(descriptors, key), Reflect.get(current, key))) { return false; }
+  }
+  // Present fields were checked above. A previously absent known field can
+  // only appear unnoticed if a Proxy now hides it from ownKeys.
+  for (const key of missingFields) {
+    if (Object.getOwnPropertyDescriptor(source, key)) { return false; }
+  }
+  return true;
 }
 
 /** One public call shares a context across its document, options and controls. */
 export class SimulationSnapshotContext {
   private readonly captures: CapturedSimulationProperties[] = [];
 
-  captureProperties(source: object, expectedFields: Iterable<PropertyKey>) {
+  captureProperties(source: object, expectedFields: Iterable<PropertyKey> = simulationRecordFields) {
     const prototype = Object.getPrototypeOf(source);
     const descriptors = Object.getOwnPropertyDescriptors(source);
-    const fields = [...expectedFields];
-    if (Reflect.ownKeys(descriptors).some((key) => !Object.hasOwn(Reflect.get(descriptors, key), "value")) ||
-        !expectedFieldsAreListed(source, descriptors, fields)) { return null; }
-    this.captures.push({ source, prototype, descriptors, expectedFields: fields });
+    const fields = expectedFields === simulationRecordFields ? simulationRecordFields : [...expectedFields];
+    const keys = Reflect.ownKeys(descriptors);
+    if (keys.some((key) => !Object.hasOwn(Reflect.get(descriptors, key), "value"))) { return null; }
+    const missingFields = missingExpectedFields(source, descriptors, fields);
+    if (!missingFields) { return null; }
+    this.captures.push({ source, prototype, descriptors, keys, missingFields });
     return { prototype, descriptors };
   }
 
@@ -128,7 +143,7 @@ function snapshotArrayIndexes(
   return entries;
 }
 
-function snapshotSimulationArray(value: unknown, context?: SimulationSnapshotContext): unknown[] | null {
+export function snapshotSimulationArray(value: unknown, context?: SimulationSnapshotContext): unknown[] | null {
   try {
     if (!Array.isArray(value)) { return null; }
     const captureContext = context ?? new SimulationSnapshotContext();

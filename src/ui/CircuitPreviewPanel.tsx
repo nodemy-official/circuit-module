@@ -2,11 +2,13 @@ import { useId, useState, type ReactNode } from "react";
 import { circuitPartCatalog, circuitPartNumericFields, type CircuitDocument, type CircuitPart, type CircuitPartNumericKey } from "../circuit-model.js";
 import type { CircuitAnalysis } from "../circuit-solver.js";
 import { formatCircuitNumber } from "../number-format.js";
+import { simulationRecordField } from "../simulation-input.js";
 import { CircuitPartIcon } from "./CircuitPalette.js";
 import { getMeterDisplay, CircuitMeterReadout } from "./CircuitMeterReadout.js";
 import { measurementLabels } from "./measurement-labels.js";
 import { Button, Input, Switch, Tabs, TabsContent, TabsList, TabsTrigger } from "./primitives.js";
 import { partNumericField } from "./part-numeric-field.js";
+import { useNumericDraft } from "./NumericInput.js";
 
 type AdjustableValue = CircuitPartNumericKey | "initiallyClosed";
 
@@ -29,8 +31,8 @@ function adjustableValues(part: CircuitPart): AdjustableValue[] {
 }
 
 function comparableValue(part: CircuitPart, key: AdjustableValue): number | boolean | undefined {
-  if (key === "initiallyClosed") { return part.initiallyClosed ?? circuitPartCatalog.switch.defaults.initiallyClosed ?? false; }
-  return part[key] ?? circuitPartCatalog[part.kind].defaults[key] as number | undefined;
+  if (key === "initiallyClosed") { return (simulationRecordField(part, key) as boolean | undefined) ?? circuitPartCatalog.switch.defaults.initiallyClosed ?? false; }
+  return (simulationRecordField(part, key) as number | undefined) ?? circuitPartCatalog[part.kind].defaults[key] as number | undefined;
 }
 
 function isValidNumericValue(key: CircuitPartNumericKey, value: number, part: CircuitPart) {
@@ -112,6 +114,51 @@ function previewChanges(parts: CircuitPart[], initialDocument?: CircuitDocument)
   return { changedPartIds, changedValueCount };
 }
 
+function PreviewNumericField({ part, field, onChange }: {
+  part: CircuitPart;
+  field: ReturnType<typeof partNumericField>;
+  onChange: CircuitPreviewPanelProps["onChange"];
+}) {
+  const id = useId();
+  const { key, label, min, max, step, exclusiveMin, exclusiveMax } = field;
+  const unit = key === "wiperPosition" ? "0–1" : field.unit;
+  const committedValue = (simulationRecordField(part, key) as number | undefined) ?? circuitPartCatalog[part.kind].defaults[key] as number | undefined;
+  const draft = useNumericDraft({
+    value: committedValue ?? 0,
+    min, max, exclusiveMin, exclusiveMax,
+    onValueChange: (value) => onChange(part.id, { [key]: value }),
+  });
+  const displayLabel = part.kind === "battery" && key === "voltageVolts" ? "電源電圧" : label;
+  const errorId = `${id}-${part.id}-${key}-error`;
+  const errorMessage = numericError(key, draft.text, part);
+
+  return (
+    <label className="circuit-preview__field" htmlFor={`${errorId}-input`}>
+      <span>{label}</span>
+      <span className="circuit-preview__field-control">
+        <span className="circuit-preview__number">
+          <Input
+            id={`${errorId}-input`}
+            type="number"
+            min={min}
+            max={max}
+            step={step ?? "any"}
+            aria-label={`${part.label}の${displayLabel}`}
+            aria-describedby={errorMessage ? errorId : undefined}
+            aria-invalid={errorMessage ? true : undefined}
+            value={draft.text}
+            onValueChange={draft.change}
+            onBlur={draft.restore}
+            onKeyDown={draft.keyDown}
+          />
+          {unit && <small>{unit}</small>}
+        </span>
+        {errorMessage && <small className="circuit-preview__field-error" id={errorId}>{errorMessage}</small>}
+      </span>
+    </label>
+  );
+}
+
 export function CircuitPreviewPanel({
   document,
   initialDocument,
@@ -123,7 +170,7 @@ export function CircuitPreviewPanel({
   partId,
 }: CircuitPreviewPanelProps) {
   const id = useId();
-  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const [resetVersion, setResetVersion] = useState(0);
   const scopedParts = partId ? document.parts.filter((part) => part.id === partId) : document.parts;
 
   const { changedPartIds, changedValueCount } = previewChanges(scopedParts, initialDocument);
@@ -134,59 +181,8 @@ export function CircuitPreviewPanel({
   const readings = scopedParts.filter((part) => part.kind !== "junction");
 
   function reset() {
-    setDrafts({});
+    setResetVersion((current) => current + 1);
     onReset();
-  }
-
-  function numeric(part: CircuitPart, key: CircuitPartNumericKey, label: string, unit: string, min?: number, max?: number, step?: number) {
-    const draftKey = `${part.id}:${key}`;
-    const draft = drafts[draftKey];
-    const defaultValue = part.kind === "battery" && key === "voltageVolts"
-      ? undefined
-      : circuitPartCatalog[part.kind].defaults[key] as number | undefined;
-    const committedValue = part[key] ?? defaultValue;
-    const displayLabel = part.kind === "battery" && key === "voltageVolts" ? "電源電圧" : label;
-    const errorId = `${id}-${part.id}-${key}-error`;
-    const errorMessage = numericError(key, draft, part);
-
-    return (
-      <label className="circuit-preview__field" key={key} htmlFor={`${errorId}-input`}>
-        <span>{label}</span>
-        <span className="circuit-preview__field-control">
-          <span className="circuit-preview__number">
-            <Input
-              id={`${errorId}-input`}
-              type="number"
-              min={min}
-              max={max}
-              step={step ?? "any"}
-              aria-label={`${part.label}の${displayLabel}`}
-              aria-describedby={errorMessage ? errorId : undefined}
-              aria-invalid={errorMessage ? true : undefined}
-              value={draft ?? (committedValue === undefined ? "" : String(committedValue))}
-              onValueChange={(valueText) => {
-                setDrafts((current) => ({ ...current, [draftKey]: valueText }));
-                if (valueText.trim() === "") { return; }
-                const value = Number(valueText);
-                if (isValidNumericValue(key, value, part)) {
-                  onChange(part.id, { [key]: value } as Pick<Partial<CircuitPart>, CircuitPartNumericKey>);
-                }
-              }}
-              onBlur={() => {
-                setDrafts((current) => {
-                  if (!(draftKey in current)) { return current; }
-                  const next = { ...current };
-                  delete next[draftKey];
-                  return next;
-                });
-              }}
-            />
-            {unit && <small>{unit}</small>}
-          </span>
-          {errorMessage && <small className="circuit-preview__field-error" id={errorId}>{errorMessage}</small>}
-        </span>
-      </label>
-    );
   }
 
   function partHeading(part: CircuitPart) {
@@ -215,14 +211,18 @@ export function CircuitPreviewPanel({
                     <Switch
                       id={`${id}-${part.id}-switch`}
                       aria-label={`${part.label}のON / OFF`}
-                      checked={part.initiallyClosed ?? circuitPartCatalog.switch.defaults.initiallyClosed ?? false}
+                      checked={Boolean(comparableValue(part, "initiallyClosed"))}
                       onCheckedChange={(checked) => onChange(part.id, { initiallyClosed: checked })}
                     />
-                    <strong>{(part.initiallyClosed ?? circuitPartCatalog.switch.defaults.initiallyClosed ?? false) ? "ON" : "OFF"}</strong>
+                    <strong>{comparableValue(part, "initiallyClosed") ? "ON" : "OFF"}</strong>
                   </label>
                 )}
-                {circuitPartNumericFields(part.kind).map((field) => partNumericField(part, field)).map(({ key, label, unit, min, max, step }) =>
-                  numeric(part, key, label, key === "wiperPosition" ? "0–1" : unit, min, max, step))}
+                {circuitPartNumericFields(part.kind).map((field) => <PreviewNumericField
+                  key={`${field.key}:${resetVersion}`}
+                  part={part}
+                  field={partNumericField(part, field)}
+                  onChange={onChange}
+                />)}
               </section>
             ))}
           </div>
@@ -237,9 +237,11 @@ export function CircuitPreviewPanel({
     return readings.length > 0 ? (
       <div className="circuit-preview__parts">
         <p className="circuit-preview__measurement-note">
-          {analysis.mode === "ac"
-            ? `交流解析 (${format(analysis.frequencyHz, "Hz")}) の電圧・電流は実効値です。位相は角度で表示します。`
-            : "直流の電圧・電流は端子の向きに対する符号付き値です。"}
+          {analysis.timeSeconds !== undefined && Number.isFinite(analysis.timeSeconds)
+            ? `時間カーソル ${formatCircuitNumber(analysis.timeSeconds)} s の瞬時値です。`
+            : analysis.mode === "ac"
+              ? `交流解析 (${format(analysis.frequencyHz, "Hz")}) の電圧・電流は実効値です。位相は角度で表示します。`
+              : "直流の電圧・電流は端子の向きに対する符号付き値です。"}
         </p>
         {readings.map((part) => {
           const reading = analysis.parts[part.id];
@@ -285,7 +287,7 @@ export function CircuitPreviewPanel({
       {!partId && <p className="circuit-preview__description">値やスイッチの変更はプレビュー内だけに反映されます。</p>}
       {summary && <div className="circuit-preview__summary">{summary}</div>}
 
-      {partId ? (
+      {partId && showReadings ? (
         <div className="circuit-preview__part-layout">
           <section className="circuit-preview__controls" aria-label="部品の操作">{renderControls()}</section>
           <section className="circuit-preview__live" aria-label="部品の計測値">

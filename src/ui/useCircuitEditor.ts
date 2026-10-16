@@ -23,7 +23,7 @@ import { createCircuitExample, type CircuitExampleKind } from "../circuit-exampl
 import { analyzeCircuit, type CircuitAnalysisOptions } from "../circuit-solver.js";
 import { inspectCircuit } from "../circuit-diagnostics.js";
 import { parseCircuitDocument, serializeCircuitDocument } from "../circuit-serialization.js";
-import { circuitDocumentShapeIssue, copySimulationDocument } from "../simulation-input.js";
+import { snapshotSimulationArray, snapshotSimulationRecord, validatedSimulationDocument } from "../simulation-input.js";
 import {
   createEmptyCircuit,
   createExampleCircuit,
@@ -32,6 +32,7 @@ import {
   type CircuitEndpoint,
   type CircuitPart,
   type CircuitPartKind,
+  type CircuitWire,
 } from "../circuit-model.js";
 
 const noSelection = (): CircuitSelection => ({ parts: [], wires: [] });
@@ -44,10 +45,30 @@ function toggleId(ids: string[], id: string) {
   return ids.includes(id) ? ids.filter((item) => item !== id) : [...ids, id];
 }
 
+function editableWire(wire: CircuitWire): CircuitWire {
+  if (wire.waypoints === undefined) { return wire; }
+  const values = snapshotSimulationArray(wire.waypoints);
+  if (!values) { return wire; }
+  const waypoints: Point[] = [];
+  for (const value of values) {
+    const point = snapshotSimulationRecord(value, ["x", "y"]);
+    if (!point || typeof point.x !== "number" || typeof point.y !== "number") { return wire; }
+    waypoints.push({ ...point, x: point.x, y: point.y });
+  }
+  return { ...wire, waypoints };
+}
+
 function editableDocument(document: CircuitDocument) {
   // Preserve every own data field before edits use ordinary object spreads.
   // Keep malformed input intact so analysis can still report it as invalid.
-  return circuitDocumentShapeIssue(document) ? document : copySimulationDocument(document);
+  const copied = validatedSimulationDocument(document);
+  if (typeof copied === "string") { return document; }
+  // Simulation snapshots do not copy layout-only waypoints. Editor history
+  // must retain its own route even when the caller later changes that input.
+  return {
+    ...copied,
+    wires: copied.wires.map(editableWire),
+  };
 }
 
 /** Commands can compose synchronously while React batches their rendered state. */
@@ -111,7 +132,15 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
   }
 
   function endEdit() {
+    // A pointer may be pressed before its first edit creates an undo group.
+    // End that gesture too, including queued moves before React commits.
+    setDocumentVersion((version) => version + 1);
     dispatch({ type: "end-group" });
+  }
+
+  function clearSelection() {
+    endEdit();
+    setSelection(noSelection());
   }
 
   function cancelConnection() {
@@ -198,13 +227,14 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
 
   function startConnection(endpoint: CircuitEndpoint) {
     const document = historyRef.current.present;
+    const pendingEndpoint = { partId: endpoint.partId, terminal: endpoint.terminal };
     endEdit();
     setPendingWire(null);
     // A junction's terminal covers its body, so also select it for editing or deletion.
-    const part = document.parts.find((item) => item.id === endpoint.partId);
+    const part = document.parts.find((item) => item.id === pendingEndpoint.partId);
     if (part?.kind === "junction") { selectPart(part.id); }
     else { setSelection(noSelection()); }
-    setPendingEndpoint(endpoint);
+    setPendingEndpoint(pendingEndpoint);
     setError(null);
   }
 
@@ -214,7 +244,8 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
     if (!wire) { return; }
     selectWire(wireId);
     setPendingWire({ wireId, end });
-    setPendingEndpoint(end === "from" ? wire.to : wire.from);
+    const endpoint = end === "from" ? wire.to : wire.from;
+    setPendingEndpoint({ partId: endpoint.partId, terminal: endpoint.terminal });
   }
 
   function finishConnection(result: EditResult<{ id: string }>) {
@@ -251,7 +282,7 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
     const pendingEndpoint = pendingEndpointRef.current;
     const pendingWire = pendingWireRef.current;
     if (!pendingEndpoint) {
-      setSelection(noSelection());
+      clearSelection();
       return;
     }
     finishConnection(pendingWire
@@ -305,13 +336,21 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
     cancelConnection();
   }
 
-  function updatePart(id: string, patch: Partial<CircuitPart>) {
+  function updatePart(id: string, patch: Partial<Omit<CircuitPart, "id" | "kind">>) {
     const document = historyRef.current.present;
     const part = document.parts.find((item) => item.id === id);
-    if (!part || Object.entries(patch).every(([key, value]) => part[key as keyof CircuitPart] === value)) { return; }
+    if (!part) { return; }
+    const nextPart = { ...part, ...patch };
+    // JavaScript callers and full-object patches can still include these fields. Changing
+    // either would invalidate existing wire endpoints and the editor's active references.
+    if (nextPart.id !== part.id || nextPart.kind !== part.kind) {
+      setError("部品の ID と種類は変更できません。");
+      return;
+    }
+    if (Object.entries(patch).every(([key, value]) => part[key as keyof CircuitPart] === value)) { return; }
     setDocument({
       ...document,
-      parts: document.parts.map((existingPart) => existingPart.id === id ? { ...existingPart, ...patch } : existingPart),
+      parts: document.parts.map((existingPart) => existingPart.id === id ? nextPart : existingPart),
     }, "initiallyClosed" in patch ? undefined : `property:${id}:${Object.keys(patch).sort().join(",")}`);
     setError(null);
   }
@@ -344,10 +383,11 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
 
   function travel(type: "undo" | "redo") {
     const history = historyRef.current;
-    if (type === "undo" ? history.past.length === 0 : history.future.length === 0) { return; }
+    const next = editorHistoryReducer(history, { type });
+    if (next === history) { return; }
     cancelConnection();
     setDocumentVersion((version) => version + 1);
-    dispatch({ type });
+    setHistory(next);
     setSelection(noSelection());
   }
 
@@ -401,7 +441,7 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
     redo: () => travel("redo"),
     endEdit,
     cancelMove: (id: string) => dispatch({ type: "cancel-group", group: `move:${id}` }),
-    clearSelection: () => setSelection(noSelection()),
+    clearSelection,
     cancelConnection,
   };
 }

@@ -28,17 +28,17 @@ export const Board: Story = {
 
 export const Palette: Story = {
   name: "部品パレット",
-  render: () => <div style={{ width: 250, padding: 18, border: "1px solid var(--circuit-line)" }}><CircuitPalette onAdd={() => {}} /></div>,
+  render: () => <div style={{ width: 250, padding: 18, border: "1px solid var(--circuit-line, var(--_circuit-line))" }}><CircuitPalette onAdd={() => {}} /></div>,
 };
 
 export const Inspector: Story = {
   name: "設定パネル",
-  render: () => <div style={{ width: 270, padding: 18, border: "1px solid var(--circuit-line)" }}><CircuitInspector part={document.parts[0]} reading={analysis.parts[document.parts[0].id]} /></div>,
+  render: () => <div style={{ width: 270, padding: 18, border: "1px solid var(--circuit-line, var(--_circuit-line))" }}><CircuitInspector part={document.parts[0]} reading={analysis.parts[document.parts[0].id]} /></div>,
 };
 
 export const Analysis: Story = {
   name: "解析パネル",
-  render: () => <div style={{ width: 270, padding: 18, border: "1px solid var(--circuit-line)" }}><CircuitAnalysisPanel analysis={analysis} partCount={document.parts.length} wireCount={document.wires.length} /></div>,
+  render: () => <div style={{ width: 270, padding: 18, border: "1px solid var(--circuit-line, var(--_circuit-line))" }}><CircuitAnalysisPanel analysis={analysis} partCount={document.parts.length} wireCount={document.wires.length} /></div>,
 };
 
 function CustomWorkbench() {
@@ -51,7 +51,7 @@ function CustomWorkbench() {
   };
   const wireEndpoints = selectedWire ? { from: endpointLabel(selectedWire.from), to: endpointLabel(selectedWire.to) } : undefined;
   return (
-    <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) 260px", gap: 20, background: "var(--circuit-soft)", padding: 24 }}>
+    <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) 260px", gap: 20, background: "var(--circuit-soft, var(--_circuit-soft))", padding: 24 }}>
       <div style={{ minWidth: 0 }}>
         <CircuitAnalysisPanel analysis={editor.analysis} partCount={editor.document.parts.length} wireCount={editor.document.wires.length} />
         <CircuitBoard
@@ -72,7 +72,7 @@ function CustomWorkbench() {
           onWireRouteEnd={editor.endEdit}
         />
       </div>
-      <div style={{ background: "var(--circuit-surface)", padding: 16 }}>
+      <div style={{ background: "var(--circuit-surface, var(--_circuit-surface))", padding: 16 }}>
         <CircuitInspector
           part={selected}
           wire={selectedWire}

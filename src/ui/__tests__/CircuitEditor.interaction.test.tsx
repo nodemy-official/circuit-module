@@ -245,6 +245,68 @@ describe("CircuitEditor interactions", () => {
     expect(required(activeSidebarPanel(ui.container), '.circuit-transient__time-controls input[type="range"]').getAttribute("data-sample-index")).toBe("160");
   });
 
+  it.each([false, true])("returns the playing board to steady state while retaining the waveform cursor (queued tick=%s)", (queuedTick) => {
+    vi.useFakeTimers();
+    try {
+      const ui = mount(createCircuitExample("charging"));
+      click(sidebarTab(ui.container, "波形"));
+      const waveforms = sidebarPanel(ui.container, "波形");
+      const findButton = (text: string) => [...waveforms.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.trim() === text);
+      const waveformButton = (text: string) => {
+        const button = findButton(text);
+        if (!button) { throw new Error(`Missing waveform button: ${text}`); }
+        return button;
+      };
+      click(waveformButton("波形を計算"));
+      click(waveformButton("再生"));
+      act(() => vi.advanceTimersByTime(100));
+      const cursor = required(waveforms, '.circuit-transient__time-controls input[type="range"]');
+      expect(Number(cursor.getAttribute("data-sample-index"))).toBeGreaterThan(0);
+      const status = required(ui.container, ".circuit-editor__analysis-status");
+      expect(status.getAttribute("data-status")).toBe("closed");
+
+      act(() => {
+        if (queuedTick) { vi.advanceTimersByTime(50); }
+        waveformButton("回路図を定常表示に戻す").click();
+      });
+
+      const pausedIndex = cursor.getAttribute("data-sample-index");
+      expect(waveformButton("再生").getAttribute("aria-pressed")).toBe("false");
+      expect(status.getAttribute("data-status")).toBe("open");
+      expect(status.querySelector("strong")?.textContent).toBe("0 A");
+      expect(findButton("回路図を定常表示に戻す")).toBeUndefined();
+      act(() => vi.advanceTimersByTime(500));
+      expect(status.getAttribute("data-status")).toBe("open");
+      expect(cursor.getAttribute("data-sample-index")).toBe(pausedIndex);
+      expect(waveforms.querySelector(".circuit-waveform")).not.toBeNull();
+
+      click(waveformButton("再生"));
+      expect(cursor.getAttribute("data-sample-index")).toBe(pausedIndex);
+      expect(status.getAttribute("data-status")).toBe("closed");
+      act(() => vi.advanceTimersByTime(100));
+      expect(Number(cursor.getAttribute("data-sample-index"))).toBeGreaterThan(Number(pausedIndex));
+      expect(status.getAttribute("data-status")).toBe("closed");
+      expect(findButton("回路図を定常表示に戻す")).toBeDefined();
+      click(waveformButton("一時停止"));
+
+      click(waveformButton("回路図を定常表示に戻す"));
+      changeNumber(cursor, "0");
+      expect(status.getAttribute("data-status")).toBe("closed");
+      click(waveformButton("回路図を定常表示に戻す"));
+      click(waveformButton("波形を計算"));
+      expect(cursor.getAttribute("data-sample-index")).toBe("0");
+      expect(status.getAttribute("data-status")).toBe("closed");
+      changeNumber(cursor, "4");
+      click(waveformButton("回路図を定常表示に戻す"));
+      click(waveformButton("先頭へ"));
+      expect(cursor.getAttribute("data-sample-index")).toBe("0");
+      expect(status.getAttribute("data-status")).toBe("closed");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("opens the analysis tab from the footer status control", () => {
     const ui = mount(createExampleCircuit());
     click(required(ui.container, ".circuit-editor__analysis-status"));
@@ -313,7 +375,7 @@ describe("CircuitEditor interactions", () => {
     click(overviewPartButton(ui.container, "電池"));
 
     expect(required(ui.container, ".circuit-preview-dialog [data-slot=dialog-title]").textContent).toBe("電池");
-    expect(previewInput(ui.container, "電池の電源電圧").value).toBe("");
+    expect(previewInput(ui.container, "電池の電源電圧").value).toBe("9");
     expect(previewInput(ui.container, "電池の内部抵抗").value).toBe("0");
     expect([...previewDialog(ui.container).querySelectorAll(".circuit-preview__controls .circuit-preview__part")]
       .map((part) => part.getAttribute("data-part-id"))).toEqual(["battery"]);

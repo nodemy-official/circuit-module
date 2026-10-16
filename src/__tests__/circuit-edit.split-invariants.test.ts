@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 
 import { connectToPoint, reconnectWireToPoint } from "../circuit-edit.js";
-import { routeDocumentWires } from "../circuit-geometry.js";
-import { MAX_CIRCUIT_WIRE_WAYPOINTS, type CircuitDocument } from "../circuit-model.js";
+import { rotate, routeDocumentWires } from "../circuit-geometry.js";
+import { MAX_CIRCUIT_WIRE_WAYPOINTS, type CircuitDocument, type CircuitRotation } from "../circuit-model.js";
 import { parseCircuitDocument, serializeCircuitDocument } from "../circuit-serialization.js";
 
 function crossingDocument(): CircuitDocument {
@@ -23,6 +23,85 @@ function crossingDocument(): CircuitDocument {
 }
 
 describe("wire split invariants", () => {
+  it.each(([0, 90, 180, 270] as CircuitRotation[]).flatMap((rotation) =>
+    [false, true].flatMap((reversed) => ["connect", "reconnect"].map((operation) => ({ rotation, reversed, operation }))),
+  ))("preserves a split inside a terminal lead at $rotation degrees (reversed=$reversed, operation=$operation)", ({ rotation, reversed, operation }) => {
+    const position = (x: number, y: number) => {
+      const point = rotate({ x, y }, rotation);
+      return { x: point.x || 0, y: point.y || 0 };
+    };
+    const source = { partId: "source", terminal: "b" as const };
+    const target = { partId: "target", terminal: "a" as const };
+    const document: CircuitDocument = {
+      title: "短い端子リードの分割",
+      parts: [
+        { id: "source", kind: "resistor", x: 0, y: 0, rotation, label: "抵抗" },
+        { id: "target", kind: "junction", ...position(10, 0), label: "終点" },
+        { id: "branch", kind: "junction", ...position(0, 10), label: "枝" },
+        { id: "old", kind: "junction", ...position(10, 10), label: "旧終点" },
+      ],
+      wires: [{ id: "crossed", from: reversed ? target : source, to: reversed ? source : target }],
+    };
+    if (operation === "reconnect") {
+      document.wires.push({ id: "edited", from: { partId: "branch", terminal: "a" }, to: { partId: "old", terminal: "a" } });
+    }
+    const point = position(2.5, 0);
+    const result = operation === "connect"
+      ? connectToPoint(document, { partId: "branch", terminal: "a" }, point)
+      : reconnectWireToPoint(document, "edited", "to", point);
+    if (!result.ok) { throw new Error(result.reason); }
+
+    const first = result.document.wires.find((wire) => wire.id === "crossed")!;
+    const second = result.document.wires.find((wire) => wire.id !== "crossed" && wire.to.partId === (reversed ? "source" : "target"))!;
+    const routes = routeDocumentWires(result.document);
+    expect(routes.get(first.id)).toEqual([position(reversed ? 10 : 2, 0), point]);
+    expect(routes.get(second.id)).toEqual([point, position(reversed ? 2 : 10, 0)]);
+    const restored = parseCircuitDocument(serializeCircuitDocument(result.document));
+    if (!restored.ok) { throw new Error(restored.reason); }
+    expect(routeDocumentWires(restored.document)).toEqual(routes);
+  });
+
+  it.each(["connect", "reconnect"] as const)("keeps later automatic wires detoured after an earlier wire is split with %s", (operation) => {
+    const document: CircuitDocument = {
+      title: "分割後も別ネットの迂回を保持",
+      parts: [
+        { id: "left", kind: "junction", x: 0, y: 0, label: "左" },
+        { id: "right", kind: "junction", x: 10, y: 0, label: "右" },
+        { id: "inner-left", kind: "junction", x: 2, y: 0, label: "内左" },
+        { id: "inner-right", kind: "junction", x: 8, y: 0, label: "内右" },
+        { id: "branch", kind: "junction", x: 5, y: 5, label: "枝" },
+        { id: "old", kind: "junction", x: 10, y: 5, label: "古い接続点" },
+      ],
+      wires: [
+        { id: "crossed", from: { partId: "left", terminal: "a" }, to: { partId: "right", terminal: "a" } },
+        { id: "detoured", from: { partId: "inner-left", terminal: "a" }, to: { partId: "inner-right", terminal: "a" } },
+      ],
+    };
+    if (operation === "reconnect") {
+      document.wires.push({ id: "edited", from: { partId: "branch", terminal: "a" }, to: { partId: "old", terminal: "a" } });
+    }
+    const original = routeDocumentWires(document).get("detoured");
+    expect(original).toEqual([{ x: 2, y: 0 }, { x: 2, y: -1 }, { x: 8, y: -1 }, { x: 8, y: 0 }]);
+
+    const result = operation === "connect"
+      ? connectToPoint(document, { partId: "branch", terminal: "a" }, { x: 5, y: 0 })
+      : reconnectWireToPoint(document, "edited", "to", { x: 5, y: 0 });
+    if (!result.ok) { throw new Error(result.reason); }
+
+    const route = routeDocumentWires(result.document).get("detoured");
+    if (!route) { throw new Error("Missing detoured route"); }
+    expect(route[0]).toEqual({ x: 2, y: 0 });
+    expect(route.at(-1)).toEqual({ x: 8, y: 0 });
+    expect(route.slice(1).some((to, index) => {
+      const from = route[index]!;
+      return from.y === 0 && to.y === 0 &&
+        Math.max(Math.min(from.x, to.x), 0) < Math.min(Math.max(from.x, to.x), 10);
+    })).toBe(false);
+    const restored = parseCircuitDocument(serializeCircuitDocument(result.document));
+    if (!restored.ok) { throw new Error(restored.reason); }
+    expect(routeDocumentWires(restored.document).get("detoured")).toEqual(route);
+  });
+
   it("splits a crossed wire when connecting another terminal of the same part", () => {
     const document: CircuitDocument = {
       title: "同一部品への接続と分岐",

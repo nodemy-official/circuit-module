@@ -1,9 +1,12 @@
-import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ComponentPropsWithoutRef, type KeyboardEvent, type MouseEvent, type PointerEvent, type ReactNode } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type ComponentPropsWithoutRef, type KeyboardEvent, type MouseEvent, type PointerEvent, type ReactNode } from "react";
+import { flushSync } from "react-dom";
 import { CircuitIcon } from "./CircuitIcon.js";
 import { CircuitPotentialControls, CircuitPotentialOverlay, useCircuitPotentialView } from "./CircuitPotentialView.js";
 import { getMeterDisplay } from "./CircuitMeterReadout.js";
 import { useWireRouteDrag } from "./useWireRouteDrag.js";
-import { useDocumentGestureBoundary, type DocumentGestureVersion } from "./useDocumentGestureBoundary.js";
+import { useDocumentGestureBoundary, type DocumentGestureToken, type DocumentGestureVersion } from "./useDocumentGestureBoundary.js";
+import { useIsomorphicLayoutEffect } from "./useIsomorphicLayoutEffect.js";
+import { useCircuitBoardInputs } from "./useCircuitBoardInputs.js";
 import { CircuitFlowLegend, CircuitWireFlow, wireFlowCurrent, wireFlowLabel, type FlowDisplay } from "./CircuitFlow.js";
 import { closestWirePoint, connectionTargetAt, wireMidpoint, type ConnectionTarget } from "./connection-target.js";
 import { circuitSlot, type CircuitStyleProps } from "./style-props.js";
@@ -22,7 +25,6 @@ import {
   isVertical,
   localTerminalOffset,
   pathData,
-  routeDocumentWires,
   routeEnd,
   routeWire,
   snapToGrid,
@@ -131,7 +133,7 @@ export interface CircuitBoardProps extends Omit<ComponentPropsWithoutRef<"div">,
 }
 
 interface DragState {
-  epoch: number;
+  gesture: DocumentGestureToken;
   id: string;
   pointerId: number;
   last: { x: number; y: number };
@@ -142,7 +144,7 @@ interface DragState {
 }
 
 interface ConnectionDrag {
-  epoch: number;
+  gesture: DocumentGestureToken;
   pointerId: number;
   origin: Point;
   endpoint: CircuitEndpoint;
@@ -158,6 +160,8 @@ interface PanState {
   cameraX: number;
   cameraY: number;
   moved: boolean;
+  suppressClick: boolean;
+  backgroundClick: boolean;
 }
 
 interface PinchState {
@@ -168,7 +172,7 @@ interface PinchState {
 }
 
 interface RangeState {
-  epoch: number;
+  gesture: DocumentGestureToken;
   pointerId: number;
   start: Point;
   current: Point;
@@ -419,9 +423,9 @@ function shouldHandleSpacePan(event: globalThis.KeyboardEvent, pointerInside: bo
 }
 
 function isPreviewPartGesture(event: PointerEvent<SVGSVGElement>, readOnly: boolean, onInspectPart: CircuitBoardProps["onInspectPart"], onSwitchToggle: CircuitBoardProps["onSwitchToggle"], spacePressed: boolean) {
-  if (!readOnly || !(event.target instanceof Element)) { return false; }
+  if (!readOnly || event.button !== 0 || spacePressed || !(event.target instanceof Element)) { return false; }
   if (onSwitchToggle && event.target.closest('[data-kind="switch"]')) { return true; }
-  return Boolean(onInspectPart) && event.button === 0 && !spacePressed && Boolean(event.target.closest('.circuit-board__part'));
+  return Boolean(onInspectPart) && Boolean(event.target.closest('.circuit-board__part'));
 }
 
 function readOnlyPartGestureStart(event: PointerEvent<SVGSVGElement>, spacePressed: boolean) {
@@ -669,7 +673,7 @@ function CircuitPartArtwork({
 }) {
   const pendingClick = useRef<ReturnType<typeof setTimeout> | null>(null);
   const canDelaySwitchClick = readOnly && part.kind === "switch" && Boolean(onSwitchToggle) && Boolean(onInspectPart);
-  useLayoutEffect(() => () => {
+  useIsomorphicLayoutEffect(() => () => {
     if (pendingClick.current !== null) { clearTimeout(pendingClick.current); pendingClick.current = null; }
   }, [canDelaySwitchClick]);
   const inspect = (element: SVGGElement) => {
@@ -925,7 +929,7 @@ export function CircuitBoard({
   style,
   ...rootProps
 }: CircuitBoardProps) {
-  const { epoch: documentEpoch, markEdit: markDocumentEdit, isCurrent: isDocumentCurrent } = useDocumentGestureBoundary(document, documentVersion);
+  const { epoch: documentEpoch, capture: captureDocumentGesture, canStart: canStartDocumentGesture, markEdit: markDocumentEdit, isCurrent: isDocumentCurrent } = useDocumentGestureBoundary(document, documentVersion);
   const generatedId = useId().replaceAll(":", "");
   const smallGridId = `circuit-board-grid-${generatedId}`;
   const majorGridId = `circuit-board-major-${generatedId}`;
@@ -969,19 +973,18 @@ export function CircuitBoard({
   const modifierPartClickRef = useRef<{ id: string; additive: boolean } | null>(null);
   const suppressPointerClickRef = useRef(false);
   const suppressCancelledClickRef = useRef(false);
+  const suppressPanActivationRef = useRef(false);
+  const backgroundClickRef = useRef(false);
   const readOnlyPartGestureRef = useRef<{ pointerId: number; x: number; y: number; moved: boolean } | null>(null);
   const keyboardPartClickRef = useRef<string | null>(null);
   const keyboardWireClickRef = useRef<string | null>(null);
   const draggedRef = useRef(false);
   const clearDragClickTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const selectedParts = useMemo(() => new Set(readOnly ? [] : selection?.parts ?? []), [readOnly, selection?.parts]);
-  const selectedWires = useMemo(() => new Set(readOnly ? [] : selection?.wires ?? []), [readOnly, selection?.wires]);
-  const connectedTerminals = useMemo(() => new Set(document.wires.flatMap((wire) => [endpointKey(wire.from), endpointKey(wire.to)])), [document.wires]);
-  const partsById = useMemo(() => new Map(document.parts.map((part) => [part.id, part])), [document.parts]);
-  useLayoutEffect(() => {
+  const { selectedParts, selectedWires, connectedTerminals, partsById, wireRoutes, visualReadings } = useCircuitBoardInputs(document, selection, readOnly, analysis);
+  useIsomorphicLayoutEffect(() => {
     const current = dragRef.current;
     const part = current && partsById.get(current.id);
-    if (!current || !part || !isDocumentCurrent(current.epoch)) { return; }
+    if (!current || !part || !isDocumentCurrent(current.gesture)) { return; }
     const dx = part.x - current.expectedPosition.x;
     const dy = part.y - current.expectedPosition.y;
     const moved = current.moved || part.x !== current.origin.x || part.y !== current.origin.y;
@@ -994,10 +997,10 @@ export function CircuitBoard({
       moved,
     };
   }, [drag, partsById, isDocumentCurrent]);
-  useLayoutEffect(() => {
+  useIsomorphicLayoutEffect(() => {
     if (!finishedPartDrag) { return; }
     setFinishedPartDrag(null);
-    if (!isDocumentCurrent(finishedPartDrag.epoch)) { return; }
+    if (!isDocumentCurrent(finishedPartDrag.gesture)) { return; }
     // Inspect the committed move so a rejected return in the same batch is still kept.
     const part = partsById.get(finishedPartDrag.id);
     const changed = finishedPartDrag.moved || part !== finishedPartDrag.originalPart;
@@ -1006,10 +1009,10 @@ export function CircuitBoard({
     }
     onMoveEnd?.();
   }, [finishedPartDrag, partsById, onMoveCancel, onMoveEnd, isDocumentCurrent]);
-  useLayoutEffect(() => {
+  useIsomorphicLayoutEffect(() => {
     if (!cancelledPartDrag) { return; }
     setCancelledPartDrag(null);
-    if (!isDocumentCurrent(cancelledPartDrag.epoch)) { return; }
+    if (!isDocumentCurrent(cancelledPartDrag.gesture)) { return; }
     // A functional host may accept or reject the last move in the same React batch.
     // Restore from the committed document so a rejected move never creates a reverse move.
     const part = partsById.get(cancelledPartDrag.id);
@@ -1027,7 +1030,6 @@ export function CircuitBoard({
       onMoveEnd?.();
     } else { setCancelledPartDrag(current); }
   }, [onMoveCancel, onMoveEnd]);
-  const wireRoutes = useMemo(() => routeDocumentWires(document), [document.parts, document.wires]);
   const hasFlow = showFlow && document.wires.some((wire) => wireFlowCurrent(analysis, wire.id) !== 0 && wireRoutes.has(wire.id));
   const potentialView = useCircuitPotentialView(document, analysis, showPotentials);
   const pendingPart = !readOnly && pendingEndpoint ? partsById.get(pendingEndpoint.partId) : undefined;
@@ -1210,7 +1212,7 @@ export function CircuitBoard({
     const current = dragRef.current;
     if (!current) { return false; }
     updatePartDrag(null);
-    if (isDocumentCurrent(current.epoch)) { restorePartDrag(current); }
+    if (isDocumentCurrent(current.gesture)) { restorePartDrag(current); }
     modifierPartClickRef.current = null;
     finishWireRoutePointer(true);
     if (releaseCapture) { releaseConnectionPointer(current.pointerId); }
@@ -1228,9 +1230,9 @@ export function CircuitBoard({
     return true;
   }, [updatePartDrag, finishWireRoutePointer]);
 
-  useLayoutEffect(() => {
+  useIsomorphicLayoutEffect(() => {
     const current = dragRef.current;
-    if (current && (!isDocumentCurrent(current.epoch) || !partsById.has(current.id))) { discardPartDrag(); }
+    if (current && (!isDocumentCurrent(current.gesture) || !partsById.has(current.id))) { discardPartDrag(); }
   }, [documentEpoch, partsById, discardPartDrag, isDocumentCurrent]);
   const cancelRange = useCallback((releaseCapture = true) => {
     const current = rangeRef.current;
@@ -1242,9 +1244,9 @@ export function CircuitBoard({
     return true;
   }, [finishWireRoutePointer]);
 
-  useLayoutEffect(() => {
+  useIsomorphicLayoutEffect(() => {
     const current = rangeRef.current;
-    if (current && !isDocumentCurrent(current.epoch)) { cancelRange(); }
+    if (current && !isDocumentCurrent(current.gesture)) { cancelRange(); }
   }, [documentEpoch, cancelRange, isDocumentCurrent]);
 
   useEffect(() => {
@@ -1287,14 +1289,14 @@ export function CircuitBoard({
 
   const startConnectionDrag = useCallback((event: PointerEvent<SVGGElement>, endpoint: CircuitEndpoint, wire?: ConnectionDrag["wire"]) => {
     event.stopPropagation();
-    if (readOnly || panMode || event.button !== 0 || (wire ? !onReconnectStart : !onConnectionStart)) { return; }
+    if (!canStartDocumentGesture() || readOnly || panMode || event.button !== 0 || (wire ? !onReconnectStart : !onConnectionStart)) { return; }
     event.preventDefault();
     event.currentTarget.focus?.({ preventScroll: true });
     if (clearDragClickTimer.current !== null) { clearTimeout(clearDragClickTimer.current); }
     draggedRef.current = false;
-    connectionDragRef.current = { epoch: documentEpoch, pointerId: event.pointerId, origin: { x: event.clientX, y: event.clientY }, endpoint, wire, moved: false };
+    connectionDragRef.current = { gesture: captureDocumentGesture(), pointerId: event.pointerId, origin: { x: event.clientX, y: event.clientY }, endpoint, wire, moved: false };
     try { svgRef.current?.setPointerCapture(event.pointerId); } catch { /* Unsupported capture. */ }
-  }, [documentEpoch, readOnly, panMode, onConnectionStart, onReconnectStart]);
+  }, [captureDocumentGesture, canStartDocumentGesture, readOnly, panMode, onConnectionStart, onReconnectStart]);
 
   function releaseConnectionPointer(pointerId: number) {
     try {
@@ -1309,7 +1311,7 @@ export function CircuitBoard({
     draggedRef.current = true;
     setPointer(null);
     setConnectionTarget(null);
-    if (isDocumentCurrent(connectionDrag.epoch)) { onConnectionCancel?.(); }
+    if (isDocumentCurrent(connectionDrag.gesture)) { onConnectionCancel?.(); }
     else { finishWireRoutePointer(true); }
     if (releaseCapture) { releaseConnectionPointer(connectionDrag.pointerId); }
   }
@@ -1320,28 +1322,30 @@ export function CircuitBoard({
     connectionDragRef.current = null;
     setPointer(null);
     setConnectionTarget(null);
-    if (current.moved) { onConnectionCancel?.(); }
+    // The host already replaced this gesture's state. Cancelling here would
+    // also erase a new connection started by that same host command.
     finishWireRoutePointer(true);
     try {
       if (svgRef.current?.hasPointerCapture(current.pointerId)) { svgRef.current.releasePointerCapture(current.pointerId); }
     } catch { /* Unsupported capture. */ }
     return true;
-  }, [finishWireRoutePointer, onConnectionCancel]);
+  }, [finishWireRoutePointer]);
 
-  useLayoutEffect(() => {
+  useIsomorphicLayoutEffect(() => {
     const current = connectionDragRef.current;
-    if (current && !isDocumentCurrent(current.epoch)) { discardConnectionDrag(); }
+    if (current && !isDocumentCurrent(current.gesture)) { discardConnectionDrag(); }
   }, [documentEpoch, discardConnectionDrag, isDocumentCurrent]);
 
   function moveConnectionDrag(event: PointerEvent<SVGSVGElement>) {
     const connectionDrag = connectionDragRef.current;
     if (!connectionDrag || connectionDrag.pointerId !== event.pointerId) { return false; }
-    if (!isDocumentCurrent(connectionDrag.epoch)) { discardConnectionDrag(); return true; }
+    if (!isDocumentCurrent(connectionDrag.gesture)) { discardConnectionDrag(); return true; }
     if (!connectionDrag.moved && Math.hypot(event.clientX - connectionDrag.origin.x, event.clientY - connectionDrag.origin.y) < 4) { return true; }
     if (!connectionDrag.moved) {
       connectionDrag.moved = true;
       if (connectionDrag.wire) { beginReconnect(connectionDrag.wire.wireId, connectionDrag.wire.end); }
       else { onConnectionStart?.(connectionDrag.endpoint); }
+      connectionDrag.gesture = captureDocumentGesture();
     }
     draggedRef.current = true;
     const target = targetAtPointer(event);
@@ -1353,7 +1357,7 @@ export function CircuitBoard({
   function finishConnectionDrag(event: PointerEvent<SVGSVGElement>) {
     const connectionDrag = connectionDragRef.current;
     if (!connectionDrag || connectionDrag.pointerId !== event.pointerId) { return false; }
-    if (!isDocumentCurrent(connectionDrag.epoch)) { discardConnectionDrag(); return true; }
+    if (!isDocumentCurrent(connectionDrag.gesture)) { discardConnectionDrag(); return true; }
     connectionDragRef.current = null;
     releaseConnectionPointer(event.pointerId);
     if (!connectionDrag.moved) {
@@ -1399,7 +1403,7 @@ export function CircuitBoard({
   }, [readOnly, panMode, wireRoutes, pendingEndpoint, onBoardClick, pointAtPointer, onSelectWire]);
 
   const startDrag = useCallback((event: PointerEvent<SVGGElement>, part: CircuitPart) => {
-    if (readOnly || event.button !== 0) { return; }
+    if (!canStartDocumentGesture() || readOnly || event.button !== 0) { return; }
     event.currentTarget.focus({ preventScroll: true });
     modifierPartClickRef.current = null;
     const additive = event.shiftKey || event.ctrlKey || event.metaKey;
@@ -1416,7 +1420,7 @@ export function CircuitBoard({
     if (clearDragClickTimer.current !== null) { clearTimeout(clearDragClickTimer.current); }
     updatePartDrag({
       id: part.id, pointerId: event.pointerId, last: point,
-      epoch: documentEpoch,
+      gesture: captureDocumentGesture(),
       origin: { x: part.x, y: part.y }, expectedPosition: { x: part.x, y: part.y },
       originalPart: part, moved: false,
     });
@@ -1425,7 +1429,7 @@ export function CircuitBoard({
     } catch {
       // Pointer capture is unavailable in some server-rendering and test environments.
     }
-  }, [documentEpoch, readOnly, onSelectPart, onMovePart, gridAtPointer, selectedParts, updatePartDrag]);
+  }, [captureDocumentGesture, canStartDocumentGesture, readOnly, onSelectPart, onMovePart, gridAtPointer, selectedParts, updatePartDrag]);
 
   const handlePartPointerClick = useCallback((event: MouseEvent<SVGGElement>, part: CircuitPart) => {
     if (event.detail === 0) {
@@ -1457,6 +1461,8 @@ export function CircuitBoard({
       cameraX: current.x,
       cameraY: current.y,
       moved: false,
+      suppressClick: event.button === 1 || spacePressedRef.current || panMode,
+      backgroundClick: !readOnly && event.target instanceof SVGElement && event.target.hasAttribute("data-circuit-board-background"),
     };
     setIsPanning(true);
     try {
@@ -1467,9 +1473,10 @@ export function CircuitBoard({
   }
 
   function startRange(event: PointerEvent<SVGSVGElement>) {
+    if (!canStartDocumentGesture()) { return; }
     const point = pointAtPointer(event);
     const next: RangeState = {
-      epoch: documentEpoch,
+      gesture: captureDocumentGesture(),
       pointerId: event.pointerId,
       start: point,
       current: point,
@@ -1487,7 +1494,7 @@ export function CircuitBoard({
   function moveRange(event: PointerEvent<SVGSVGElement>) {
     const current = rangeRef.current;
     if (!current || current.pointerId !== event.pointerId) { return false; }
-    if (!isDocumentCurrent(current.epoch)) { return cancelRange(); }
+    if (!isDocumentCurrent(current.gesture)) { return cancelRange(); }
     const point = pointAtPointer(event);
     const moved = current.moved || Math.hypot(
       (point.x - current.start.x) * GRID * cameraRef.current.zoom,
@@ -1503,7 +1510,7 @@ export function CircuitBoard({
   function finishRange(event: PointerEvent<SVGSVGElement>) {
     const current = rangeRef.current;
     if (!current || current.pointerId !== event.pointerId) { return false; }
-    if (!isDocumentCurrent(current.epoch)) { return cancelRange(); }
+    if (!isDocumentCurrent(current.gesture)) { return cancelRange(); }
     if (event.type === "pointercancel") { return cancelRange(); }
     rangeRef.current = null;
     setRange(null);
@@ -1549,6 +1556,11 @@ export function CircuitBoard({
     if (pan?.pointerId !== event.pointerId) { return false; }
     panRef.current = null;
     setIsPanning(false);
+    // An explicitly requested pan never activates a part, even below the
+    // movement threshold or after Space was released during the gesture.
+    suppressPanActivationRef.current = pan.suppressClick || pan.moved || event.type === "pointercancel";
+    backgroundClickRef.current = pan.backgroundClick && !suppressPanActivationRef.current;
+    if (suppressPanActivationRef.current) { draggedRef.current = true; }
     clearDragClickTimer.current = setTimeout(() => {
       draggedRef.current = false;
       clearDragClickTimer.current = null;
@@ -1577,6 +1589,13 @@ export function CircuitBoard({
   function trackTouchStart(event: PointerEvent<SVGSVGElement>) {
     if (event.pointerType !== "touch") { return false; }
     touchesRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
+    if (gesturePointersRef.current.size > 0) {
+      // Every touch that joins a pinch belongs to that gesture until released,
+      // even after another finger ended the zoom. None may begin a part edit.
+      gesturePointersRef.current.add(event.pointerId);
+      try { event.currentTarget.setPointerCapture(event.pointerId); } catch { /* Unsupported capture. */ }
+      return true;
+    }
     if (touchesRef.current.size !== 2) { return false; }
     readOnlyPartGestureRef.current = null;
     if (clearDragClickTimer.current !== null) { clearTimeout(clearDragClickTimer.current); }
@@ -1596,6 +1615,9 @@ export function CircuitBoard({
     };
     gesturePointersRef.current.add(first[0]);
     gesturePointersRef.current.add(second[0]);
+    // Each finger can emit its own click. Keep suppression latched until a new
+    // independent press, even when an earlier click consumed the drag marker.
+    suppressPanActivationRef.current = true;
     panRef.current = null;
     setIsPanning(false);
     rangeRef.current = null;
@@ -1646,6 +1668,23 @@ export function CircuitBoard({
     return true;
   }
 
+  function cancelCameraPointer(pointerId: number) {
+    const panning = panRef.current?.pointerId === pointerId;
+    const touching = touchesRef.current.delete(pointerId);
+    const pinching = gesturePointersRef.current.delete(pointerId);
+    const inspecting = readOnlyPartGestureRef.current?.pointerId === pointerId;
+    if (panning) {
+      panRef.current = null;
+      setIsPanning(false);
+      suppressPanActivationRef.current = true;
+    }
+    // The other pinch finger stays blocked until its own release. It cannot
+    // continue zooming against the last position of the lost pointer.
+    if (pinching) { pinchRef.current = null; }
+    if (inspecting) { readOnlyPartGestureRef.current = null; }
+    if (panning || touching || pinching || inspecting) { finishWireRoutePointer(true); }
+  }
+
   function changeZoom(nextZoom: number) {
     const viewport = viewportRef.current;
     if (!viewport) { return; }
@@ -1667,19 +1706,23 @@ export function CircuitBoard({
     if (wireRouteDrag.move(event)) { return; }
     const current = dragRef.current;
     if (!current || current.pointerId !== event.pointerId) { return; }
-    if (!isDocumentCurrent(current.epoch)) { discardPartDrag(); return; }
+    if (!isDocumentCurrent(current.gesture)) { discardPartDrag(); return; }
     const next = gridAtPointer(event);
     const dx = next.x - current.last.x;
     const dy = next.y - current.last.y;
     if (dx === 0 && dy === 0) { return; }
     draggedRef.current = true;
-    updatePartDrag({
-      ...current,
-      last: next,
-      expectedPosition: { x: current.expectedPosition.x + dx, y: current.expectedPosition.y + dy },
+    // A host may reject a move in its state updater. Commit that result and the
+    // layout correction before another pointer event computes its relative delta.
+    flushSync(() => {
+      updatePartDrag({
+        ...current,
+        last: next,
+        expectedPosition: { x: current.expectedPosition.x + dx, y: current.expectedPosition.y + dy },
+      });
+      markDocumentEdit();
+      onMovePart?.(current.id, dx, dy);
     });
-    markDocumentEdit();
-    onMovePart?.(current.id, dx, dy);
   }
 
   function commitPartDrag(current: DragState) {
@@ -1695,7 +1738,7 @@ export function CircuitBoard({
     if (wireRouteDrag.finish(event)) { return; }
     const current = dragRef.current;
     if (current?.pointerId !== event.pointerId) { return; }
-    if (!isDocumentCurrent(current.epoch)) { discardPartDrag(); return; }
+    if (!isDocumentCurrent(current.gesture)) { discardPartDrag(); return; }
     if (event.type === "pointercancel") { cancelPartDrag(); return; }
     const modifierClick = modifierPartClickRef.current;
     modifierPartClickRef.current = null;
@@ -1844,7 +1887,7 @@ export function CircuitBoard({
           )}
         </g>
     </>
-  ), [analysis, showFlow, flowDisplay, connectedTerminals, document.parts, document.wires, drag?.id, handlePartKeyDown, handlePartPointerClick, onSwitchToggle, readOnly,
+  ), [analysis, visualReadings, showFlow, flowDisplay, connectedTerminals, document.parts, document.wires, drag?.id, handlePartKeyDown, handlePartPointerClick, onSwitchToggle, readOnly,
     onSelectPart, onInspectPart, chooseWire, chooseTerminal, pendingEndpoint, pendingWire, partsById, renderPart,
     selectedParts, selectedWires, slotProps, startDrag, startConnectionDrag, wireRoutes,
     canEditWireRoute, wireRouteDrag.start, wireRouteDrag.draggingWireId]);
@@ -1897,9 +1940,13 @@ export function CircuitBoard({
             const wireFinished = wireRouteDrag.finish();
             const partDrag = dragRef.current;
             if (partDrag) {
-              updatePartDrag(null);
               modifierPartClickRef.current = null;
-              onMoveEnd?.();
+              // Resolve an unchanged round trip, including its redo history,
+              // before the shortcut bubbles to the host's command handler.
+              flushSync(() => {
+                updatePartDrag(null);
+                commitPartDrag(partDrag);
+              });
               releaseConnectionPointer(partDrag.pointerId);
             }
             if (wireFinished || partDrag) { finishWireRoutePointer(true); }
@@ -1947,7 +1994,11 @@ export function CircuitBoard({
         }}
         onClick={(event) => {
           const target = event.target;
-          if (!(target instanceof SVGElement) || !target.hasAttribute("data-circuit-board-background")) { return; }
+          // Capture retargets a completed background click to the SVG surface.
+          // Only its recorded press may activate the background through that target.
+          const capturedBackground = target === event.currentTarget && backgroundClickRef.current;
+          backgroundClickRef.current = false;
+          if (!capturedBackground && (!(target instanceof SVGElement) || !target.hasAttribute("data-circuit-board-background"))) { return; }
           if (!wasDragged() && !panMode && !readOnly && !spacePressedRef.current) {
             const destination: ConnectionTarget = pendingEndpoint ? targetAtPointer(event) : { point: gridAtPointer(event) };
             if (destination.endpoint) { onTerminalClick?.(destination.endpoint); }
@@ -1962,6 +2013,8 @@ export function CircuitBoard({
             draggedRef.current = false;
             suppressPointerClickRef.current = false;
             suppressCancelledClickRef.current = false;
+            suppressPanActivationRef.current = false;
+            backgroundClickRef.current = false;
             if (clearDragClickTimer.current !== null) { clearTimeout(clearDragClickTimer.current); }
             clearDragClickTimer.current = null;
           }
@@ -1978,7 +2031,7 @@ export function CircuitBoard({
             startRange(event);
             return;
           }
-          if (isPreviewPartGesture(event, readOnly, onInspectPart, onSwitchToggle, spacePressedRef.current)) {
+          if (!panMode && isPreviewPartGesture(event, readOnly, onInspectPart, onSwitchToggle, spacePressedRef.current)) {
             readOnlyPartGestureRef.current = readOnlyPartGestureStart(event, spacePressedRef.current);
             return;
           }
@@ -2006,17 +2059,18 @@ export function CircuitBoard({
         }}
         onPointerCancel={(event) => {
           if (readOnlyPartGestureRef.current?.pointerId === event.pointerId) { readOnlyPartGestureRef.current = null; }
-          cancelConnectionDrag();
+          if (connectionDragRef.current?.pointerId === event.pointerId) { cancelConnectionDrag(); }
           finishDrag(event);
         }}
         onLostPointerCapture={(event) => {
+          cancelCameraPointer(event.pointerId);
           wireRouteDrag.cancel(event.pointerId, false);
           if (dragRef.current?.pointerId === event.pointerId) { cancelPartDrag(false); }
           if (rangeRef.current?.pointerId === event.pointerId) { cancelRange(false); }
           if (connectionDragRef.current?.pointerId === event.pointerId) { cancelConnectionDrag(); }
         }}
         onClickCapture={(event) => {
-          if (suppressPointerClickRef.current || suppressCancelledClickRef.current) {
+          if ((event.detail > 0 && suppressPanActivationRef.current) || suppressPointerClickRef.current || suppressCancelledClickRef.current) {
             suppressPointerClickRef.current = false;
             suppressCancelledClickRef.current = false;
             draggedRef.current = false;
@@ -2037,6 +2091,12 @@ export function CircuitBoard({
           }
           event.preventDefault();
           event.stopPropagation();
+        }}
+        onDoubleClickCapture={(event) => {
+          if (event.detail > 0 && suppressPanActivationRef.current) {
+            event.preventDefault();
+            event.stopPropagation();
+          }
         }}
       >
         <title>{document.title}</title>

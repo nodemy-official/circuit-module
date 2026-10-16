@@ -152,6 +152,52 @@ function pointerDrag(
 }
 
 describe("Circuit wiring interactions", () => {
+  const selectionCommands = ["selectAll", "selectPart", "selectWire", "selectRange", "clearSelection", "choosePoint", "endEdit"] as const;
+  const interruptedDrags = (["part", "wire"] as const).flatMap((kind) =>
+    [...selectionCommands, ...(kind === "part" ? ["copySelected" as const] : [])].flatMap((command) =>
+      [false, true].flatMap((batched) => [false, true].map((hasMoved) => ({ kind, command, batched, hasMoved }))),
+    ),
+  );
+
+  it.each(interruptedDrags)("commits the active $kind drag before $command (batched=$batched, moved=$hasMoved)", ({ kind, command, batched, hasMoved }) => {
+    const initial = fixture(true);
+    const ui = mount(initial);
+    const surface = required(ui.container, ".circuit-board__surface");
+    if (kind === "wire") { click(required(ui.container, '[data-wire-id="wire-1"]')); }
+    const world = kind === "part" ? battery : longestRouteMidpoint(initial, "wire-1");
+    const screen = (dy: number) => screenPointForWorld(ui.container, { x: world.x * GRID, y: (world.y + dy) * GRID });
+    const target = required(ui.container, kind === "part"
+      ? '.circuit-board__part[data-part-id="battery"]'
+      : '[data-wire-id="wire-1"][data-segment-index="0"]');
+    pointer(target, "pointerdown", screen(0), 92);
+    if (hasMoved) { pointer(surface, "pointermove", screen(2), 92); }
+    const moved = ui.editor.document;
+    if (hasMoved) { expect(moved).not.toEqual(initial); }
+    const commands = {
+      selectAll: () => ui.editor.selectAll(),
+      selectPart: () => ui.editor.selectPart(resistor.id),
+      selectWire: () => ui.editor.selectWire("wire-1"),
+      selectRange: () => ui.editor.selectRange({ parts: [junction.id], wires: [] }),
+      clearSelection: () => ui.editor.clearSelection(),
+      choosePoint: () => ui.editor.choosePoint({ x: 0, y: 0 }),
+      copySelected: () => ui.editor.copySelected(),
+      endEdit: () => ui.editor.endEdit(),
+    };
+    const interrupt = () => act(() => { commands[command](); });
+    const finish = () => {
+      pointer(surface, "pointermove", screen(3), 92);
+      pointer(surface, "pointerup", screen(3), 92);
+    };
+    if (batched) { act(() => { interrupt(); finish(); }); }
+    else { interrupt(); finish(); }
+    expect(ui.editor.document).toEqual(moved);
+    expect(ui.editor.canUndo).toBe(hasMoved);
+    act(() => ui.editor.undo());
+    expect(ui.editor.document).toEqual(initial);
+    act(() => ui.editor.redo());
+    expect(ui.editor.document).toEqual(moved);
+  });
+
   it.each(["part", "wire"])("ends the active %s drag before Undo and ignores its later pointer events", (kind) => {
     const initial = fixture(true);
     const ui = mount(initial);
@@ -176,6 +222,76 @@ describe("Circuit wiring interactions", () => {
     expect(ui.editor.document).toEqual(initial);
     act(() => ui.editor.redo());
     expect(ui.editor.document).toEqual(moved);
+  });
+
+  it.each([false, true])("preserves a new connection that replaces an older pointer gesture (batched=%s)", (batched) => {
+    const initial = fixture();
+    const ui = mount(initial);
+    const surface = required(ui.container, ".circuit-board__surface");
+    const from = screenPointForTerminal(ui.container, battery, "b");
+    const to = screenPointForTerminal(ui.container, resistor, "a");
+    pointer(terminal(ui.container, battery.id, "b"), "pointerdown", from, 93);
+    pointer(surface, "pointermove", to, 93);
+    expect(ui.editor.pendingEndpoint).toEqual({ partId: battery.id, terminal: "b" });
+    const replace = () => act(() => ui.editor.startConnection({ partId: junction.id, terminal: "a" }));
+    const finish = () => {
+      pointer(surface, "pointermove", to, 93);
+      pointer(surface, "pointerup", to, 93);
+    };
+    if (batched) { act(() => { replace(); finish(); }); }
+    else { replace(); finish(); }
+    expect(ui.editor.pendingEndpoint).toEqual({ partId: junction.id, terminal: "a" });
+    expect(ui.editor.document).toEqual(initial);
+    act(() => ui.editor.chooseTerminal({ partId: resistor.id, terminal: "a" }));
+    expect(ui.editor.document.wires).toEqual([{
+      id: "wire-1", from: { partId: junction.id, terminal: "a" }, to: { partId: resistor.id, terminal: "a" },
+    }]);
+  });
+
+  it("ignores a different pointer's cancellation during a connection drag", () => {
+    const ui = mount(fixture());
+    const surface = required(ui.container, ".circuit-board__surface");
+    const from = screenPointForTerminal(ui.container, battery, "b");
+    const to = screenPointForTerminal(ui.container, resistor, "a");
+    pointer(terminal(ui.container, battery.id, "b"), "pointerdown", from, 95);
+    pointer(surface, "pointermove", to, 95);
+    pointer(surface, "pointercancel", to, 96);
+    expect(ui.editor.pendingEndpoint).toEqual({ partId: battery.id, terminal: "b" });
+    pointer(surface, "pointerup", to, 95);
+    expect(ui.editor.document.wires).toEqual([existingWire]);
+  });
+
+  it.each(["part", "wire", "wire-key"])("rejects a new %s edit on stale artwork before a batched Undo commits", (kind) => {
+    const initial = fixture(true);
+    const ui = mount(initial);
+    act(() => {
+      if (kind === "part") { ui.editor.movePart(battery.id, 0, 2); }
+      else { ui.editor.updateWireRoute("wire-1", [{ x: 6, y: 7 }, { x: 10, y: 7 }]); }
+      ui.editor.endEdit();
+    });
+    if (kind !== "part") { click(required(ui.container, '[data-wire-id="wire-1"]')); }
+    const edited = ui.editor.document;
+    const world = kind === "part" ? edited.parts[0]! : longestRouteMidpoint(edited, "wire-1");
+    const from = screenPointForWorld(ui.container, { x: world.x * GRID, y: world.y * GRID });
+    const to = screenPointForWorld(ui.container, { x: world.x * GRID, y: (world.y + 3) * GRID });
+    const target = required(ui.container, kind === "part"
+      ? '.circuit-board__part[data-part-id="battery"]'
+      : kind === "wire" ? '.circuit-board__wire[data-wire-id="wire-1"]'
+        : '[data-wire-id="wire-1"][data-segment-index="0"]');
+    const surface = required(ui.container, ".circuit-board__surface");
+    act(() => {
+      ui.editor.undo();
+      if (kind === "wire-key") { keyDown(target, "ArrowDown"); }
+      else {
+        pointer(target, "pointerdown", from, 94);
+        pointer(surface, "pointermove", to, 94);
+        pointer(surface, "pointerup", to, 94);
+      }
+    });
+    expect(ui.editor.document).toEqual(initial);
+    expect(ui.editor.canRedo).toBe(true);
+    act(() => ui.editor.redo());
+    expect(ui.editor.document).toEqual(edited);
   });
 
   it("splits a fractional wire when connecting to it with the keyboard", () => {

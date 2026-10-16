@@ -4,6 +4,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { circuitPartCatalog, type CircuitDocument, type CircuitPart } from "../../circuit-model.js";
 import { analyzeCircuit, type CircuitAnalysis, type CircuitPartReading } from "../../circuit-solver.js";
+import { serializeCircuitDocument } from "../../circuit-serialization.js";
 import { CircuitComparisonPanel } from "../CircuitComparisonPanel.js";
 
 const mounted: Array<{ root: Root; container: HTMLElement }> = [];
@@ -91,6 +92,62 @@ function clickButton(container: ParentNode, label: string) {
 }
 
 describe("CircuitComparisonPanel", () => {
+  it("captures measurements without reading unused layout data accepted by analysis and storage", () => {
+    const circuit = documentOf([
+      { ...part("source", "battery", "電池"), voltageVolts: 9 },
+      { ...part("r", "resistor", "抵抗"), resistanceOhms: 3 },
+    ]);
+    const readLayout = vi.fn(() => { throw new Error("Unused layout must not be read"); });
+    const route = [{ x: 2, y: 3 }, { x: 6, y: 3 }];
+    circuit.wires = [
+      { id: "a", from: { partId: "source", terminal: "a" }, to: { partId: "r", terminal: "a" },
+        waypoints: new Proxy(route, { get: readLayout }) },
+      { id: "b", from: { partId: "r", terminal: "b" }, to: { partId: "source", terminal: "b" } },
+    ];
+    const result = analyzeCircuit(circuit);
+    expect(result.status).toBe("closed");
+    expect(() => serializeCircuitDocument(circuit)).not.toThrow();
+    expect(readLayout).not.toHaveBeenCalled();
+    const ui = mount({ document: circuit, analysis: result });
+
+    clickButton(ui.container, "現在を比較の基準にする");
+
+    expect(ui.container.querySelector('[role="alert"]')).toBeNull();
+    circuit.parts[1]!.resistanceOhms = 6;
+    route[0]!.x = 99;
+    ui.rerender({ document: circuit, analysis: analyzeCircuit(circuit) });
+    chooseMetric(ui.container, "currentAmps");
+    const row = required(ui.container, 'tr[data-part-id="r"]');
+    expect([...row.querySelectorAll("td")].map((cell) => cell.textContent)).toEqual(["3", "1.5", "-1.5"]);
+    expect(readLayout).not.toHaveBeenCalled();
+  });
+
+  it.each(["exactVoltage", "exactTerminalVoltages", "exactTerminalCurrents", "precisionExpressions"] as const)(
+    "captures scalar comparisons when optional %s metadata cannot be read",
+    (field) => {
+      const circuit = documentOf([part("r", "resistor", "抵抗")]);
+      const result = analysis({ r: reading(9, 3, 27) });
+      const target = field === "precisionExpressions" ? result : result.parts.r!;
+      Object.defineProperty(target, field, {
+        enumerable: true,
+        get() { throw new Error("Unavailable optional precision"); },
+      });
+      const ui = mount({ document: circuit, analysis: result });
+
+      clickButton(ui.container, "現在を比較の基準にする");
+
+      expect(ui.container.querySelector('[role="alert"]')).toBeNull();
+      const next = analysis({ r: reading(12, 4, 48) });
+      ui.rerender({ document: circuit, analysis: next });
+      const row = required(ui.container, 'tr[data-part-id="r"]');
+      expect([...row.querySelectorAll("td")].map((cell) => cell.textContent)).toEqual(["9", "12", "+3"]);
+      chooseMetric(ui.container, "currentAmps");
+      expect([...row.querySelectorAll("td")].map((cell) => cell.textContent)).toEqual(["3", "4", "+1"]);
+      chooseMetric(ui.container, "powerWatts");
+      expect([...row.querySelectorAll("td")].slice(0, 3).map((cell) => cell.textContent)).toEqual(["27", "48", "+21"]);
+    },
+  );
+
   it.each(["id", "kind"] as const)("preserves a non-enumerable %s in a local comparison snapshot", (field) => {
     const load = part("load", "resistor", "抵抗");
     Object.defineProperty(load, field, { value: load[field], enumerable: false });

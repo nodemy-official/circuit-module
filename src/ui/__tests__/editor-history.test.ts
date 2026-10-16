@@ -143,4 +143,123 @@ describe("editorHistoryReducer", () => {
     expect(editorHistoryReducer(state, { type: "undo" })).toBe(state);
     expect(editorHistoryReducer(state, { type: "redo" })).toBe(state);
   });
+
+  it.each(["end-group", "undo", "redo", "edit"] as const)("removes an unchanged group before %s and preserves the original history branch", (boundary) => {
+    const older = document("older");
+    const original = document("original");
+    const redo = document("redo");
+    const next = document("next");
+    let state: EditorHistory = { past: [older], present: original, future: [redo] };
+    state = editorHistoryReducer(state, { type: "edit", document: document("changed"), group: "title" });
+    state = editorHistoryReducer(state, { type: "edit", document: document("original"), group: "title" });
+    state = editorHistoryReducer(state, boundary === "edit" ? { type: "edit", document: next, group: "next" } : { type: boundary });
+
+    if (boundary === "end-group") {
+      expect(state).toEqual({ past: [older], present: original, future: [redo] });
+      expect(state.present).toBe(original);
+    } else if (boundary === "undo") {
+      expect(state).toEqual({ past: [], present: older, future: [original, redo] });
+    } else if (boundary === "redo") {
+      expect(state).toEqual({ past: [older, original], present: redo, future: [] });
+    } else {
+      expect(state.past).toEqual([older, original]);
+      expect(state.present).toBe(next);
+      expect(state.future).toEqual([]);
+    }
+  });
+
+  it("does not retain a first grouped edit whose contents never changed", () => {
+    const original = document("same");
+    let state = history(original);
+    state = editorHistoryReducer(state, { type: "edit", document: document("same"), group: "title" });
+    state = editorHistoryReducer(state, { type: "end-group" });
+
+    expect(state).toEqual(history(original));
+    expect(state.present).toBe(original);
+  });
+
+  it("restores the entire bounded history and redo branch after an unchanged group", () => {
+    const past = Array.from({ length: 100 }, (_, index) => document(String(index)));
+    const original: EditorHistory = { past, present: document("original"), future: [document("redo")] };
+    let state = editorHistoryReducer(original, { type: "edit", document: document("changed"), group: "title" });
+    state = editorHistoryReducer(state, { type: "edit", document: document("original"), group: "title" });
+    state = editorHistoryReducer(state, { type: "end-group" });
+
+    expect(state).toEqual(original);
+    expect(state.present).toBe(original.present);
+    expect(state.past).toBe(past);
+  });
+
+  it.each([
+    { before: {}, after: { extra: undefined } },
+    { before: { extra: Number.NaN }, after: { extra: Number.POSITIVE_INFINITY } },
+    { before: { extra: -0 }, after: { extra: 0 } },
+    { before: { extra: [undefined] }, after: { extra: new Array<unknown>(1) } },
+    { before: { extra: new Date(0) }, after: { extra: new Date(0) } },
+    { before: { extra: { nested: 1n } }, after: { extra: { nested: 2n } } },
+  ])("preserves edits to fields that JSON would discard or conflate ($before, $after)", ({ before, after }) => {
+    const original = { ...document("same"), ...before };
+    const edited = { ...document("same"), ...after };
+    let state = editorHistoryReducer(history(original), { type: "edit", document: edited, group: "metadata" });
+    state = editorHistoryReducer(state, { type: "end-group" });
+
+    expect(state.past).toEqual([original]);
+    expect(state.present).toBe(edited);
+  });
+
+  it("compares unknown symbol fields and property descriptors without invoking getters", () => {
+    const symbol = Symbol("metadata");
+    let reads = 0;
+    const getter = () => { reads += 1; throw new Error("must not read accessor"); };
+    const original = Object.defineProperty({ ...document("same"), [symbol]: 1 }, "extra", { get: getter });
+    const equivalent = Object.defineProperty({ ...document("same"), [symbol]: 1 }, "extra", { get: getter });
+    const changed = Object.defineProperty({ ...document("same"), [symbol]: 2 }, "extra", { get: getter });
+
+    const ended = editorHistoryReducer(editorHistoryReducer(history(original), { type: "edit", document: equivalent, group: "metadata" }), { type: "end-group" });
+    expect(ended.present === original).toBe(true);
+    expect(ended.past).toEqual([]);
+    const kept = editorHistoryReducer(editorHistoryReducer(history(original), { type: "edit", document: changed, group: "metadata" }), { type: "end-group" });
+    expect(kept.present === changed).toBe(true);
+    expect(kept.past[0] === original).toBe(true);
+    expect(reads).toBe(0);
+  });
+
+  it("handles cyclic metadata and equal NaN values without recursing indefinitely", () => {
+    function cyclicDocument() {
+      const metadata: { value: number; self?: unknown } = { value: Number.NaN };
+      metadata.self = metadata;
+      return { ...document("same"), metadata };
+    }
+    const original = cyclicDocument();
+    let state = editorHistoryReducer(history(original), { type: "edit", document: cyclicDocument(), group: "metadata" });
+    state = editorHistoryReducer(state, { type: "end-group" });
+
+    expect(state.present).toBe(original);
+    expect(state.past).toEqual([]);
+  });
+
+  it("does not discard changes to metadata sharing or property attributes", () => {
+    const shared = { value: 1 };
+    const original = { ...document("same"), metadata: [shared, shared] };
+    const separate = { ...document("same"), metadata: [{ value: 1 }, { value: 1 }] };
+    const changedSharing = editorHistoryReducer(editorHistoryReducer(history(original), { type: "edit", document: separate, group: "metadata" }), { type: "end-group" });
+    expect(changedSharing.present).toBe(separate);
+    expect(changedSharing.past).toEqual([original]);
+
+    const hidden = Object.defineProperty(document("same"), "metadata", { value: 1, enumerable: false });
+    const visible = Object.defineProperty(document("same"), "metadata", { value: 1, enumerable: true });
+    const changedAttributes = editorHistoryReducer(editorHistoryReducer(history(hidden), { type: "edit", document: visible, group: "metadata" }), { type: "end-group" });
+    expect(changedAttributes.present).toBe(visible);
+    expect(changedAttributes.past[0]).toBe(hidden);
+  });
+
+  it("retains malformed documents when their properties cannot be inspected safely", () => {
+    const original = new Proxy(document("same"), { ownKeys() { throw new Error("unreadable input"); } });
+    const edited = document("same");
+    const state = editorHistoryReducer(history(original), { type: "edit", document: edited, group: "title" });
+
+    const ended = editorHistoryReducer(state, { type: "end-group" });
+    expect(ended.present).toBe(edited);
+    expect(ended.past[0]).toBe(original);
+  });
 });

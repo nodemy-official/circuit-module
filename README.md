@@ -153,6 +153,8 @@ export function Workbench() {
 
 `CircuitEditor` の `children` は通常の `ReactNode` でも、`(editor) => ReactNode` の render prop でも構いません。render prop を使わず子孫から状態を読む場合は `useCircuitEditorContext()` を使えます。`initialDocument` は初期値、`onDocumentChange` は変更通知です。controller が持つ `document`、`selection`、`pendingEndpoint`、`pendingWire`、`analysis`、`error` と、追加・選択・接続・つなぎ替え・移動・回転・削除・Undo/Redo などの操作を組み合わせてください。provider を使わず hook を直接使いたい場合は、従来どおり `useCircuitEditor(initialDocument?)` を利用できます。
 
+`updatePart(id, patch)` は表示名・数値・スイッチ状態などの属性を更新します。部品の ID と種類を変更する操作には対応していません。これらを変更する patch は拒否し、文書・選択・接続中の状態・履歴を保ったまま `error` に理由を設定します。
+
 ### 標準の見た目を使う
 
 標準レイアウトは preset として分離されています。利用するアプリだけが CSS と preset を明示的に import します。
@@ -256,7 +258,11 @@ const lessonFeatures = {
 <CircuitPreview initialDocument={document} previewFeatures={lessonFeatures} />
 ```
 
-標準スタイルは任意です。`/ui/styles.css` は全スタイル、`/ui/board.css` は基板、`/ui/editor.css` はエディターと各パネル用です。どれも必要なものだけを import できます。モジュールの root には `className`、`style`、HTML 属性を渡せます。内部要素は `slotProps` の `className` と `style` で調整します。root と slot の `style` では CSS カスタムプロパティも型キャストなしで指定できます（例: `style={{ "--circuit-accent": "#7c3aed" }}`）。全 slot 名は公開型 `CircuitBoardSlot`、`CircuitPaletteSlot`、`CircuitInspectorSlot`、`CircuitAnalysisPanelSlot` に定義されています。部品・導線・端子の `data-selected` / `data-pending` や、パネルの `data-state` / `data-status` を使い、状態に応じた CSS も書けます。`CircuitBoard` の `showFlow` を `true` にすると解析に基づく電流・電子の流れを表示できます（既定は `false`）。標準レイアウトではプレビュー中に自動で有効になります。
+標準スタイルは任意です。`/ui/styles.css` は全スタイル、`/ui/board.css` は基板、`/ui/editor.css` はエディターと各パネル用です。どれも必要なものだけを import できます。`CircuitBoard`、`CircuitPalette`、`CircuitInspector`、`CircuitAnalysisPanel`、`CircuitDiagnosticsPanel` と、preset の `CircuitEditorLayout` / `CircuitPreview` の root には `className`、`style`、HTML 属性を渡せます。これらの `style` では CSS カスタムプロパティも型キャストなしで指定できます（例: `style={{ "--circuit-accent": "#7c3aed" }}`）。
+
+`CircuitSimulationPanel`、`CircuitTransientPanel`、`CircuitMeterReadout` も root の HTML 属性に対応し、`style` は React 標準型です。`CircuitEnergyPanel`、`CircuitAcPanel`、`CircuitComparisonPanel` は専用 props のみを受け取り、HTML 属性を転送しません。レイアウトや CSS 変数は親要素で指定してください。
+
+内部要素の `slotProps` に対応する5モジュールの全 slot 名は、公開型 `CircuitBoardSlot`、`CircuitPaletteSlot`、`CircuitInspectorSlot`、`CircuitAnalysisPanelSlot`、`CircuitDiagnosticsPanelSlot` に定義されています。各 slot の `className` と、CSS カスタムプロパティに対応した `style` で見た目を調整できます。部品・導線・端子の `data-selected` / `data-pending` や、パネルの `data-state` / `data-status` を使い、状態に応じた CSS も書けます。`CircuitBoard` の `showFlow` を `true` にすると解析に基づく電流・電子の流れを表示できます（既定は `false`）。標準レイアウトではプレビュー中に自動で有効になります。
 
 余白には `--circuit-space-1`〜`--circuit-space-6` と `--circuit-space-8`（順に 4/8/12/16/20/24/32px）、コントロールの高さには標準 `--circuit-control-height`（36px）、コンパクト `--circuit-control-height-compact`（32px）、タッチ `--circuit-control-height-touch`（44px）を使います。これらは各 CSS entry から自動で読み込まれるため追加の import は不要です。親要素に同名の CSS 変数を指定すると子 UI に継承され、アプリに合わせて調整できます。
 
@@ -267,6 +273,8 @@ const lessonFeatures = {
 基本コントロールは `src/ui/primitives.tsx` の `@base-ui/react` ラッパーを使います。`Button`、`Input`、`NativeSelect`、`Switch`、`Tabs`、`Dialog` は `data-slot` と `circuit-ui-*` クラスを通じて標準 CSS の `--circuit-*` 変数に馴染みます。構成は [shadcn/ui の Base UI Button](https://ui.shadcn.com/docs/components/base/button) と [Dialog](https://ui.shadcn.com/docs/components/base/dialog) を参考にしています。shadcn/ui の参照実装は [MIT ライセンス](https://github.com/shadcn-ui/ui/blob/main/LICENSE.md) です。
 
 標準 CSS を読み込まないときは、各モジュールの DOM と SVG に必要なレイアウト・色・操作領域を利用側で定義します。基板では特に `viewport` の幅と高さ、`surface` の `touch-action: none`、部品・端子・導線の透明な hit 領域が必要です。独自 CSS の実用例は `stories/Headless.stories.tsx` と `stories/headless-story.css` にあります。標準 CSS は `@layer circuit` 内にあるため、利用側の通常の CSS で上書きでき、CSS 変数も親要素から継承できます。
+
+`--circuit-accent` や `--circuit-board-current` などの色変数は、親または root に指定した値を部品プレビューやダイアログにも継承します。未指定の場合だけ、ライト・ダーク各テーマの既定色を使います。これらは利用側の上書き用の変数なので、独自 CSS から参照する場合も `var(--circuit-accent, #3265da)` のように未指定時の代替値を指定してください。
 
 従来のように `CircuitEditor` 一つで標準画面を出していた箇所は、provider の子に `<CircuitEditorLayout />` を置く形へ移行してください。画面の一部だけ使う場合は preset を使わず、必要な UI モジュールを配置します。`CircuitBoard` の `renderPart` では部品の SVG 表現を差し替えられ、`renderControls` ではズームや格子切り替え操作の見た目と並びを組み替えられます。標準コントロールは callback が `null` を返すか、`renderControls={null}` を渡して隠せます。
 

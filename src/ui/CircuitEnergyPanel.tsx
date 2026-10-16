@@ -1,6 +1,6 @@
 import { complexConjugate, complexMagnitudeNormalization, complexMultiply, scaledProduct } from "../analog-math.js";
 import type { CircuitDocument, CircuitPart } from "../circuit-model.js";
-import { restoredReadingComplex } from "../circuit-reading.js";
+import { readOptionalPrecision, restoredReadingComplex } from "../circuit-reading.js";
 import type { CircuitAnalysis } from "../circuit-solver.js";
 import { snapshotExactExpressions, type ExactExpressionNode } from "../exact-expression.js";
 import { addExactRational, exactRationalToNumber, multiplyExactRational, numberToExactRational, subtractExactRational, type ExactRational } from "../exact-linear-algebra.js";
@@ -35,7 +35,7 @@ function storedEnergy(
   if (!finite(coefficient) || coefficient < 0 || !finite(scalar)) { return null; }
   const phase = capacitive ? "voltagePhaseDegrees" in reading ? reading.voltagePhaseDegrees : undefined
     : "currentPhaseDegrees" in reading ? reading.currentPhaseDegrees : undefined;
-  const retained = restoredReadingComplex(capacitive ? reading.exactVoltage : reading.exactTerminalCurrents?.a, scalar, phase, ac, expressions);
+  const retained = restoredReadingComplex(readOptionalPrecision(() => capacitive ? reading.exactVoltage : reading.exactTerminalCurrents?.a), scalar, phase, ac, expressions);
   if (!retained) { return scaledProduct([0.5, coefficient, scalar, scalar]); }
   // Keep algebraic terms through V*conj(V): the rectangular expansion alone
   // can lose the correct side of an energy midpoint. The product's squared
@@ -50,8 +50,8 @@ function storedEnergy(
 function resistivePower(reading: TransientPartReading, expressions?: readonly ExactExpressionNode[]): ExactRational {
   const fallback = numberToExactRational(Math.max(0, reading.powerWatts))!;
   if (!finite(reading.voltageVolts) || !finite(reading.currentAmps) || reading.powerWatts < 0) { return fallback; }
-  const voltage = restoredReadingComplex(reading.exactVoltage, reading.voltageVolts, undefined, false, expressions);
-  const current = restoredReadingComplex(reading.exactTerminalCurrents?.a, reading.currentAmps, undefined, false, expressions);
+  const voltage = restoredReadingComplex(readOptionalPrecision(() => reading.exactVoltage), reading.voltageVolts, undefined, false, expressions);
+  const current = restoredReadingComplex(readOptionalPrecision(() => reading.exactTerminalCurrents?.a), reading.currentAmps, undefined, false, expressions);
   const power = multiplyExactRational(
     voltage ? exactComplexValue(voltage)!.real : numberToExactRational(reading.voltageVolts)!,
     current ? exactComplexValue(current)!.real : numberToExactRational(reading.currentAmps)!,
@@ -277,8 +277,8 @@ function DissipationGroup({ entries, maximum }: { entries: DissipationEntry[]; m
 
 function transientEnergy(document: CircuitDocument, transient: CircuitTransientFrame["analysis"] | null) {
   return new Map(document.parts.flatMap((part) => {
-    const energy = transient && matchingTransientEnergy(part, transient.samples, transient.energyReadings,
-      transient.precisionExpressions, transient.energyPrecisionExpressions);
+    const energy = transient && matchingTransientEnergy(part, transient.samples, readOptionalPrecision(() => transient.energyReadings),
+      readOptionalPrecision(() => transient.precisionExpressions), readOptionalPrecision(() => transient.energyPrecisionExpressions));
     return energy ? [[part.id, energy] as const] : [];
   }));
 }
@@ -320,7 +320,7 @@ export function CircuitEnergyPanel({ document, analysis, frame }: CircuitEnergyP
   const canShowSteady = !["invalid", "empty", "short"].includes(analysis.status);
   // Revalidate on every render: callers may edit samples or the document in place.
   const precomputed = transientEnergy(document, transient);
-  const expressions = energyExpressions(transient?.precisionExpressions);
+  const expressions = energyExpressions(readOptionalPrecision(() => transient?.precisionExpressions));
   const maximumStoredJoules = maximumStoredEnergy(document, transient, precomputed, expressions);
   const resistiveParts = document.parts.filter((part) => resistiveKinds.has(part.kind));
   const dissipatedByPart = dissipatedEnergy(resistiveParts, transient, precomputed, expressions);
@@ -341,7 +341,7 @@ export function CircuitEnergyPanel({ document, analysis, frame }: CircuitEnergyP
   const sources = powers.filter(({ part }) => isPowerSource(part, ac, usingTransient));
   const components = powers.filter(({ part }) => !isPowerSource(part, ac, usingTransient));
   const maximumPower = powerGroupMaximum(powers);
-  const energies = energyEntries(document, analysis, sample, usingTransient, transient ? expressions : analysis.precisionExpressions, precomputed, sampleIndex);
+  const energies = energyEntries(document, analysis, sample, usingTransient, transient ? expressions : readOptionalPrecision(() => analysis.precisionExpressions), precomputed, sampleIndex);
   const dissipation = usingTransient
     ? resistiveParts.map((part) => ({ part, joules: dissipatedByPart.get(part.id)?.[sampleIndex] ?? null }))
     : [];

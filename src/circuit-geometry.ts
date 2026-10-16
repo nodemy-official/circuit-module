@@ -177,7 +177,14 @@ export interface RouteEnd {
   direction: Point | null;
 }
 
-function stub({ point, direction }: RouteEnd): Point {
+function stub({ point, direction }: RouteEnd, target?: Point): Point {
+  if (direction && target) {
+    const dx = target.x - point.x;
+    const dy = target.y - point.y;
+    const progress = dx * direction.x + dy * direction.y;
+    // A nearby junction can terminate a lead before its normal one-cell length.
+    if (progress > 0 && progress < 1 && dx * direction.y === dy * direction.x) { return target; }
+  }
   return direction ? { x: point.x + direction.x, y: point.y + direction.y } : point;
 }
 
@@ -197,9 +204,29 @@ function leavesHorizontally(start: RouteEnd, end: RouteEnd) {
  * Crossings at a point are allowed. Terminal stubs keep their fixed outward direction.
  */
 export function routeWire(start: RouteEnd, end: RouteEnd, occupied: readonly (readonly Point[])[] = []): Point[] {
-  const first = stub(start);
-  const last = stub(end);
-  return routeAroundWires(start, end, first, last, occupied);
+  return routeAvoidingTerminalPoints(start, end, occupied, []);
+}
+
+function facingLeads(start: RouteEnd, end: RouteEnd): { first: Point; last: Point } | undefined {
+  if (!start.direction || !end.direction ||
+      start.direction.x !== -end.direction.x || start.direction.y !== -end.direction.y) { return; }
+  const dx = end.point.x - start.point.x;
+  const dy = end.point.y - start.point.y;
+  const progress = dx * start.direction.x + dy * start.direction.y;
+  if (progress <= 0 || progress >= 2 || dx * start.direction.y !== dy * start.direction.x) { return; }
+  return {
+    first: { x: start.point.x + dx / 4, y: start.point.y + dy / 4 },
+    last: { x: end.point.x - dx / 4, y: end.point.y - dy / 4 },
+  };
+}
+
+function routeAvoidingTerminalPoints(start: RouteEnd, end: RouteEnd, occupied: readonly (readonly Point[])[], protectedPins: readonly Point[]): Point[] {
+  // Facing pins closer than two cells share their lead corridor without
+  // passing through either pin or retracing a full one-cell stub.
+  const facing = facingLeads(start, end);
+  const first = facing?.first ?? stub(start, end.direction ? undefined : end.point);
+  const last = facing?.last ?? stub(end, start.direction ? undefined : start.point);
+  return routeAroundWires(start, end, first, last, occupied, protectedPins);
 }
 
 function directWireRoute(start: RouteEnd, end: RouteEnd, first: Point, last: Point): Point[] {
@@ -331,6 +358,7 @@ interface RouteSpan extends RouteInterval {
 interface UsedSegments {
   horizontal: Map<number, RouteInterval[]>;
   vertical: Map<number, RouteInterval[]>;
+  blockedPoints: readonly Point[];
 }
 
 const ROUTE_DIRECTIONS = [{ x: 1, y: 0 }, { x: 0, y: 1 }, { x: -1, y: 0 }, { x: 0, y: -1}];
@@ -360,8 +388,8 @@ function mergeIntervals(lanes: Map<number, RouteInterval[]>) {
   }
 }
 
-function collectUsedSegments(occupied: readonly (readonly Point[])[]): UsedSegments {
-  const used: UsedSegments = { horizontal: new Map(), vertical: new Map() };
+function collectUsedSegments(occupied: readonly (readonly Point[])[], blockedPoints: readonly Point[] = []): UsedSegments {
+  const used: UsedSegments = { horizontal: new Map(), vertical: new Map(), blockedPoints };
   for (const route of occupied) {
     for (let index = 0; index < route.length - 1; index += 1) {
       const a = route[index];
@@ -413,6 +441,7 @@ function edgeConflicts(
   from: Point,
   to: Point,
 ) {
+  if (used.blockedPoints.some((point) => pointOnSegment(point, from, to))) { return true; }
   const span = routeSpan(from, to);
   if (!span) { return false; }
   let intervals: RouteInterval[] = [span];
@@ -533,7 +562,8 @@ function createNextRouteNode(
   const y = grid.y[yIndex];
   if (x === undefined || y === undefined) { return undefined; }
   const point = { x, y };
-  if (terminalBlocksSegment(start, current.point, point) || terminalBlocksSegment(end, current.point, point)) { return undefined; }
+  if (terminalBlocksSegment(start, current.point, point) || terminalBlocksSegment(end, current.point, point) ||
+      used.blockedPoints.some((blocked) => pointOnSegment(blocked, current.point, point))) { return undefined; }
   const span = routeSpan(current.point, point);
   const intervals = span ? (span.horizontal ? used.horizontal : used.vertical).get(span.lane) ?? [] : [];
   const conflict = span && intervalOverlaps(intervals, span);
@@ -590,8 +620,14 @@ function routeAroundWires(
   first: Point,
   last: Point,
   occupied: readonly (readonly Point[])[],
+  protectedPins: readonly Point[] = [],
 ): Point[] {
-  const used = collectUsedSegments(occupied);
+  // Explicit waypoint endpoints remain reachable. Other component pins are
+  // forbidden interior points, even though ordinary wire crossings are allowed.
+  const blockedPoints = protectedPins.filter((point) =>
+    (point.x !== start.point.x || point.y !== start.point.y) &&
+    (point.x !== end.point.x || point.y !== end.point.y));
+  const used = collectUsedSegments(occupied, blockedPoints);
   const direct = directWireRoute(start, end, first, last);
   if (routePreservesTerminals(direct, start, end) && !routeHasConflict(direct, start, end, first, last, used)) { return direct; }
 
@@ -661,6 +697,13 @@ function routeAroundBounds(start: RouteEnd, end: RouteEnd, rect: GridRect, used:
   return score(candidates[0]) <= score(candidates[1]) ? candidates[0] : candidates[1];
 }
 
+function continuesStraight(before: Point, middle: Point, point: Point) {
+  return before.y === middle.y && middle.y === point.y &&
+    (middle.x - before.x) * (point.x - middle.x) > 0 ||
+    before.x === middle.x && middle.x === point.x &&
+    (middle.y - before.y) * (point.y - middle.y) > 0;
+}
+
 function simplifyManualRoute(points: readonly Point[]): Point[] {
   const route: Point[] = [];
   for (const point of points) {
@@ -670,11 +713,7 @@ function simplifyManualRoute(points: readonly Point[]): Point[] {
       const before = route.at(-2);
       const middle = route.at(-1);
       if (!before || !middle) { break; }
-      const continuesHorizontally = before.y === middle.y && middle.y === point.y &&
-        (middle.x - before.x) * (point.x - middle.x) > 0;
-      const continuesVertically = before.x === middle.x && middle.x === point.x &&
-        (middle.y - before.y) * (point.y - middle.y) > 0;
-      if (!continuesHorizontally && !continuesVertically) { break; }
+      if (!continuesStraight(before, middle, point)) { break; }
       route.pop();
     }
     route.push({ ...point });
@@ -699,9 +738,25 @@ function approachStubWaypoint(firstStub: Point, target: Point, continuation: Poi
   ];
 }
 
-function terminalLead(start: RouteEnd, target: Point, continuation: Point): Point[] {
-  if (!start.direction) { return routeWire(start, { point: target, direction: null }); }
-  const firstStub = stub(start);
+function routeLeadAroundOccupied(lead: readonly Point[], occupied: readonly (readonly Point[])[], protectedPins: readonly Point[]) {
+  const route = lead.slice(0, 2).map((point) => ({ ...point }));
+  // Generated approach corners are movable. Only the final user waypoint may
+  // deliberately coincide with a pin; an intermediate corner must avoid it.
+  const corners = lead.slice(2).filter((point, index, points) => index === points.length - 1 ||
+    !protectedPins.some((pin) => pin.x === point.x && pin.y === point.y));
+  for (const point of corners) {
+    appendRoute(route, routeAvoidingTerminalPoints(
+      { point: route.at(-1) as Point, direction: null },
+      { point, direction: null },
+      occupied,
+      protectedPins,
+    ).slice(1));
+  }
+  return simplifyManualRoute(route);
+}
+
+function terminalLead(start: RouteEnd, target: Point, continuation: Point, occupied: readonly (readonly Point[])[], protectedPins: readonly Point[], firstStub = stub(start)): Point[] {
+  if (!start.direction) { return routeAvoidingTerminalPoints(start, { point: target, direction: null }, occupied, protectedPins); }
   const lead = [{ ...start.point }, firstStub];
   const offset = {
     x: -start.direction.y * 2,
@@ -714,18 +769,23 @@ function terminalLead(start: RouteEnd, target: Point, continuation: Point): Poin
     (target.x - start.point.x) * start.direction.y -
     (target.y - start.point.y) * start.direction.x;
   if (progress >= 1) {
-    appendRoute(lead, routeWire(
+    appendRoute(lead, routeAvoidingTerminalPoints(
       { point: firstStub, direction: null },
       { point: target, direction: null },
+      occupied,
+      protectedPins,
     ).slice(1));
     return simplifyManualRoute(lead);
   }
 
   if (progress > 0 && perpendicularDistance === 0) {
+    if (target.x === continuation.x && target.y === continuation.y) {
+      return [{ ...start.point }, { ...target }];
+    }
     // Fractional waypoints may lie within the outward stub. Approach them perpendicular to
     // the stub so the lead is not retraced on the way back to the waypoint.
     appendRoute(lead, approachStubWaypoint(firstStub, target, continuation, offset));
-    return simplifyManualRoute(lead);
+    return routeLeadAroundOccupied(lead, occupied, protectedPins);
   }
 
   const continuationRoute = routeWire(
@@ -772,89 +832,153 @@ function terminalLead(start: RouteEnd, target: Point, continuation: Point): Poin
       appendRoute(lead, [stubOffset, { x: target.x + offset.x, y: target.y + offset.y }, target]);
     }
   }
-  return simplifyManualRoute(lead);
+  return routeLeadAroundOccupied(lead, occupied, protectedPins);
 }
 
-function routeThroughWaypoints(start: RouteEnd, end: RouteEnd, waypoints: readonly Point[]): Point[] {
+function routeThroughWaypoints(start: RouteEnd, end: RouteEnd, waypoints: readonly Point[], preserveWaypoints = false): Point[] {
   const firstWaypoint = waypoints[0];
   const lastWaypoint = waypoints.at(-1);
   if (!firstWaypoint || !lastWaypoint) { return routeWire(start, end); }
-  const startContinuation = waypoints[1] ?? (end.direction ? stub(end) : end.point);
-  const route = terminalLead(start, firstWaypoint, startContinuation);
   const terminalLeads: Point[][] = [];
-  for (const terminal of [start, end]) {
-    if (terminal.direction) { terminalLeads.push([terminal.point, stub(terminal)]); }
+  const protectedPins: Point[] = [];
+  const facing = facingLeads(start, end);
+  const startStub = facing?.first ?? stub(start);
+  const endStub = facing?.last ?? stub(end);
+  for (const [terminal, leadEnd] of [[start, startStub], [end, endStub]] as const) {
+    if (terminal.direction) {
+      terminalLeads.push([terminal.point, leadEnd]);
+      protectedPins.push(terminal.point);
+    }
   }
+  const startContinuation = waypoints[1] ?? endStub;
+  const route = terminalLead(start, firstWaypoint, startContinuation, terminalLeads, protectedPins, startStub);
   let current = firstWaypoint;
   for (const waypoint of waypoints.slice(1)) {
-    appendRoute(route, routeWire(
+    appendRoute(route, routeAvoidingTerminalPoints(
       { point: current, direction: null },
       { point: waypoint, direction: null },
       terminalLeads,
+      protectedPins,
     ).slice(1));
     current = waypoint;
   }
   if (end.direction) {
-    const previousWaypoint = waypoints.at(-2) ?? (start.direction ? stub(start) : start.point);
-    const tail = terminalLead(end, current, previousWaypoint).reverse();
+    const previousWaypoint = waypoints.at(-2) ?? startStub;
+    const tail = terminalLead(end, current, previousWaypoint, terminalLeads, protectedPins, endStub).reverse();
     appendRoute(route, tail.slice(1));
   } else {
-    appendRoute(route, routeWire(
+    appendRoute(route, routeAvoidingTerminalPoints(
       { point: current, direction: null },
       end,
       terminalLeads,
+      protectedPins,
     ).slice(1));
   }
-  return simplifyManualRoute(route);
+  return preserveWaypoints ? route : simplifyManualRoute(route);
 }
 
-/** Stores a rendered route with implicit orthogonal bends, preserving its exact geometry. */
-export function compactWireRouteWaypoints(route: readonly Point[], start: RouteEnd, end: RouteEnd): Point[] {
-  const original = route.slice(1, -1).map((point) => ({ ...point }));
-  if (route.length === 2) {
-    // An empty list selects automatic routing, which may detour around a wire added before this
-    // split segment. Keep one anchor even for a straight segment; use the outward stub where a
-    // component terminal needs it, and the endpoint itself where a junction has no fixed lead.
-    const anchor = stub(start);
-    const restored = routeThroughWaypoints(start, end, [anchor]);
-    return restored.length === 2 && restored.every((point, index) =>
-      point.x === route[index].x && point.y === route[index].y,
-    ) ? [anchor] : original;
+function equalRoutes(first: readonly Point[], second: readonly Point[]) {
+  return first.length === second.length && first.every((point, index) =>
+    point.x === second[index].x && point.y === second[index].y,
+  );
+}
+
+/** Long straight runs need only their first and last internal anchors. */
+function compactStraightRunAnchors(route: readonly Point[]) {
+  const points: Point[] = [];
+  const appendRun = (runFirst: number, last: number) => {
+    const indexes = last - runFirst > 3 ? [runFirst, runFirst + 1, last - 1, last] :
+      Array.from({ length: last - runFirst + 1 }, (_, index) => runFirst + index);
+    appendRoute(points, indexes.map((index) => route[index]));
+  };
+  let first = 0;
+  for (let index = 1; index < route.length - 1; index += 1) {
+    if (continuesStraight(route[index - 1], route[index], route[index + 1])) { continue; }
+    appendRun(first, index);
+    first = index;
   }
-  if (route.length < 4) { return original; }
-  // Keep the first and last internal points so terminalLead preserves each outward lead.
+  appendRun(first, route.length - 1);
+  return points;
+}
+
+function compactRouteAnchors(route: readonly Point[], first: number, last: number, protectedPins: readonly Point[]) {
   const counts = Array.from({ length: route.length }, () => Number.POSITIVE_INFINITY);
   const previous = Array.from({ length: route.length }, () => -1);
-  counts[1] = 1;
-  for (let index = 1; index < route.length - 2; index += 1) {
-    // An implicit dog-leg has at most three segments, hence at most two removable bends.
-    for (let candidate = index + 1; candidate <= Math.min(index + 3, route.length - 2); candidate += 1) {
+  counts[first] = 0;
+  for (let index = first; index < last; index += 1) {
+    if (!Number.isFinite(counts[index])) { continue; }
+    for (let candidate = index + 1; candidate <= last; candidate += 1) {
+      const span = simplifyManualRoute(route.slice(index, candidate + 1));
+      // An implicit dog-leg has at most three segments. Collinear source anchors may
+      // lie between its bends, so count geometric segments rather than array entries.
+      if (span.length > 4) { break; }
       if (counts[index] + 1 >= counts[candidate]) { continue; }
-      const implicit = routeWire(
+      const implicit = routeAvoidingTerminalPoints(
         { point: route[index], direction: null },
         { point: route[candidate], direction: null },
+        [],
+        protectedPins,
       );
-      if (implicit.length === candidate - index + 1 && implicit.every((point, offset) =>
-        point.x === route[index + offset].x && point.y === route[index + offset].y,
-      )) {
+      if (equalRoutes(implicit, span)) {
         counts[candidate] = counts[index] + 1;
         previous[candidate] = index;
       }
     }
   }
-  const waypoints: Point[] = [];
-  for (let index = route.length - 2; index >= 1; index = previous[index]) { waypoints.push({ ...route[index] }); }
-  waypoints.reverse();
-  const restored = routeThroughWaypoints(start, end, waypoints);
-  return restored.length === route.length && restored.every((point, offset) =>
-    point.x === route[offset].x && point.y === route[offset].y,
-  ) ? waypoints : original;
+  const anchors: Point[] = [];
+  for (let index = last; index >= first; index = previous[index]) { anchors.push({ ...route[index] }); }
+  return anchors.reverse();
 }
 
-/** Routes each wire around the preceding wires in document order. */
-export function routeDocumentWires(document: CircuitDocument): Map<string, Point[]> {
+function explicitPinAnchors(route: readonly Point[], start: RouteEnd, end: RouteEnd): Point[] {
+  const pins = [start, end].filter((terminal) => terminal.direction).map((terminal) => terminal.point);
+  const result: Point[] = [];
+  for (let index = 0; index < route.length - 1; index += 1) {
+    const from = route[index];
+    const to = route[index + 1];
+    appendRoute(result, [from]);
+    const interior = pins.filter((pin) => pointOnSegment(pin, from, to) &&
+      (pin.x !== from.x || pin.y !== from.y) && (pin.x !== to.x || pin.y !== to.y));
+    interior.sort((first, second) => Math.abs(first.x - from.x) + Math.abs(first.y - from.y) -
+      Math.abs(second.x - from.x) - Math.abs(second.y - from.y));
+    appendRoute(result, interior);
+  }
+  if (route.length) { appendRoute(result, [route.at(-1)!]); }
+  return result;
+}
+
+/** Stores a rendered route with implicit orthogonal bends, preserving its exact geometry. */
+export function compactWireRouteWaypoints(route: readonly Point[], start: RouteEnd, end: RouteEnd): Point[] {
+  const rendered = simplifyManualRoute(route);
+  // A user may explicitly route back through a pin. Collinear simplification
+  // must retain that intent when the protected interior segments are replayed.
+  const original = explicitPinAnchors(rendered, start, end).slice(1, -1);
+  if (rendered.length === 2) {
+    // An empty list selects automatic routing, which may detour around a wire added before this
+    // split segment. Keep one anchor even for a straight segment; use the outward stub where a
+    // component terminal needs it, and the endpoint itself where a junction has no fixed lead.
+    const anchor = stub(start, end.direction ? undefined : end.point);
+    const restored = routeThroughWaypoints(start, end, [anchor]);
+    return equalRoutes(restored, rendered) ? [anchor] : original;
+  }
+  if (rendered.length < 4) { return original; }
+  const protectedPins = [start, end].filter((terminal) => terminal.direction).map((terminal) => terminal.point);
+  // Keep intentional pin visits available to the span search. Its protected
+  // rerouting checks retain those local anchors without discarding distant compression.
+  const candidates = explicitPinAnchors(compactStraightRunAnchors(route), start, end);
+  const compact = compactRouteAnchors(candidates, 0, candidates.length - 1, protectedPins).slice(1, -1);
+  if (compact.length > 0 && equalRoutes(routeThroughWaypoints(start, end, compact), rendered)) { return compact; }
+  // Fixed-direction terminals may need their first and last internal points. Only
+  // accept a compaction after re-rendering it with the real terminal directions.
+  const waypoints = compactRouteAnchors(candidates, 1, candidates.length - 2, protectedPins);
+  return equalRoutes(routeThroughWaypoints(start, end, waypoints), rendered) ? waypoints : original;
+}
+
+/** Routes each wire around preceding wires; optionally retains collinear source anchors for edits. */
+export function routeDocumentWires(document: CircuitDocument, options: { preserveWaypoints?: boolean } = {}): Map<string, Point[]> {
   const parts = new Map(document.parts.map((part) => [part.id, part]));
   const routes = new Map<string, Point[]>();
+  const occupied: Point[][] = [];
   for (const wire of document.wires) {
     const from = parts.get(wire.from.partId);
     const to = parts.get(wire.to.partId);
@@ -862,11 +986,13 @@ export function routeDocumentWires(document: CircuitDocument): Map<string, Point
     const start = routeEnd(from, wire.from.terminal);
     const end = routeEnd(to, wire.to.terminal);
     const route = wire.waypoints?.length
-      ? routeThroughWaypoints(start, end, wire.waypoints)
+      ? routeThroughWaypoints(start, end, wire.waypoints, options.preserveWaypoints)
       : from.id === to.id && terminalsOf(from.kind).length >= 2
-        ? routeTiedPins(from, wire.from.terminal, wire.to.terminal, [...routes.values()])
-        : routeWire(start, end, [...routes.values()]);
+        ? routeTiedPins(from, wire.from.terminal, wire.to.terminal, occupied)
+        : routeWire(start, end, occupied);
     routes.set(wire.id, route);
+    // Collinear editing anchors must not change the grid used to route later wires.
+    occupied.push(options.preserveWaypoints ? simplifyManualRoute(route) : route);
   }
   return routes;
 }

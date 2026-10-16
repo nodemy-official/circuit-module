@@ -4,10 +4,14 @@ import { simulateTransient } from "../../transient-solver.js";
 import { createCircuitFromSpecs, type CircuitSpec } from "../helpers/circuit-fixture.js";
 import { addRational, assertCorrectRounding, divideRational, multiplyRational, negateRational, rational, rationalFromNumber } from "../helpers/numeric-oracle.js";
 
+// Each order/mode verifies an independent result. Separate cases identify the
+// failing analysis and apply the existing timeout to each analysis call.
 it.each([2 ** -1000, 1, 2 ** 900].flatMap((scale) =>
   [1e-14, 1e-16, 1e-20].flatMap((lambda) =>
-    ["none", "diode-r", "diode-i", "led-r", "bjt-r"].map((island) => ({ scale, lambda, island }))),
-))("resolves the symmetric CMOS voltage with a small output slope (scale=$scale, lambda=$lambda, island=$island)", ({ scale, lambda, island }) => {
+    ["none", "diode-r", "diode-i", "led-r", "bjt-r"].flatMap((island) =>
+      ["forward", "reverse"].flatMap((order) =>
+        ["dc", "transient", "ac"].map((mode) => ({ scale, lambda, island, order, mode }))))),
+))("resolves the symmetric CMOS voltage with a small output slope (scale=$scale, lambda=$lambda, island=$island, order=$order, mode=$mode)", ({ scale, lambda, island, order, mode }) => {
   const specs: CircuitSpec[] = [
     ["ground", "ground", ["0"]],
     ["supply", "battery", ["v", "0"], { voltageVolts: 5 }],
@@ -31,33 +35,38 @@ it.each([2 ** -1000, 1, 2 ** 900].flatMap((scale) =>
   }
   // Both overdrives are 1.5 V. In saturation, KCL cancels the identical
   // beta*U^2/2 terms, leaving lambda*(Vout-(5-Vout))=0 exactly.
-  for (const ordered of [specs, specs.toReversed()]) {
-    const document = createCircuitFromSpecs(ordered, "CMOS with nonzero sub-ulp output conductance");
+  const ordered = order === "reverse" ? specs.toReversed() : specs;
+  const document = createCircuitFromSpecs(ordered, "CMOS with nonzero sub-ulp output conductance");
+  if (mode === "dc") {
     const dc = analyzeAnalogCircuit(document);
     expect(dc.status, dc.message).toBe("valid");
     expect(dc.parts.n!.voltage.real).toBe(2.5);
     expect(dc.parts.p!.voltage.real).toBe(-2.5);
     expect(dc.parts.n!.current.real).toBe(-dc.parts.p!.current.real);
+    return;
+  }
+  if (mode === "transient") {
     const transient = simulateTransient(document, { durationSeconds: 0.125, timeStepSeconds: 0.125 });
     expect(transient.status, transient.message).toBe("valid");
     for (const sample of transient.samples) {
       expect(sample.parts.n!.voltageVolts).toBe(2.5);
       expect(sample.parts.p!.voltageVolts).toBe(-2.5);
     }
-    const amplitude = lambda / 1024;
-    const acDocument = { ...document, parts: document.parts.map((part) => part.id === "input" ? { ...part, voltageVolts: amplitude } : part) };
-    const ac = analyzeAnalogCircuit(acDocument, { mode: "ac", frequencyHz: 1 });
-    expect(ac.status, ac.message).toBe("valid");
-    // -sum(gm)/sum(gds) = -(1 + 2.5*lambda)/(0.75*lambda).
-    // Compute the expectation with the independent rational oracle; a
-    // bisection of rounded terminal currents cannot resolve this weak slope.
-    const exactLambda = rationalFromNumber(lambda)!;
-    const gain = negateRational(divideRational(
-      addRational(rational(1n), multiplyRational(rational(5n, 2n), exactLambda)),
-      multiplyRational(rational(3n, 4n), exactLambda),
-    ));
-    const expected = multiplyRational(gain, rationalFromNumber(amplitude)!);
-    assertCorrectRounding(ac.parts.n!.voltage.real, expected, "CMOS small-signal output voltage");
-    expect(ac.parts.n!.voltage.imaginary).toBe(0);
+    return;
   }
+  const amplitude = lambda / 1024;
+  const acDocument = { ...document, parts: document.parts.map((part) => part.id === "input" ? { ...part, voltageVolts: amplitude } : part) };
+  const ac = analyzeAnalogCircuit(acDocument, { mode: "ac", frequencyHz: 1 });
+  expect(ac.status, ac.message).toBe("valid");
+  // -sum(gm)/sum(gds) = -(1 + 2.5*lambda)/(0.75*lambda).
+  // Compute the expectation with the independent rational oracle; a
+  // bisection of rounded terminal currents cannot resolve this weak slope.
+  const exactLambda = rationalFromNumber(lambda)!;
+  const gain = negateRational(divideRational(
+    addRational(rational(1n), multiplyRational(rational(5n, 2n), exactLambda)),
+    multiplyRational(rational(3n, 4n), exactLambda),
+  ));
+  const expected = multiplyRational(gain, rationalFromNumber(amplitude)!);
+  assertCorrectRounding(ac.parts.n!.voltage.real, expected, "CMOS small-signal output voltage");
+  expect(ac.parts.n!.voltage.imaginary).toBe(0);
 });

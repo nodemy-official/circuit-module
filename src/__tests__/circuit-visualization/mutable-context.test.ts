@@ -3,6 +3,8 @@ import { expect, it } from "vitest";
 import { analyzeCircuit } from "../../circuit-solver.js";
 import { circuitNodes, circuitPotential, type CircuitPotentialContext } from "../../circuit-visualization.js";
 import type { CircuitDocument } from "../../circuit-model.js";
+import type { CircuitExactComplex, CircuitExactNormalizedTerm } from "../../circuit-reading.js";
+import type { ExactExpressionNode } from "../../exact-expression.js";
 
 const document: CircuitDocument = {
   title: "Mutable potential context",
@@ -81,4 +83,91 @@ it("invalidates precise paths when a terminal phasor changes in place", () => {
   expect(initial?.volts).toBeCloseTo(analysis.parts.r2!.voltageVolts + analysis.parts.r3!.voltageVolts, 12);
   expect(updated?.volts).toBeCloseTo(expectedMagnitude, 12);
   expect(updated?.phaseDegrees).toBeCloseTo(45, 10);
+});
+
+function cancellationContext(exactVoltage: CircuitExactComplex, precisionExpressions?: readonly ExactExpressionNode[]) {
+  const cancellationDocument: CircuitDocument = {
+    title: "Exact potential cancellation",
+    parts: [
+      { id: "positive", kind: "battery", label: "正方向電池", x: 0, y: 0, voltageVolts: 1e20 },
+      { id: "negative", kind: "battery", label: "逆方向電池", x: 0, y: 0, voltageVolts: 1e20 },
+      { id: "ground", kind: "ground", label: "GND", x: 0, y: 0 },
+    ],
+    wires: [
+      { id: "series", from: { partId: "positive", terminal: "b" }, to: { partId: "negative", terminal: "b" } },
+      { id: "reference", from: { partId: "negative", terminal: "a" }, to: { partId: "ground", terminal: "a" } },
+    ],
+  };
+  const analysis = analyzeCircuit(cancellationDocument);
+  analysis.parts.positive!.exactVoltage = exactVoltage;
+  analysis.precisionExpressions = precisionExpressions;
+  const nodes = circuitNodes(cancellationDocument, analysis);
+  const context: CircuitPotentialContext = { document: cancellationDocument, analysis, nodes };
+  const from = nodeAt(nodes, "positive", "a");
+  const reference = nodeAt(nodes, "ground", "a");
+  return { analysis, potential: () => circuitPotential(from, reference, false, context)?.volts };
+}
+
+const rational = (numerator: string) => ({ numerator, denominator: "1" });
+
+it.each([false, true])("invalidates precise paths when a transported expression literal changes in place (shallow frozen table: %s)", (frozen) => {
+  const literal = { operation: "literal" as const, numerator: "100000000000000000001", denominator: "1" };
+  const table = frozen ? Object.freeze([literal]) : [literal];
+  const { analysis, potential } = cancellationContext({ real: { expression: 0, sign: 1 }, imaginary: rational("0") }, table);
+  expect(analysis.status, analysis.message).toBe("open");
+  expect(potential()).toBe(1);
+  literal.numerator = "100000000000000000002";
+  expect(potential()).toBe(2);
+});
+
+it("invalidates precise paths when transported expression arguments change in place", () => {
+  const sum = { operation: "sum" as const, arguments: [0, 1] };
+  const expressions: ExactExpressionNode[] = [
+    { operation: "literal", ...rational("100000000000000000000") },
+    { operation: "literal", ...rational("1") },
+    { operation: "literal", ...rational("2") },
+    sum,
+  ];
+  const { analysis, potential } = cancellationContext({ real: { expression: 3, sign: 1 }, imaginary: rational("0") }, expressions);
+  expect(analysis.status, analysis.message).toBe("open");
+  expect(potential()).toBe(1);
+  sum.arguments[1] = 2;
+  expect(potential()).toBe(2);
+});
+
+it("invalidates precise paths when normalized fraction coefficients change in place", () => {
+  const term: CircuitExactNormalizedTerm = {
+    real: rational("100000000000000000001"), imaginary: rational("0"), magnitudeNormalizationSquared: rational("1"),
+  };
+  const { analysis, potential } = cancellationContext({
+    real: rational("100000000000000000000"), imaginary: rational("0"),
+    normalizedFraction: {
+      numerator: [term],
+      denominator: [{ real: rational("1"), imaginary: rational("0"), magnitudeNormalizationSquared: rational("1") }],
+    },
+  });
+  expect(analysis.status, analysis.message).toBe("open");
+  expect(potential()).toBe(1);
+  term.real = rational("100000000000000000002");
+  expect(potential()).toBe(2);
+  if (!("numerator" in term.real)) { throw new Error("Expected a literal rational"); }
+  term.real.numerator = "100000000000000000003";
+  expect(potential()).toBe(3);
+});
+
+it("drops cached paths when optional normalized terms become unreadable", () => {
+  const numerator = [{
+    real: rational("100000000000000000001"), imaginary: rational("0"), magnitudeNormalizationSquared: rational("1"),
+  }];
+  const denominator = [{ real: rational("1"), imaginary: rational("0"), magnitudeNormalizationSquared: rational("1") }];
+  const fraction = { numerator, denominator };
+  const { analysis, potential } = cancellationContext({
+    real: rational("100000000000000000000"), imaginary: rational("0"), normalizedFraction: fraction,
+  });
+  expect(analysis.status, analysis.message).toBe("open");
+  expect(potential()).toBe(1);
+  Object.defineProperty(fraction, "numerator", { configurable: true, get() { throw new Error("unavailable metadata"); } });
+  expect(potential()).toBe(0);
+  Object.defineProperty(fraction, "numerator", { configurable: true, value: numerator });
+  expect(potential()).toBe(1);
 });

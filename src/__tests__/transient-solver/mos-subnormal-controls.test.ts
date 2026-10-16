@@ -75,6 +75,6 @@ it("keeps a long subnormal MOS discharge bounded while retaining nonzero stored 
     expect(sample.parts.m!.channelConducting).toBe(true);
     expect(retainedComplexIsNonzero(sample.parts.m!.exactTerminalCurrents?.a, result.precisionExpressions)).toBe(true);
   }
-// A hundred exact history steps exposes nonlinear denominator growth without
-// making the suite depend on the much longer extreme-value benchmark.
-}, 15_000);
+  // Keep all 100 history steps and their independent checks together to cover
+  // nonlinear denominator growth; allow wall-clock headroom on a busy CPU.
+}, 30_000);
