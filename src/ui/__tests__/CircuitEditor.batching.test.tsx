@@ -292,6 +292,22 @@ describe("batched editor commands", () => {
     expect(ui.editor.document.title).toBe("redo");
   });
 
+  it("clears a rejected movement error when cancelling the drag", () => {
+    const ui = mount();
+    act(() => {
+      ui.editor.selectPart("a");
+      ui.editor.movePart("a", 0, 1);
+      ui.editor.movePart("a", 12, -1);
+    });
+    expect(ui.editor.error).not.toBeNull();
+
+    act(() => ui.editor.cancelMove("a"));
+
+    expect(ui.editor.document).toEqual(fixture());
+    expect(ui.editor.error).toBeNull();
+    expect(ui.editor.canUndo).toBe(false);
+  });
+
   it("uses current data when a caller retains commands from an earlier render", () => {
     const ui = mount();
     const retained = ui.editor;

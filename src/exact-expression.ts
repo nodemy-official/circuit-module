@@ -165,39 +165,94 @@ interface ExpressionOperations {
   sum: (values: readonly ExactRational[]) => ExactRational;
 }
 
-/** A separate immutable snapshot preserves evidence across editable result transports. */
-export function snapshotExactExpressions(table: readonly ExactExpressionNode[]): readonly ExactExpressionNode[] {
+function isArithmeticOperation(operation: unknown): operation is BinaryOperation | "sum" {
+  return operation === "add" || operation === "subtract" || operation === "multiply" || operation === "divide" || operation === "sum";
+}
+
+function expressionArrayLength(array: readonly unknown[]) {
+  const length = array.length;
+  if (!Number.isInteger(length) || length < 0 || length > 0xff_ff_ff_ff) { throw new TypeError("Expression arrays must have valid lengths."); }
+  return length;
+}
+
+function snapshotExpressionNode(node: ExactExpressionNode, previous: ExactExpressionNode | undefined): ExactExpressionNode {
+  const operation = node.operation;
+  if (operation === "literal") {
+    const numerator = node.numerator;
+    const denominator = node.denominator;
+    return previous?.operation === operation && numerator === previous.numerator && denominator === previous.denominator
+      ? previous : Object.freeze({ operation, numerator, denominator });
+  }
+  if (!isArithmeticOperation(operation)) { throw new TypeError("Expression operations must be supported arithmetic operations."); }
+  const arguments_ = node.arguments;
+  if (!Array.isArray(arguments_)) { throw new TypeError("Expression arguments must be arrays."); }
+  const length = expressionArrayLength(arguments_);
+  const previousArguments = previous?.operation !== "literal" ? previous?.arguments : undefined;
+  let changedArguments: number[] | undefined = previousArguments?.length === length ? undefined : [];
+  for (let index = 0; index < length; index += 1) {
+    const argument = arguments_[index]!;
+    if (!changedArguments && (!Number.isSafeInteger(argument) || argument !== previousArguments![index])) {
+      changedArguments = previousArguments!.slice(0, index);
+    }
+    changedArguments?.push(argument);
+  }
+  const capturedArguments = changedArguments ? Object.freeze(changedArguments) : previousArguments!;
+  return previous?.operation === operation && capturedArguments === previousArguments
+    ? previous : Object.freeze({ operation, arguments: capturedArguments });
+}
+
+function snapshotExpressionTable(table: readonly ExactExpressionNode[], previous?: readonly ExactExpressionNode[]): readonly ExactExpressionNode[] {
   if (!Array.isArray(table)) { throw new TypeError("Expression tables must be arrays."); }
-  // Expressions are JSON data: copy indexed entries, without executing an
-  // array's overridden map or iterator and silently changing its equations.
-  const snapshot = Object.freeze(Array.from({ length: table.length }, (_, index) => {
+  const length = expressionArrayLength(table);
+  let changed: ExactExpressionNode[] | undefined = previous?.length === length ? undefined : [];
+  // Read every indexed field once, even for the same raw objects. Reuse only
+  // immutable evidence whose observed values match, without allocating and
+  // freezing every node on each transported-result playback frame.
+  for (let index = 0; index < length; index += 1) {
     const node = table[index];
     if (!node) { throw new TypeError("Expression tables must contain every node."); }
-    if (node.operation === "literal") { return Object.freeze({ ...node }); }
-    if (!Array.isArray(node.arguments)) { throw new TypeError("Expression arguments must be arrays."); }
-    return Object.freeze({ ...node, arguments: Object.freeze(Array.from(
-      { length: node.arguments.length }, (_entry, argumentIndex) => node.arguments[argumentIndex]!,
-    )) });
-  }));
+    const previousNode = previous?.[index];
+    const captured = snapshotExpressionNode(node, previousNode);
+    if (!changed && captured !== previousNode) { changed = previous!.slice(0, index); }
+    changed?.push(captured);
+  }
+  if (!changed) { return previous!; }
+  const snapshot = Object.freeze(changed);
   immutableTables.add(snapshot);
   return snapshot;
 }
 
+/** A separate immutable snapshot preserves evidence across editable result transports. */
+export function snapshotExactExpressions(table: readonly ExactExpressionNode[]): readonly ExactExpressionNode[] {
+  return snapshotExpressionTable(table);
+}
+
 export function matchingExactExpressions(first: readonly ExactExpressionNode[] | undefined, second: readonly ExactExpressionNode[] | undefined): boolean {
   if (first === undefined || second === undefined) { return first === second; }
-  if (!Array.isArray(first) || !Array.isArray(second) || first.length !== second.length) { return false; }
   try {
-    return Array.from({ length: first.length }, (_, index) => index).every((index) => {
+    if (!Array.isArray(first) || !Array.isArray(second)) { return false; }
+    const length = expressionArrayLength(first);
+    if (length !== expressionArrayLength(second)) { return false; }
+    return Array.from({ length }, (_, index) => index).every((index) => {
       const node = first[index];
       const other = second[index];
-      if (!node || !other || node.operation !== other.operation) { return false; }
-      if (node.operation === "literal") {
-        return other.operation === "literal" && node.numerator === other.numerator && node.denominator === other.denominator;
+      if (!node || !other) { return false; }
+      const operation = node.operation;
+      const otherOperation = other.operation;
+      if (operation !== otherOperation) { return false; }
+      if (operation === "literal") {
+        return otherOperation === "literal" && node.numerator === other.numerator && node.denominator === other.denominator;
       }
-      return other.operation !== "literal" && Array.isArray(node.arguments) && Array.isArray(other.arguments) &&
-        node.arguments.length === other.arguments.length &&
-        Array.from({ length: node.arguments.length }, (_, argumentIndex) => argumentIndex).every((argumentIndex) =>
-          Number.isSafeInteger(node.arguments[argumentIndex]) && node.arguments[argumentIndex] === other.arguments[argumentIndex]);
+      if (!isArithmeticOperation(operation) || otherOperation === "literal") { return false; }
+      const arguments_ = node.arguments;
+      const otherArguments = other.arguments;
+      if (!Array.isArray(arguments_) || !Array.isArray(otherArguments)) { return false; }
+      const argumentCount = expressionArrayLength(arguments_);
+      if (argumentCount !== expressionArrayLength(otherArguments)) { return false; }
+      return Array.from({ length: argumentCount }, (_, argumentIndex) => argumentIndex).every((argumentIndex) => {
+        const argument = arguments_[argumentIndex];
+        return Number.isSafeInteger(argument) && argument === otherArguments[argumentIndex];
+      });
     });
   } catch { return false; }
 }
@@ -240,6 +295,7 @@ function evaluateExpression(node: ExactExpressionNode, live: ReadonlyMap<number,
     const denominator = BigInt(serializedDenominator);
     return denominator > 0n ? operations.literal({ numerator, denominator }) : undefined;
   }
+  if (!isArithmeticOperation(node.operation)) { return; }
   const arguments_ = Array.from({ length: node.arguments.length }, (_, index) => live.get(node.arguments[index]!));
   if (arguments_.some((argument) => !argument)) { return; }
   const values = arguments_.filter((argument): argument is ExactRational => argument !== undefined);
@@ -276,16 +332,17 @@ function evaluateDependencies(table: readonly ExactExpressionNode[], reference: 
 }
 
 export function restoreExactExpression(table: readonly ExactExpressionNode[] | undefined, reference: number, operations: ExpressionOperations): ExactRational | undefined {
-  if (!Array.isArray(table) || !Number.isSafeInteger(reference) || reference < 0 || reference >= table.length) { return; }
   try {
+    if (!Array.isArray(table) || !Number.isSafeInteger(reference) || reference < 0) { return; }
     const previous = restoredRoots.get(table);
     const immutable = immutableTables.has(table);
-    const cached = previous && (immutable || matchingExactExpressions(table, previous.snapshot)) ? previous : undefined;
     // Evaluate the same immutable evidence used to validate a future cache
     // hit. Editable metadata may contain accessors that change dependencies
     // while being read; taking the snapshot afterward could pair an old
     // result with the new equations and then incorrectly keep reusing it.
-    const snapshot = cached?.snapshot ?? (immutable ? table : snapshotExactExpressions(table));
+    const snapshot = immutable ? table : snapshotExpressionTable(table, previous?.snapshot);
+    if (reference >= snapshot.length) { return; }
+    const cached = previous && snapshot === previous.snapshot ? previous : undefined;
     const roots = cached?.roots ?? new Map<number, ExactRational>();
     const known = roots.get(reference);
     if (known) { return known; }

@@ -2,13 +2,15 @@ import { complex, exactProductSumRatio, type ComplexValue } from "./analog-math.
 import { circuitPartCatalog, type CircuitDocument, type CircuitPart } from "./circuit-model.js";
 import { divideExactRational } from "./exact-linear-algebra.js";
 import { complexFromExact, exactComplexValue } from "./exact-numeric-state.js";
+import { simulationRecordField } from "./simulation-input.js";
 
 const defaultCapacitanceFarads = circuitPartCatalog.capacitor.defaults.capacitanceFarads ?? 1e-6;
 const defaultInductanceHenries = circuitPartCatalog.inductor.defaults.inductanceHenries ?? 0.01;
 
 export function acAnalysisFrequency(document: CircuitDocument, requested: number | undefined) {
   if (requested !== undefined) { return requested; }
-  return document.parts.find((part) => part.kind === "ac-source")?.frequencyHz ?? 1000;
+  const source = document.parts.find((part) => part.kind === "ac-source");
+  return (source ? simulationRecordField(source, "frequencyHz") as number | undefined : undefined) ?? 1000;
 }
 
 /** Treat only floating-point roundoff as the same frequency, not nearby tones. */
@@ -28,13 +30,14 @@ function angularProduct(frequencyHz: number, value: number) {
   return exactProductSumRatio([{ factors: [2, Math.PI, frequencyHz, value] }], 1);
 }
 
+function reactiveCoefficient(part: CircuitPart) {
+  return part.kind === "capacitor"
+    ? (simulationRecordField(part, "capacitanceFarads") as number | undefined) ?? defaultCapacitanceFarads
+    : (simulationRecordField(part, "inductanceHenries") as number | undefined) ?? defaultInductanceHenries;
+}
+
 export function acReactiveImpedance(part: CircuitPart, frequencyHz: number): ComplexValue {
-  const angularValue = angularProduct(
-    frequencyHz,
-    part.kind === "capacitor"
-      ? (part.capacitanceFarads ?? defaultCapacitanceFarads)
-      : (part.inductanceHenries ?? defaultInductanceHenries),
-  );
+  const angularValue = angularProduct(frequencyHz, reactiveCoefficient(part));
   if (!angularValue) { return complex(0, Number.NaN); }
   const imaginary = part.kind === "capacitor"
     ? divideExactRational({ numerator: -1n, denominator: 1n }, angularValue)
@@ -49,9 +52,7 @@ export function acReactiveReactance(part: CircuitPart, frequencyHz: number) {
 }
 
 export function acReactiveAdmittance(part: CircuitPart, frequencyHz: number): ComplexValue {
-  const angularValue = angularProduct(frequencyHz, part.kind === "capacitor"
-    ? part.capacitanceFarads ?? defaultCapacitanceFarads
-    : part.inductanceHenries ?? defaultInductanceHenries);
+  const angularValue = angularProduct(frequencyHz, reactiveCoefficient(part));
   if (!angularValue) { return complex(0, Number.NaN); }
   const imaginary = part.kind === "capacitor"
     ? angularValue

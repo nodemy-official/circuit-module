@@ -253,6 +253,24 @@ describe("editorHistoryReducer", () => {
     expect(changedAttributes.past[0]).toBe(hidden);
   });
 
+  it.each((["plain", "date", "function"] as const).flatMap((representation) => [false, true].map((reversed) => ({ representation, reversed }))))
+  ("retains alias changes underneath unchanged $representation metadata (reversed=$reversed)", ({ representation, reversed }) => {
+    const shared = { value: 1 };
+    const parent = representation === "plain" ? {} : representation === "date" ? new Date(0) : () => {};
+    const unchanged = Object.assign(parent, { nested: shared });
+    const metadata = reversed ? [shared, unchanged] : [unchanged, shared];
+    const changedMetadata = reversed ? [{ value: 1 }, unchanged] : [unchanged, { value: 1 }];
+    const original = { ...document("same"), metadata };
+    const edited = { ...document("same"), metadata: changedMetadata };
+    const state = editorHistoryReducer(history(original), { type: "edit", document: edited, group: "metadata" });
+
+    const ended = editorHistoryReducer(state, { type: "end-group" });
+
+    expect(ended.present).toBe(edited);
+    expect(ended.past).toEqual([original]);
+    expect(editorHistoryReducer(ended, { type: "undo" }).present).toBe(original);
+  });
+
   it("retains malformed documents when their properties cannot be inspected safely", () => {
     const original = new Proxy(document("same"), { ownKeys() { throw new Error("unreadable input"); } });
     const edited = document("same");
@@ -261,5 +279,25 @@ describe("editorHistoryReducer", () => {
     const ended = editorHistoryReducer(state, { type: "end-group" });
     expect(ended.present).toBe(edited);
     expect(ended.past[0]).toBe(original);
+  });
+
+  it.each(["count", "keys"] as const)("keeps edits when an unchanged Proxy reports inconsistent own field %s", (difference) => {
+    const shared = { value: 1 };
+    let reads = 0;
+    const parent = new Proxy({ nested: shared, other: 0 }, {
+      ownKeys() {
+        reads += 1;
+        if (difference === "count") { return reads % 2 ? ["nested"] : []; }
+        return reads % 2 ? ["other"] : ["nested"];
+      },
+    });
+    const original = { ...document("same"), metadata: [parent, shared] };
+    const edited = { ...document("same"), metadata: [parent, { value: 1 }] };
+    const changed = editorHistoryReducer(history(original), { type: "edit", document: edited, group: "metadata" });
+
+    const ended = editorHistoryReducer(changed, { type: "end-group" });
+
+    expect(ended.present).toBe(edited);
+    expect(ended.past).toEqual([original]);
   });
 });

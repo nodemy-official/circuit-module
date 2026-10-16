@@ -155,6 +155,35 @@ describe("CircuitTransientPanel synchronized waveforms", () => {
     expect(slider?.dataset.sampleIndex).toBe("0");
   });
 
+  it("keeps playback controls available when every waveform part is deselected", () => {
+    vi.useFakeTimers();
+    const frames: Array<CircuitTransientFrame | null> = [];
+    const ui = mount(createCircuitExample("charging"), undefined, (frame) => frames.push(frame));
+    click(buttonWithText(ui.container, "波形を計算"));
+    click(buttonWithText(ui.container, "再生"));
+    act(() => vi.advanceTimersByTime(100));
+    const choices = [...ui.container.querySelectorAll<HTMLInputElement>('.circuit-transient__parts input:checked')];
+    for (const choice of choices) { click(choice); }
+
+    expect(ui.container.querySelector(".circuit-waveform")).toBeNull();
+    expect(ui.container.textContent).toContain("波形に表示する部品を選んでください");
+    click(buttonWithText(ui.container, "一時停止"));
+    const pausedIndex = frames.at(-1)?.sampleIndex;
+    act(() => vi.advanceTimersByTime(150));
+    expect(frames.at(-1)?.sampleIndex).toBe(pausedIndex);
+    const slider = ui.container.querySelector<HTMLInputElement>('input[type="range"]')!;
+    setRangeValue(slider, 80);
+    expect(frames.at(-1)?.sampleIndex).toBe(80);
+    click(buttonWithText(ui.container, "先頭へ"));
+    expect(frames.at(-1)?.sampleIndex).toBe(0);
+
+    click(choices[0]!);
+    expect(ui.container.querySelectorAll(".circuit-waveform")).toHaveLength(2);
+    click(buttonWithText(ui.container, "再生"));
+    act(() => vi.advanceTimersByTime(50));
+    expect(frames.at(-1)?.sampleIndex).toBeGreaterThan(0);
+  });
+
   it("stops inactive playback while keeping the result and cursor, without resuming on activation", () => {
     vi.useFakeTimers();
     const frames: Array<CircuitTransientFrame | null> = [];

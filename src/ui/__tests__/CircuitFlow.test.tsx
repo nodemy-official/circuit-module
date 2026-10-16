@@ -164,7 +164,7 @@ function mount(element: ReactNode) {
   return container;
 }
 
-function mockFlowMotion() {
+function mockFlowMotion(scale = "1") {
   let offsetDistance = "10%";
   let nextFrameId = 1;
   const frames = new Map<number, FrameRequestCallback>();
@@ -176,7 +176,7 @@ function mockFlowMotion() {
   const cancelAnimationFrame = vi.fn((id: number) => { frames.delete(id); });
   const getComputedStyle = vi.fn((element: Element) => ({
     offsetDistance: element.classList.contains("circuit-board__flow-particle") ? offsetDistance : "",
-    getPropertyValue: (property: string) => property === "--circuit-board-flow-scale" ? "1" : "",
+    getPropertyValue: (property: string) => property === "--circuit-board-flow-scale" ? scale : "",
   }) as CSSStyleDeclaration);
 
   vi.stubGlobal("requestAnimationFrame", requestAnimationFrame);
@@ -228,6 +228,22 @@ function flowDisplayKey(container: ParentNode, kind: "current" | "electron") {
 }
 
 describe("Circuit flow preview", () => {
+  it.each(["200", String(Number.MAX_VALUE)])("bounds the current-arrow geometry for CSS scale %s", (scale) => {
+    const motion = mockFlowMotion(scale);
+    const route = [{ x: 0, y: 0 }, { x: 2, y: 0 }, { x: 2, y: 2 }];
+    const container = mount(<svg aria-hidden="true"><CircuitWireFlow route={route} current={1} display="current" /></svg>);
+    const arrow = required(container, ".circuit-board__current-arrow");
+    const data = arrow.getAttribute("d") ?? "";
+
+    expect(data.match(/\b[ML]\b/g)?.length).toBeLessThanOrEqual(448);
+    expect(data).not.toMatch(/NaN|Infinity/);
+    expect(data).toContain("M ");
+    expect(motion.pendingFrameCount()).toBe(1);
+    motion.setOffsetDistance("50%");
+    motion.advanceFrame();
+    expect(arrow.getAttribute("d")).not.toMatch(/NaN|Infinity/);
+  });
+
   it("deforms the current arrow with its CSS path position and preserves its shape when position is unchanged", () => {
     const motion = mockFlowMotion();
     const route = [{ x: 0, y: 0 }, { x: 2, y: 0 }, { x: 2, y: 2 }];

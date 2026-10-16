@@ -306,7 +306,7 @@ function EditorCanvasNotices({
   return <>
     {!preview && editor.document.parts.length === 0 && <div className="circuit-editor__empty-canvas"><CircuitIcon name="circuit" size={32} /><h2>最初の部品を置きましょう</h2><p>部品パレットから選ぶと、ここに追加されます。</p><button type="button" className="circuit-button" onClick={onAddBattery}><CircuitIcon name="plus" />電池を追加</button></div>}
     {!preview && editor.pendingEndpoint && <div className="circuit-editor__connection" role="status"><CircuitIcon name="wire" /><span>{editor.pendingWire ? "新しい接続先の端子・導線を選択" : "接続先の端子・導線を選択"}<span className="circuit-editor__connection-detail"> · 空白で接続点を追加 · Escで中止</span></span><button type="button" onClick={editor.cancelConnection} aria-label="接続をキャンセル" title="接続をキャンセル (Esc)"><CircuitIcon name="close" /></button></div>}
-    {!preview && editor.error && <p className="circuit-editor__error" role="alert">{editor.error}</p>}
+    {editor.error && <p className="circuit-editor__error" role="alert">{editor.error}</p>}
   </>;
 }
 
@@ -571,12 +571,13 @@ export function CircuitEditorLayout({
   const [previewDocument, setPreviewDocument] = useState<CircuitDocument | null>(() => previewOnly
     ? { ...editor.document, parts: editor.document.parts.map((item) => ({ ...item })) }
     : null);
+  const previewSourceDocumentRef = useRef(editor.document);
   const previewGenerationRef = useRef(0);
   const previewGeneration = previewGenerationRef.current;
   const [previewPanelOpen, setPreviewPanelOpen] = useState(false);
   const [previewPartId, setPreviewPartId] = useState<string | null>(null);
   const previewReturnFocus = useRef<HTMLElement | SVGElement | null>(null);
-  const preview = previewDocument !== null;
+  const preview = previewOnly || previewDocument !== null;
   const previewAnalysis = useMemo(() => previewDocument ? analyzeCircuit(previewDocument, {}, editor.analysisOptions) : null, [previewDocument, editor.analysisOptions]);
   const activeDocument = previewDocument ?? editor.document;
   const features = resolvePreviewFeatures(previewFeatures, activeDocument, previewAnalysis ?? editor.analysis, editor.analysisOptions);
@@ -610,6 +611,24 @@ export function CircuitEditorLayout({
     if (!features.dialog) { setPreviewPanelOpen(false); }
     if (!features.parts) { setPreviewPartId(null); }
   }, [features.dialog, features.parts]);
+
+  useEffect(() => {
+    const sourceChanged = previewSourceDocumentRef.current !== editor.document;
+    previewSourceDocumentRef.current = editor.document;
+    if (!(sourceChanged && previewDocument) && !(previewOnly && !previewDocument)) { return; }
+    if (previewOnly && !previewDocument) {
+      editor.cancelConnection();
+      setPanel(null);
+    }
+    // Experiments belong to one source document, including controller-driven
+    // imports and history changes that do not go through the file controls.
+    previewGenerationRef.current += 1;
+    setPreviewDocument(previewOnly
+      ? { ...editor.document, parts: editor.document.parts.map((item) => ({ ...item })) }
+      : null);
+    setPreviewPanelOpen(false);
+    setPreviewPartId(null);
+  }, [previewOnly, previewDocument, editor.document]);
 
   function resetPreview(partId?: string) {
     previewGenerationRef.current += 1;

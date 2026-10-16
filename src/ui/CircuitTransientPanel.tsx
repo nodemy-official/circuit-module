@@ -301,7 +301,17 @@ function TransientVisualizations({
 }) {
   const cursorSample = analysis.samples[sampleIndex];
   if (!cursorSample) { return null; }
-  if (parts.length === 0) { return <p role="status">波形に表示する部品を選んでください。</p>; }
+  const timeControls = <TimeControls
+    id={id}
+    sampleIndex={sampleIndex}
+    maxSampleIndex={maxSampleIndex}
+    timeSeconds={cursorSample.timeSeconds}
+    playing={playing}
+    onFirst={onFirst}
+    onTogglePlayback={onTogglePlayback}
+    onSeek={onSeek}
+  />;
+  if (parts.length === 0) { return <><p role="status">波形に表示する部品を選んでください。</p>{timeControls}</>; }
   const baselineIsAvailable = baselineAnalysis?.status === "valid";
   return <>
     {baselineIsAvailable && <p className="circuit-transient__comparison-key"><span data-source="current">実線: 変更後</span><span data-source="baseline">破線: 変更前</span></p>}
@@ -312,16 +322,7 @@ function TransientVisualizations({
       <Waveform analysis={analysis} baselineAnalysis={baselineAnalysis} baselineDocument={baselineDocument} parts={parts} quantity="voltageVolts" sampleIndex={sampleIndex} />
       <Waveform analysis={analysis} baselineAnalysis={baselineAnalysis} baselineDocument={baselineDocument} parts={parts} quantity="currentAmps" sampleIndex={sampleIndex} />
     </div>
-    <TimeControls
-      id={id}
-      sampleIndex={sampleIndex}
-      maxSampleIndex={maxSampleIndex}
-      timeSeconds={cursorSample.timeSeconds}
-      playing={playing}
-      onFirst={onFirst}
-      onTogglePlayback={onTogglePlayback}
-      onSeek={onSeek}
-    />
+    {timeControls}
     <TransientReadings
       analysis={analysis}
       baselineAnalysis={baselineAnalysis}

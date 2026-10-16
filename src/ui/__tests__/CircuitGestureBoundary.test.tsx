@@ -131,9 +131,10 @@ describe("document gesture boundaries", () => {
     }
   });
 
-  it.each(["part", "wire"] as const)("discards %s after external cancellation before rendering", (gesture) => {
+  it.each((["part", "wire"] as const).flatMap((gesture) => [false, true].map((moved) => ({ gesture, moved }))))
+  ("discards $gesture after external cancellation before rendering (moved=$moved)", ({ gesture, moved }) => {
     const ui = mount(fixture());
-    const origin = start(ui, gesture, true);
+    const origin = start(ui, gesture, moved);
     let saved = "";
     act(() => {
       if (gesture === "part") { ui.editor.cancelMove("part-1"); }
@@ -145,15 +146,79 @@ describe("document gesture boundaries", () => {
     expect(ui.editor.canUndo).toBe(false);
   });
 
-  it.each(["connection", "reconnect"] as const)("discards %s after its pending connection is cancelled externally", (gesture) => {
+  it.each((["part", "wire"] as const).flatMap((gesture) => [false, true].flatMap((moved) =>
+    ["other-id", "other-group", "connection"].map((target) => ({ gesture, moved, target })),
+  )))
+  ("continues $gesture after cancelling $target (moved=$moved)", ({ gesture, moved, target }) => {
+    const initial = fixture();
+    initial.wires.push({
+      id: "wire-other", from: { partId: "part-1", terminal: "a" }, to: { partId: "part-2", terminal: "b" },
+    });
+    const ui = mount(initial);
+    const origin = start(ui, gesture, moved);
+    act(() => {
+      if (target === "connection") { ui.editor.cancelConnection(); }
+      else if (gesture === "part" && target === "other-id") { ui.editor.cancelMove("part-2"); }
+      else if (gesture === "wire" && target === "other-group") { ui.editor.cancelMove("part-1"); }
+      else { ui.editor.cancelWireRoute(target === "other-id" ? "wire-other" : "wire-1"); }
+      finish(ui, origin);
+    });
+
+    if (gesture === "part") { expect(ui.editor.document.parts[0]?.y).toBe(4); }
+    else { expect(routeDocumentWires(ui.editor.document).get("wire-1")?.some((point) => point.y === 4)).toBe(true); }
+    expect(ui.editor.error).toBeNull();
+    act(() => ui.editor.undo());
+    expect(ui.editor.document).toEqual(initial);
+    expect(ui.editor.canUndo).toBe(false);
+  });
+
+  it.each(["part", "wire"] as const)("keeps a queued %s edit when cancelling another drag before rendering", (gesture) => {
     const ui = mount(fixture());
-    start(ui, gesture, true);
+    const origin = start(ui, gesture, false);
+    act(() => {
+      pointer(ui, ".circuit-board__surface", "pointermove", { x: origin.x, y: 2 });
+      if (gesture === "part") { ui.editor.cancelWireRoute("wire-1"); }
+      else { ui.editor.cancelMove("part-1"); }
+      finish(ui, origin);
+    });
+
+    if (gesture === "part") { expect(ui.editor.document.parts[0]?.y).toBe(4); }
+    else { expect(routeDocumentWires(ui.editor.document).get("wire-1")?.some((point) => point.y === 4)).toBe(true); }
+    act(() => ui.editor.undo());
+    expect(ui.editor.document).toEqual(fixture());
+    expect(ui.editor.canUndo).toBe(false);
+  });
+
+  it.each((["connection", "reconnect"] as const).flatMap((gesture) => [false, true].map((moved) => ({ gesture, moved }))))
+  ("discards $gesture after its connection is cancelled externally (moved=$moved)", ({ gesture, moved }) => {
+    const ui = mount(fixture());
+    start(ui, gesture, moved);
     act(() => {
       ui.editor.cancelConnection();
       pointer(ui, ".circuit-board__surface", "pointermove", { x: 12, y: 0 });
       pointer(ui, ".circuit-board__surface", "pointerup", { x: 12, y: 0 });
     });
     expect(ui.editor.pendingEndpoint).toBeNull();
+    expect(ui.editor.document).toEqual(fixture());
+  });
+
+  it.each((["connection", "reconnect"] as const).flatMap((gesture) => [false, true].flatMap((moved) =>
+    ["part", "wire"].map((target) => ({ gesture, moved, target })),
+  )))
+  ("continues $gesture after cancelling an unrelated $target drag (moved=$moved)", ({ gesture, moved, target }) => {
+    const ui = mount(fixture());
+    const origin = start(ui, gesture, moved);
+    act(() => {
+      if (target === "part") { ui.editor.cancelMove("part-1"); }
+      else { ui.editor.cancelWireRoute("wire-1"); }
+      finish(ui, origin);
+    });
+
+    expect(ui.editor.pendingEndpoint).toBeNull();
+    expect(ui.editor.error).toBeNull();
+    if (gesture === "connection") { expect(ui.editor.document.wires).toHaveLength(2); }
+    else { expect(ui.editor.document.wires[0]?.to.partId).not.toBe("part-2"); }
+    act(() => ui.editor.undo());
     expect(ui.editor.document).toEqual(fixture());
   });
 

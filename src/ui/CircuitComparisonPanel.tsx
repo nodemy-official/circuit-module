@@ -2,7 +2,7 @@ import { useId, useState } from "react";
 import type { CircuitAnalysis } from "../circuit-solver.js";
 import type { CircuitDocument, CircuitPart } from "../circuit-model.js";
 import { formatCircuitNumber } from "../number-format.js";
-import { copySimulationDocument } from "../simulation-input.js";
+import { copySimulationDocument, simulationRecordField } from "../simulation-input.js";
 
 type ComparisonMetric = "voltageVolts" | "currentAmps" | "powerWatts";
 type ComparisonDocument = Pick<CircuitDocument, "title" | "parts">;
@@ -113,7 +113,8 @@ function analysisMode(analysis: ComparisonAnalysis): "dc" | "ac" {
 
 function analysisFrequency(document: ComparisonDocument, analysis: ComparisonAnalysis): number {
   if (isFiniteValue(analysis.frequencyHz)) { return analysis.frequencyHz; }
-  const sourceFrequency = document.parts.find((part) => part.kind === "ac-source")?.frequencyHz;
+  const source = document.parts.find((part) => part.kind === "ac-source");
+  const sourceFrequency = source ? simulationRecordField(source, "frequencyHz") : undefined;
   return isFiniteValue(sourceFrequency) ? sourceFrequency : 1000;
 }
 

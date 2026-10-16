@@ -97,6 +97,8 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
   }));
   const renderedDocument = renderedHistory.present;
   const [documentVersion, setDocumentVersion, documentVersionRef] = useCommandState(0);
+  const globalDocumentVersionRef = useRef(0);
+  const cancelledGroupVersionsRef = useRef(new Map<string, number>());
   const [renderedSelection, setSelection, selectionRef] = useCommandState<CircuitSelection>(noSelection);
   const [renderedPendingEndpoint, setPendingEndpoint, pendingEndpointRef] = useCommandState<CircuitEndpoint | null>(null);
   const [renderedPendingWire, setPendingWire, pendingWireRef] = useCommandState<{ wireId: string; end: CircuitWireEnd } | null>(null);
@@ -107,17 +109,33 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
   const diagnostics = useMemo(() => inspectCircuit(renderedDocument), [renderedDocument]);
   const canCut = canCutSelection(renderedDocument, renderedSelection);
 
+  function invalidateDocument() {
+    globalDocumentVersionRef.current += 1;
+    setDocumentVersion((version) => version + 1);
+  }
+
+  function invalidateGestureGroup(group: string, documentChanged = false) {
+    const versions = cancelledGroupVersionsRef.current;
+    versions.set(group, (versions.get(group) ?? 0) + 1);
+    if (documentChanged) { globalDocumentVersionRef.current += 1; }
+    // Number-based hosts observe every cancellation after rendering; group-aware
+    // getters also detect their own cancellation before that render commits.
+    setDocumentVersion((version) => version + 1);
+  }
+
   function dispatch(action: HistoryAction) {
     const previousDocument = historyRef.current.present;
     setHistory((current) => editorHistoryReducer(current, action));
-    if (action.type === "cancel-group" && historyRef.current.present !== previousDocument) {
-      setDocumentVersion((version) => version + 1);
+    // A pressed pointer may not have produced its first accepted edit yet.
+    // Cancel its pending events even when there is no history group to restore.
+    if (action.type === "cancel-group") {
+      invalidateGestureGroup(action.group, historyRef.current.present !== previousDocument);
     }
   }
 
   function setDocument(next: CircuitDocument, group?: string) {
     if (next !== historyRef.current.present && !group?.startsWith("move:") && !group?.startsWith("wire-route:")) {
-      setDocumentVersion((version) => version + 1);
+      invalidateDocument();
     }
     dispatch({ type: "edit", document: next, group });
   }
@@ -134,7 +152,7 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
   function endEdit() {
     // A pointer may be pressed before its first edit creates an undo group.
     // End that gesture too, including queued moves before React commits.
-    setDocumentVersion((version) => version + 1);
+    invalidateDocument();
     dispatch({ type: "end-group" });
   }
 
@@ -144,9 +162,7 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
   }
 
   function cancelConnection() {
-    if (pendingEndpointRef.current || pendingWireRef.current) {
-      setDocumentVersion((version) => version + 1);
-    }
+    invalidateGestureGroup("connection");
     setPendingEndpoint(null);
     setPendingWire(null);
     setError(null);
@@ -310,6 +326,11 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
     setError(null);
   }
 
+  function cancelMove(id: string) {
+    dispatch({ type: "cancel-group", group: `move:${id}` });
+    setError(null);
+  }
+
   function resetWireRoute(id: string) {
     const document = historyRef.current.present;
     const wire = document.wires.find((item) => item.id === id);
@@ -386,7 +407,7 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
     const next = editorHistoryReducer(history, { type });
     if (next === history) { return; }
     cancelConnection();
-    setDocumentVersion((version) => version + 1);
+    invalidateDocument();
     setHistory(next);
     setSelection(noSelection());
   }
@@ -394,7 +415,9 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
   return {
     document: renderedDocument,
     documentVersion,
-    getDocumentVersion: () => documentVersionRef.current,
+    getDocumentVersion: (group?: string) => group === undefined
+      ? documentVersionRef.current
+      : globalDocumentVersionRef.current + (cancelledGroupVersionsRef.current.get(group) ?? 0),
     selection: renderedSelection,
     pendingEndpoint: renderedPendingEndpoint,
     pendingWire: renderedPendingWire,
@@ -440,7 +463,7 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
     undo: () => travel("undo"),
     redo: () => travel("redo"),
     endEdit,
-    cancelMove: (id: string) => dispatch({ type: "cancel-group", group: `move:${id}` }),
+    cancelMove,
     clearSelection,
     cancelConnection,
   };

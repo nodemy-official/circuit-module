@@ -3,6 +3,7 @@ import { expect, it } from "vitest";
 import { createCircuitFromSpecs } from "../../__tests__/helpers/circuit-fixture.js";
 import { analyzeCircuit } from "../../circuit-solver.js";
 import { simulateTransient } from "../../transient-solver.js";
+import type { ExactExpressionNode } from "../../exact-expression.js";
 import { CircuitEnergyPanel } from "../CircuitEnergyPanel.js";
 
 const unavailable = { configurable: true, get() { throw new Error("Unavailable optional precision"); } };
@@ -56,3 +57,28 @@ it.each(["exactVoltage", "exactTerminalCurrents", "terminal-current", "precision
     expect(markup).toContain('data-dissipated-joules="0.625"');
   },
 );
+
+it("uses scalar energy when a transported expression names an inherited operation", () => {
+  const document = createCircuitFromSpecs([
+    ["c", "capacitor", ["v", "g"], { capacitanceFarads: 1, initialVoltageVolts: 1 }],
+    ["r", "resistor", ["v", "g"], { resistanceOhms: 1 }],
+  ]);
+  const transient = simulateTransient(document, { durationSeconds: 1, timeStepSeconds: 1 });
+  expect(transient.status).toBe("valid");
+  const table: ExactExpressionNode[] = [
+    { operation: "literal", numerator: "1", denominator: "3" },
+    { operation: "literal", numerator: "2", denominator: "1" },
+    { operation: "multiply", arguments: [0, 1] },
+  ];
+  Reflect.set(table[2]!, "operation", "constructor");
+  transient.precisionExpressions = table;
+  transient.samples[1]!.parts.c!.exactVoltage = {
+    real: { expression: 2, sign: 1 }, imaginary: { numerator: "0", denominator: "1" },
+  };
+
+  const markup = renderToStaticMarkup(<CircuitEnergyPanel document={document} analysis={analyzeCircuit(document)}
+    frame={{ analysis: transient, sampleIndex: 1 }} />);
+
+  // Backward Euler gives V1=1/2 V, hence E=C*V1²/2=1/8 J.
+  expect(markup).toContain('data-energy-joules="0.125"');
+});

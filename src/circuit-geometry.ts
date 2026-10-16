@@ -220,12 +220,25 @@ function facingLeads(start: RouteEnd, end: RouteEnd): { first: Point; last: Poin
   };
 }
 
+function leadBeforeOtherPin(start: RouteEnd, end: RouteEnd, fallback: Point): Point {
+  if (!start.direction || !end.direction) { return fallback; }
+  const dx = end.point.x - start.point.x;
+  const dy = end.point.y - start.point.y;
+  const progress = dx * start.direction.x + dy * start.direction.y;
+  // A perpendicular pin can sit exactly at the normal one-cell stub. Leave room
+  // to turn before reaching it, rather than visiting the pin midway through a route.
+  if (progress > 0 && progress <= 1 && dx * start.direction.y === dy * start.direction.x) {
+    return { x: start.point.x + dx / 2, y: start.point.y + dy / 2 };
+  }
+  return fallback;
+}
+
 function routeAvoidingTerminalPoints(start: RouteEnd, end: RouteEnd, occupied: readonly (readonly Point[])[], protectedPins: readonly Point[]): Point[] {
   // Facing pins closer than two cells share their lead corridor without
   // passing through either pin or retracing a full one-cell stub.
   const facing = facingLeads(start, end);
-  const first = facing?.first ?? stub(start, end.direction ? undefined : end.point);
-  const last = facing?.last ?? stub(end, start.direction ? undefined : start.point);
+  const first = facing?.first ?? leadBeforeOtherPin(start, end, stub(start, end.direction ? undefined : end.point));
+  const last = facing?.last ?? leadBeforeOtherPin(end, start, stub(end, start.direction ? undefined : start.point));
   return routeAroundWires(start, end, first, last, occupied, protectedPins);
 }
 
@@ -728,6 +741,10 @@ function appendRoute(target: Point[], points: readonly Point[]) {
   }
 }
 
+function samePoint(first: Point, second: Point) {
+  return first.x === second.x && first.y === second.y;
+}
+
 function approachStubWaypoint(firstStub: Point, target: Point, continuation: Point, offset: Point): Point[] {
   const sign = (continuation.x - target.x) * offset.x + (continuation.y - target.y) * offset.y > 0 ? -1 : 1;
   const approachOffset = { x: sign * offset.x, y: sign * offset.y };
@@ -758,6 +775,7 @@ function routeLeadAroundOccupied(lead: readonly Point[], occupied: readonly (rea
 function terminalLead(start: RouteEnd, target: Point, continuation: Point, occupied: readonly (readonly Point[])[], protectedPins: readonly Point[], firstStub = stub(start)): Point[] {
   if (!start.direction) { return routeAvoidingTerminalPoints(start, { point: target, direction: null }, occupied, protectedPins); }
   const lead = [{ ...start.point }, firstStub];
+  if (samePoint(target, firstStub)) { return lead; }
   const offset = {
     x: -start.direction.y * 2,
     y: start.direction.x * 2,
@@ -779,7 +797,7 @@ function terminalLead(start: RouteEnd, target: Point, continuation: Point, occup
   }
 
   if (progress > 0 && perpendicularDistance === 0) {
-    if (target.x === continuation.x && target.y === continuation.y) {
+    if (samePoint(target, continuation)) {
       return [{ ...start.point }, { ...target }];
     }
     // Fractional waypoints may lie within the outward stub. Approach them perpendicular to
@@ -842,8 +860,8 @@ function routeThroughWaypoints(start: RouteEnd, end: RouteEnd, waypoints: readon
   const terminalLeads: Point[][] = [];
   const protectedPins: Point[] = [];
   const facing = facingLeads(start, end);
-  const startStub = facing?.first ?? stub(start);
-  const endStub = facing?.last ?? stub(end);
+  const startStub = facing?.first ?? leadBeforeOtherPin(start, end, stub(start));
+  const endStub = facing?.last ?? leadBeforeOtherPin(end, start, stub(end));
   for (const [terminal, leadEnd] of [[start, startStub], [end, endStub]] as const) {
     if (terminal.direction) {
       terminalLeads.push([terminal.point, leadEnd]);
@@ -878,9 +896,7 @@ function routeThroughWaypoints(start: RouteEnd, end: RouteEnd, waypoints: readon
 }
 
 function equalRoutes(first: readonly Point[], second: readonly Point[]) {
-  return first.length === second.length && first.every((point, index) =>
-    point.x === second[index].x && point.y === second[index].y,
-  );
+  return first.length === second.length && first.every((point, index) => samePoint(point, second[index]));
 }
 
 /** Long straight runs need only their first and last internal anchors. */
@@ -1008,7 +1024,7 @@ export function pathData(points: readonly Point[]) {
     .join(" ");
 }
 
-/** Bounds of every part footprint, or null for an empty document. */
+/** Bounds of every part footprint and wire route, or null for an empty document. */
 export function contentBounds(document: CircuitDocument): GridRect | null {
   if (document.parts.length === 0) { return null; }
   const rects = document.parts.map(footprint);
@@ -1018,6 +1034,16 @@ export function contentBounds(document: CircuitDocument): GridRect | null {
   let maxY = Math.max(...rects.map((rect) => rect.maxY));
   for (const wire of document.wires) {
     for (const point of wire.waypoints ?? []) {
+      minX = Math.min(minX, point.x);
+      minY = Math.min(minY, point.y);
+      maxX = Math.max(maxX, point.x);
+      maxY = Math.max(maxY, point.y);
+    }
+  }
+  // Automatic detours and terminal approaches can extend beyond both the parts
+  // and the authored waypoints. Fit the actual paths that are shown on the board.
+  for (const route of routeDocumentWires(document).values()) {
+    for (const point of route) {
       minX = Math.min(minX, point.x);
       minY = Math.min(minY, point.y);
       maxX = Math.max(maxX, point.x);

@@ -1,4 +1,4 @@
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 import { retainedComplex, restoredComplex } from "../../circuit-reading.js";
 import { capturedExactReference, combineExactExpressionHandles, createExactExpressionCapture, exactExpressionHandle, freezeCapturedExactExpressions, matchingExactExpressions, retainExactExpressionHandle, snapshotExactExpressions, withExactExpressionCapture, type ExactExpressionNode } from "../../exact-expression.js";
 import { addExactRational, deferExactRationalReduction, divideExactRational, multiplyExactRational, numberToExactRational, solveExactComplexLinearSystem, solveExactRealLinearSystem, sumExactRationals, type ExactRational } from "../../exact-linear-algebra.js";
@@ -146,6 +146,233 @@ it("keeps replayed values paired with the dependency snapshot actually evaluated
   expect(restoredComplex(reading, table)?.real).toBe(2);
 });
 
+it("reuses unchanged immutable metadata during mutable-table replay cache hits", () => {
+  const table: ExactExpressionNode[] = [
+    { operation: "literal", numerator: "1", denominator: "3" },
+    { operation: "literal", numerator: "2", denominator: "1" },
+    { operation: "multiply", arguments: [0, 1] },
+  ];
+  const reading = { real: { expression: 2, sign: 1 as const }, imaginary: { numerator: "0", denominator: "1" } };
+  expect(restoredComplex(reading, table)?.real).toBe(2 / 3);
+  const freeze = vi.spyOn(Object, "freeze");
+  let frozenMetadata = 0;
+  try {
+    for (let repeat = 0; repeat < 10; repeat += 1) {
+      restoredComplex(reading, table);
+    }
+    frozenMetadata = freeze.mock.calls.filter(([value]) => Array.isArray(value) || Object.hasOwn(value, "operation")).length;
+  } finally { freeze.mockRestore(); }
+  // Cache hits still inspect the editable equations, but must not allocate
+  // and freeze another copy of every node on every playback frame.
+  expect(frozenMetadata).toBe(0);
+});
+
+it("keeps previously observed prefixes when a later accessor changes both equations", () => {
+  let numerator = "1";
+  let numeratorReads = 0;
+  const table: ExactExpressionNode[] = [
+    { operation: "literal", get numerator() { numeratorReads += 1; return numerator; }, denominator: "3" },
+    { operation: "literal", numerator: "2", denominator: "1" },
+    { operation: "multiply", arguments: [0, 1] },
+  ];
+  const reading = { real: { expression: 2, sign: 1 as const }, imaginary: { numerator: "0", denominator: "1" } };
+  expect(restoredComplex(reading, table)?.real).toBe(2 / 3);
+  numeratorReads = 0;
+  let operationReads = 0;
+  Object.defineProperty(table[2]!, "operation", {
+    get() { operationReads += 1; numerator = "2"; return "add"; },
+  });
+
+  // The first replay observes 1/3 before observing the new addition. The
+  // later edit to that numerator belongs to the next replay's evidence.
+  expect(restoredComplex(reading, table)?.real).toBe(7 / 3);
+  expect(numeratorReads).toBe(1);
+  expect(operationReads).toBe(1);
+  expect(restoredComplex(reading, table)?.real).toBe(8 / 3);
+  expect(numeratorReads).toBe(2);
+  expect(operationReads).toBe(2);
+});
+
+it("invalidates all cached roots when only a shared dependency changes", () => {
+  const table: ExactExpressionNode[] = [
+    { operation: "literal", numerator: "1", denominator: "3" },
+    { operation: "literal", numerator: "2", denominator: "1" },
+    { operation: "multiply", arguments: [0, 1] },
+    { operation: "add", arguments: [0, 1] },
+  ];
+  const reading = (expression: number) => ({ real: { expression, sign: 1 as const }, imaginary: { numerator: "0", denominator: "1" } });
+  expect(restoredComplex(reading(2), table)?.real).toBe(2 / 3);
+  expect(restoredComplex(reading(3), table)?.real).toBe(7 / 3);
+  Reflect.set(table[0]!, "numerator", "2");
+  expect(restoredComplex(reading(2), table)?.real).toBe(4 / 3);
+  expect(restoredComplex(reading(3), table)?.real).toBe(8 / 3);
+});
+
+it.each(["table", "arguments"] as const)("observes the transported %s length once during replay", (field) => {
+  const table: ExactExpressionNode[] = [
+    { operation: "literal", numerator: "1", denominator: "3" },
+    { operation: "literal", numerator: "2", denominator: "1" },
+    { operation: "multiply", arguments: [0, 1] },
+  ];
+  const reading = { real: { expression: 2, sign: 1 as const }, imaginary: { numerator: "0", denominator: "1" } };
+  let lengthReads = 0;
+  const proxy = <T extends unknown[]>(array: T) => new Proxy(array, {
+    get(target, key, receiver) {
+      if (key === "length") { lengthReads += 1; return lengthReads === 1 ? array.length : 1; }
+      return Reflect.get(target, key, receiver);
+    },
+  });
+  const transported = field === "table" ? proxy(table) : table;
+  if (field === "arguments") { Reflect.set(table[2]!, "arguments", proxy([0, 1])); }
+  for (let repeat = 0; repeat < 2; repeat += 1) {
+    lengthReads = 0;
+    expect(restoredComplex(reading, transported)?.real).toBe(2 / 3);
+    expect(lengthReads).toBe(1);
+  }
+});
+
+it.each(["table", "arguments"] as const)("rejects invalid Proxy %s lengths without reusing warmed roots", (field) => {
+  const table: ExactExpressionNode[] = [
+    { operation: "literal", numerator: "1", denominator: "3" },
+    { operation: "literal", numerator: "2", denominator: "1" },
+    { operation: "multiply", arguments: [0, 1] },
+  ];
+  let length: unknown = field === "table" ? 3 : 2;
+  const proxy = <T extends unknown[]>(array: T) => new Proxy(array, {
+    get(target, key, receiver) { return key === "length" ? length : Reflect.get(target, key, receiver); },
+  });
+  const transported = field === "table" ? proxy(table) : table;
+  if (field === "arguments") { Reflect.set(table[2]!, "arguments", proxy([0, 1])); }
+  const snapshot = snapshotExactExpressions(transported);
+  const reading = { real: { expression: 2, sign: 1 as const }, imaginary: { numerator: "0", denominator: "1" } };
+  expect(restoredComplex(reading, transported)?.real).toBe(2 / 3);
+  for (length of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 32, field === "table" ? "3" : "2"]) {
+    expect(() => snapshotExactExpressions(transported)).toThrow();
+    expect(matchingExactExpressions(transported, snapshot)).toBe(false);
+    expect(restoredComplex(reading, transported)).toBeUndefined();
+  }
+  length = field === "table" ? 3 : 2;
+  expect(restoredComplex(reading, transported)?.real).toBe(2 / 3);
+});
+
+it.each(["operation", "arguments", "argument-index"] as const)("captures a mutable %s once before matching a replay cache", (field) => {
+  const table: ExactExpressionNode[] = [
+    { operation: "literal", numerator: "1", denominator: "3" },
+    { operation: "literal", numerator: "2", denominator: "1" },
+    { operation: "multiply", arguments: [0, 1] },
+  ];
+  const reading = { real: { expression: 2, sign: 1 as const }, imaginary: { numerator: "0", denominator: "1" } };
+  expect(restoredComplex(reading, table)?.real).toBe(2 / 3);
+  let reads = 0;
+  const node = table[2]!;
+  if (field === "argument-index") {
+    if (node.operation === "literal") { throw new Error("Expected arithmetic expression"); }
+    Object.defineProperty(node.arguments, "0", { get() { reads += 1; return reads === 1 ? 0 : 1; } });
+  } else {
+    Object.defineProperty(node, field, {
+      get() {
+        reads += 1;
+        return field === "operation" ? reads === 1 ? "multiply" : "add" : reads === 1 ? [0, 1] : [1, 1];
+      },
+    });
+  }
+
+  // The first observed equation is (1/3)*2. The changed equation belongs to
+  // the next read: either 1/3+2=7/3 or 2*2=4, independently of replay helpers.
+  expect(restoredComplex(reading, table)?.real).toBe(2 / 3);
+  expect(reads).toBe(1);
+  expect(restoredComplex(reading, table)?.real).toBe(field === "operation" ? 7 / 3 : 4);
+  expect(reads).toBe(2);
+});
+
+it.each(["operation", "arguments", "argument-index"] as const)("compares a mutable %s from one observation", (field) => {
+  const table: ExactExpressionNode[] = [
+    { operation: "literal", numerator: "5", denominator: "9" },
+    { operation: "literal", numerator: "0", denominator: "1" },
+    { operation: "add", arguments: [0, 1] },
+  ];
+  const snapshot = snapshotExactExpressions(table);
+  let reads = 0;
+  const node = table[2]!;
+  if (field === "argument-index") {
+    if (node.operation === "literal") { throw new Error("Expected arithmetic expression"); }
+    Object.defineProperty(node.arguments, "0", { get() { reads += 1; return reads === 1 ? 0 : 1; } });
+  } else {
+    Object.defineProperty(node, field, {
+      get() {
+        reads += 1;
+        return field === "operation" ? reads === 1 ? "add" : "constructor" : reads === 1 ? [0, 1] : [1, 1];
+      },
+    });
+  }
+
+  expect(matchingExactExpressions(table, snapshot)).toBe(true);
+  expect(reads).toBe(1);
+  expect(matchingExactExpressions(table, snapshot)).toBe(false);
+  expect(reads).toBe(2);
+});
+
+it.each(["literal", "arithmetic"])("snapshots known %s fields without reading unrelated metadata", (kind) => {
+  const table: ExactExpressionNode[] = [
+    { operation: "literal", numerator: "5", denominator: "9" },
+    { operation: "literal", numerator: "0", denominator: "1" },
+    { operation: "add", arguments: [0, 1] },
+  ];
+  Object.defineProperty(table[kind === "literal" ? 0 : 2]!, "unused", {
+    enumerable: true,
+    get() { throw new Error("Unused metadata must not be read"); },
+  });
+  const reading = { real: { expression: 2, sign: 1 as const }, imaginary: { numerator: "0", denominator: "1" } };
+  const snapshot = snapshotExactExpressions(table);
+
+  expect(restoredComplex(reading, table)?.real).toBe(5 / 9);
+  expect(restoredComplex(reading, snapshot)?.real).toBe(5 / 9);
+});
+
+it("compares every expression argument using the initially observed array length", () => {
+  const table: ExactExpressionNode[] = [
+    { operation: "literal", numerator: "1", denominator: "3" },
+    { operation: "literal", numerator: "2", denominator: "1" },
+    { operation: "multiply", arguments: [0, 1] },
+  ];
+  const snapshot = snapshotExactExpressions(table);
+  let lengthReads = 0;
+  Reflect.set(table[2]!, "arguments", new Proxy([0, 0], {
+    get(target, key, receiver) {
+      if (key === "length") { lengthReads += 1; return lengthReads === 1 ? 2 : 1; }
+      return Reflect.get(target, key, receiver);
+    },
+  }));
+
+  expect(matchingExactExpressions(table, snapshot)).toBe(false);
+  expect(lengthReads).toBe(1);
+});
+
+it.each([
+  { name: "self reference", node: { operation: "multiply", arguments: [2, 1] } },
+  { name: "forward reference", node: { operation: "multiply", arguments: [3, 1] } },
+  { name: "negative reference", node: { operation: "multiply", arguments: [-1, 1] } },
+  { name: "fractional reference", node: { operation: "multiply", arguments: [0.5, 1] } },
+  { name: "missing operand", node: { operation: "multiply", arguments: [0] } },
+  { name: "self sum", node: { operation: "sum", arguments: [2] } },
+  { name: "zero denominator", node: { operation: "literal", numerator: "1", denominator: "0" } },
+  { name: "invalid literal", node: { operation: "literal", numerator: " 1", denominator: "3" } },
+] satisfies { name: string; node: ExactExpressionNode }[])("rejects $name metadata after warming the cache and recovers after repair", ({ node }) => {
+  const table: ExactExpressionNode[] = [
+    { operation: "literal", numerator: "1", denominator: "3" },
+    { operation: "literal", numerator: "2", denominator: "1" },
+    { operation: "multiply", arguments: [0, 1] },
+  ];
+  const reading = { real: { expression: 2, sign: 1 as const }, imaginary: { numerator: "0", denominator: "1" } };
+  expect(restoredComplex(reading, table)?.real).toBe(2 / 3);
+  table[2] = node;
+  expect(restoredComplex(reading, table)).toBeUndefined();
+
+  table[0] = { operation: "literal", numerator: "1", denominator: "5" };
+  table[2] = { operation: "multiply", arguments: [0, 1] };
+  expect(restoredComplex(reading, table)?.real).toBe(2 / 5);
+});
+
 it.each(["node", "argument"])("rejects sparse expression tables after a %s is deleted", (field) => {
   const table: ExactExpressionNode[] = [
     { operation: "literal", numerator: "5", denominator: "9" },
@@ -213,4 +440,21 @@ it.each(["iterator", "map"])("uses indexed expression arguments after a %s metho
   expect(restoredComplex(reading, table.slice())!.real).toBe(5 / 9);
   expect(restoredComplex(reading, snapshotExactExpressions(table))!.real).toBe(5 / 9);
   expect(methodCalls).toBe(0);
+});
+
+it.each(["constructor", "__proto__", "toString", "unsupported"])("rejects an unsupported expression operation (%s)", (operation) => {
+  const table: ExactExpressionNode[] = [
+    { operation: "literal", numerator: "1", denominator: "3" },
+    { operation: "literal", numerator: "2", denominator: "1" },
+    { operation: "multiply", arguments: [0, 1] },
+  ];
+  const original = snapshotExactExpressions(table);
+  const reading = { real: { expression: 2, sign: 1 as const }, imaginary: { numerator: "0", denominator: "1" } };
+  expect(restoredComplex(reading, table)?.real).toBe(2 / 3);
+  Reflect.set(table[2]!, "operation", operation);
+
+  expect(matchingExactExpressions(table, original)).toBe(false);
+  expect(matchingExactExpressions(table, table)).toBe(false);
+  expect(() => snapshotExactExpressions(table)).toThrow();
+  expect(restoredComplex(reading, table)).toBeUndefined();
 });

@@ -20,8 +20,8 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-function mount(kind: CircuitPart["kind"], view: "inspector" | "preview" = "inspector") {
-  const initial: CircuitPart = { id: "part", kind, x: 0, y: 0, ...circuitPartCatalog[kind].defaults };
+function mount(kind: CircuitPart["kind"], view: "inspector" | "preview" = "inspector", initialPatch: Partial<CircuitPart> = {}) {
+  const initial: CircuitPart = { id: "part", kind, x: 0, y: 0, ...circuitPartCatalog[kind].defaults, ...initialPatch };
   const container = document.createElement("div");
   document.body.append(container);
   const root = createRoot(container);
@@ -69,6 +69,53 @@ function inputValue(input: HTMLInputElement, value: string) {
 
 describe("Inspector numeric drafts", () => {
   describe.each(["inspector", "preview"] as const)("%s op-amp supply rails", (view) => {
+    it.each([
+      { positiveRailVolts: Number.NEGATIVE_INFINITY, negativeRailVolts: Number.POSITIVE_INFINITY },
+      { positiveRailVolts: Number.NaN, negativeRailVolts: Number.NaN },
+      { positiveRailVolts: -Number.MAX_VALUE, negativeRailVolts: Number.MAX_VALUE },
+    ].flatMap((rails) => (["positiveRailVolts", "negativeRailVolts"] as const).map((firstKey) => ({ rails, firstKey }))))
+    ("repairs invalid initial rails starting with $firstKey ($rails)", ({ rails, firstKey }) => {
+      const ui = mount("op-amp", view, rails);
+      expect(ui.part).toMatchObject(rails);
+      expect(analyzeCircuit({ title: "", parts: [ui.part], wires: [] }).status).toBe("invalid");
+      const secondKey = firstKey === "positiveRailVolts" ? "negativeRailVolts" : "positiveRailVolts";
+      const repaired = { positiveRailVolts: 15, negativeRailVolts: -15 };
+
+      inputValue(ui.field(firstKey), String(repaired[firstKey]));
+
+      expect(ui.part[firstKey]).toBe(repaired[firstKey]);
+      expect(ui.part[secondKey]).toBe(rails[secondKey]);
+      inputValue(ui.field(secondKey), String(repaired[secondKey]));
+      expect(ui.part).toMatchObject(repaired);
+      expect(() => serializeCircuitDocument({ title: "", parts: [ui.part], wires: [] })).not.toThrow();
+    });
+
+    it("preserves useful finite bounds while repairing an inverted range", () => {
+      const rails = { positiveRailVolts: -10, negativeRailVolts: 10 };
+      const ui = mount("op-amp", view, rails);
+      inputValue(ui.field("positiveRailVolts"), "0");
+      inputValue(ui.field("negativeRailVolts"), "0");
+      expect(ui.part).toMatchObject(rails);
+
+      inputValue(ui.field("positiveRailVolts"), "20");
+
+      expect(ui.part).toMatchObject({ positiveRailVolts: 20, negativeRailVolts: 10 });
+      expect(() => serializeCircuitDocument({ title: "", parts: [ui.part], wires: [] })).not.toThrow();
+    });
+
+    it("preserves strict bounds at the widest valid finite supply range", () => {
+      const rails = { positiveRailVolts: Number.MAX_VALUE, negativeRailVolts: -Number.MAX_VALUE };
+      const ui = mount("op-amp", view, rails);
+      inputValue(ui.field("positiveRailVolts"), String(-Number.MAX_VALUE));
+      inputValue(ui.field("negativeRailVolts"), String(Number.MAX_VALUE));
+      expect(ui.part).toMatchObject(rails);
+      inputValue(ui.field("positiveRailVolts"), "0");
+      inputValue(ui.field("negativeRailVolts"), "0");
+      expect(ui.part).toMatchObject({ positiveRailVolts: 0, negativeRailVolts: -Number.MAX_VALUE });
+      inputValue(ui.field("negativeRailVolts"), "-1");
+      expect(() => serializeCircuitDocument({ title: "", parts: [ui.part], wires: [] })).not.toThrow();
+    });
+
     it.each([
       ["positiveRailVolts", -15], ["positiveRailVolts", -16],
       ["negativeRailVolts", 15], ["negativeRailVolts", 16],

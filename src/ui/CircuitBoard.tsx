@@ -7,6 +7,7 @@ import { useWireRouteDrag } from "./useWireRouteDrag.js";
 import { useDocumentGestureBoundary, type DocumentGestureToken, type DocumentGestureVersion } from "./useDocumentGestureBoundary.js";
 import { useIsomorphicLayoutEffect } from "./useIsomorphicLayoutEffect.js";
 import { useCircuitBoardInputs } from "./useCircuitBoardInputs.js";
+import { simulationRecordField } from "../simulation-input.js";
 import { CircuitFlowLegend, CircuitWireFlow, wireFlowCurrent, wireFlowLabel, type FlowDisplay } from "./CircuitFlow.js";
 import { closestWirePoint, connectionTargetAt, wireMidpoint, type ConnectionTarget } from "./connection-target.js";
 import { circuitSlot, type CircuitStyleProps } from "./style-props.js";
@@ -246,7 +247,7 @@ const partDetailKeys: Partial<Record<CircuitPartKind, readonly CircuitPartNumeri
 };
 
 function formatPartDetail(part: CircuitPart, key: CircuitPartNumericKey, unit: string) {
-  const value = part[key] ?? circuitPartCatalog[part.kind].defaults[key];
+  const value = (simulationRecordField(part, key) as number | undefined) ?? circuitPartCatalog[part.kind].defaults[key];
   if (value === undefined) { return ""; }
   if (key === "wiperPosition") { return `${Math.round(value * 100)}%`; }
   const prefix = key === "currentGain" ? "β " : key === "thresholdVolts" ? "Vth " : key === "openLoopGain" ? "A₀ " : "";
@@ -308,7 +309,7 @@ function StandardPartArt({ part, brightness = 0, switchClosed, slotProps }: { pa
         </g>
       );
     case "switch": {
-      const closed = switchClosed ?? part.initiallyClosed ?? circuitPartCatalog.switch.defaults.initiallyClosed ?? false;
+      const closed = switchClosed ?? (simulationRecordField(part, "initiallyClosed") as boolean | undefined) ?? circuitPartCatalog.switch.defaults.initiallyClosed ?? false;
       return (
         <g {...symbol}>
           <path d="M -20 0 H -9 M 9 0 H 20" />
@@ -537,7 +538,7 @@ function keyDownOnCircuitPart(
 
 function circuitPartAccessibility(part: CircuitPart, isSelected: boolean, readOnly: boolean, onSwitchToggle?: (id: string) => void, switchClosed?: boolean) {
   const canToggleSwitch = readOnly && part.kind === "switch" && onSwitchToggle !== undefined;
-  const closed = switchClosed ?? part.initiallyClosed ?? circuitPartCatalog.switch.defaults.initiallyClosed ?? false;
+  const closed = switchClosed ?? (simulationRecordField(part, "initiallyClosed") as boolean | undefined) ?? circuitPartCatalog.switch.defaults.initiallyClosed ?? false;
   return {
     canToggleSwitch,
     role: readOnly ? canToggleSwitch ? "button" : undefined : "button",
@@ -1294,7 +1295,7 @@ export function CircuitBoard({
     event.currentTarget.focus?.({ preventScroll: true });
     if (clearDragClickTimer.current !== null) { clearTimeout(clearDragClickTimer.current); }
     draggedRef.current = false;
-    connectionDragRef.current = { gesture: captureDocumentGesture(), pointerId: event.pointerId, origin: { x: event.clientX, y: event.clientY }, endpoint, wire, moved: false };
+    connectionDragRef.current = { gesture: captureDocumentGesture("connection"), pointerId: event.pointerId, origin: { x: event.clientX, y: event.clientY }, endpoint, wire, moved: false };
     try { svgRef.current?.setPointerCapture(event.pointerId); } catch { /* Unsupported capture. */ }
   }, [captureDocumentGesture, canStartDocumentGesture, readOnly, panMode, onConnectionStart, onReconnectStart]);
 
@@ -1345,7 +1346,7 @@ export function CircuitBoard({
       connectionDrag.moved = true;
       if (connectionDrag.wire) { beginReconnect(connectionDrag.wire.wireId, connectionDrag.wire.end); }
       else { onConnectionStart?.(connectionDrag.endpoint); }
-      connectionDrag.gesture = captureDocumentGesture();
+      connectionDrag.gesture = captureDocumentGesture("connection");
     }
     draggedRef.current = true;
     const target = targetAtPointer(event);
@@ -1420,7 +1421,7 @@ export function CircuitBoard({
     if (clearDragClickTimer.current !== null) { clearTimeout(clearDragClickTimer.current); }
     updatePartDrag({
       id: part.id, pointerId: event.pointerId, last: point,
-      gesture: captureDocumentGesture(),
+      gesture: captureDocumentGesture(`move:${part.id}`),
       origin: { x: part.x, y: part.y }, expectedPosition: { x: part.x, y: part.y },
       originalPart: part, moved: false,
     });
@@ -1476,7 +1477,7 @@ export function CircuitBoard({
     if (!canStartDocumentGesture()) { return; }
     const point = pointAtPointer(event);
     const next: RangeState = {
-      gesture: captureDocumentGesture(),
+      gesture: captureDocumentGesture("range"),
       pointerId: event.pointerId,
       start: point,
       current: point,

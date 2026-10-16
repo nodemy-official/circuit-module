@@ -12,6 +12,7 @@ import { formatCircuitNumber } from "./number-format.js";
 import type { TransientAnalysis } from "./transient-solver.js";
 import { optionalPrecisionFailureToken, readOptionalPrecision, retainedComplexIsNonzero, restoredReadingComplex, type CircuitExactComplex } from "./circuit-reading.js";
 import { exactExpressionsAreImmutable, type ExactExpressionNode } from "./exact-expression.js";
+import { simulationRecordField } from "./simulation-input.js";
 
 export interface CircuitPotentialContext {
   document: CircuitDocument;
@@ -62,8 +63,8 @@ function transientFrameParts(document: CircuitDocument, sample: TransientAnalysi
       const current = restoredReadingComplex(readOptionalPrecision(() => reading.exactTerminalCurrents?.a), reading.currentAmps, undefined, false, expressions) ?? complex(reading.currentAmps);
       const voltage = restoredReadingComplex(readOptionalPrecision(() => reading.exactVoltage), reading.voltageVolts, undefined, false, expressions) ?? complex(reading.voltageVolts);
       const relative = part.kind === "bulb"
-        ? complexDivide(complexMultiply(voltage, current), complex(part.ratedPowerWatts ?? 2))
-        : complexDivide(current, complex(part.ratedCurrentAmps ?? 0.02));
+        ? complexDivide(complexMultiply(voltage, current), complex((simulationRecordField(part, "ratedPowerWatts") as number | undefined) ?? 2))
+        : complexDivide(current, complex((simulationRecordField(part, "ratedCurrentAmps") as number | undefined) ?? 0.02));
       brightness = Math.max(0, Math.min(1, relative.real));
     }
     // Spreading a transported reading would invoke optional accessors before
@@ -88,13 +89,13 @@ function transientFrameParts(document: CircuitDocument, sample: TransientAnalysi
 }
 
 function transientSourceIsActive(part: CircuitPart, sample: TransientAnalysis["samples"][number], expressions?: readonly ExactExpressionNode[]) {
-  if (part.kind === "battery") { return (part.voltageVolts ?? circuitPartCatalog.battery.defaults.voltageVolts ?? 0) !== 0; }
+  if (part.kind === "battery") { return ((simulationRecordField(part, "voltageVolts") as number | undefined) ?? circuitPartCatalog.battery.defaults.voltageVolts ?? 0) !== 0; }
   if (part.kind === "ac-source") {
-    return (part.voltageVolts ?? circuitPartCatalog["ac-source"].defaults.voltageVolts ?? 0) !== 0 ||
-      (part.offsetVolts ?? circuitPartCatalog["ac-source"].defaults.offsetVolts ?? 0) !== 0;
+    return ((simulationRecordField(part, "voltageVolts") as number | undefined) ?? circuitPartCatalog["ac-source"].defaults.voltageVolts ?? 0) !== 0 ||
+      ((simulationRecordField(part, "offsetVolts") as number | undefined) ?? circuitPartCatalog["ac-source"].defaults.offsetVolts ?? 0) !== 0;
   }
   if (part.kind === "current-source") {
-    return (part.currentAmps ?? circuitPartCatalog["current-source"].defaults.currentAmps ?? 0) !== 0;
+    return ((simulationRecordField(part, "currentAmps") as number | undefined) ?? circuitPartCatalog["current-source"].defaults.currentAmps ?? 0) !== 0;
   }
   const reading = sample.parts[part.id];
   // Displayed state values can underflow while the exact state still drives
@@ -132,7 +133,7 @@ function transientConductiveTerminals(
     case "inductor":
       return ["a", "b"];
     case "switch":
-      return sample.parts[part.id]?.switchClosed ?? part.initiallyClosed ?? circuitPartCatalog.switch.defaults.initiallyClosed ?? false
+      return sample.parts[part.id]?.switchClosed ?? (simulationRecordField(part, "initiallyClosed") as boolean | undefined) ?? circuitPartCatalog.switch.defaults.initiallyClosed ?? false
         ? ["a", "b"] : [];
     case "potentiometer":
     case "npn-transistor":
@@ -276,7 +277,7 @@ function referenceTerminalGroups(
         ? isAcReactiveConductive(part, frequencyHz) ? [["a", "b"]] : []
         : [["a", "b"]];
     case "switch":
-      return (analysis.parts[part.id]?.switchClosed ?? part.initiallyClosed ?? circuitPartCatalog.switch.defaults.initiallyClosed ?? false) ? [["a", "b"]] : [];
+      return (analysis.parts[part.id]?.switchClosed ?? (simulationRecordField(part, "initiallyClosed") as boolean | undefined) ?? circuitPartCatalog.switch.defaults.initiallyClosed ?? false) ? [["a", "b"]] : [];
     case "capacitor":
       return analysis.timeSeconds !== undefined ||
         (analysis.mode === "ac" && isAcReactiveConductive(part, frequencyHz)) ? [["a", "b"]] : [];
@@ -521,8 +522,8 @@ function potentiometerBranchPhasor(
   if (pair.fromTerminal === "b" && pair.toTerminal === "a") { return primaryReadingPhasor(reading, true, ac, expressions); }
   const segment = potentiometerSegmentForPair(pair);
   if (!segment) { return; }
-  const position = part.wiperPosition ?? 0.5;
-  const totalResistance = part.resistanceOhms ?? 1000;
+  const position = (simulationRecordField(part, "wiperPosition") as number | undefined) ?? 0.5;
+  const totalResistance = (simulationRecordField(part, "resistanceOhms") as number | undefined) ?? 1000;
   const fraction = segment.terminal === "a" ? complex(position) : complexSubtract(complex(1), complex(position));
   const resistance = complexMultiply(complex(totalResistance), fraction);
   const voltage = terminalBranchPhasor(reading, segment.terminal, resistance, ac, expressions);
@@ -736,12 +737,12 @@ function potentialContextSnapshot(context: CircuitPotentialContext) {
       part,
       part.id,
       part.kind,
-      part.resistanceOhms,
-      part.wiperPosition,
-      part.initiallyClosed,
-      part.frequencyHz,
-      part.capacitanceFarads,
-      part.inductanceHenries,
+      simulationRecordField(part, "resistanceOhms"),
+      simulationRecordField(part, "wiperPosition"),
+      simulationRecordField(part, "initiallyClosed"),
+      simulationRecordField(part, "frequencyHz"),
+      simulationRecordField(part, "capacitanceFarads"),
+      simulationRecordField(part, "inductanceHenries"),
       reading,
       reading?.meterStatus,
       reading?.switchClosed,

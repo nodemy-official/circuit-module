@@ -342,6 +342,27 @@ describe("documents and diagnostics", () => {
     expect(ui.editor.document).toEqual(createExampleCircuit());
   });
 
+  it.each(["{", '{"parts":false}'])("shows a rejected file's validation error if preview was opened while it was being read (%s)", async (json) => {
+    const ui = mount();
+    const initial = ui.editor.document;
+    let finishRead: (value: string) => void = () => {};
+    const input = required(ui.container, 'input[type="file"]');
+    Object.defineProperty(input, "files", { configurable: true, value: [{ size: 100,
+      text: () => new Promise<string>((resolve) => { finishRead = resolve; }),
+    }] });
+    act(() => input.dispatchEvent(new Event("change", { bubbles: true })));
+    click(required(ui.container, ".circuit-editor__preview-toggle"));
+
+    await act(async () => finishRead(json));
+
+    expect(ui.editor.document).toBe(initial);
+    expect(ui.editor.canUndo).toBe(false);
+    expect(ui.editor.error).not.toBeNull();
+    expect(required(ui.container, "main").getAttribute("data-preview")).toBe("true");
+    expect(ui.container.querySelector('[role="alert"]')?.textContent).toBe(ui.editor.error);
+    expect(ui.container.querySelector(".circuit-editor__file-status")).toBeNull();
+  });
+
   it("selects the affected objects from an actionable diagnostic", () => {
     const initial = createExampleCircuit();
     initial.parts.push({ id: "isolated", kind: "resistor", x: 50, y: 10, label: "孤立抵抗", resistanceOhms: 10 });

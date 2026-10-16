@@ -113,6 +113,32 @@ describe("flow geometry", () => {
     }
   });
 
+  it.each([1000, 1e6, Number.MAX_VALUE])("bounds arrow tessellation at the finite scale %s", (scale) => {
+    const original = createFlowPath([{ x: 0, y: 0 }, { x: 10, y: 0 }]);
+    let samples = 0;
+    const path = {
+      ...original,
+      sample(distance: number) {
+        samples += 1;
+        // The original loop grows with scale, or never finishes after overflow.
+        // Interrupt the fixture before either behavior can block the test run.
+        if (samples > 1500) { throw new Error("Unbounded arrow tessellation"); }
+        return original.sample(distance);
+      },
+    };
+
+    const data = flowArrowPath(path, 80, scale);
+    const points = arrowPoints(data);
+
+    expect(samples).toBeLessThanOrEqual(1500);
+    expect(points.length).toBeLessThanOrEqual(448);
+    expect(points.length).toBeGreaterThanOrEqual(arrowVertices.length);
+    expect(data).not.toMatch(/NaN|Infinity/);
+    for (const vertex of arrowVertices) {
+      expect(points.some((point) => pointIsClose(point, vertex, 0.001))).toBe(true);
+    }
+  });
+
   it("warps arrow points along an inside and outside turn", () => {
     const clockwise = createFlowPath([{ x: 0, y: 0 }, { x: 3, y: 0 }, { x: 3, y: 2 }]);
     const counterClockwise = createFlowPath([{ x: 3, y: 2 }, { x: 3, y: 0 }, { x: 0, y: 0 }]);

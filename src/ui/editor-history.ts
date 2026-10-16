@@ -16,14 +16,20 @@ export type HistoryAction =
 
 type ValuePair = readonly [unknown, unknown];
 
+function isReference(value: unknown): value is object {
+  return typeof value === "object" && value !== null || typeof value === "function";
+}
+
 function queueOwnValues(left: object, right: object, pending: ValuePair[]) {
   if (Array.isArray(left) !== Array.isArray(right)) { return false; }
   const prototype = Reflect.getPrototypeOf(left);
   if (prototype !== Reflect.getPrototypeOf(right) ||
-      (prototype !== null && prototype !== Object.prototype && prototype !== Array.prototype)) { return false; }
+      (left !== right && prototype !== null && prototype !== Object.prototype && prototype !== Array.prototype)) { return false; }
   const keys = Reflect.ownKeys(left);
-  if (keys.length !== Reflect.ownKeys(right).length) { return false; }
+  const rightKeys = new Set(Reflect.ownKeys(right));
+  if (keys.length !== rightKeys.size) { return false; }
   for (const key of keys) {
+    if (!rightKeys.has(key)) { return false; }
     const before = Reflect.getOwnPropertyDescriptor(left, key);
     const after = Reflect.getOwnPropertyDescriptor(right, key);
     if (!before || !after || before.enumerable !== after.enumerable || before.configurable !== after.configurable ||
@@ -44,7 +50,7 @@ function sameHistoryDocument(left: CircuitDocument, right: CircuitDocument) {
   try {
     while (pending.length > 0) {
       const [before, after] = pending.pop()!;
-      if (typeof before !== "object" || before === null || typeof after !== "object" || after === null) {
+      if (!isReference(before) || !isReference(after)) {
         if (!Object.is(before, after)) { return false; }
         continue;
       }
@@ -54,7 +60,9 @@ function sameHistoryDocument(left: CircuitDocument, right: CircuitDocument) {
       }
       leftReferences.set(before, after);
       rightReferences.set(after, before);
-      if (!Object.is(before, after) && !queueOwnValues(before, after, pending)) { return false; }
+      // Shared containers still need visiting: one of their children may also
+      // appear elsewhere, where an edit could have changed that alias.
+      if (!queueOwnValues(before, after, pending)) { return false; }
     }
     return true;
   } catch {

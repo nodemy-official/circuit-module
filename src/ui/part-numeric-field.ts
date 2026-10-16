@@ -6,10 +6,17 @@ export function partNumericField(part: CircuitPart, field: CircuitPartNumericFie
   if (part.kind !== "op-amp") { return field; }
   const defaults = circuitPartCatalog["op-amp"].defaults;
   if (field.key === "positiveRailVolts") {
-    return { ...field, min: (simulationRecordField(part, "negativeRailVolts") as number | undefined) ?? defaults.negativeRailVolts, exclusiveMin: true };
+    const opposite = simulationRecordField(part, "negativeRailVolts");
+    // An invalid source value must not remove every finite repair candidate.
+    const min = typeof opposite === "number" && Number.isFinite(opposite) && opposite < Number.MAX_VALUE
+      ? opposite : defaults.negativeRailVolts;
+    return { ...field, min, exclusiveMin: true };
   }
   if (field.key === "negativeRailVolts") {
-    return { ...field, max: (simulationRecordField(part, "positiveRailVolts") as number | undefined) ?? defaults.positiveRailVolts, exclusiveMax: true };
+    const opposite = simulationRecordField(part, "positiveRailVolts");
+    const max = typeof opposite === "number" && Number.isFinite(opposite) && opposite > -Number.MAX_VALUE
+      ? opposite : defaults.positiveRailVolts;
+    return { ...field, max, exclusiveMax: true };
   }
   return field;
 }

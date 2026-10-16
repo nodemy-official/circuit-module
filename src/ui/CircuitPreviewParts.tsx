@@ -2,6 +2,7 @@ import { useId, useState } from "react";
 import { circuitPartCatalog, circuitPartNumericFields, type CircuitDocument, type CircuitPart } from "../circuit-model.js";
 import type { CircuitAnalysis } from "../circuit-solver.js";
 import { formatCircuitQuantity } from "../circuit-visualization.js";
+import { simulationRecordField } from "../simulation-input.js";
 import { CircuitIcon } from "./CircuitIcon.js";
 import { getMeterDisplay } from "./CircuitMeterReadout.js";
 import { CircuitPartIcon } from "./CircuitPalette.js";
@@ -21,16 +22,16 @@ function partChanged(part: CircuitPart, initial?: CircuitPart) {
   if (!initial) { return true; }
   const defaults = circuitPartCatalog[part.kind].defaults;
   const numericChanged = circuitPartNumericFields(part.kind).some(({ key }) =>
-    !Object.is(part[key] ?? defaults[key], initial[key] ?? defaults[key]));
+    !Object.is(simulationRecordField(part, key) ?? defaults[key], simulationRecordField(initial, key) ?? defaults[key]));
   return numericChanged || (part.kind === "switch" &&
-    (part.initiallyClosed ?? defaults.initiallyClosed) !== (initial.initiallyClosed ?? defaults.initiallyClosed));
+    (simulationRecordField(part, "initiallyClosed") ?? defaults.initiallyClosed) !== (simulationRecordField(initial, "initiallyClosed") ?? defaults.initiallyClosed));
 }
 
 function setting(part: CircuitPart) {
   const fields = circuitPartNumericFields(part.kind);
   const field = part.kind === "led" ? fields.find(({ key }) => key === "ratedCurrentAmps") : fields[0];
   if (!field) { return; }
-  const value = part[field.key] ?? circuitPartCatalog[part.kind].defaults[field.key];
+  const value = (simulationRecordField(part, field.key) as number | undefined) ?? circuitPartCatalog[part.kind].defaults[field.key];
   return {
     label: field.label,
     value: field.unit === "°" ? `${value ?? "—"}°` : field.unit ? formatCircuitQuantity(value, field.unit) : String(value ?? "—"),
@@ -86,7 +87,7 @@ export function CircuitPreviewParts({ document, initialDocument, analysis, onIns
           {document.parts.map((part) => {
             const value = setting(part);
             const reading = analysis.parts[part.id];
-            const closed = reading?.switchClosed ?? part.initiallyClosed ?? circuitPartCatalog.switch.defaults.initiallyClosed ?? false;
+            const closed = reading?.switchClosed ?? (simulationRecordField(part, "initiallyClosed") as boolean | undefined) ?? circuitPartCatalog.switch.defaults.initiallyClosed ?? false;
             return <li className="circuit-preview-parts__card" key={part.id} data-part-id={part.id} data-kind={part.kind} data-changed={changedIds.has(part.id)}>
               <div className="circuit-preview-parts__identity">
                 <span className="circuit-preview-parts__icon"><CircuitPartIcon kind={part.kind} aria-hidden="true" /></span>

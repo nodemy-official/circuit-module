@@ -7,6 +7,7 @@ import { addExactRational, exactRationalToNumber, multiplyExactRational, numberT
 import { complexFromExact, exactComplexValue } from "../exact-numeric-state.js";
 import { formatCircuitNumber } from "../number-format.js";
 import { formatCircuitQuantity, type CircuitTransientFrame } from "../circuit-visualization.js";
+import { simulationRecordField } from "../simulation-input.js";
 import type { TransientPartReading, TransientSample } from "../transient-solver.js";
 import { matchingTransientEnergy, type TransientEnergySample } from "../transient-energy.js";
 
@@ -30,7 +31,7 @@ function storedEnergy(
 ): number | null {
   if (part.kind !== "capacitor" && part.kind !== "inductor") { return null; }
   const capacitive = part.kind === "capacitor";
-  const coefficient = capacitive ? part.capacitanceFarads ?? 1e-6 : part.inductanceHenries ?? 0.01;
+  const coefficient = (simulationRecordField(part, capacitive ? "capacitanceFarads" : "inductanceHenries") as number | undefined) ?? (capacitive ? 1e-6 : 0.01);
   const scalar = capacitive ? reading.voltageVolts : reading.currentAmps;
   if (!finite(coefficient) || coefficient < 0 || !finite(scalar)) { return null; }
   const phase = capacitive ? "voltagePhaseDegrees" in reading ? reading.voltagePhaseDegrees : undefined

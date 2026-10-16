@@ -149,7 +149,7 @@ export function useWireRouteDrag(options: WireRouteDragOptions) {
     current.onSelect?.(id);
     const axis = from.y === to.y ? "y" : "x";
     dragRef.current = {
-      ...initial, gesture: capture(), pointerId: event.pointerId, segmentIndex: index, origin,
+      ...initial, gesture: capture(`wire-route:${id}`), pointerId: event.pointerId, segmentIndex: index, origin,
       clientOrigin: { x: event.clientX, y: event.clientY },
       axis, coordinate: from[axis], lastCoordinate: from[axis], changed: false,
     };

@@ -2,6 +2,7 @@ import { GRID, type Point } from "../circuit-geometry.js";
 
 const FLOW_CORNER_TRIM = 12;
 const QUADRATIC_LUT_STEPS = 32;
+const MAX_ARROW_EDGE_STEPS = 64;
 const FLOW_ARROW_POINTS = [
   { x: -8, y: -8 },
   { x: -1, y: -8 },
@@ -258,6 +259,11 @@ export function flowArrowPath(
 ): string {
   const effectiveScale = Number.isFinite(scale) && scale > 0 ? scale : 1;
   const targetDistance = Number.isFinite(distance) ? distance : 0;
+  // Width tangents probe at most 8 + 10 scaled units from the anchor. When
+  // those distances overflow, retain the ordinary glyph's finite outline.
+  const sampleExtent = 18 * effectiveScale;
+  if (!Number.isFinite(sampleExtent) || !Number.isFinite(targetDistance - sampleExtent) ||
+      !Number.isFinite(targetDistance + sampleExtent)) { return arrowOutlinePath(FLOW_ARROW_POINTS); }
   const anchor = path.sample(targetDistance);
   // A secant keeps the scaled lane shift from reversing inside tight bends.
   const laneBefore = path.sample(targetDistance - 12 * effectiveScale);
@@ -298,21 +304,30 @@ export function flowArrowPath(
     const end = FLOW_ARROW_POINTS[(index + 1) % FLOW_ARROW_POINTS.length];
     if (!start || !end) { continue; }
     const edgeLength = Math.hypot(end.x - start.x, end.y - start.y) * effectiveScale;
-    const steps = Math.max(1, Math.ceil(edgeLength));
+    // CSS scale must not make one animation frame allocate an unbounded path.
+    // Retain every silhouette vertex while limiting interpolation per edge.
+    const steps = Math.min(MAX_ARROW_EDGE_STEPS, Math.max(1, Math.ceil(edgeLength)));
     for (let step = 0; step < steps; step++) {
       const fraction = step / steps;
       const point = anchorSample(
         start.x + (end.x - start.x) * fraction,
         start.y + (end.y - start.y) * fraction,
       );
-      vertices.push(toLocal(point));
+      const local = toLocal(point);
+      if (!Number.isFinite(local.x) || !Number.isFinite(local.y)) { return arrowOutlinePath(FLOW_ARROW_POINTS); }
+      vertices.push(local);
     }
   }
 
+  return arrowOutlinePath(vertices);
+}
+
+function arrowOutlinePath(vertices: readonly Vector[]) {
   const first = vertices[0];
   if (!first) { return ""; }
   const format = (value: number) => {
-    const rounded = Math.round(value * 1000) / 1000;
+    const scaled = value * 1000;
+    const rounded = Number.isFinite(scaled) ? Math.round(scaled) / 1000 : value;
     return Object.is(rounded, -0) ? "0" : String(rounded);
   };
   return `M ${format(first.x)} ${format(first.y)}${vertices.slice(1).map((point) => ` L ${format(point.x)} ${format(point.y)}`).join("")} Z`;

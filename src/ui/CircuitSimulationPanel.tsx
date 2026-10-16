@@ -38,30 +38,42 @@ function AnalysisSettings({
   onChange,
   frequency,
   acAvailable,
+  hasAcSource,
 }: {
   analysis: CircuitAnalysis;
   options: CircuitAnalysisOptions;
   onChange: (options: CircuitAnalysisOptions) => void;
   frequency: number;
   acAvailable: boolean;
+  hasAcSource: boolean;
 }) {
   const id = useId();
-  const acAnalysisSelected = analysis.mode === "ac" || options.mode === "ac";
+  const acAnalysisSelected = options.mode === "ac" ||
+    options.mode !== "dc" && (analysis.mode === "ac" || hasAcSource);
   const frequencyInput = useNumericDraft({
     value: frequency, min: 0, exclusiveMin: true,
     onValueChange: (value) => onChange({ ...options, mode: "ac", frequencyHz: value }),
   });
+  const changeMode = (mode: CircuitAnalysisOptions["mode"]) => {
+    const next = { ...options, mode };
+    // An invalid frequency is rejected in every mode, including DC. A mode
+    // change must allow recovery when its frequency input is not available.
+    if (next.frequencyHz !== undefined && (!Number.isFinite(next.frequencyHz) || next.frequencyHz <= 0)) {
+      next.frequencyHz = undefined;
+    }
+    onChange(next);
+  };
   return <>
     <div className="circuit-panel__heading"><h2>解析の設定</h2></div>
     {acAvailable || !acAnalysisSelected ? <>
       <label htmlFor={`${id}-mode`}>定常解析</label>
-      <NativeSelect id={`${id}-mode`} value={options.mode ?? "auto"} onChange={(event) => onChange({ ...options, mode: event.target.value as CircuitAnalysisOptions["mode"] })}>
+      <NativeSelect id={`${id}-mode`} value={options.mode ?? "auto"} onChange={(event) => changeMode(event.target.value as CircuitAnalysisOptions["mode"])}>
         <option value="auto">自動（電源に合わせる）</option>
         <option value="dc">直流・動作点</option>
         {acAvailable && <option value="ac">交流・小信号</option>}
       </NativeSelect>
     </> : <p>定常解析：交流・小信号</p>}
-    {analysis.mode === "ac" ? <>
+    {acAnalysisSelected ? <>
       {acAvailable && <>
         <label htmlFor={`${id}-frequency`}>解析周波数 (Hz)</label>
         <Input id={`${id}-frequency`} type="number" min="0" step="any" value={frequencyInput.text}
@@ -221,7 +233,7 @@ export function CircuitSimulationPanel({
   const ariaLabel = props["aria-label"] ?? (showAnalysisSettings ? "解析の設定" : "解析結果と学習ビュー");
   if (!showAnalysisSettings && !showTransient && !showEnergy && !showAc && !showComparison) { return null; }
   return <section {...props} className={`circuit-panel circuit-simulation ${className}`} aria-label={ariaLabel}>
-    {showAnalysisSettings && <AnalysisSettings analysis={analysis} options={options} onChange={onChange} frequency={frequency} acAvailable={resolveAcFeature(learningFeatures?.ac, document, analysis, options)} />}
+    {showAnalysisSettings && <AnalysisSettings analysis={analysis} options={options} onChange={onChange} frequency={frequency} acAvailable={resolveAcFeature(learningFeatures?.ac, document, analysis, options)} hasAcSource={source !== undefined} />}
     {switchStateUnavailable && <p role="alert">スイッチ状態を読み取れないため、過渡解析を開始できません。</p>}
     {(transientAvailable || showEnergy || showAc || showComparison) && <SimulationDocumentKeysContext.Provider value={learningDocumentKeys(
       document, documentKey, baselineDocument, baselineDocumentKey, transientAvailable, showComparison,

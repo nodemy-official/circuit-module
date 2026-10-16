@@ -362,6 +362,28 @@ describe("CircuitComparisonPanel", () => {
     expect(row.querySelector(".circuit-comparison__bar")).toBeNull();
   });
 
+  it.each([undefined, 50])("uses the own source frequency or catalog default when an AC baseline omits its frequency (%s)", (frequencyHz) => {
+    const source = part("source", "ac-source", "交流電源");
+    if (frequencyHz === undefined) { Reflect.deleteProperty(source, "frequencyHz"); }
+    else { source.frequencyHz = frequencyHz; }
+    const baselineDocument = documentOf([new Proxy(source, {
+      get(target, key, receiver) {
+        return key === "frequencyHz" ? 60 : Reflect.get(target, key, receiver);
+      },
+    })], "交流基準");
+    const expectedFrequency = frequencyHz ?? 1000;
+    const ui = mount({
+      document: documentOf([{ ...source }]),
+      analysis: analysis({ source: reading(5, 0.2, 1) }, { mode: "ac", frequencyHz: expectedFrequency }),
+      baselineDocument,
+      baselineAnalysis: analysis({ source: reading(5, 0.1, 0.5) }, { mode: "ac" }),
+    });
+
+    expect(ui.container.querySelector(".circuit-comparison")?.getAttribute("data-comparison-state")).toBe("ready");
+    expect(ui.container.querySelector(".circuit-comparison__baseline")?.textContent).toContain(`交流 ${expectedFrequency} Hz`);
+    expect(required<HTMLTableRowElement>(ui.container, 'tr[data-part-id="source"]').querySelectorAll("td")[2]?.textContent).toBe("0");
+  });
+
   it("does not compare transient instantaneous values with steady-state readings", () => {
     const transient = analysis({ r1: reading(3, 0.2, 0.6) }, { timeSeconds: 0.02 });
     const ui = mount({ document: afterDocument, analysis: transient, baselineDocument: beforeDocument, baselineAnalysis: beforeAnalysis });

@@ -2,16 +2,17 @@ import { useCallback, useReducer, useRef } from "react";
 import type { CircuitDocument } from "../circuit-model.js";
 import { useIsomorphicLayoutEffect } from "./useIsomorphicLayoutEffect.js";
 
-/** A getter also detects document replacement before a batched render commits. */
-export type DocumentGestureVersion = number | (() => number);
+/** A getter detects batched replacement and may also track cancellation of one edit group. */
+export type DocumentGestureVersion = number | ((group?: string) => number);
 
 export interface DocumentGestureToken {
   documentEpoch: number;
   version: number | undefined;
+  group?: string;
 }
 
-function versionOf(version?: DocumentGestureVersion) {
-  return typeof version === "function" ? version() : version;
+function versionOf(version?: DocumentGestureVersion, group?: string) {
+  return typeof version === "function" ? version(group) : version;
 }
 
 /** Distinguishes a gesture's own pending edits from changes made by its host. */
@@ -40,9 +41,10 @@ export function useDocumentGestureBoundary(document: CircuitDocument, documentVe
 
   // Starting a gesture may select its target synchronously. Capture after that
   // callback so only subsequent host commands invalidate the new gesture.
-  const capture = useCallback((): DocumentGestureToken => ({
+  const capture = useCallback((group?: string): DocumentGestureToken => ({
     documentEpoch: committed.current.documentEpoch,
-    version: versionOf(latestVersion.current),
+    version: versionOf(latestVersion.current, group),
+    group,
   }), []);
 
   const canStart = useCallback(() =>
@@ -50,7 +52,7 @@ export function useDocumentGestureBoundary(document: CircuitDocument, documentVe
   []);
 
   const isCurrent = useCallback((gesture: DocumentGestureToken) =>
-    gesture.documentEpoch === committed.current.documentEpoch && versionOf(latestVersion.current) === gesture.version,
+    gesture.documentEpoch === committed.current.documentEpoch && versionOf(latestVersion.current, gesture.group) === gesture.version,
   []);
 
   return { epoch, capture, canStart, markEdit, isCurrent };
