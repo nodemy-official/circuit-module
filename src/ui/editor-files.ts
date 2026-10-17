@@ -1,4 +1,4 @@
-import { useRef, useState, type ChangeEvent } from "react";
+import { useEffect, useRef, useState, type ChangeEvent } from "react";
 import { MAX_CIRCUIT_DOCUMENT_JSON_LENGTH } from "../circuit-serialization.js";
 import type { CircuitEditorController } from "./useCircuitEditor.js";
 
@@ -23,6 +23,8 @@ export function useCircuitFiles(editor: CircuitEditorController, onOpen: () => v
   const inputRef = useRef<HTMLInputElement>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const readGeneration = useRef(0);
+  useEffect(() => () => { readGeneration.current += 1; }, []);
 
   function save() {
     try {
@@ -37,16 +39,23 @@ export function useCircuitFiles(editor: CircuitEditorController, onOpen: () => v
     const file = event.currentTarget.files?.[0];
     event.currentTarget.value = "";
     if (!file) { return; }
+    const generation = ++readGeneration.current;
     setLoading(true);
     setError(null);
     try {
       // UTF-8 can use up to four bytes per character; the parser also limits characters.
       if (file.size > MAX_CIRCUIT_DOCUMENT_JSON_LENGTH * 4) { throw new Error("回路ファイルが大きすぎます。"); }
       const json = await file.text();
+      // The read belongs to its mounted layout and selected file. It must not
+      // overwrite a replacement layout or a later file selection.
+      if (generation !== readGeneration.current) { return; }
       if (editor.importDocument(json)) { onOpen(); }
     } catch {
+      if (generation !== readGeneration.current) { return; }
       setError("回路ファイルを読み込めませんでした。ファイルのサイズと内容を確認してください。");
-    } finally { setLoading(false); }
+    } finally {
+      if (generation === readGeneration.current) { setLoading(false); }
+    }
   }
 
   function newDocument() {

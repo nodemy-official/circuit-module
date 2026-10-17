@@ -440,6 +440,22 @@ describe("manual wire routing", () => {
     expect(isOrthogonal(moved)).toBe(true);
   });
 
+  it.each(([0, 90, 180, 270] as CircuitRotation[]).flatMap((rotation) =>
+    [false, true].map((reversed) => ({ rotation, reversed })),
+  ))("keeps a short terminal lead unchanged at its existing coordinate (rotation=$rotation, reversed=$reversed)", ({ rotation, reversed }) => {
+    const source: CircuitPart = { id: "source", kind: "resistor", x: 0, y: 0, rotation, label: "R" };
+    const target: CircuitPart = { id: "target", kind: "junction", ...rotate({ x: 2.5, y: 0 }, rotation), label: "J" };
+    const sourceEnd = routeEnd(source, "b");
+    const targetEnd = routeEnd(target, "a");
+    const start = reversed ? targetEnd : sourceEnd;
+    const end = reversed ? sourceEnd : targetEnd;
+    const route = routeWire(start, end);
+    const coordinate = route[0]!.y === route[1]!.y ? route[0]!.y : route[0]!.x;
+
+    expect(route).toHaveLength(2);
+    expect(moveWireSegment(route, 0, coordinate, start, end)).toEqual(route);
+  });
+
   it("creates a movable dog-leg for a one-segment junction wire", () => {
     const route = [{ x: 0, y: 0 }, { x: 5, y: 0 }];
     const moved = moveWireSegment(route, 0, 2);

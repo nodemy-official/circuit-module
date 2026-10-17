@@ -73,7 +73,12 @@ function large(value: ExactRational) {
 }
 
 function expressionFor(value: ExactRational): Expression {
-  return expressions.get(value) ?? { operation: "literal", value };
+  // A caller can retain a mutable alias even though ExactRational is readonly.
+  // Provenance must preserve the operands at the time of the operation.
+  const direction = value.denominator < 0n ? -1n : 1n;
+  return expressions.get(value) ?? { operation: "literal", value: Object.freeze({
+    numerator: direction * value.numerator, denominator: direction * value.denominator,
+  }) };
 }
 
 /** Symbolic unscaled RHS, separate from Bareiss's common integer denominator. */

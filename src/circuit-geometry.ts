@@ -287,7 +287,8 @@ export function moveWireSegment(
   if (!first || !last) { return unchanged(); }
   const horizontal = first.y === last.y;
   const vertical = first.x === last.x;
-  if ((!horizontal && !vertical) || (first.x === last.x && first.y === last.y)) { return unchanged(); }
+  if ((!horizontal && !vertical) || (first.x === last.x && first.y === last.y) ||
+    coordinate === (horizontal ? first.y : first.x)) { return unchanged(); }
 
   const moveToLane = (point: Point): Point => horizontal
     ? { x: point.x, y: coordinate }
@@ -973,7 +974,7 @@ export function compactWireRouteWaypoints(route: readonly Point[], start: RouteE
     // An empty list selects automatic routing, which may detour around a wire added before this
     // split segment. Keep one anchor even for a straight segment; use the outward stub where a
     // component terminal needs it, and the endpoint itself where a junction has no fixed lead.
-    const anchor = stub(start, end.direction ? undefined : end.point);
+    const anchor = facingLeads(start, end)?.first ?? stub(start, end.direction ? undefined : end.point);
     const restored = routeThroughWaypoints(start, end, [anchor]);
     return equalRoutes(restored, rendered) ? [anchor] : original;
   }

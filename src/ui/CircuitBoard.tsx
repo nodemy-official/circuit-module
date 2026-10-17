@@ -1579,12 +1579,7 @@ export function CircuitBoard({
     if (!gesture || gesture.pointerId !== event.pointerId) { return; }
     readOnlyPartGestureRef.current = null;
     if (!gesture.moved) { return; }
-    draggedRef.current = true;
-    if (clearDragClickTimer.current !== null) { clearTimeout(clearDragClickTimer.current); }
-    clearDragClickTimer.current = setTimeout(() => {
-      draggedRef.current = false;
-      clearDragClickTimer.current = null;
-    }, 0);
+    finishWireRoutePointer(true);
   }
 
   function trackTouchStart(event: PointerEvent<SVGSVGElement>) {
@@ -2059,7 +2054,10 @@ export function CircuitBoard({
           finishDrag(event);
         }}
         onPointerCancel={(event) => {
-          if (readOnlyPartGestureRef.current?.pointerId === event.pointerId) { readOnlyPartGestureRef.current = null; }
+          if (readOnlyPartGestureRef.current?.pointerId === event.pointerId) {
+            readOnlyPartGestureRef.current = null;
+            finishWireRoutePointer(true);
+          }
           if (connectionDragRef.current?.pointerId === event.pointerId) { cancelConnectionDrag(); }
           finishDrag(event);
         }}

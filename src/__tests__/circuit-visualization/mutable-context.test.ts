@@ -1,6 +1,6 @@
 import { expect, it } from "vitest";
 
-import { analyzeCircuit } from "../../circuit-solver.js";
+import { analyzeCircuit, type CircuitAnalysis } from "../../circuit-solver.js";
 import { circuitNodes, circuitPotential, type CircuitPotentialContext } from "../../circuit-visualization.js";
 import type { CircuitDocument } from "../../circuit-model.js";
 import type { CircuitExactComplex, CircuitExactNormalizedTerm } from "../../circuit-reading.js";
@@ -29,6 +29,35 @@ function nodeAt(nodes: ReturnType<typeof circuitNodes>, partId: string, terminal
     endpoint.partId === partId && endpoint.terminal === terminal,
   ));
 }
+
+it.each((["invalid", "short", "empty"] as const).flatMap((status) =>
+  [false, true].map((ac) => ({ status, ac })),
+))("discards old explicit nodes when a reused context becomes $status (AC: $ac)", ({ status, ac }) => {
+  const sourceDocument: CircuitDocument = {
+    title: "Updated analysis status",
+    parts: [{ id: "source", kind: ac ? "ac-source" : "battery", x: 0, y: 0, voltageVolts: 5, frequencyHz: 50 }],
+    wires: [],
+  };
+  const analysis = analyzeCircuit(sourceDocument);
+  const nodes = circuitNodes(sourceDocument, analysis);
+  const from = nodeAt(nodes, "source", "a");
+  const reference = nodeAt(nodes, "source", "b");
+  const context: CircuitPotentialContext = { document: sourceDocument, analysis, nodes };
+  expect(circuitPotential(from, reference, ac, context)?.volts).toBe(5);
+
+  analysis.status = status;
+
+  expect(circuitNodes(sourceDocument, analysis)).toEqual([]);
+  expect(circuitPotential(from, reference, ac, context)).toBeNull();
+  // A caller may also retain node arguments while allowing the context to
+  // build its own graph. That fallback must obey the current analysis status.
+  Reflect.deleteProperty(context, "nodes");
+  expect(circuitPotential(from, reference, ac, context)).toBeNull();
+  for (const validStatus of ["open", "idle", "closed"] satisfies CircuitAnalysis["status"][]) {
+    analysis.status = validStatus;
+    expect(circuitPotential(from, reference, ac, context)?.volts).toBe(5);
+  }
+});
 
 it("rebuilds cached precise paths when a reused context receives a new analysis", () => {
   const firstAnalysis = analyzeCircuit(document);

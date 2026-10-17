@@ -51,6 +51,10 @@ export const circuitEndpointKey = (endpoint: CircuitEndpoint) => JSON.stringify(
 const sourceKinds = new Set(["battery", "ac-source", "current-source"]);
 const finite = (value: number | undefined): value is number => value !== undefined && Number.isFinite(value);
 
+function hasNodeReadings(analysis: CircuitAnalysis) {
+  return analysis.status !== "invalid" && analysis.status !== "short" && analysis.status !== "empty";
+}
+
 function transientFrameParts(document: CircuitDocument, sample: TransientAnalysis["samples"][number], expressions?: readonly ExactExpressionNode[]) {
   const parts = Object.create(null) as Record<string, CircuitPartReading>;
   for (const part of document.parts) {
@@ -380,7 +384,7 @@ function markImplicitSupplyReturn(document: CircuitDocument, nodes: CircuitNode[
 
 /** Merge ideal-wire endpoints, retaining terminal currents instead of inventing currents in wire loops. */
 export function circuitNodes(document: CircuitDocument, analysis: CircuitAnalysis): CircuitNode[] {
-  if (analysis.status === "invalid" || analysis.status === "short" || analysis.status === "empty") { return []; }
+  if (!hasNodeReadings(analysis)) { return []; }
   const endpoints = document.parts.flatMap((part) => terminalsOf(part.kind).map((terminal) => ({ partId: part.id, terminal })));
   const keys = endpoints.map(circuitEndpointKey);
   const nets = nodeGroups(keys);
@@ -986,17 +990,17 @@ export function circuitPotential(
   ac: boolean,
   context?: CircuitPotentialContext,
 ) {
+  if (context && !hasNodeReadings(context.analysis)) { return null; }
   if (!node || !reference || node.referenceGroup !== reference.referenceGroup) { return null; }
   const precise = precisePartPotential(node, reference, context);
   if (precise) { return precise; }
   const expressions = readOptionalPrecision(() => context?.analysis.precisionExpressions);
+  if (!finite(node.voltageVolts) || !finite(reference.voltageVolts)) { return null; }
   if (!ac) {
-    if (!finite(node.voltageVolts) || !finite(reference.voltageVolts)) { return null; }
     const difference = complexSubtract((context && restoredReadingComplex(readOptionalPrecision(() => node.exactVoltage), node.voltageVolts, undefined, false, expressions)) || complex(node.voltageVolts),
       (context && restoredReadingComplex(readOptionalPrecision(() => reference.exactVoltage), reference.voltageVolts, undefined, false, expressions)) || complex(reference.voltageVolts));
     return finitePotential(difference.real, 0);
   }
-  if (!finite(node.voltageVolts) || !finite(reference.voltageVolts)) { return null; }
   if (!finite(node.voltagePhaseDegrees) || !finite(reference.voltagePhaseDegrees)) { return null; }
   const first = (context && restoredReadingComplex(readOptionalPrecision(() => node.exactVoltage), node.voltageVolts, node.voltagePhaseDegrees, true, expressions)) || phasor(node.voltageVolts, node.voltagePhaseDegrees);
   const second = (context && restoredReadingComplex(readOptionalPrecision(() => reference.exactVoltage), reference.voltageVolts, reference.voltagePhaseDegrees, true, expressions)) || phasor(reference.voltageVolts, reference.voltagePhaseDegrees);

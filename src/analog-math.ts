@@ -35,8 +35,8 @@ export interface ComplexValue {
 
 export const complex = (real = 0, imaginary = 0): ComplexValue => ({ real, imaginary });
 
-const ONE: ExactRational = { numerator: 1n, denominator: 1n };
-const ZERO: ExactRational = { numerator: 0n, denominator: 1n };
+const ONE: ExactRational = Object.freeze({ numerator: 1n, denominator: 1n });
+const ZERO: ExactRational = Object.freeze({ numerator: 0n, denominator: 1n });
 const magnitudeNormalizations = new WeakMap<ComplexValue, { squared: ExactRational; real: number; imaginary: number }>();
 export interface NormalizedTerm {
   coefficient: ExactComplexValue;
@@ -55,12 +55,24 @@ function storedNormalizedFraction(value: ComplexValue) {
   normalizedFractions.delete(value);
 }
 
-/** Preserve algebraic provenance when rectangular expansions are transported. */
+function snapshotNormalizedTerms(terms: readonly NormalizedTerm[]) {
+  return terms.map(({ coefficient, squared }) => ({
+    coefficient: {
+      real: addExactRational(coefficient.real, ZERO),
+      imaginary: addExactRational(coefficient.imaginary, ZERO),
+    },
+    squared: addExactRational(squared, ZERO),
+  }));
+}
+
+/** Transport algebraic provenance without exposing mutable internal terms. */
 export function complexNormalizedFraction(value: ComplexValue): NormalizedFraction | undefined {
   const fraction = storedNormalizedFraction(value);
-  if (fraction) { return fraction; }
+  if (fraction) {
+    return { numerator: snapshotNormalizedTerms(fraction.numerator), denominator: snapshotNormalizedTerms(fraction.denominator) };
+  }
   const terms = storedNormalizedTerms(value);
-  return terms ? { numerator: terms, denominator: [{ coefficient: { real: ONE, imaginary: ZERO }, squared: ONE }] } : undefined;
+  return terms ? { numerator: snapshotNormalizedTerms(terms), denominator: [{ coefficient: { real: ONE, imaginary: ZERO }, squared: ONE }] } : undefined;
 }
 
 function normalizedFraction(value: ComplexValue): NormalizedFraction | null {
@@ -371,8 +383,8 @@ function expandNormalizedFraction(fraction: NormalizedFraction, target: ExactRat
 }
 
 export function complexFromNormalizedFraction(input: NormalizedFraction, target = ONE): ComplexValue {
-  const numerator = compactNormalizedTerms(input.numerator);
-  const denominator = compactNormalizedTerms(input.denominator);
+  const numerator = compactNormalizedTerms(snapshotNormalizedTerms(input.numerator));
+  const denominator = compactNormalizedTerms(snapshotNormalizedTerms(input.denominator));
   if (denominator.length === 0) { return complex(Number.NaN, Number.NaN); }
   if (numerator.length === 0) { return complexFromNormalizedTerms([], target); }
   if (denominator.length === 1) {

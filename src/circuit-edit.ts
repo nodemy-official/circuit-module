@@ -61,10 +61,11 @@ function validCoordinate(point: Point | undefined): boolean {
 }
 
 const coordinateError = `座標は±${MAX_WIRE_COORDINATE}セル以内の有限な値で指定してください。`;
+const waypointCountError = `導線の経由点は${MAX_CIRCUIT_WIRE_WAYPOINTS}個以下にしてください。`;
 
 function waypointError(waypoints?: readonly Point[]): string | null {
   if (waypoints && waypoints.length > MAX_CIRCUIT_WIRE_WAYPOINTS) {
-    return `導線の経由点は${MAX_CIRCUIT_WIRE_WAYPOINTS}個以下にしてください。`;
+    return waypointCountError;
   }
   // Iteration visits sparse array slots, unlike some/every/map.
   for (const point of waypoints ?? []) {
@@ -497,9 +498,16 @@ export function setWireWaypoints(
 ): EditResult {
   const wire = document.wires.find((item) => item.id === wireId);
   if (!wire) { return { ok: false, reason: "導線が見つかりません。" }; }
-  const reason = waypointError(waypoints);
+  const count = waypoints?.length ?? 0;
+  if (count > MAX_CIRCUIT_WIRE_WAYPOINTS) { return { ok: false, reason: waypointCountError }; }
+  // Validate the same captured coordinates that will be compared and stored.
+  const points = Array.from({ length: count }, (_, index) => {
+    const point = waypoints![index]!;
+    return point && { x: point.x, y: point.y };
+  });
+  const reason = waypointError(points);
   if (reason) { return { ok: false, reason }; }
-  const nextPoints = waypoints && waypoints.length > 0 ? waypoints : undefined;
+  const nextPoints = points.length > 0 ? points : undefined;
   const unchanged = (wire.waypoints?.length ?? 0) === (nextPoints?.length ?? 0) &&
     (wire.waypoints ?? []).every((point, index) =>
       point.x === nextPoints?.[index]?.x && point.y === nextPoints?.[index]?.y,

@@ -9,6 +9,7 @@ import { CircuitPreviewPanel } from "./CircuitPreviewPanel.js";
 import { CircuitSimulationPanel } from "./CircuitSimulationPanel.js";
 import { Button, Dialog, DialogClose, DialogContent, DialogDescription, DialogTitle, Tabs, TabsContent, TabsList, TabsTrigger } from "./primitives.js";
 import type { ResolvedPreviewFeatures } from "./preview-features.js";
+import { previewPartChanged } from "./preview-part-changes.js";
 
 interface CircuitPreviewDialogProps {
   open: boolean;
@@ -36,7 +37,7 @@ export function CircuitPreviewDialog({
   const part = features.parts ? document.parts.find((item) => item.id === partId) : undefined;
   const changed = document.parts.filter((item) => {
     const initial = initialDocument.parts.find((candidate) => candidate.id === item.id);
-    return JSON.stringify(item) !== JSON.stringify(initial);
+    return previewPartChanged(item, initial);
   }).length;
   useEffect(() => {
     if (!open) { return; }

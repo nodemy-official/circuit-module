@@ -1,11 +1,42 @@
 import { describe, expect, it } from "vitest";
 
 import { connectToPoint, reconnectWireToPoint } from "../circuit-edit.js";
-import { compactWireRouteWaypoints, routeDocumentWires, routeEnd } from "../circuit-geometry.js";
-import { MAX_CIRCUIT_WIRE_WAYPOINTS, type CircuitDocument } from "../circuit-model.js";
+import { compactWireRouteWaypoints, rotate, routeDocumentWires, routeEnd } from "../circuit-geometry.js";
+import { MAX_CIRCUIT_WIRE_WAYPOINTS, type CircuitDocument, type CircuitRotation } from "../circuit-model.js";
 import { parseCircuitDocument, serializeCircuitDocument } from "../circuit-serialization.js";
 
 describe("wire split waypoint compaction", () => {
+  it.each(([0, 90, 180, 270] as CircuitRotation[]).flatMap((rotation) =>
+    [false, true].map((reversed) => ({ rotation, reversed })),
+  ))("pins a short straight route between facing terminals (rotation=$rotation, reversed=$reversed)", ({ rotation, reversed }) => {
+    const position = (x: number) => {
+      const point = rotate({ x, y: 0 }, rotation);
+      return { x: point.x + 10, y: point.y + 10 };
+    };
+    const source = { id: "source", kind: "resistor" as const, ...position(0), rotation, label: "R1" };
+    const target = { id: "target", kind: "resistor" as const, ...position(4.5), rotation, label: "R2" };
+    const sourceEndpoint = { partId: source.id, terminal: "b" as const };
+    const targetEndpoint = { partId: target.id, terminal: "a" as const };
+    const start = reversed ? routeEnd(target, "a") : routeEnd(source, "b");
+    const end = reversed ? routeEnd(source, "b") : routeEnd(target, "a");
+    const route = [start.point, end.point];
+    const waypoints = compactWireRouteWaypoints(route, start, end);
+    const document: CircuitDocument = {
+      title: "向かい合う短い端子リード",
+      parts: [source, target, { id: "tap", kind: "junction", ...position(2.25), label: "J" }],
+      wires: [
+        { id: "occupied", from: sourceEndpoint, to: { partId: "tap", terminal: "a" } },
+        { id: "wire", from: reversed ? targetEndpoint : sourceEndpoint, to: reversed ? sourceEndpoint : targetEndpoint, waypoints },
+      ],
+    };
+
+    expect(waypoints.length).toBeGreaterThan(0);
+    expect(routeDocumentWires(document).get("wire")).toEqual(route);
+    const restored = parseCircuitDocument(serializeCircuitDocument(document));
+    if (!restored.ok) { throw new Error(restored.reason); }
+    expect(routeDocumentWires(restored.document).get("wire")).toEqual(route);
+  });
+
   it.each([8, 4000])("keeps %s distant spans compact when an explicit pin anchor lies on a straight run", (spanCount) => {
     let seed = 123;
     let x = 0;

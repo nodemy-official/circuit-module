@@ -283,6 +283,37 @@ describe("CircuitBoard pan pointer capture", () => {
 });
 
 describe("CircuitBoard panning over read-only switches", () => {
+  it.each(["switch", "inspection", "switch with inspection"].flatMap((control) =>
+    ["mouse", "touch"].flatMap((pointerType) =>
+      ["pointercancel", "lostpointercapture", "drag"].map((end) => ({ control, pointerType, end }))),
+  ))("does not activate read-only $control after $end ($pointerType)", ({ control, pointerType, end }) => {
+    vi.useFakeTimers();
+    const onSwitchToggle = vi.fn();
+    const onInspectPart = vi.fn();
+    const controls = {
+      onSwitchToggle: control === "inspection" ? undefined : onSwitchToggle,
+      onInspectPart: control === "switch" ? undefined : onInspectPart,
+    };
+    renderBoard({ readOnly: true, ...controls });
+    const surface = required(".circuit-board__surface");
+    const part = required(`.circuit-board__part[data-kind="${control === "inspection" ? "resistor" : "switch"}"]`);
+    pointer(part, "pointerdown", 100, 1, { pointerType });
+    if (end === "drag") { pointer(surface, "pointermove", 108, 1, { pointerType }); }
+    pointer(surface, end === "drag" ? "pointerup" : end, 108, 1, { pointerType });
+    act(() => vi.advanceTimersByTime(400));
+    click(part);
+    act(() => vi.advanceTimersByTime(400));
+    expect(onSwitchToggle).not.toHaveBeenCalled();
+    expect(onInspectPart).not.toHaveBeenCalled();
+
+    pointer(part, "pointerdown", 100, 1, { pointerType });
+    pointer(surface, "pointerup", 100, 1, { pointerType });
+    click(part);
+    act(() => vi.advanceTimersByTime(400));
+    if (control === "inspection") { expect(onInspectPart).toHaveBeenCalledOnce(); }
+    else { expect(onSwitchToggle).toHaveBeenCalledOnce(); }
+  });
+
   it.each(["middle button", "Space", "hand tool"])("allows %s without toggling the switch", (gesture) => {
     const onSwitchToggle = vi.fn();
     renderBoard({ readOnly: true, onSwitchToggle, panMode: gesture === "hand tool" });

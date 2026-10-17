@@ -4,6 +4,34 @@ import { capturedExactReference, combineExactExpressionHandles, createExactExpre
 import { addExactRational, deferExactRationalReduction, divideExactRational, multiplyExactRational, numberToExactRational, solveExactComplexLinearSystem, solveExactRealLinearSystem, sumExactRationals, type ExactRational } from "../../exact-linear-algebra.js";
 import { complexFromExact, exactComplexValue } from "../../exact-numeric-state.js";
 
+it.each((["add", "sum", "handle"] as const).flatMap((source) => [1n, -1n].map((direction) => ({ source, direction }))))(
+  "snapshots caller-owned literal operands recorded through $source with denominator sign $direction",
+  ({ source, direction }) => {
+    const denominator = 2n ** 5000n;
+    const input = { numerator: direction * (denominator + 1n), denominator: direction * denominator };
+    const one = { numerator: 1n, denominator: 1n };
+    const capture = createExactExpressionCapture();
+    const reading = withExactExpressionCapture(capture, () => {
+      const handle = source === "handle"
+        ? combineExactExpressionHandles("add", exactExpressionHandle(input), exactExpressionHandle(one)) : undefined;
+      const result = source === "sum" ? sumExactRationals([input, one]) : addExactRational(input, one);
+      if (handle) { retainExactExpressionHandle(result, handle); }
+      input.numerator += denominator;
+      input.denominator *= 3n;
+      return retainedComplex(complexFromExact({ real: result, imaginary: { numerator: 0n, denominator: 1n } }))!;
+    });
+    const original = { reading, table: freezeCapturedExactExpressions(capture) };
+
+    for (const transported of [original, JSON.parse(JSON.stringify(original)) as typeof original, structuredClone(original)]) {
+      const value = restoredComplex(transported.reading, transported.table);
+      expect(value).toBeDefined();
+      const restored = exactComplexValue(value!)!.real;
+      // At the time of the operation: (d + 1) / d + 1 = (2d + 1) / d.
+      expect(restored.numerator * denominator).toBe((2n * denominator + 1n) * restored.denominator);
+    }
+  },
+);
+
 it.each(["divide", "sum", "alias", "retained"].flatMap((source) => [-1, 1].map((unitSign) => ({ source, unitSign }))))(
   "keeps a canonical unit from $source ($unitSign) independent of previous captures",
   ({ source, unitSign }) => {

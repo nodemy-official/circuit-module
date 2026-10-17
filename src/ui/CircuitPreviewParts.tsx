@@ -8,6 +8,7 @@ import { getMeterDisplay } from "./CircuitMeterReadout.js";
 import { CircuitPartIcon } from "./CircuitPalette.js";
 import { measurementLabels } from "./measurement-labels.js";
 import { Button } from "./primitives.js";
+import { previewPartChanged } from "./preview-part-changes.js";
 
 interface CircuitPreviewPartsProps {
   document: CircuitDocument;
@@ -16,15 +17,6 @@ interface CircuitPreviewPartsProps {
   onInspectPart: (id: string) => void;
   onSwitchToggle: (id: string) => void;
   onReset: () => void;
-}
-
-function partChanged(part: CircuitPart, initial?: CircuitPart) {
-  if (!initial) { return true; }
-  const defaults = circuitPartCatalog[part.kind].defaults;
-  const numericChanged = circuitPartNumericFields(part.kind).some(({ key }) =>
-    !Object.is(simulationRecordField(part, key) ?? defaults[key], simulationRecordField(initial, key) ?? defaults[key]));
-  return numericChanged || (part.kind === "switch" &&
-    (simulationRecordField(part, "initiallyClosed") ?? defaults.initiallyClosed) !== (simulationRecordField(initial, "initiallyClosed") ?? defaults.initiallyClosed));
 }
 
 function setting(part: CircuitPart) {
@@ -71,7 +63,7 @@ export function CircuitPreviewParts({ document, initialDocument, analysis, onIns
   const [expanded, setExpanded] = useState(false);
   const listId = useId();
   const initialParts = new Map(initialDocument.parts.map((part) => [part.id, part]));
-  const changedIds = new Set(document.parts.filter((part) => partChanged(part, initialParts.get(part.id))).map((part) => part.id));
+  const changedIds = new Set(document.parts.filter((part) => previewPartChanged(part, initialParts.get(part.id))).map((part) => part.id));
   if (document.parts.length === 0) { return null; }
   return <section className="circuit-preview-parts" aria-label="部品の操作と計測">
     <header className="circuit-preview-parts__heading">

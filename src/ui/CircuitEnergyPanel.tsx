@@ -120,6 +120,7 @@ function powerForPart(
   transient: boolean,
 ): number | null {
   if (!reading || part.kind === "ground" || part.kind === "junction" || !finite(reading.powerWatts)) { return null; }
+  if (reading.meterStatus === "floating" || reading.meterStatus === "unconnected") { return null; }
   const watts = transient && sourceKinds.has(part.kind) ? -reading.powerWatts : reading.powerWatts;
   return watts;
 }
