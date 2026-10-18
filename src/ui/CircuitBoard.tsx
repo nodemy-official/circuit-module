@@ -483,6 +483,7 @@ function handleCircuitPartClick(
   onPointerClick: ((event: MouseEvent<SVGGElement>, part: CircuitPart) => void) | undefined,
   pendingClick: { current: ReturnType<typeof setTimeout> | null },
   inspect: (element: SVGGElement) => void,
+  isCurrentDocument: () => boolean,
 ) {
   const switchCanToggle = canToggleReadOnlySwitch(part, readOnly, onSwitchToggle);
   if (readOnly && onInspectPart && switchCanToggle && event.detail > 0) {
@@ -490,7 +491,10 @@ function handleCircuitPartClick(
     if (pendingClick.current !== null) { clearTimeout(pendingClick.current); }
     if (event.detail === 1 && onSwitchToggle) {
       const toggleSwitch = onSwitchToggle;
-      pendingClick.current = setTimeout(() => { pendingClick.current = null; toggleSwitch(part.id); }, 350);
+      pendingClick.current = setTimeout(() => {
+        pendingClick.current = null;
+        if (isCurrentDocument()) { toggleSwitch(part.id); }
+      }, 350);
     }
     return;
   }
@@ -645,6 +649,9 @@ function CircuitPartDetail({ part, meter, slotProps }: {
 
 function CircuitPartArtwork({
   part,
+  documentEpoch,
+  captureDocumentGesture,
+  isDocumentCurrent,
   isSelected,
   isDragging,
   readOnly,
@@ -659,6 +666,9 @@ function CircuitPartArtwork({
   slotProps,
 }: {
   part: CircuitPart;
+  documentEpoch: number;
+  captureDocumentGesture: () => DocumentGestureToken;
+  isDocumentCurrent: (gesture: DocumentGestureToken) => boolean;
   isSelected: boolean;
   isDragging: boolean;
   readOnly: boolean;
@@ -676,7 +686,7 @@ function CircuitPartArtwork({
   const canDelaySwitchClick = readOnly && part.kind === "switch" && Boolean(onSwitchToggle) && Boolean(onInspectPart);
   useIsomorphicLayoutEffect(() => () => {
     if (pendingClick.current !== null) { clearTimeout(pendingClick.current); pendingClick.current = null; }
-  }, [canDelaySwitchClick]);
+  }, [canDelaySwitchClick, documentEpoch]);
   const inspect = (element: SVGGElement) => {
     if (!onInspectPart) { return; }
     if (pendingClick.current !== null) { clearTimeout(pendingClick.current); pendingClick.current = null; }
@@ -708,7 +718,11 @@ function CircuitPartArtwork({
       aria-haspopup={onInspectPart ? "dialog" : undefined}
       aria-keyshortcuts={inspectionAccessibility.keyShortcuts}
       onPointerDown={(event) => onPointerDown(event, part)}
-      onClick={(event) => handleCircuitPartClick(event, part, readOnly, onInspectPart, onSelectPart, onSwitchToggle, onPointerClick, pendingClick, inspect)}
+      onClick={(event) => {
+        const gesture = captureDocumentGesture();
+        handleCircuitPartClick(event, part, readOnly, onInspectPart, onSelectPart, onSwitchToggle, onPointerClick, pendingClick, inspect,
+          () => isDocumentCurrent(gesture));
+      }}
       onDoubleClick={onInspectPart ? (event) => { event.preventDefault(); event.stopPropagation(); inspect(event.currentTarget); } : undefined}
       onKeyDown={(event) => handleCircuitPartKeyDown(event, part, readOnly, onInspectPart, onSwitchToggle, inspect, onKeyDown)}
     >
@@ -1838,6 +1852,9 @@ export function CircuitBoard({
             <CircuitPartArtwork
               key={part.id}
               part={part}
+              documentEpoch={documentEpoch}
+              captureDocumentGesture={captureDocumentGesture}
+              isDocumentCurrent={isDocumentCurrent}
               isSelected={selectedParts.has(part.id)}
               isDragging={drag?.id === part.id}
               readOnly={readOnly}
@@ -1883,7 +1900,7 @@ export function CircuitBoard({
           )}
         </g>
     </>
-  ), [analysis, visualReadings, showFlow, flowDisplay, connectedTerminals, document.parts, document.wires, drag?.id, handlePartKeyDown, handlePartPointerClick, onSwitchToggle, readOnly,
+  ), [analysis, visualReadings, showFlow, flowDisplay, connectedTerminals, document.parts, document.wires, documentEpoch, captureDocumentGesture, isDocumentCurrent, drag?.id, handlePartKeyDown, handlePartPointerClick, onSwitchToggle, readOnly,
     onSelectPart, onInspectPart, chooseWire, chooseTerminal, pendingEndpoint, pendingWire, partsById, renderPart,
     selectedParts, selectedWires, slotProps, startDrag, startConnectionDrag, wireRoutes,
     canEditWireRoute, wireRouteDrag.start, wireRouteDrag.draggingWireId]);
@@ -1984,6 +2001,15 @@ export function CircuitBoard({
         height={size.height}
         role="group"
         aria-label={readOnly ? `${document.title}。ドラッグして表示位置を移動できます。` : `${document.title}。部品をドラッグして移動できます。`}
+        onKeyDownCapture={(event) => {
+          // Discrete activations must use the displayed document, just as a new drag does.
+          // Existing drags keep their own scoped token checks in their event handlers.
+          if (event.target !== event.currentTarget && !canStartDocumentGesture() &&
+              ["Enter", " ", "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) {
+            event.preventDefault();
+            event.stopPropagation();
+          }
+        }}
         onPointerDown={(event) => {
           const target = event.target;
           if (target instanceof SVGElement && target.hasAttribute("data-circuit-board-background")) { startPan(event); }
@@ -2069,6 +2095,7 @@ export function CircuitBoard({
           if (connectionDragRef.current?.pointerId === event.pointerId) { cancelConnectionDrag(); }
         }}
         onClickCapture={(event) => {
+          if (!canStartDocumentGesture()) { event.preventDefault(); event.stopPropagation(); return; }
           if ((event.detail > 0 && suppressPanActivationRef.current) || suppressPointerClickRef.current || suppressCancelledClickRef.current) {
             suppressPointerClickRef.current = false;
             suppressCancelledClickRef.current = false;
@@ -2092,7 +2119,7 @@ export function CircuitBoard({
           event.stopPropagation();
         }}
         onDoubleClickCapture={(event) => {
-          if (event.detail > 0 && suppressPanActivationRef.current) {
+          if (!canStartDocumentGesture() || (event.detail > 0 && suppressPanActivationRef.current)) {
             event.preventDefault();
             event.stopPropagation();
           }

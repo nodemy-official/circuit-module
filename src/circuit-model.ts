@@ -318,7 +318,8 @@ const partNumericKeys: Partial<Record<CircuitPartKind, readonly CircuitPartNumer
 /** Editable quantities and their domains, shared by forms and file validation. */
 export function circuitPartNumericFields(kind: CircuitPartKind): readonly CircuitPartNumericField[] {
   return (partNumericKeys[kind] ?? []).map((key) => {
-    const field = numericFields[key];
+    // Hosts may customize a form's fields without changing other forms or validation.
+    const field = { ...numericFields[key] };
     if (key !== "voltageVolts") { return field; }
     return kind === "ac-source"
       ? { ...field, label: "電圧（実効値）" }

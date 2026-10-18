@@ -539,7 +539,7 @@ describe("CircuitBoard selection and board gestures", () => {
     expect(surface.classList.contains("circuit-board__surface--pan-ready")).toBe(false);
   });
 
-  it.each(["editable", "toggle disabled", "inspection disabled", "part replaced"])("discards a pending switch toggle when its context becomes %s", (context) => {
+  it.each(["editable", "toggle disabled", "inspection disabled", "part replaced", "same-kind part replaced", "document replaced", "document version changed"])("discards a pending switch toggle when its context becomes %s", (context) => {
     try {
       vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
       const initial: CircuitDocument = {
@@ -554,6 +554,9 @@ describe("CircuitBoard selection and board gestures", () => {
       if (context === "editable") { ui.update({ readOnly: false }); }
       else if (context === "toggle disabled") { ui.update({ onSwitchToggle: undefined }); }
       else if (context === "inspection disabled") { ui.update({ onInspectPart: undefined }); }
+      else if (context === "same-kind part replaced") { ui.update({ document: { ...initial, parts: [{ ...initial.parts[0]!, initiallyClosed: true }] } }); }
+      else if (context === "document replaced") { ui.update({ document: { ...initial, title: "replacement" } }); }
+      else if (context === "document version changed") { ui.update({ documentVersion: 1 }); }
       else { ui.update({ document: { ...initial, parts: [{ ...initial.parts[0]!, kind: "resistor" }] } }); }
       act(() => vi.advanceTimersByTime(400));
       expect(onSwitchToggle).not.toHaveBeenCalled();
@@ -561,6 +564,87 @@ describe("CircuitBoard selection and board gestures", () => {
       dispatchClick(requiredElement(ui.container, '[data-part-id="switch"]'), { detail: 1 });
       act(() => vi.advanceTimersByTime(400));
       expect(onSwitchToggle).toHaveBeenCalledExactlyOnceWith("switch");
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("keeps a pending switch toggle across ordinary renders of the same document", () => {
+    try {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      const initial: CircuitDocument = {
+        title: "pending switch",
+        parts: [{ id: "switch", kind: "switch", label: "switch", x: 0, y: 0 }],
+        wires: [],
+      };
+      const onSwitchToggle = vi.fn();
+      const ui = mountBoard(initial, { readOnly: true, onSwitchToggle, onInspectPart: vi.fn() });
+      dispatchClick(requiredElement(ui.container, '[data-part-id="switch"]'), { detail: 1 });
+      ui.update({ showFlow: true });
+      act(() => vi.advanceTimersByTime(400));
+      expect(onSwitchToggle).toHaveBeenCalledExactlyOnceWith("switch");
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("checks the current document version before a delayed switch toggle without a render", () => {
+    try {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      const initial: CircuitDocument = {
+        title: "pending switch",
+        parts: [{ id: "switch", kind: "switch", label: "switch", x: 0, y: 0 }],
+        wires: [],
+      };
+      let version = 0;
+      const onSwitchToggle = vi.fn();
+      const ui = mountBoard(initial, { readOnly: true, documentVersion: () => version, onSwitchToggle, onInspectPart: vi.fn() });
+      dispatchClick(requiredElement(ui.container, '[data-part-id="switch"]'), { detail: 1 });
+      version += 1;
+      act(() => vi.advanceTimersByTime(400));
+      expect(onSwitchToggle).not.toHaveBeenCalled();
+
+      ui.update({ showFlow: true });
+      dispatchClick(requiredElement(ui.container, '[data-part-id="switch"]'), { detail: 1 });
+      act(() => vi.advanceTimersByTime(400));
+      expect(onSwitchToggle).toHaveBeenCalledExactlyOnceWith("switch");
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each(["delayed click", "immediate click", "Enter", "Space", "double click", "inspection key"])("rejects %s on a switch from before an uncommitted document version change", (activation) => {
+    try {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      const initial: CircuitDocument = {
+        title: "pending switch",
+        parts: [{ id: "switch", kind: "switch", label: "switch", x: 0, y: 0 }],
+        wires: [],
+      };
+      let version = 0;
+      const onSwitchToggle = vi.fn();
+      const onInspectPart = vi.fn();
+      const ui = mountBoard(initial, { readOnly: true, documentVersion: () => version, onSwitchToggle,
+        onInspectPart: activation === "immediate click" ? undefined : onInspectPart });
+      const activate = () => {
+        const part = requiredElement(ui.container, '[data-part-id="switch"]');
+        if (activation === "double click") {
+          act(() => part.dispatchEvent(new MouseEvent("dblclick", { bubbles: true, cancelable: true, detail: 2 })));
+        } else if (["Enter", "Space", "inspection key"].includes(activation)) {
+          act(() => part.dispatchEvent(new KeyboardEvent("keydown", {
+            key: activation === "Space" ? " " : "Enter", shiftKey: activation === "inspection key", bubbles: true, cancelable: true,
+          })));
+        } else { dispatchClick(part, { detail: 1 }); }
+        act(() => vi.advanceTimersByTime(400));
+      };
+      version += 1;
+      activate();
+      expect(onSwitchToggle).not.toHaveBeenCalled();
+      expect(onInspectPart).not.toHaveBeenCalled();
+
+      ui.update({ showFlow: true });
+      activate();
+      if (activation === "double click" || activation === "inspection key") {
+        expect(onInspectPart).toHaveBeenCalledExactlyOnceWith("switch");
+        expect(onSwitchToggle).not.toHaveBeenCalled();
+      } else {
+        expect(onSwitchToggle).toHaveBeenCalledExactlyOnceWith("switch");
+        expect(onInspectPart).not.toHaveBeenCalled();
+      }
     } finally { vi.useRealTimers(); }
   });
 
