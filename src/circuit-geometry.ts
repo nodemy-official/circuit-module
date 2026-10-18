@@ -861,8 +861,16 @@ function routeThroughWaypoints(start: RouteEnd, end: RouteEnd, waypoints: readon
   const terminalLeads: Point[][] = [];
   const protectedPins: Point[] = [];
   const facing = facingLeads(start, end);
-  const startStub = facing?.first ?? leadBeforeOtherPin(start, end, stub(start));
-  const endStub = facing?.last ?? leadBeforeOtherPin(end, start, stub(end));
+  // A persisted first/last anchor may be the bend of a shortened terminal lead.
+  // Splitting removes the old peer terminal, so recomputing only from the new
+  // endpoints would grow that lead through the old peer pin or component body.
+  const anchoredStub = (terminal: RouteEnd, waypoint: Point, fallback: Point) => {
+    const anchored = stub(terminal, waypoint);
+    const distance = (point: Point) => Math.abs(point.x - terminal.point.x) + Math.abs(point.y - terminal.point.y);
+    return distance(anchored) < distance(fallback) ? anchored : fallback;
+  };
+  const startStub = anchoredStub(start, firstWaypoint, facing?.first ?? leadBeforeOtherPin(start, end, stub(start)));
+  const endStub = anchoredStub(end, lastWaypoint, facing?.last ?? leadBeforeOtherPin(end, start, stub(end)));
   for (const [terminal, leadEnd] of [[start, startStub], [end, endStub]] as const) {
     if (terminal.direction) {
       terminalLeads.push([terminal.point, leadEnd]);

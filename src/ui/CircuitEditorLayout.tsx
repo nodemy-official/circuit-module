@@ -815,6 +815,7 @@ export function CircuitEditorLayout({
         document={previewDocument}
         initialDocument={editor.document}
         analysis={previewAnalysis}
+        displayAnalysis={sampledAnalysis ?? undefined}
         analysisProps={analysisProps}
         options={editor.analysisOptions}
         features={features}

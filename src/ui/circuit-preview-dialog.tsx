@@ -17,6 +17,7 @@ interface CircuitPreviewDialogProps {
   document: CircuitDocument;
   initialDocument: CircuitDocument;
   analysis: CircuitAnalysis;
+  displayAnalysis?: CircuitAnalysis;
   analysisProps?: Partial<CircuitAnalysisPanelProps>;
   options: CircuitAnalysisOptions;
   features: ResolvedPreviewFeatures;
@@ -31,7 +32,7 @@ interface CircuitPreviewDialogProps {
 
 /** The preview keeps experiments local; closing a dialog preserves its current values. */
 export function CircuitPreviewDialog({
-  open, partId, document, initialDocument, analysis, analysisProps, options, features, container, returnFocus,
+  open, partId, document, initialDocument, analysis, displayAnalysis = analysis, analysisProps, options, features, container, returnFocus,
   onOpenChange, onSelectPart, onChange, onOptionsChange, onReset,
 }: CircuitPreviewDialogProps) {
   const part = features.parts ? document.parts.find((item) => item.id === partId) : undefined;
@@ -70,13 +71,13 @@ export function CircuitPreviewDialog({
               partId={part.id}
               document={document}
               initialDocument={initialDocument}
-              analysis={analysis}
+              analysis={displayAnalysis}
               onChange={onChange}
               onReset={() => onReset(part.id)}
             />
           ) : (
             <>
-              {features.summary && <CircuitAnalysisPanel {...analysisProps} analysis={analysis} className={`circuit-preview-dialog__analysis ${analysisProps?.className ?? ""}`} />}
+              {features.summary && <CircuitAnalysisPanel {...analysisProps} analysis={displayAnalysis} className={`circuit-preview-dialog__analysis ${analysisProps?.className ?? ""}`} />}
               <Tabs key={`${features.parts}-${features.analysisSettings}`} defaultValue={features.parts ? "parts" : "analysis"}>
                 <TabsList aria-label="回路プレビューの設定">
                   {features.parts && <TabsTrigger value="parts">部品<span className="circuit-preview-dialog__count">{document.parts.length}</span></TabsTrigger>}
