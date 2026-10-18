@@ -93,6 +93,10 @@ function copyEndpoint(endpoint: CircuitEndpoint): CircuitEndpoint {
   return { partId: endpoint.partId, terminal: endpoint.terminal };
 }
 
+function copyPoint(point: Point): Point {
+  return { x: point.x, y: point.y };
+}
+
 /** Whether the candidates fit among the document's other parts. */
 export function canPlace(document: CircuitDocument, candidates: readonly CircuitPart[]) {
   const moving = new Set(candidates.map((part) => part.id));
@@ -107,6 +111,7 @@ export function canPlace(document: CircuitDocument, candidates: readonly Circuit
 
 /** Nearest free cell for a new part, searching outwards in rings. */
 export function findFreeSpot(document: CircuitDocument, kind: CircuitPartKind, near: Point): Point {
+  const center = copyPoint(near);
   const probeId = nextId("part", document.parts.map((part) => part.id));
   const probe = (x: number, y: number): CircuitPart => ({
     id: probeId,
@@ -119,12 +124,12 @@ export function findFreeSpot(document: CircuitDocument, kind: CircuitPartKind, n
     for (let dy = -ring; dy <= ring; dy += 1) {
       for (let dx = -ring; dx <= ring; dx += 1) {
         if (Math.max(Math.abs(dx), Math.abs(dy)) !== ring) { continue; }
-        const candidate = probe(near.x + dx * 2, near.y + dy * 2);
+        const candidate = probe(center.x + dx * 2, center.y + dy * 2);
         if (canPlace(document, [candidate])) { return { x: candidate.x, y: candidate.y }; }
       }
     }
   }
-  return near;
+  return center;
 }
 
 export function addPart(
@@ -132,7 +137,9 @@ export function addPart(
   kind: CircuitPartKind,
   at: Point,
 ): EditResult<{ id: string }> {
-  if (!validCoordinate(at)) { return { ok: false, reason: coordinateError }; }
+  if (!at) { return { ok: false, reason: coordinateError }; }
+  const point = copyPoint(at);
+  if (!validCoordinate(point)) { return { ok: false, reason: coordinateError }; }
   const id = nextId(
     "part",
     document.parts.map((existingPart) => existingPart.id),
@@ -140,8 +147,8 @@ export function addPart(
   const part: CircuitPart = {
     id,
     kind,
-    x: at.x,
-    y: at.y,
+    x: point.x,
+    y: point.y,
     ...circuitPartCatalog[kind].defaults,
     label: nextLabel(document, kind),
   };
@@ -471,7 +478,7 @@ export function connect(
   to: CircuitEndpoint,
 ): EditResult<{ id: string }> {
   const fromEndpoint = copyEndpoint(from);
-  const toEndpoint = copyEndpoint(to);
+  const toEndpoint = from === to ? fromEndpoint : copyEndpoint(to);
   const reason = connectionError(document, fromEndpoint, toEndpoint);
   if (reason) { return { ok: false, reason }; }
   const id = nextId(
@@ -498,12 +505,22 @@ export function setWireWaypoints(
 ): EditResult {
   const wire = document.wires.find((item) => item.id === wireId);
   if (!wire) { return { ok: false, reason: "導線が見つかりません。" }; }
-  const count = waypoints?.length ?? 0;
+  if (waypoints !== undefined && !Array.isArray(waypoints)) {
+    return { ok: false, reason: "導線の経由点は座標の配列で指定してください。" };
+  }
+  const count = waypoints === undefined ? 0 : waypoints.length;
+  if (!Number.isInteger(count) || count < 0) {
+    return { ok: false, reason: "導線の経由点数は0以上の整数で指定してください。" };
+  }
   if (count > MAX_CIRCUIT_WIRE_WAYPOINTS) { return { ok: false, reason: waypointCountError }; }
   // Validate the same captured coordinates that will be compared and stored.
+  const snapshots = new Map<Point, Point>();
   const points = Array.from({ length: count }, (_, index) => {
     const point = waypoints![index]!;
-    return point && { x: point.x, y: point.y };
+    if (!point) { return point; }
+    const captured = snapshots.get(point) ?? copyPoint(point);
+    snapshots.set(point, captured);
+    return captured;
   });
   const reason = waypointError(points);
   if (reason) { return { ok: false, reason }; }
@@ -583,10 +600,11 @@ export function reconnectWire(
 
 /** Terminal whose position is exactly this cell, if any. */
 export function terminalAt(document: CircuitDocument, point: Point): CircuitEndpoint | null {
+  const target = copyPoint(point);
   for (const part of document.parts) {
     for (const terminal of terminalsOf(part.kind)) {
       const position = terminalPoint(part, terminal);
-      if (position.x === point.x && position.y === point.y) { return { partId: part.id, terminal }; }
+      if (position.x === target.x && position.y === target.y) { return { partId: part.id, terminal }; }
     }
   }
   return null;
@@ -618,22 +636,24 @@ export function connectToPoint(
   from: CircuitEndpoint,
   point: Point,
 ): EditResult<{ id: string }> {
-  const prepared = preparePointConnection(document, point, terminalAt(document, point));
+  const fromEndpoint = copyEndpoint(from);
+  const target = copyPoint(point);
+  const prepared = preparePointConnection(document, target, terminalAt(document, target));
   if (!prepared.ok) { return prepared; }
   const { document: baseDocument, endpoint, crossedWires } = prepared;
-  if (crossedWires.length === 0) { return connect(baseDocument, from, endpoint); }
-  if (sameEndpoint(from, endpoint)) {
-    return connect(document, from, endpoint);
+  if (crossedWires.length === 0) { return connect(baseDocument, fromEndpoint, endpoint); }
+  if (sameEndpoint(fromEndpoint, endpoint)) {
+    return connect(document, fromEndpoint, endpoint);
   }
 
   const { document: splitDocument, splitWires } = splitWiresAtJunction(baseDocument, crossedWires, endpoint);
   const splitIssue = wireWaypointError(splitWires);
   if (splitIssue) { return { ok: false, reason: splitIssue }; }
   const attached = splitWires.find(
-    (wire) => sameEndpoint(wire.from, from) || sameEndpoint(wire.to, from),
+    (wire) => sameEndpoint(wire.from, fromEndpoint) || sameEndpoint(wire.to, fromEndpoint),
   );
   if (attached) { return { ok: true, id: attached.id, document: splitDocument }; }
-  return connect(splitDocument, from, endpoint);
+  return connect(splitDocument, fromEndpoint, endpoint);
 }
 
 /** Reconnects one wire end to a terminal or point on the board, splitting crossed wires. */
@@ -646,11 +666,12 @@ export function reconnectWireToPoint(
   const wire = document.wires.find((item) => item.id === wireId);
   if (!wire) { return { ok: false, reason: "導線が見つかりません。" }; }
 
+  const target = copyPoint(point);
   const current = wire[end];
-  const existing = terminalAt(document, point);
+  const existing = terminalAt(document, target);
   if (existing && sameEndpoint(current, existing)) { return { ok: true, id: wireId, document }; }
 
-  const prepared = preparePointConnection(document, point, existing, wireId);
+  const prepared = preparePointConnection(document, target, existing, wireId);
   if (!prepared.ok) { return prepared; }
   const { document: baseDocument, endpoint, crossedWires } = prepared;
   const reconnected = reconnectWire(baseDocument, wireId, end, endpoint);

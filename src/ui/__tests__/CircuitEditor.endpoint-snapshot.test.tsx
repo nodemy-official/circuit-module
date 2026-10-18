@@ -47,6 +47,30 @@ function mount() {
 }
 
 describe("editor connection endpoint snapshots", () => {
+  it.each(["partId", "terminal"] as const)("uses one captured target %s when finishing a connection", (field) => {
+    const ui = mount();
+    const initial = ui.editor.document;
+    act(() => ui.editor.startConnection({ partId: "a", terminal: "a" }));
+    const target: CircuitEndpoint = { partId: field === "partId" ? "c" : "a", terminal: field === "terminal" ? "b" : "a" };
+    const expected = { ...target };
+    let reads = 0;
+    Object.defineProperty(target, field, {
+      get() { reads += 1; return reads === 1 ? expected[field] : field === "partId" ? "missing" : "c"; },
+    });
+
+    act(() => ui.editor.chooseTerminal(target));
+
+    expect(ui.editor.error).toBeNull();
+    expect(ui.editor.pendingEndpoint).toBeNull();
+    expect(ui.editor.document.wires.at(-1)?.to).toEqual(expected);
+    expect(reads).toBe(1);
+    const connected = ui.editor.document;
+    act(() => ui.editor.undo());
+    expect(ui.editor.document).toBe(initial);
+    act(() => ui.editor.redo());
+    expect(ui.editor.document).toBe(connected);
+  });
+
   it.each(["startConnection", "chooseTerminal"] as const)("captures the caller endpoint when starting with %s", (command) => {
     const ui = mount();
     const initial = ui.editor.document;

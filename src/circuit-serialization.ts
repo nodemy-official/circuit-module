@@ -56,13 +56,23 @@ const allNumericKeys = new Set<CircuitPartNumericKey>(
 );
 const savedPartKeys = ["id", "kind", "x", "y", "label", "rotation", "initiallyClosed", ...allNumericKeys];
 
+type SavedSnapshot = WeakMap<object, Map<string, PropertyDescriptor | undefined>>;
+
+/** Shared records and arrays must describe one value throughout a save. */
+function savedDescriptor(value: object, key: string, snapshot: SavedSnapshot) {
+  let fields = snapshot.get(value);
+  if (!fields) { fields = new Map(); snapshot.set(value, fields); }
+  if (!fields.has(key)) { fields.set(key, Object.getOwnPropertyDescriptor(value, key)); }
+  return fields.get(key);
+}
+
 /** Capture only persisted own data fields; unknown getters and Proxy get traps never run. */
-function snapshotSavedRecord(value: unknown, keys: readonly string[]): Record<string, unknown> | null {
+function snapshotSavedRecord(value: unknown, keys: readonly string[], snapshot: SavedSnapshot): Record<string, unknown> | null {
   try {
     if (typeof value !== "object" || value === null || Array.isArray(value)) { return null; }
     const entries: [string, unknown][] = [];
     for (const key of keys) {
-      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      const descriptor = savedDescriptor(value, key, snapshot);
       if (descriptor && !Object.hasOwn(descriptor, "value")) { return null; }
       // Include missing fields as undefined so inherited values cannot fill them.
       entries.push([key, descriptor?.value]);
@@ -74,16 +84,16 @@ function snapshotSavedRecord(value: unknown, keys: readonly string[]): Record<st
 }
 
 /** Read array length and indexes directly so caller iterators and indexed accessors cannot run. */
-function snapshotSavedArray(value: unknown, max: number, arrayError: string, limitError: string): { values?: unknown[]; reason?: string } {
+function snapshotSavedArray(value: unknown, max: number, arrayError: string, limitError: string, snapshot: SavedSnapshot): { values?: unknown[]; reason?: string } {
   try {
     if (!Array.isArray(value)) { return { reason: arrayError }; }
-    const lengthDescriptor = Object.getOwnPropertyDescriptor(value, "length");
+    const lengthDescriptor = savedDescriptor(value, "length", snapshot);
     const length: unknown = lengthDescriptor && Object.hasOwn(lengthDescriptor, "value") ? lengthDescriptor.value : undefined;
     if (typeof length !== "number" || !Number.isInteger(length) || length < 0) { return { reason: arrayError }; }
     if (length > max) { return { reason: limitError }; }
     const values: unknown[] = [];
     for (let index = 0; index < length; index += 1) {
-      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+      const descriptor = savedDescriptor(value, String(index), snapshot);
       if (!descriptor || !Object.hasOwn(descriptor, "value")) { return { reason: arrayError }; }
       values.push(descriptor.value);
     }
@@ -133,8 +143,9 @@ function validateEndpoint(
   value: unknown,
   side: string,
   partsById: ReadonlyMap<string, CircuitPart>,
+  snapshot: SavedSnapshot,
 ): { endpoint?: CircuitEndpoint; reason?: string } {
-  const candidate = snapshotSavedRecord(value, ["partId", "terminal"]);
+  const candidate = snapshotSavedRecord(value, ["partId", "terminal"], snapshot);
   if (!candidate) { return { reason: `${side}の接続先の形式が正しくありません。` }; }
   const { partId, terminal } = candidate;
   const id = simulationIdentifierSchema.safeParse(partId);
@@ -205,9 +216,10 @@ function normalizePart(
   value: unknown,
   index: number,
   ids: Set<string>,
+  snapshot: SavedSnapshot,
 ): { part?: CircuitPart; reason?: string } {
   const label = `部品${index + 1}`;
-  const candidate = snapshotSavedRecord(value, savedPartKeys);
+  const candidate = snapshotSavedRecord(value, savedPartKeys, snapshot);
   if (!candidate) { return { reason: `${label}の形式が正しくありません。` }; }
   const idIssue = checkString(candidate.id, `${label}の ID`, false);
   if (idIssue) { return { reason: idIssue }; }
@@ -233,29 +245,29 @@ function normalizePart(
   return { part };
 }
 
-function normalizeParts(value: unknown): { parts?: CircuitPart[]; reason?: string } {
+function normalizeParts(value: unknown, snapshot: SavedSnapshot): { parts?: CircuitPart[]; reason?: string } {
   const captured = snapshotSavedArray(value, MAX_CIRCUIT_DOCUMENT_PARTS,
-    "部品一覧は配列で指定してください。", `部品数は${MAX_CIRCUIT_DOCUMENT_PARTS}個以下にしてください。`);
+    "部品一覧は配列で指定してください。", `部品数は${MAX_CIRCUIT_DOCUMENT_PARTS}個以下にしてください。`, snapshot);
   if (!captured.values) { return { reason: captured.reason }; }
   const ids = new Set<string>();
   const parts: CircuitPart[] = [];
   for (const [index, candidate] of captured.values.entries()) {
-    const result = normalizePart(candidate, index, ids);
+    const result = normalizePart(candidate, index, ids, snapshot);
     if (result.reason) { return { reason: result.reason }; }
     if (result.part) { parts.push(result.part); }
   }
   return { parts };
 }
 
-function normalizeWireWaypoints(value: unknown, label: string): { waypoints?: { x: number; y: number }[]; reason?: string } {
+function normalizeWireWaypoints(value: unknown, label: string, snapshot: SavedSnapshot): { waypoints?: { x: number; y: number }[]; reason?: string } {
   if (value === undefined) { return {}; }
   const captured = snapshotSavedArray(value, MAX_CIRCUIT_DOCUMENT_WIRE_WAYPOINTS,
-    `${label}の経由点は配列で指定してください。`, `${label}の経由点は${MAX_CIRCUIT_DOCUMENT_WIRE_WAYPOINTS}個以下にしてください。`);
+    `${label}の経由点は配列で指定してください。`, `${label}の経由点は${MAX_CIRCUIT_DOCUMENT_WIRE_WAYPOINTS}個以下にしてください。`, snapshot);
   if (!captured.values) { return { reason: captured.reason }; }
   const waypoints: { x: number; y: number }[] = [];
   for (const [index, pointValue] of captured.values.entries()) {
     const waypointLabel = `${label}の経由点${index + 1}`;
-    const candidate = snapshotSavedRecord(pointValue, ["x", "y"]);
+    const candidate = snapshotSavedRecord(pointValue, ["x", "y"], snapshot);
     if (!candidate) { return { reason: `${waypointLabel}の形式が正しくありません。` }; }
     const point = z.object({
       x: coordinateSchema(`${waypointLabel}のx座標`),
@@ -273,9 +285,10 @@ function normalizeWire(
   partsById: ReadonlyMap<string, CircuitPart>,
   wireIds: Set<string>,
   seenWireKeys: Set<string>,
+  snapshot: SavedSnapshot,
 ): { wire?: CircuitWire; reason?: string } {
   const label = `導線${index + 1}`;
-  const candidate = snapshotSavedRecord(value, ["id", "from", "to", "waypoints"]);
+  const candidate = snapshotSavedRecord(value, ["id", "from", "to", "waypoints"], snapshot);
   if (!candidate) { return { reason: `${label}の形式が正しくありません。` }; }
   const idIssue = checkString(candidate.id, `${label}の ID`, false);
   if (idIssue) { return { reason: idIssue }; }
@@ -283,11 +296,11 @@ function normalizeWire(
   if (wireIds.has(id)) { return { reason: `導線 ID「${id}」が重複しています。` }; }
   wireIds.add(id);
 
-  const fromResult = validateEndpoint(candidate.from, `${label}の始点`, partsById);
+  const fromResult = validateEndpoint(candidate.from, `${label}の始点`, partsById, snapshot);
   if (fromResult.reason || !fromResult.endpoint) {
     return { reason: fromResult.reason ?? `${label}の始点が不正です。` };
   }
-  const toResult = validateEndpoint(candidate.to, `${label}の終点`, partsById);
+  const toResult = validateEndpoint(candidate.to, `${label}の終点`, partsById, snapshot);
   if (toResult.reason || !toResult.endpoint) {
     return { reason: toResult.reason ?? `${label}の終点が不正です。` };
   }
@@ -299,23 +312,23 @@ function normalizeWire(
   const wireKey = unorderedWireKey(from, to);
   if (seenWireKeys.has(wireKey)) { return { reason: `${label}は既存の導線と同じ端子間を接続しています。` }; }
   seenWireKeys.add(wireKey);
-  const waypointResult = normalizeWireWaypoints(candidate.waypoints, label);
+  const waypointResult = normalizeWireWaypoints(candidate.waypoints, label, snapshot);
   if (waypointResult.reason) { return { reason: waypointResult.reason }; }
   const wire: CircuitWire = { id, from, to };
   if (waypointResult.waypoints) { wire.waypoints = waypointResult.waypoints; }
   return { wire };
 }
 
-function normalizeWires(value: unknown, parts: readonly CircuitPart[]): { wires?: CircuitWire[]; reason?: string } {
+function normalizeWires(value: unknown, parts: readonly CircuitPart[], snapshot: SavedSnapshot): { wires?: CircuitWire[]; reason?: string } {
   const captured = snapshotSavedArray(value, MAX_CIRCUIT_DOCUMENT_WIRES,
-    "導線一覧は配列で指定してください。", `導線数は${MAX_CIRCUIT_DOCUMENT_WIRES}本以下にしてください。`);
+    "導線一覧は配列で指定してください。", `導線数は${MAX_CIRCUIT_DOCUMENT_WIRES}本以下にしてください。`, snapshot);
   if (!captured.values) { return { reason: captured.reason }; }
   const partsById = new Map(parts.map((part) => [part.id, part]));
   const ids = new Set<string>();
   const seenWireKeys = new Set<string>();
   const wires: CircuitWire[] = [];
   for (const [index, candidate] of captured.values.entries()) {
-    const result = normalizeWire(candidate, index, partsById, ids, seenWireKeys);
+    const result = normalizeWire(candidate, index, partsById, ids, seenWireKeys, snapshot);
     if (result.reason) { return { reason: result.reason }; }
     if (result.wire) { wires.push(result.wire); }
   }
@@ -326,13 +339,17 @@ function normalizeWires(value: unknown, parts: readonly CircuitPart[]): { wires?
 export function validateCircuitFragment(input: unknown):
   | { ok: true; fragment: Pick<CircuitDocument, "parts" | "wires"> }
   | { ok: false; reason: string } {
-  const value = snapshotSavedRecord(input, ["parts", "wires"]);
+  return validateFragment(input, new WeakMap());
+}
+
+function validateFragment(input: unknown, snapshot: SavedSnapshot): ReturnType<typeof validateCircuitFragment> {
+  const value = snapshotSavedRecord(input, ["parts", "wires"], snapshot);
   if (!value) { return { ok: false, reason: "コピーした回路データの形式が正しくありません。" }; }
-  const partsResult = normalizeParts(value.parts);
+  const partsResult = normalizeParts(value.parts, snapshot);
   if (partsResult.reason || !partsResult.parts) {
     return { ok: false, reason: partsResult.reason ?? "部品一覧が不正です。" };
   }
-  const wiresResult = normalizeWires(value.wires, partsResult.parts);
+  const wiresResult = normalizeWires(value.wires, partsResult.parts, snapshot);
   if (wiresResult.reason || !wiresResult.wires) {
     return { ok: false, reason: wiresResult.reason ?? "導線一覧が不正です。" };
   }
@@ -340,11 +357,12 @@ export function validateCircuitFragment(input: unknown):
 }
 
 function validateDocument(input: unknown): ValidationResult {
-  const value = snapshotSavedRecord(input, ["title", "parts", "wires"]);
+  const snapshot: SavedSnapshot = new WeakMap();
+  const value = snapshotSavedRecord(input, ["title", "parts", "wires"], snapshot);
   if (!value) { return fail("回路データはオブジェクトで指定してください。"); }
   const titleIssue = checkString(value.title, "回路名", true);
   if (titleIssue) { return fail(titleIssue); }
-  const fragmentResult = validateCircuitFragment(value);
+  const fragmentResult = validateFragment(value, snapshot);
   if (!fragmentResult.ok) { return fragmentResult; }
   return { ok: true, document: { title: value.title as string, ...fragmentResult.fragment } };
 }

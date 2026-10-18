@@ -23,6 +23,21 @@ function changeEndpoint(endpoint: CircuitEndpoint) {
 }
 
 describe("new connection endpoint snapshots", () => {
+  it("rejects a shared endpoint's self-connection without reading it twice", () => {
+    const document = sourceDocument();
+    let reads = 0;
+    const endpoint: CircuitEndpoint = {
+      get partId() { reads += 1; return reads === 1 ? "branch" : "other"; },
+      terminal: "a",
+    };
+
+    expect(connect(document, endpoint, endpoint)).toMatchObject({
+      ok: false, reason: expect.stringContaining("同じ端子"),
+    });
+    expect(reads).toBe(1);
+    expect(document.wires).toHaveLength(1);
+  });
+
   it("keeps a new connection independent of both caller endpoints", () => {
     const document = sourceDocument();
     const before = structuredClone(document);
@@ -57,6 +72,24 @@ describe("new connection endpoint snapshots", () => {
     changeEndpoint(from);
 
     expect(result.document.wires.find((wire) => wire.id === result.id)?.from).toEqual({ partId: "branch", terminal: "a" });
+    expect(() => serializeCircuitDocument(result.document)).not.toThrow();
+    expect(document).toEqual(before);
+  });
+
+  it("uses the first source endpoint throughout wire splitting", () => {
+    const document = sourceDocument();
+    const before = structuredClone(document);
+    let reads = 0;
+    const from: CircuitEndpoint = {
+      get partId() { reads += 1; return reads === 1 ? "branch" : "missing"; },
+      terminal: "a",
+    };
+    const result = connectToPoint(document, from, { x: 5, y: 0 });
+    if (!result.ok) { throw new Error(result.reason); }
+
+    expect(result.document.wires).toHaveLength(3);
+    expect(result.document.wires.find((wire) => wire.id === result.id)?.from).toEqual({ partId: "branch", terminal: "a" });
+    expect(reads).toBe(1);
     expect(() => serializeCircuitDocument(result.document)).not.toThrow();
     expect(document).toEqual(before);
   });

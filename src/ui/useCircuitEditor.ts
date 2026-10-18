@@ -275,22 +275,23 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
   }
 
   function chooseTerminal(endpoint: CircuitEndpoint) {
+    const target = { partId: endpoint.partId, terminal: endpoint.terminal };
     const document = historyRef.current.present;
     const pendingEndpoint = pendingEndpointRef.current;
     const pendingWire = pendingWireRef.current;
     if (!pendingEndpoint) {
-      startConnection(endpoint);
+      startConnection(target);
       return;
     }
     if (pendingWire) {
-      finishConnection(reconnectWire(document, pendingWire.wireId, pendingWire.end, endpoint));
+      finishConnection(reconnectWire(document, pendingWire.wireId, pendingWire.end, target));
       return;
     }
-    if (sameEndpoint(pendingEndpoint, endpoint)) {
+    if (sameEndpoint(pendingEndpoint, target)) {
       cancelConnection();
       return;
     }
-    finishConnection(connect(document, pendingEndpoint, endpoint));
+    finishConnection(connect(document, pendingEndpoint, target));
   }
 
   function choosePoint(point: Point) {
@@ -361,18 +362,19 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
     const document = historyRef.current.present;
     const part = document.parts.find((item) => item.id === id);
     if (!part) { return; }
-    const nextPart = { ...part, ...patch };
+    const values = { ...patch };
+    const nextPart = { ...part, ...values };
     // JavaScript callers and full-object patches can still include these fields. Changing
     // either would invalidate existing wire endpoints and the editor's active references.
     if (nextPart.id !== part.id || nextPart.kind !== part.kind) {
       setError("部品の ID と種類は変更できません。");
       return;
     }
-    if (Object.entries(patch).every(([key, value]) => part[key as keyof CircuitPart] === value)) { return; }
+    if (Object.entries(values).every(([key, value]) => part[key as keyof CircuitPart] === value)) { return; }
     setDocument({
       ...document,
       parts: document.parts.map((existingPart) => existingPart.id === id ? nextPart : existingPart),
-    }, "initiallyClosed" in patch ? undefined : `property:${id}:${Object.keys(patch).sort().join(",")}`);
+    }, "initiallyClosed" in values ? undefined : `property:${id}:${Object.keys(values).sort().join(",")}`);
     setError(null);
   }
 

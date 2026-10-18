@@ -47,6 +47,33 @@ function mount(initialDocument = fixture()) {
 }
 
 describe("part property updates", () => {
+  it.each([10, 22])("uses the same captured patch for change detection, storage, and history (%s Ω)", (resistanceOhms) => {
+    const ui = mount();
+    act(() => { ui.editor.setTitle("redo"); ui.editor.undo(); });
+    const initial = ui.editor.document;
+    let reads = 0;
+    const patch = {
+      get resistanceOhms() { reads += 1; return reads === 1 ? resistanceOhms : resistanceOhms === 10 ? 22 : 10; },
+    };
+
+    act(() => ui.editor.updatePart("a", patch));
+
+    expect(ui.editor.document.parts[0]?.resistanceOhms).toBe(resistanceOhms);
+    expect(reads).toBe(1);
+    if (resistanceOhms === 10) {
+      expect(ui.editor.document).toBe(initial);
+      expect(ui.editor.canUndo).toBe(false);
+      expect(ui.editor.canRedo).toBe(true);
+    } else {
+      const changed = ui.editor.document;
+      expect(ui.editor.canRedo).toBe(false);
+      act(() => ui.editor.undo());
+      expect(ui.editor.document).toBe(initial);
+      act(() => ui.editor.redo());
+      expect(ui.editor.document).toBe(changed);
+    }
+  });
+
   it.each([
     { field: "id", patch: { id: "renamed", label: "rejected" } },
     { field: "kind", patch: { kind: "ground", label: "rejected" } },

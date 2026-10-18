@@ -10,6 +10,7 @@ import {
   MAX_CIRCUIT_DOCUMENT_COORDINATE,
   parseCircuitDocument,
   serializeCircuitDocument,
+  validateCircuitFragment,
 } from "../circuit-serialization.js";
 import { circuitPartCatalog, type CircuitDocument, type CircuitPart, type CircuitPartKind } from "../circuit-model.js";
 
@@ -336,6 +337,69 @@ describe("circuit document serialization", () => {
     const restored = parseCircuitDocument(serializeCircuitDocument({ title: "", parts: [resistor], wires: [] }));
     expect(restored.ok && restored.document.parts[0]!.resistanceOhms).toBe(20);
     expect(captures).toBe(1);
+  });
+
+  it.each(["document", "fragment"] as const)("rejects a shared endpoint's self-connection while capturing a %s", (kind) => {
+    let captures = 0;
+    const endpoint = new Proxy({ partId: "first", terminal: "a" as const }, {
+      getOwnPropertyDescriptor(target, key) {
+        if (key === "partId" && ++captures === 2) { target.partId = "second"; }
+        return Reflect.getOwnPropertyDescriptor(target, key);
+      },
+    });
+    const document: CircuitDocument = {
+      title: "共有された接続先",
+      parts: [part("first"), part("second")],
+      wires: [{ id: "wire", from: endpoint, to: endpoint }],
+    };
+
+    if (kind === "document") { expect(() => serializeCircuitDocument(document)).toThrow(/同じ端子/); }
+    else { expect(validateCircuitFragment(document)).toMatchObject({ ok: false, reason: expect.stringContaining("同じ端子") }); }
+    expect(captures).toBe(1);
+  });
+
+  it.each(["document", "fragment"] as const)("rejects a repeated part while capturing a %s without inventing another ID", (kind) => {
+    let captures = 0;
+    const sharedPart = new Proxy(part("first"), {
+      getOwnPropertyDescriptor(target, key) {
+        if (key === "id" && ++captures === 2) { target.id = "second"; }
+        return Reflect.getOwnPropertyDescriptor(target, key);
+      },
+    });
+    const document: CircuitDocument = { title: "共有された部品", parts: [sharedPart, sharedPart], wires: [] };
+
+    if (kind === "document") { expect(() => serializeCircuitDocument(document)).toThrow(/重複/); }
+    else { expect(validateCircuitFragment(document)).toMatchObject({ ok: false, reason: expect.stringContaining("重複") }); }
+    expect(captures).toBe(1);
+  });
+
+  it("shares captured route values within a save and refreshes them on the next save", () => {
+    let captures = 0;
+    const point = new Proxy({ x: 3, y: 4 }, {
+      getOwnPropertyDescriptor(target, key) {
+        const descriptor = Reflect.getOwnPropertyDescriptor(target, key);
+        return key === "x" && descriptor ? { ...descriptor, value: ++captures } : descriptor;
+      },
+    });
+    const waypoints = [point, point];
+    const sharedFrom = { partId: "first", terminal: "a" as const };
+    const document: CircuitDocument = {
+      title: "共有された経由点",
+      parts: [part("first"), part("second"), part("third")],
+      wires: [
+        { id: "one", from: sharedFrom, to: { partId: "second", terminal: "a" }, waypoints },
+        { id: "two", from: sharedFrom, to: { partId: "third", terminal: "a" }, waypoints },
+      ],
+    };
+
+    for (const x of [1, 2]) {
+      const saved = parseCircuitDocument(serializeCircuitDocument(document));
+      if (!saved.ok) { throw new Error(saved.reason); }
+      for (const wire of saved.document.wires) {
+        expect(wire.waypoints).toEqual([{ x, y: 4 }, { x, y: 4 }]);
+      }
+      expect(captures).toBe(x);
+    }
   });
 
   it("preserves omitted model properties and allows empty, incomplete, and unpowered circuits", () => {
