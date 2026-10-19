@@ -742,6 +742,7 @@ export function CircuitEditorLayout({
   function resetSample(kind: CircuitExampleKind) {
     if (files.loading) { return; }
     editor.openExample(kind);
+    files.clearError();
     setBoardVersion((version) => version + 1);
     setSidebarTab("properties");
     setTool("select");

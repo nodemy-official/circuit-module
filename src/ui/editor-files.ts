@@ -64,5 +64,6 @@ export function useCircuitFiles(editor: CircuitEditorController, onOpen: () => v
     onOpen();
   }
 
-  return { inputRef, error, loading, save, readFile, newDocument, open: () => inputRef.current?.click() };
+  return { inputRef, error, loading, save, readFile, newDocument,
+    clearError: () => setError(null), open: () => inputRef.current?.click() };
 }

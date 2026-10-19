@@ -74,7 +74,7 @@ export interface CircuitInspectorProps extends Omit<ComponentPropsWithoutRef<"se
   onRotate?: () => void;
   onDelete?: () => void;
   onReconnect?: (end: "from" | "to") => void;
-  /** Removes manual waypoints so the wire returns to automatic routing. */
+  /** Removes stored waypoints and generated anchors to restore automatic routing. */
   onResetWireRoute?: () => void;
   style?: CircuitStyleProps["style"];
   slotProps?: Partial<Record<CircuitInspectorSlot, CircuitStyleProps>>;
@@ -162,7 +162,7 @@ function WireInspector({
       <p {...circuitSlot("circuit-inspector__wire-route-hint", slotProps?.wireRouteHint)}>
         導線や四角のハンドルをドラッグして経路を調整できます。端の丸は接続先変更に使います。
       </p>
-      {wire.waypoints !== undefined && onResetWireRoute && (
+      {(wire.waypoints !== undefined || wire.routeAnchors !== undefined) && onResetWireRoute && (
         <button
           {...circuitSlot("circuit-inspector__wire-route-reset-button", slotProps?.wireRouteResetButton)}
           type="button"

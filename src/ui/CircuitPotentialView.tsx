@@ -83,7 +83,7 @@ export function CircuitPotentialControls({ view, timeSeconds, visible = true }: 
   </section>;
 }
 
-export function CircuitPotentialOverlay({ document, routes, view, visible = true }: { document: CircuitDocument; routes: Map<string, Point[]>; view: PotentialView; visible?: boolean }) {
+export function CircuitPotentialOverlay({ document, routes, drawingOrigin = { x: 0, y: 0 }, view, visible = true }: { document: CircuitDocument; routes: Map<string, Point[]>; drawingOrigin?: Point; view: PotentialView; visible?: boolean }) {
   if (!visible || !view.enabled) { return null; }
   return <g className="circuit-potential-overlay" pointerEvents="none">
     {document.wires.map((wire) => {
@@ -99,7 +99,7 @@ export function CircuitPotentialOverlay({ document, routes, view, visible = true
       const point = terminalPoint(part, endpoint.terminal);
       const selected = node.id === view.selected?.id;
       const reference = node.id === view.reference?.id;
-      return <g key={circuitEndpointKey(endpoint)} data-potential-terminal={circuitEndpointKey(endpoint)} transform={`translate(${point.x * GRID} ${point.y * GRID})`}>
+      return <g key={circuitEndpointKey(endpoint)} data-potential-terminal={circuitEndpointKey(endpoint)} transform={`translate(${(point.x - drawingOrigin.x) * GRID} ${(point.y - drawingOrigin.y) * GRID})`}>
         <circle r="8" fill={circuitPotentialColor(value.volts, view.scale)} opacity="0.8" />
         {(selected || reference) && <circle r="12" fill="none" stroke={reference ? "#303944" : "#c54336"} strokeWidth="2" strokeDasharray={reference ? "3 2" : undefined} />}
         <text y="-17" textAnchor="middle">{formatCircuitQuantity(value.volts, "V")}</text>

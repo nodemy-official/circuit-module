@@ -9,13 +9,15 @@ import {
   moveParts,
   pasteFragment,
   removeSelection,
+  repairWireRoutes,
   reconnectWire,
   reconnectWireToPoint,
   rotateParts,
-  setWireWaypoints,
+  setWireRoute,
   type CircuitFragment,
   type CircuitSelection,
   type CircuitWireEnd,
+  type CircuitWireRouteHint,
   type EditResult,
 } from "../circuit-edit.js";
 import type { Point } from "../circuit-geometry.js";
@@ -32,6 +34,7 @@ import {
   type CircuitEndpoint,
   type CircuitPart,
   type CircuitPartKind,
+  type CircuitRouteAnchor,
   type CircuitWire,
 } from "../circuit-model.js";
 
@@ -46,6 +49,26 @@ function toggleId(ids: string[], id: string) {
 }
 
 function editableWire(wire: CircuitWire): CircuitWire {
+  const copied = editableWireWaypoints(wire);
+  if (wire.routeAnchors === undefined) { return copied; }
+  const values = snapshotSimulationArray(wire.routeAnchors);
+  if (!values) { return wire; }
+  const routeAnchors: CircuitRouteAnchor[] = [];
+  for (const value of values) {
+    const point = snapshotSimulationRecord(value, ["x", "y", "xBoundary", "yBoundary"]);
+    if (!point || typeof point.x !== "number" || typeof point.y !== "number") { return wire; }
+    const { xBoundary, yBoundary } = point;
+    if (xBoundary !== undefined && xBoundary !== -1 && xBoundary !== 1 ||
+        yBoundary !== undefined && yBoundary !== -1 && yBoundary !== 1) { return wire; }
+    const anchor: CircuitRouteAnchor = { ...point, x: point.x, y: point.y };
+    if (xBoundary !== undefined) { anchor.xBoundary = xBoundary; }
+    if (yBoundary !== undefined) { anchor.yBoundary = yBoundary; }
+    routeAnchors.push(anchor);
+  }
+  return { ...copied, routeAnchors };
+}
+
+function editableWireWaypoints(wire: CircuitWire): CircuitWire {
   if (wire.waypoints === undefined) { return wire; }
   const values = snapshotSimulationArray(wire.waypoints);
   if (!values) { return wire; }
@@ -63,7 +86,7 @@ function editableDocument(document: CircuitDocument) {
   // Keep malformed input intact so analysis can still report it as invalid.
   const copied = validatedSimulationDocument(document);
   if (typeof copied === "string") { return document; }
-  // Simulation snapshots do not copy layout-only waypoints. Editor history
+  // Simulation snapshots do not copy layout-only route points. Editor history
   // must retain its own route even when the caller later changes that input.
   return {
     ...copied,
@@ -316,9 +339,9 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
     applyEditResult(result, `move:${id}`);
   }
 
-  function updateWireRoute(id: string, waypoints?: readonly Point[]) {
+  function updateWireRoute(id: string, waypoints?: readonly Point[] & CircuitWireRouteHint) {
     const document = historyRef.current.present;
-    const result = setWireWaypoints(document, id, waypoints);
+    const result = setWireRoute(document, id, waypoints);
     applyEditResult(result, `wire-route:${id}`);
   }
 
@@ -335,9 +358,9 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
   function resetWireRoute(id: string) {
     const document = historyRef.current.present;
     const wire = document.wires.find((item) => item.id === id);
-    if (!wire || wire.waypoints === undefined) { return; }
+    if (!wire || wire.waypoints === undefined && wire.routeAnchors === undefined) { return; }
     endEdit();
-    const result = setWireWaypoints(document, id, undefined);
+    const result = setWireRoute(document, id, undefined);
     applyEditResult(result);
   }
 
@@ -371,10 +394,16 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
       return;
     }
     if (Object.entries(values).every(([key, value]) => part[key as keyof CircuitPart] === value)) { return; }
-    setDocument({
+    let next = {
       ...document,
       parts: document.parts.map((existingPart) => existingPart.id === id ? nextPart : existingPart),
-    }, "initiallyClosed" in values ? undefined : `property:${id}:${Object.keys(values).sort().join(",")}`);
+    };
+    if (nextPart.x !== part.x || nextPart.y !== part.y || (nextPart.rotation ?? 0) !== (part.rotation ?? 0)) {
+      const repaired = repairWireRoutes(next, [id]);
+      if (!repaired.ok) { setError(repaired.reason); return; }
+      next = repaired.document;
+    }
+    setDocument(next, "initiallyClosed" in values ? undefined : `property:${id}:${Object.keys(values).sort().join(",")}`);
     setError(null);
   }
 

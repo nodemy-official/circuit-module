@@ -12,6 +12,7 @@ import { CircuitFlowLegend, CircuitWireFlow, wireFlowCurrent, wireFlowLabel, typ
 import { closestWirePoint, connectionTargetAt, wireMidpoint, type ConnectionTarget } from "./connection-target.js";
 import { circuitSlot, type CircuitStyleProps } from "./style-props.js";
 import {
+  cameraDrawingOrigin,
   cameraLabelSizes,
   createCameraFrame,
   MAX_ZOOM,
@@ -32,7 +33,7 @@ import {
   terminalPoint,
   type Point,
 } from "../circuit-geometry.js";
-import type { CircuitSelection, CircuitWireEnd } from "../circuit-edit.js";
+import type { CircuitSelection, CircuitWireEnd, CircuitWireRoutePoints } from "../circuit-edit.js";
 import {
   circuitPartCatalog,
   circuitPartNumericFields,
@@ -92,8 +93,8 @@ export interface CircuitBoardProps extends Omit<ComponentPropsWithoutRef<"div">,
   /** Begins a connection when dragging from a terminal. */
   onConnectionStart?: (endpoint: CircuitEndpoint) => void;
   onReconnectStart?: (wireId: string, end: CircuitWireEnd) => void;
-  /** Update a wire's intermediate route points in grid cells, keeping its electrical endpoints. */
-  onWireRouteChange?: (id: string, waypoints: Point[] | undefined) => void;
+  /** Forward arrays directly to setWireRoute, retaining generatedRoute geometry and restoreRoute cancellation data. */
+  onWireRouteChange?: (id: string, waypoints: CircuitWireRoutePoints | undefined) => void;
   /** Restore the route from before the current drag, including its undo/redo history. */
   onWireRouteCancel?: (id: string) => void;
   /** Finish one route edit so a complete drag becomes a single undo step. */
@@ -185,14 +186,12 @@ interface RangeState {
 function fitCamera(document: CircuitDocument, width: number, height: number): Camera {
   const bounds = contentBounds(document);
   if (!bounds) { return { x: -width / 2, y: -height / 2, zoom: 1 }; }
-  const left = bounds.minX * GRID - 90;
-  const right = bounds.maxX * GRID + 90;
-  const top = bounds.minY * GRID - 90;
-  const bottom = bounds.maxY * GRID + 90;
-  const zoom = Math.min(1.5, Math.max(MIN_ZOOM, Math.min(width / (right - left), height / (bottom - top))));
+  const spanX = (bounds.maxX - bounds.minX) * GRID + 180;
+  const spanY = (bounds.maxY - bounds.minY) * GRID + 180;
+  const zoom = Math.min(1.5, Math.max(MIN_ZOOM, Math.min(width / spanX, height / spanY)));
   return {
-    x: (left + right) / 2 - width / (2 * zoom),
-    y: (top + bottom) / 2 - height / (2 * zoom),
+    x: bounds.minX * GRID - 90 + (spanX - width / zoom) / 2,
+    y: bounds.minY * GRID - 90 + (spanY - height / zoom) / 2,
     zoom,
   };
 }
@@ -649,6 +648,7 @@ function CircuitPartDetail({ part, meter, slotProps }: {
 
 function CircuitPartArtwork({
   part,
+  drawingOrigin,
   documentEpoch,
   captureDocumentGesture,
   isDocumentCurrent,
@@ -666,6 +666,7 @@ function CircuitPartArtwork({
   slotProps,
 }: {
   part: CircuitPart;
+  drawingOrigin: Point;
   documentEpoch: number;
   captureDocumentGesture: () => DocumentGestureToken;
   isDocumentCurrent: (gesture: DocumentGestureToken) => boolean;
@@ -710,7 +711,7 @@ function CircuitPartArtwork({
       data-kind={part.kind}
       data-selected={isSelected}
       data-dragging={isDragging}
-      transform={`translate(${part.x * GRID} ${part.y * GRID})`}
+      transform={`translate(${(part.x - drawingOrigin.x) * GRID} ${(part.y - drawingOrigin.y) * GRID})`}
       role={onInspectPart ? "button" : accessibility.role ?? (meter ? "img" : undefined)}
       tabIndex={onInspectPart ? 0 : accessibility.tabIndex}
       aria-label={meter ? `${accessibility.ariaLabel}、${meter.text}` : accessibility.ariaLabel}
@@ -740,6 +741,7 @@ function CircuitPartArtwork({
 
 function CircuitTerminalArtwork({
   part,
+  drawingOrigin,
   terminal,
   pending,
   connected,
@@ -751,6 +753,7 @@ function CircuitTerminalArtwork({
   slotProps,
 }: {
   part: CircuitPart;
+  drawingOrigin: Point;
   terminal: CircuitTerminal;
   pending: boolean;
   connected: boolean;
@@ -773,7 +776,7 @@ function CircuitTerminalArtwork({
       data-connected={connected}
       data-pending={pending}
       data-selected={selected}
-      transform={`translate(${point.x * GRID} ${point.y * GRID})`}
+      transform={`translate(${(point.x - drawingOrigin.x) * GRID} ${(point.y - drawingOrigin.y) * GRID})`}
       role={readOnly ? undefined : "button"}
       tabIndex={readOnly ? undefined : 0}
       aria-label={endpointName(part, terminal)}
@@ -825,6 +828,7 @@ function CircuitWireSegmentHandles({
   enabled,
   document,
   routes,
+  drawingOrigin,
   selected,
   scale,
   onStart,
@@ -834,6 +838,7 @@ function CircuitWireSegmentHandles({
   enabled: boolean;
   document: CircuitDocument;
   routes: ReadonlyMap<string, readonly Point[]>;
+  drawingOrigin: Point;
   selected: ReadonlySet<string>;
   scale: number;
   onStart: (event: PointerEvent<SVGGElement>, id: string, index: number) => void;
@@ -856,7 +861,7 @@ function CircuitWireSegmentHandles({
           data-wire-id={wire.id}
           data-segment-index={index}
           data-orientation={horizontal ? "horizontal" : "vertical"}
-          transform={`translate(${(from.x + to.x) * GRID / 2} ${(from.y + to.y) * GRID / 2})`}
+          transform={`translate(${((from.x - drawingOrigin.x) + (to.x - drawingOrigin.x)) * GRID / 2} ${((from.y - drawingOrigin.y) + (to.y - drawingOrigin.y)) * GRID / 2})`}
           role="button"
           tabIndex={0}
           aria-label={label}
@@ -880,7 +885,7 @@ function wireRouteEditingEnabled(props: Pick<CircuitBoardProps, "readOnly" | "pa
 
 function wireRouteChangeHandler(onChange: CircuitBoardProps["onWireRouteChange"], markEdit: () => void) {
   if (!onChange) { return; }
-  return (id: string, waypoints: Point[] | undefined) => { markEdit(); onChange(id, waypoints); };
+  return (id: string, waypoints: CircuitWireRoutePoints | undefined) => { markEdit(); onChange(id, waypoints); };
 }
 
 function wireTitle(from: string, to: string, editable: boolean) {
@@ -996,6 +1001,13 @@ export function CircuitBoard({
   const draggedRef = useRef(false);
   const clearDragClickTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const { selectedParts, selectedWires, connectedTerminals, partsById, wireRoutes, visualReadings } = useCircuitBoardInputs(document, selection, readOnly, analysis);
+  const origin = cameraDrawingOrigin(camera);
+  const drawingOrigin = useMemo(() => ({ x: origin.x, y: origin.y }), [origin.x, origin.y]);
+  const drawingCamera = { x: camera.x - drawingOrigin.x * GRID, y: camera.y - drawingOrigin.y * GRID };
+  const drawingRoutes = useMemo(() => drawingOrigin.x === 0 && drawingOrigin.y === 0 ? wireRoutes
+    : new Map([...wireRoutes].map(([id, route]) => [id, route.map((point) => ({
+      x: point.x - drawingOrigin.x, y: point.y - drawingOrigin.y,
+    }))])), [wireRoutes, drawingOrigin]);
   useIsomorphicLayoutEffect(() => {
     const current = dragRef.current;
     const part = current && partsById.get(current.id);
@@ -1800,7 +1812,7 @@ export function CircuitBoard({
             const from = partsById.get(wire.from.partId);
             const to = partsById.get(wire.to.partId);
             if (!from || !to) { return null; }
-            const route = wireRoutes.get(wire.id);
+            const route = drawingRoutes.get(wire.id);
             if (!route) { return null; }
             const d = pathData(route);
             const isSelected = selectedWires.has(wire.id);
@@ -1852,6 +1864,7 @@ export function CircuitBoard({
             <CircuitPartArtwork
               key={part.id}
               part={part}
+              drawingOrigin={drawingOrigin}
               documentEpoch={documentEpoch}
               captureDocumentGesture={captureDocumentGesture}
               isDocumentCurrent={isDocumentCurrent}
@@ -1886,6 +1899,7 @@ export function CircuitBoard({
               return <CircuitTerminalArtwork
                 key={endpointKey(endpoint)}
                 part={part}
+                drawingOrigin={drawingOrigin}
                 terminal={terminal}
                 pending={pending}
                 connected={connected}
@@ -1902,7 +1916,7 @@ export function CircuitBoard({
     </>
   ), [analysis, visualReadings, showFlow, flowDisplay, connectedTerminals, document.parts, document.wires, documentEpoch, captureDocumentGesture, isDocumentCurrent, drag?.id, handlePartKeyDown, handlePartPointerClick, onSwitchToggle, readOnly,
     onSelectPart, onInspectPart, chooseWire, chooseTerminal, pendingEndpoint, pendingWire, partsById, renderPart,
-    selectedParts, selectedWires, slotProps, startDrag, startConnectionDrag, wireRoutes,
+    selectedParts, selectedWires, slotProps, startDrag, startConnectionDrag, drawingRoutes, drawingOrigin,
     canEditWireRoute, wireRouteDrag.start, wireRouteDrag.draggingWireId]);
   const labelSizes = cameraLabelSizes(camera.zoom);
   const previewEnd = connectionPreviewEnd(partsById, connectionTarget, pointer);
@@ -1996,7 +2010,7 @@ export function CircuitBoard({
         data-panning={isPanning}
         data-connecting={Boolean(pendingEndpoint && !readOnly)}
         xmlns="http://www.w3.org/2000/svg"
-        viewBox={`${camera.x} ${camera.y} ${size.width / camera.zoom} ${size.height / camera.zoom}`}
+        viewBox={`${drawingCamera.x} ${drawingCamera.y} ${size.width / camera.zoom} ${size.height / camera.zoom}`}
         width={size.width}
         height={size.height}
         role="group"
@@ -2137,18 +2151,19 @@ export function CircuitBoard({
         <g
           {...circuitSlot("circuit-board__background", slotProps?.background)}
         >
-          <rect {...circuitSlot("circuit-board__paper", slotProps?.paper)} data-circuit-board-background="true" x={camera.x} y={camera.y} width={size.width / camera.zoom} height={size.height / camera.zoom} />
-          {showGrid && <rect {...circuitSlot("circuit-board__grid", slotProps?.grid)} data-circuit-board-background="true" x={camera.x} y={camera.y} width={size.width / camera.zoom} height={size.height / camera.zoom} fill={`url(#${majorGridId})`} />}
+          <rect {...circuitSlot("circuit-board__paper", slotProps?.paper)} data-circuit-board-background="true" x={drawingCamera.x} y={drawingCamera.y} width={size.width / camera.zoom} height={size.height / camera.zoom} />
+          {showGrid && <rect {...circuitSlot("circuit-board__grid", slotProps?.grid)} data-circuit-board-background="true" x={drawingCamera.x} y={drawingCamera.y} width={size.width / camera.zoom} height={size.height / camera.zoom} fill={`url(#${majorGridId})`} />}
         </g>
 
-        {pendingPart && pendingEndpoint && pointer && <path {...circuitSlot("circuit-board__connection-preview", slotProps?.connectionPreview)} d={pathData(routeWire(routeEnd(pendingPart, pendingEndpoint.terminal), previewEnd, [...wireRoutes].filter(([id]) => id !== pendingWire?.wireId).map(([, route]) => route)))} />}
+        {pendingPart && pendingEndpoint && pointer && <path {...circuitSlot("circuit-board__connection-preview", slotProps?.connectionPreview)} d={pathData(routeWire(routeEnd(pendingPart, pendingEndpoint.terminal), previewEnd, [...wireRoutes].filter(([id]) => id !== pendingWire?.wireId).map(([, route]) => route)).map((point) => ({ x: point.x - drawingOrigin.x, y: point.y - drawingOrigin.y })))} />}
 
         {artwork}
-        <CircuitPotentialOverlay visible={showPotentials} document={document} routes={wireRoutes} view={potentialView} />
+        <CircuitPotentialOverlay visible={showPotentials} document={document} routes={drawingRoutes} drawingOrigin={drawingOrigin} view={potentialView} />
         <CircuitWireSegmentHandles
           enabled={canEditWireRoute}
           document={document}
           routes={wireRoutes}
+          drawingOrigin={drawingOrigin}
           selected={selectedWires}
           scale={Math.max(1, Math.min(3, 1 / camera.zoom))}
           onStart={wireRouteDrag.start}
@@ -2160,8 +2175,8 @@ export function CircuitBoard({
           return <rect
             {...circuitSlot("circuit-board__selection-rect", slotProps?.selectionRect)}
             data-selection-rect="true"
-            x={bounds.left * GRID}
-            y={bounds.top * GRID}
+            x={(bounds.left - drawingOrigin.x) * GRID}
+            y={(bounds.top - drawingOrigin.y) * GRID}
             width={(bounds.right - bounds.left) * GRID}
             height={(bounds.bottom - bounds.top) * GRID}
           />;
@@ -2179,7 +2194,7 @@ export function CircuitBoard({
                 {...circuitSlot("circuit-board__wire-handle", slotProps?.wireHandle)}
                 data-wire-id={wire.id}
                 data-wire-handle={end}
-                transform={`translate(${point.x * GRID} ${point.y * GRID})`}
+                transform={`translate(${(point.x - drawingOrigin.x) * GRID} ${(point.y - drawingOrigin.y) * GRID})`}
                 role="button"
                 tabIndex={0}
                 aria-label={label}
@@ -2205,8 +2220,8 @@ export function CircuitBoard({
         {!readOnly && pendingEndpoint && connectionTarget && (connectionTarget.endpoint || connectionTarget.wireId) && (
           <circle
             {...circuitSlot("circuit-board__connection-target", slotProps?.connectionTarget)}
-            cx={connectionTarget.point.x * GRID}
-            cy={connectionTarget.point.y * GRID}
+            cx={(connectionTarget.point.x - drawingOrigin.x) * GRID}
+            cy={(connectionTarget.point.y - drawingOrigin.y) * GRID}
             r={10 / camera.zoom}
           />
         )}

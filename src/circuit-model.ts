@@ -70,16 +70,28 @@ export interface CircuitEndpoint {
   terminal: CircuitTerminal;
 }
 
+/** An explicit internal polyline vertex; marked axes store offsets from their signed coordinate boundary. */
+export interface CircuitRouteAnchor {
+  x: number;
+  y: number;
+  xBoundary?: -1 | 1;
+  yBoundary?: -1 | 1;
+}
+
 export interface CircuitWire {
   id: string;
   from: CircuitEndpoint;
   to: CircuitEndpoint;
   /** Optional intermediate route points in grid cells; endpoints are derived from their parts. */
   waypoints?: { x: number; y: number }[];
+  /** Finished orthogonal polyline vertices, with no implicit bends or terminal routing; exclusive with nonempty waypoints. */
+  routeAnchors?: CircuitRouteAnchor[];
 }
 
 /** Maximum number of manually stored route points on one wire. */
 export const MAX_CIRCUIT_WIRE_WAYPOINTS = 10_000;
+/** Legacy authored points plus up to 20,000 search nodes per terminal approach; splitting explicit vertices never increases this count. */
+export const MAX_CIRCUIT_WIRE_ROUTE_ANCHORS = MAX_CIRCUIT_WIRE_WAYPOINTS + 2 * 20_000;
 
 export interface CircuitDocument {
   title: string;

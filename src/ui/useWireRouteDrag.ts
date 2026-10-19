@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type KeyboardEvent, type PointerEvent, type RefObject } from "react";
-import { compactWireRouteWaypoints, moveWireSegment, routeEnd, type Point, type RouteEnd } from "../circuit-geometry.js";
+import { compactWireRouteWaypoints, decodeWireRouteAnchors, moveWireSegment, routeEnd, type Point, type RouteEnd } from "../circuit-geometry.js";
+import type { CircuitWireRoutePoints, CircuitWireRouteSnapshot } from "../circuit-edit.js";
 import type { CircuitDocument } from "../circuit-model.js";
 import { useDocumentGestureBoundary, type DocumentGestureToken, type DocumentGestureVersion } from "./useDocumentGestureBoundary.js";
 import { useIsomorphicLayoutEffect } from "./useIsomorphicLayoutEffect.js";
@@ -12,7 +13,8 @@ interface WireRouteDragOptions {
   svgRef: RefObject<SVGSVGElement | null>;
   pointAtPointer: (event: { clientX: number; clientY: number }) => Point;
   onSelect?: (id: string) => void;
-  onChange?: (id: string, waypoints: Point[] | undefined) => void;
+  /** Forward unchanged to setWireRoute, retaining the generatedRoute and restoreRoute own data attributes. */
+  onChange?: (id: string, waypoints: CircuitWireRoutePoints | undefined) => void;
   onCancel?: (id: string) => void;
   onEnd?: () => void;
   onDrag: () => void;
@@ -24,7 +26,7 @@ interface RouteSnapshot {
   route: readonly Point[];
   start: RouteEnd;
   end: RouteEnd;
-  originalWaypoints: Point[] | undefined;
+  originalRoute: CircuitWireRouteSnapshot | undefined;
 }
 
 interface SegmentDrag extends RouteSnapshot {
@@ -65,8 +67,37 @@ function snapshot(options: WireRouteDragOptions, id: string): RouteSnapshot | un
     id, route,
     start: routeEnd(from, wire.from.terminal),
     end: routeEnd(to, wire.to.terminal),
-    originalWaypoints: wire.waypoints?.map((point) => ({ ...point })),
+    originalRoute: wire.routeAnchors?.length
+      ? Object.freeze({ kind: "routeAnchors", points: Object.freeze(wire.routeAnchors.map(({ x, y, xBoundary, yBoundary }) => Object.freeze({
+        x, y, ...(xBoundary === undefined ? {} : { xBoundary }), ...(yBoundary === undefined ? {} : { yBoundary }),
+      }))) })
+      : wire.waypoints?.length ? Object.freeze({ kind: "waypoints", points: Object.freeze(wire.waypoints.map(({ x, y }) => Object.freeze({ x, y }))) }) : undefined,
   };
+}
+
+function literalPoints(route: readonly Point[]): Point[] {
+  const points = route.length > 2 ? route.slice(1, -1) : route.slice(0, 1);
+  return points.map((point) => ({ ...point }));
+}
+
+function changedRoutePoints(initial: RouteSnapshot, route: readonly Point[]): CircuitWireRoutePoints {
+  // Describe the finished geometry independently of rendered props. The controller
+  // can already have restored a legacy route while this render still sees anchors.
+  const explicit = initial.originalRoute?.kind === "routeAnchors";
+  const points = explicit ? literalPoints(route) : compactWireRouteWaypoints(route, initial.start, initial.end);
+  return Object.defineProperty(points, "generatedRoute", {
+    value: Object.freeze({ kind: explicit ? "routeAnchors" : "generated", points: Object.freeze(literalPoints(route).map((point) => Object.freeze(point))) }),
+  });
+}
+
+function restoredRoutePoints(initial: RouteSnapshot): CircuitWireRoutePoints | undefined {
+  const original = initial.originalRoute;
+  if (!original) { return; }
+  const points = original.kind === "routeAnchors" ? decodeWireRouteAnchors(original.points)
+    : original.points.map(({ x, y }) => ({ x, y }));
+  // Keep the original interpretation and encoded offsets separate from the drawing
+  // coordinates. A nonenumerable own tag survives ordinary two-argument forwarding.
+  return Object.defineProperty(points, "restoreRoute", { value: original });
 }
 
 function releasePointer(svg: SVGSVGElement | null, pointerId: number) {
@@ -103,7 +134,7 @@ export function useWireRouteDrag(options: WireRouteDragOptions) {
     const current = latest.current;
     if (drag.changed) {
       if (current.onCancel) { current.onCancel(drag.id); }
-      else { current.onChange?.(drag.id, drag.originalWaypoints); }
+      else { current.onChange?.(drag.id, restoredRoutePoints(drag)); }
     }
     current.onEnd?.();
     current.onFinish(true);
@@ -172,7 +203,7 @@ export function useWireRouteDrag(options: WireRouteDragOptions) {
     setDraggingWireId(drag.id);
     const next = moveWireSegment(drag.route, drag.segmentIndex, coordinate, drag.start, drag.end);
     markEdit();
-    current.onChange?.(drag.id, coordinate === drag.coordinate ? drag.originalWaypoints : compactWireRouteWaypoints(next, drag.start, drag.end));
+    current.onChange?.(drag.id, coordinate === drag.coordinate ? restoredRoutePoints(drag) : changedRoutePoints(drag, next));
     return true;
   }, [cancel, discard, isCurrent, markEdit]);
 
@@ -207,7 +238,7 @@ export function useWireRouteDrag(options: WireRouteDragOptions) {
     const delta = direction * (event.shiftKey ? 5 : 1);
     const next = moveWireSegment(initial.route, index, from[axis] + delta, initial.start, initial.end);
     focusAtRef.current = { id, point: { x: (from.x + to.x) / 2, y: (from.y + to.y) / 2, [axis]: from[axis] + delta } };
-    current.onChange(id, compactWireRouteWaypoints(next, initial.start, initial.end));
+    current.onChange(id, changedRoutePoints(initial, next));
     current.onEnd?.();
   }, [canStart]);
 

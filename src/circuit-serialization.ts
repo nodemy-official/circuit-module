@@ -3,22 +3,25 @@ import { circuitNumericValueSchema, simulationBooleanSchema, simulationIdentifie
 import {
   circuitPartKinds,
   circuitPartNumericFields,
+  MAX_CIRCUIT_WIRE_ROUTE_ANCHORS,
   MAX_CIRCUIT_WIRE_WAYPOINTS,
   terminalsOf,
   type CircuitPartNumericKey,
 } from "./circuit-model.js";
-import { MAX_WIRE_COORDINATE } from "./circuit-geometry.js";
+import { MAX_WIRE_COORDINATE, terminalPoint, type Point } from "./circuit-geometry.js";
 import type {
   CircuitDocument,
   CircuitEndpoint,
   CircuitPart,
   CircuitPartKind,
   CircuitRotation,
+  CircuitRouteAnchor,
   CircuitWire,
 } from "./circuit-model.js";
 
 const DOCUMENT_FORMAT = "circuit-module";
 const DOCUMENT_VERSION = 1;
+const ROUTE_ANCHOR_DOCUMENT_VERSION = 2;
 export const MAX_CIRCUIT_DOCUMENT_COORDINATE = MAX_WIRE_COORDINATE;
 
 /** JSON text limit for saving or loading a circuit document, measured in JavaScript string characters. */
@@ -29,6 +32,8 @@ export const MAX_CIRCUIT_DOCUMENT_PARTS = 10_000;
 export const MAX_CIRCUIT_DOCUMENT_WIRES = 20_000;
 /** Maximum number of stored route points on a single wire. */
 export const MAX_CIRCUIT_DOCUMENT_WIRE_WAYPOINTS = MAX_CIRCUIT_WIRE_WAYPOINTS;
+/** Maximum number of generated route anchors on a single wire. */
+export const MAX_CIRCUIT_DOCUMENT_WIRE_ROUTE_ANCHORS = MAX_CIRCUIT_WIRE_ROUTE_ANCHORS;
 
 const rotationSchema = z.literal([0, 90, 180, 270]);
 
@@ -279,6 +284,98 @@ function normalizeWireWaypoints(value: unknown, label: string, snapshot: SavedSn
   return waypoints.length > 0 ? { waypoints } : {};
 }
 
+function routeAnchorBoundaryIssue(anchor: CircuitRouteAnchor, label: string): string | null {
+  for (const axis of ["x", "y"] as const) {
+    const boundary = axis === "x" ? anchor.xBoundary : anchor.yBoundary;
+    if (boundary === undefined) { continue; }
+    const decoded = boundary * MAX_WIRE_COORDINATE + anchor[axis];
+    if (Math.sign(anchor[axis]) !== boundary || !Number.isFinite(decoded) || boundary * decoded <= MAX_WIRE_COORDINATE) {
+      return `${label}の${axis}境界オフセットは境界の外側を表す同符号の有限な値で指定してください。`;
+    }
+  }
+  return null;
+}
+
+const routeAnchorSchema = z.object({
+  x: coordinateSchema("x座標"),
+  y: coordinateSchema("y座標"),
+  xBoundary: z.literal([-1, 1], { error: "x境界は-1または1で指定してください。" }).optional(),
+  yBoundary: z.literal([-1, 1], { error: "y境界は-1または1で指定してください。" }).optional(),
+});
+
+function decodedRouteAnchor(anchor: CircuitRouteAnchor): Point {
+  return {
+    x: anchor.xBoundary === undefined ? anchor.x : anchor.xBoundary * MAX_WIRE_COORDINATE + anchor.x,
+    y: anchor.yBoundary === undefined ? anchor.y : anchor.yBoundary * MAX_WIRE_COORDINATE + anchor.y,
+  };
+}
+
+function orthogonalRoutePoints(from: Point, to: Point) {
+  return from.x === to.x || from.y === to.y;
+}
+
+function normalizeRouteAnchors(value: unknown, label: string, snapshot: SavedSnapshot): ReturnType<typeof validateCircuitRouteAnchors> {
+  const captured = snapshotSavedArray(value, MAX_CIRCUIT_WIRE_ROUTE_ANCHORS,
+    `${label}は配列で指定してください。`, `${label}は${MAX_CIRCUIT_WIRE_ROUTE_ANCHORS}個以下にしてください。`, snapshot);
+  if (!captured.values) { return { ok: false, reason: captured.reason! }; }
+  const routeAnchors: CircuitRouteAnchor[] = [];
+  let previous: Point | undefined;
+  for (const [index, anchorValue] of captured.values.entries()) {
+    const anchorLabel = `${label}${index + 1}`;
+    const candidate = snapshotSavedRecord(anchorValue, ["x", "y", "xBoundary", "yBoundary"], snapshot);
+    if (!candidate) { return { ok: false, reason: `${anchorLabel}の形式が正しくありません。` }; }
+    const parsed = routeAnchorSchema.safeParse(candidate);
+    if (!parsed.success) { return { ok: false, reason: `${anchorLabel}の${parsed.error.issues[0]!.message}` }; }
+    const anchor = parsed.data;
+    const boundaryIssue = routeAnchorBoundaryIssue(anchor, anchorLabel);
+    if (boundaryIssue) { return { ok: false, reason: boundaryIssue }; }
+    const point = decodedRouteAnchor(anchor);
+    if (previous && !orthogonalRoutePoints(previous, point)) {
+      return { ok: false, reason: `${anchorLabel}は直前のルートアンカーと直交するように指定してください。` };
+    }
+    previous = point;
+    // Omitted markers remain omitted in the canonical saved representation.
+    routeAnchors.push({ x: anchor.x, y: anchor.y,
+      ...(anchor.xBoundary === undefined ? {} : { xBoundary: anchor.xBoundary }),
+      ...(anchor.yBoundary === undefined ? {} : { yBoundary: anchor.yBoundary }),
+    });
+  }
+  return { ok: true, routeAnchors };
+}
+
+/** Captures orthogonal polyline vertices using the same own-data rules and bounds as saved documents. */
+export function validateCircuitRouteAnchors(input: unknown):
+  | { ok: true; routeAnchors: CircuitRouteAnchor[] }
+  | { ok: false; reason: string } {
+  return normalizeRouteAnchors(input, "導線のルートアンカー", new WeakMap());
+}
+
+function routeAnchorConnectionIssue(routeAnchors: readonly CircuitRouteAnchor[], from: Point, to: Point, label: string): string | null {
+  if (!orthogonalRoutePoints(from, decodedRouteAnchor(routeAnchors[0]!))) {
+    return `${label}の始点とルートアンカーは直交するように指定してください。`;
+  }
+  if (!orthogonalRoutePoints(decodedRouteAnchor(routeAnchors.at(-1)!), to)) {
+    return `${label}の終点とルートアンカーは直交するように指定してください。`;
+  }
+  return null;
+}
+
+function normalizeWireRoute(candidate: Record<string, unknown>, label: string, snapshot: SavedSnapshot, from: Point, to: Point):
+  { route?: Pick<CircuitWire, "waypoints" | "routeAnchors">; reason?: string } {
+  const waypointResult = normalizeWireWaypoints(candidate.waypoints, label, snapshot);
+  if (waypointResult.reason) { return { reason: waypointResult.reason }; }
+  const anchorResult = candidate.routeAnchors === undefined ? undefined
+    : normalizeRouteAnchors(candidate.routeAnchors, `${label}のルートアンカー`, snapshot);
+  if (anchorResult && !anchorResult.ok) { return { reason: anchorResult.reason }; }
+  const routeAnchors = anchorResult?.ok && anchorResult.routeAnchors.length > 0 ? anchorResult.routeAnchors : undefined;
+  if (waypointResult.waypoints && routeAnchors) {
+    return { reason: `${label}の経由点とルートアンカーは同時に指定できません。` };
+  }
+  const connectionIssue = routeAnchors && routeAnchorConnectionIssue(routeAnchors, from, to, label);
+  if (connectionIssue) { return { reason: connectionIssue }; }
+  return { route: { ...waypointResult, ...(routeAnchors ? { routeAnchors } : {}) } };
+}
+
 function normalizeWire(
   value: unknown,
   index: number,
@@ -288,7 +385,7 @@ function normalizeWire(
   snapshot: SavedSnapshot,
 ): { wire?: CircuitWire; reason?: string } {
   const label = `導線${index + 1}`;
-  const candidate = snapshotSavedRecord(value, ["id", "from", "to", "waypoints"], snapshot);
+  const candidate = snapshotSavedRecord(value, ["id", "from", "to", "waypoints", "routeAnchors"], snapshot);
   if (!candidate) { return { reason: `${label}の形式が正しくありません。` }; }
   const idIssue = checkString(candidate.id, `${label}の ID`, false);
   if (idIssue) { return { reason: idIssue }; }
@@ -312,11 +409,10 @@ function normalizeWire(
   const wireKey = unorderedWireKey(from, to);
   if (seenWireKeys.has(wireKey)) { return { reason: `${label}は既存の導線と同じ端子間を接続しています。` }; }
   seenWireKeys.add(wireKey);
-  const waypointResult = normalizeWireWaypoints(candidate.waypoints, label, snapshot);
-  if (waypointResult.reason) { return { reason: waypointResult.reason }; }
-  const wire: CircuitWire = { id, from, to };
-  if (waypointResult.waypoints) { wire.waypoints = waypointResult.waypoints; }
-  return { wire };
+  const routeResult = normalizeWireRoute(candidate, label, snapshot,
+    terminalPoint(partsById.get(from.partId)!, from.terminal), terminalPoint(partsById.get(to.partId)!, to.terminal));
+  if (routeResult.reason) { return { reason: routeResult.reason }; }
+  return { wire: { id, from, to, ...routeResult.route } };
 }
 
 function normalizeWires(value: unknown, parts: readonly CircuitPart[], snapshot: SavedSnapshot): { wires?: CircuitWire[]; reason?: string } {
@@ -367,6 +463,15 @@ function validateDocument(input: unknown): ValidationResult {
   return { ok: true, document: { title: value.title as string, ...fragmentResult.fragment } };
 }
 
+function savedEnvelope(document: CircuitDocument) {
+  return {
+    format: DOCUMENT_FORMAT,
+    version: document.wires.some((wire) => wire.routeAnchors?.length)
+      ? ROUTE_ANCHOR_DOCUMENT_VERSION : DOCUMENT_VERSION,
+    document,
+  };
+}
+
 /**
  * Encodes own data fields as a versioned JSON document. Unknown properties are dropped; known accessors are invalid.
  * Throws when the input is invalid or the encoded document exceeds the public text limit.
@@ -374,11 +479,10 @@ function validateDocument(input: unknown): ValidationResult {
 export function serializeCircuitDocument(document: CircuitDocument): string {
   const validation = validateDocument(document as unknown);
   if (!validation.ok) { throw new TypeError(`回路を保存できません。${validation.reason}`); }
-  const json = JSON.stringify({
-    format: DOCUMENT_FORMAT,
-    version: DOCUMENT_VERSION,
-    document: validation.document,
-  }, null, 2);
+  const envelope = savedEnvelope(validation.document);
+  let json = JSON.stringify(envelope, null, 2);
+  // Formatting alone must not make a valid compact input impossible to save again.
+  if (json.length > MAX_CIRCUIT_DOCUMENT_JSON_LENGTH) { json = JSON.stringify(envelope); }
   if (json.length > MAX_CIRCUIT_DOCUMENT_JSON_LENGTH) {
     throw new RangeError(`保存データは${MAX_CIRCUIT_DOCUMENT_JSON_LENGTH}文字以下にしてください。`);
   }
@@ -404,20 +508,30 @@ export function parseCircuitDocument(
   if (!isRecord(parsed)) { return { ok: false, reason: "回路ファイルの形式が正しくありません。" }; }
 
   let documentValue: unknown = parsed;
+  let documentVersion: number | undefined;
   if ("format" in parsed) {
     if (!z.literal(DOCUMENT_FORMAT).safeParse(parsed.format).success) {
       return { ok: false, reason: "回路ファイルの形式が対応していません。" };
     }
-    if (!z.literal(DOCUMENT_VERSION).safeParse(parsed.version).success) {
-      return { ok: false, reason: `回路ファイルのバージョン${DOCUMENT_VERSION}に対応しています。` };
+    if (!z.literal([DOCUMENT_VERSION, ROUTE_ANCHOR_DOCUMENT_VERSION]).safeParse(parsed.version).success) {
+      return { ok: false, reason: `回路ファイルのバージョン${DOCUMENT_VERSION}と${ROUTE_ANCHOR_DOCUMENT_VERSION}に対応しています。` };
     }
     if (!("document" in parsed)) {
       return { ok: false, reason: "回路ファイルに回路データがありません。" };
     }
     documentValue = parsed.document;
+    documentVersion = parsed.version as number;
   }
 
   const validation = validateDocument(documentValue);
   if (!validation.ok) { return validation; }
+  if (documentVersion === DOCUMENT_VERSION && validation.document.wires.some((wire) => wire.routeAnchors?.length)) {
+    return { ok: false, reason: `ルートアンカーを含む回路ファイルはバージョン${ROUTE_ANCHOR_DOCUMENT_VERSION}で保存してください。` };
+  }
+  // Legacy documents and compact numeric literals can grow during normalization.
+  // Only accept documents that can be saved again within the same public limit.
+  if (JSON.stringify(savedEnvelope(validation.document)).length > MAX_CIRCUIT_DOCUMENT_JSON_LENGTH) {
+    return { ok: false, reason: `正規化後の保存データは${MAX_CIRCUIT_DOCUMENT_JSON_LENGTH}文字以下にしてください。` };
+  }
   return { ok: true, document: validation.document };
 }

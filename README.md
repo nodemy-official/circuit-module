@@ -50,7 +50,7 @@ React UI は headless です。各モジュールは標準 CSS を自動で読�
 
 ```tsx
 import { CircuitEditor, CircuitBoard, CircuitPalette, CircuitInspector, CircuitAnalysisPanel } from "@nodemy-official/circuit-module/ui";
-import { createExampleCircuit, type CircuitDocument, type CircuitEndpoint } from "@nodemy-official/circuit-module/model";
+import { createExampleCircuit, endpointName, type CircuitDocument, type CircuitEndpoint } from "@nodemy-official/circuit-module/model";
 import "./workbench.css";
 
 function saveDraft(document: CircuitDocument) {
@@ -66,7 +66,9 @@ export function Workbench() {
         const endpointLabel = (endpoint: CircuitEndpoint) => {
           const item = editor.document.parts.find((candidate) => candidate.id === endpoint.partId);
           const partName = item?.label || item?.id || "部品";
-          return `${partName}の${endpoint.terminal === "a" ? "端子A" : "端子B"}`;
+          return item
+            ? endpointName({ kind: item.kind, label: partName }, endpoint.terminal)
+            : `${partName}の端子${endpoint.terminal.toUpperCase()}`;
         };
         const wireEndpoints = wire ? { from: endpointLabel(wire.from), to: endpointLabel(wire.to) } : undefined;
 
@@ -150,6 +152,14 @@ export function Workbench() {
 部品や導線のドラッグ中に選択・コピー・切り取り・貼り付け・複製・Undo/Redoのショートカットを使うと、その時点の移動を確定してからコマンドを実行します。押下を続けたままポインターを動かしても、新しい選択へ移動を適用しません。
 
 独自UIで導線経路を管理する場合、`CircuitBoard` の `onWireRouteChange(id, waypoints?)` で更新を保存し、`onWireRouteCancel(id)` で取消時に変更を戻し、`onWireRouteEnd()` でドラッグを確定します。`useCircuitEditor` controller の `updateWireRoute`、`cancelWireRoute`、`resetWireRoute` はこの流れを扱います。`CircuitInspector` の `onResetWireRoute` は選択中の手動経路を自動配線へ戻し、`onReconnect` と `wireEndpoints` は再接続操作とボタンの端子名を設定します。`onBlur={editor.endEdit}` は値の連続編集を一操作にまとめます。解析は `editor.analysis` から参照し、失敗理由は `editor.error` に表示できます。
+
+基板から渡される `CircuitWireRoutePoints` は、非列挙の own 属性 `generatedRoute` に完成形状と保存方針を、取消用の `restoreRoute` に元の保存経路を保持します。配列をそのまま `setWireRoute` または controller の `updateWireRoute` に渡すと、連続入力の描画タイミングに依存せず経路を保存し、取消時には自動配線・従来の経由点・明示経路の区別と境界からの差分値も復元できます。配列を `map`・`slice`・JSONで複製するとこれらの属性は失われるため、渡された経路を複製して保存する場合は属性も保持してください。`onWireRouteCancel` を渡すと、取消時のUndo/Redo履歴も復元できます。
+
+headless で生成済みの導線形状を保存する場合は `setWireRoute(document, id, waypoints?)` を使います。自動配線や従来の `waypoints` を持つ導線への入力は、従来の経由点として一度描画し、端子回避も含めた生成形状を保存します。通常の経由点だけで同一形状を再現でき、点数と座標も従来の上限内なら `waypoints` として保存し、端子リードなどの生成角を明示保存する必要がある場合は `routeAnchors` を使います。既存の `routeAnchors` を編集する際は、端子まで直交している入力を外向き判定によらず明示頂点として保持します。直交しない入力は従来の経由点として一度描画してから明示保存します。
+
+`routeAnchors` は終端処理を済ませた直交折れ線の内部頂点で、描画時に角や端子リードを追加しません。`CircuitRouteAnchor` の `xBoundary` / `yBoundary` は `-1` または `1` で、その軸の値を負側または正側の座標境界からの差分として表します。`encodeWireRouteAnchors` / `decodeWireRouteAnchors` で相互変換できます。従来の `setWireWaypoints` の描画と座標上限は維持し、両関数とも経由点を省略すると自動配線へ戻します。
+
+部品座標や回転を独自処理で変更した場合は、変更後の文書と部品 ID を `repairWireRoutes(document, partIds)` に渡すと、明示経路の端子接続を補修し保存上限を検証できます。`moveParts`、`rotateParts`、`reconnectWire` はこの補修を含めて処理します。
 
 `CircuitEditor` の `children` は通常の `ReactNode` でも、`(editor) => ReactNode` の render prop でも構いません。render prop を使わず子孫から状態を読む場合は `useCircuitEditorContext()` を使えます。`initialDocument` は初期値、`onDocumentChange` は変更通知です。controller が持つ `document`、`selection`、`pendingEndpoint`、`pendingWire`、`analysis`、`error` と、追加・選択・接続・つなぎ替え・移動・回転・削除・Undo/Redo などの操作を組み合わせてください。provider を使わず hook を直接使いたい場合は、従来どおり `useCircuitEditor(initialDocument?)` を利用できます。
 
@@ -294,7 +304,9 @@ npm run storybook
 
 コア API から回路を版付き JSON に保存し、読み込めます。読み込みは JSON の形・部品種別・数値・端子参照を検証して新しい `CircuitDocument` を返します。以前の `CircuitDocument` をそのまま JSON 化した形式も読み込めます。外部データを使うときは `parseCircuitDocument` の結果を確認してから利用してください。
 
-保存は解析と同じ own data property の値を使い、非列挙の属性や配列要素も保持します。Proxy の `get` や配列の iterator が返す見かけの値は保存しません。保存対象の属性や配列要素に getter/setter がある場合は実行せず拒否し、保存対象外の属性は getter を含めて無視します。
+保存は解析と同じ own data property の値を使い、非列挙の属性や配列要素も保持します。`copyFragment` も有効な選択範囲をこの保存対象の値で複製します。Proxy の `get` や配列の iterator が返す見かけの値は保存しません。保存対象の属性や配列要素に getter/setter がある場合は実行せず拒否し、保存対象外の属性は getter を含めて無視します。
+
+文字数の上限は入力JSONと正規化後の版付きJSONの両方に適用します。旧形式へのenvelope追加や数値表記の展開で、読み込んだ回路が再保存できない状態になる場合は、読み込み時に理由を返します。保存時は通常の整形で上限を超えるとcompact JSONへ切り替えます。
 
 ```ts
 import {
@@ -317,7 +329,9 @@ function load(json: string) {
 const diagnostics = inspectCircuit(load(save({ title: "例", parts: [], wires: [] })));
 ```
 
-保存データは `{ "format": "circuit-module", "version": 1, "document": ... }` の envelope です。保存・読み込み上限は `MAX_CIRCUIT_DOCUMENT_JSON_LENGTH`（1,000,000 文字）、`MAX_CIRCUIT_DOCUMENT_PARTS`（10,000 個）、`MAX_CIRCUIT_DOCUMENT_WIRES`（20,000 本）、`MAX_CIRCUIT_DOCUMENT_COORDINATE`（座標の絶対値、格子セル単位）で公開しています。座標上限は `Number.MAX_SAFE_INTEGER / (GRID * 4)` で、基板のピクセル変換と座標差分が有限値に収まるよう設定しています。これらはファイル形式の上限で、solver が解析できる回路規模の保証ではありません。回路が未接続、未完成、または電源なしでもファイルとして保存できます。解析上の問題は `inspectCircuit(document)` で個別に確認します。利用可能な subpath は `@nodemy-official/circuit-module/serialization` と `/diagnostics` です。
+保存データは `{ "format": "circuit-module", "version": 1, "document": ... }` の envelope です。`routeAnchors` を使う文書だけ `version: 2` で保存し、対応しない旧リーダーが生成角を黙って削除することを防ぎます。現在のリーダーは両バージョンを受け入れ、旧データの配線形状を維持します。保存・読み込み上限は `MAX_CIRCUIT_DOCUMENT_JSON_LENGTH`（1,000,000 文字）、`MAX_CIRCUIT_DOCUMENT_PARTS`（10,000 個）、`MAX_CIRCUIT_DOCUMENT_WIRES`（20,000 本）、`MAX_CIRCUIT_DOCUMENT_COORDINATE`（座標の絶対値、格子セル単位）で公開しています。座標上限は `Number.MAX_SAFE_INTEGER / (GRID * 4)` で、基板のピクセル変換と座標差分が有限値に収まるよう設定しています。これらはファイル形式の上限で、solver が解析できる回路規模の保証ではありません。回路が未接続、未完成、または電源なしでもファイルとして保存できます。解析上の問題は `inspectCircuit(document)` で個別に確認します。利用可能な subpath は `@nodemy-official/circuit-module/serialization` と `/diagnostics` です。
+
+通常の経由点は1本につき `MAX_CIRCUIT_WIRE_WAYPOINTS`（10,000 点）までです。生成経路の `routeAnchors` は `MAX_CIRCUIT_WIRE_ROUTE_ANCHORS`（50,000 点）までで、元の経由点10,000点と、両端のリードでそれぞれ最大20,000探索点から生成される角の保存余地を設けています。明示経路の分割では元の内部頂点を各半区間へ保持し、切断点は新しい端点になるため、各導線の保存頂点数は元より増えません。内部頂点のない直線区間は1点を保持して自動配線との区別を保ちます。移動・回転・再接続で新たな接続角が必要になり上限を超える場合、その編集を拒否して元の文書を保ちます。`waypoints` と `routeAnchors` の同時指定はできません。生成角の差分も有限で絶対値が座標上限以下に制限され、JSON全体の1,000,000文字上限も維持されます。
 
 headless の保存上限はエディターで読み込めるサイズとは別です。UI の `useCircuitEditor.importDocument()` は `MAX_CIRCUIT_EDITOR_PARTS`（256 個）と `MAX_CIRCUIT_EDITOR_WIRES`（1,024 本）を超えるファイルを拒否し、現在の document と履歴を保って controller の `error` に理由を設定します。同期描画と解析にかかる負荷を抑えるための制限です。headless `analyzeCircuit()` は `MAX_CIRCUIT_ANALYSIS_TERMINALS`（512 端子）を超えると `invalid` を返します。ファイル保存上限を解析可能サイズとみなさないでください。
 

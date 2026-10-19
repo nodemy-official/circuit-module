@@ -1,4 +1,4 @@
-import type { Point } from "../circuit-geometry.js";
+import { GRID, type Point } from "../circuit-geometry.js";
 
 export interface BoardCamera {
   x: number;
@@ -8,6 +8,15 @@ export interface BoardCamera {
 
 export const MIN_ZOOM = 0.25;
 export const MAX_ZOOM = 3;
+
+/** Keep SVG coordinates near the viewport; large absolute transforms exceed browser precision. */
+export function cameraDrawingOrigin(camera: BoardCamera): Point {
+  // A multiple of five cells preserves the major grid's world-space alignment.
+  // Rebase in chunks so ordinary pan frames retain the cached SVG artwork.
+  const chunk = 1280;
+  const axis = (pixels: number) => Math.abs(pixels) <= 2 ** 20 ? 0 : Math.trunc(pixels / (GRID * chunk)) * chunk;
+  return { x: axis(camera.x), y: axis(camera.y) };
+}
 
 /** Keep the world position underneath a viewport-relative pointer fixed. */
 export function zoomCameraAt(camera: BoardCamera, nextZoom: number, pointer: Point): BoardCamera {

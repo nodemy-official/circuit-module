@@ -591,16 +591,18 @@ describe("wiring", () => {
     if (!result.ok) { throw new Error(result.reason); }
     expect(result.document.parts).toHaveLength(4);
     expect(result.document.wires).toHaveLength(3);
-    expect(result.document.wires).toContainEqual({
+    expect(result.document.wires).toContainEqual(expect.objectContaining({
       id: "wire-1",
       from: { partId: "left", terminal: "b" },
       to: { partId: "tap", terminal: "a" },
-    });
-    expect(result.document.wires).toContainEqual({
+    }));
+    expect(result.document.wires).toContainEqual(expect.objectContaining({
       id: "wire-2",
       from: { partId: "tap", terminal: "a" },
       to: { partId: "right", terminal: "a" },
-    });
+    }));
+    expect(routeDocumentWires(result.document).get("wire-1")).toEqual([{ x: 7, y: 5 }, { x: 10, y: 5 }]);
+    expect(routeDocumentWires(result.document).get("wire-2")).toEqual([{ x: 10, y: 5 }, { x: 13, y: 5 }]);
     expect(result.document.wires).toContainEqual({
       id: result.id,
       from: { partId: "branch", terminal: "a" },

@@ -4,7 +4,7 @@ import { simulationDocumentCollectionsSchema, simulationEndpointSchema, simulati
 const simulationRecordFields = [...new Set([
   ...Object.values(circuitPartCatalog).flatMap(({ defaults }) => Object.keys(defaults)),
   "id", "kind", "label", "x", "y", "rotation", "title", "parts", "wires",
-  "from", "to", "waypoints", "partId", "terminal", "mode", "frequencyHz",
+  "from", "to", "waypoints", "routeAnchors", "xBoundary", "yBoundary", "partId", "terminal", "mode", "frequencyHz",
   "switchStates", "voltageOverrides", "initialInductorCurrents", "durationSeconds",
   "timeStepSeconds", "startFromOperatingPoint",
 ])];

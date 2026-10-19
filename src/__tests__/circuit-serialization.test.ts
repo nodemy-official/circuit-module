@@ -43,8 +43,8 @@ function documentWithWaypoints() {
 
 describe("circuit document serialization", () => {
   it("counts UTF-16 units at the JSON input length boundary", () => {
-    const prefix = '{"title":"';
-    const suffix = '","parts":[],"wires":[]}';
+    const prefix = '{"format":"circuit-module","version":1,"document":{"title":"';
+    const suffix = '","parts":[],"wires":[]}}';
     const titleLength = MAX_CIRCUIT_DOCUMENT_JSON_LENGTH - prefix.length - suffix.length;
     const title = "😀".repeat(Math.floor(titleLength / 2)) + "a".repeat(titleLength % 2);
     const json = prefix + title + suffix;
@@ -497,9 +497,9 @@ describe("circuit document serialization", () => {
       expect(result.ok).toBe(false);
       if (!result.ok) { expect(result.reason).toMatch(/[ぁ-んァ-ヶ一-龠]/); }
     }
-    expect(parseCircuitDocument(JSON.stringify({ format: "circuit-module", version: 2, document: simpleDocument }))).toEqual({
+    expect(parseCircuitDocument(JSON.stringify({ format: "circuit-module", version: 3, document: simpleDocument }))).toEqual({
       ok: false,
-      reason: "回路ファイルのバージョン1に対応しています。",
+      reason: "回路ファイルのバージョン1と2に対応しています。",
     });
   });
 

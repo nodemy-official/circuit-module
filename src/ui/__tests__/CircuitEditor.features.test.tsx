@@ -288,6 +288,35 @@ describe("documents and diagnostics", () => {
     expect(required(ui.container, '[role="alert"]').textContent).toContain("読み込めませんでした");
   });
 
+  it("clears an earlier file read error when opening a sample", async () => {
+    const ui = mount();
+    const initial = ui.editor.document;
+    const input = required(ui.container, 'input[type="file"]');
+    Object.defineProperty(input, "files", { configurable: true, value: [{ size: 100,
+      text: () => Promise.reject(new Error("read failed")),
+    }] });
+    await act(async () => input.dispatchEvent(new Event("change", { bubbles: true })));
+    expect(required(ui.container, '[role="alert"]').textContent).toContain("読み込めませんでした");
+
+    const sampleSelect = required(ui.container, ".circuit-sample-select") as HTMLSelectElement;
+    const dialog = sampleSelect.closest("dialog");
+    if (!dialog) { throw new Error("Missing sample dialog"); }
+    Object.defineProperties(dialog, {
+      showModal: { configurable: true, value: () => { dialog.open = true; } },
+      close: { configurable: true, value: () => { dialog.open = false; } },
+    });
+    click(button(ui.container, "サンプルを開く"));
+    act(() => { sampleSelect.value = "charging"; sampleSelect.dispatchEvent(new Event("change", { bubbles: true })); });
+    click(required(dialog, ".circuit-button--primary"));
+
+    expect(ui.editor.document).toEqual(createCircuitExample("charging"));
+    expect(ui.container.querySelector('[role="alert"]')).toBeNull();
+    expect(dialog.open).toBe(false);
+    command(ui.container, "z");
+    expect(ui.editor.document).toBe(initial);
+    expect(ui.container.querySelector('[role="alert"]')).toBeNull();
+  });
+
   it("downloads a versioned file using the save shortcut", () => {
     vi.useFakeTimers();
     const createObjectURL = vi.fn().mockReturnValue("blob:circuit");

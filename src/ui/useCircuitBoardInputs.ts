@@ -40,6 +40,7 @@ export function useCircuitBoardInputs(document: CircuitDocument, selection: Circ
   ]));
   const waypoints = useContentSnapshot(document.wires.flatMap((wire) => [
     wire.waypoints?.length ?? 0, ...wire.waypoints?.flatMap((point) => [point.x, point.y]) ?? [],
+    wire.routeAnchors?.length ?? 0, ...wire.routeAnchors?.flatMap((point) => [point.x, point.y, point.xBoundary, point.yBoundary]) ?? [],
   ]));
   const visualReadings = useContentSnapshot(readingValues(document, analysis));
   const selectedParts = useMemo(() => new Set(partIds), [partIds]);

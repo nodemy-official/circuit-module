@@ -4,6 +4,7 @@ import {
   type CircuitPart,
   type CircuitPartKind,
   type CircuitRotation,
+  type CircuitRouteAnchor,
   type CircuitTerminal,
 } from "./circuit-model.js";
 
@@ -746,6 +747,32 @@ function samePoint(first: Point, second: Point) {
   return first.x === second.x && first.y === second.y;
 }
 
+function withinWireCoordinates(point: Point) {
+  return Math.abs(point.x) <= MAX_WIRE_COORDINATE && Math.abs(point.y) <= MAX_WIRE_COORDINATE;
+}
+
+/** Encodes generated corners beyond the authored coordinate range as boundary-relative offsets. */
+export function encodeWireRouteAnchors(points: readonly Point[]): CircuitRouteAnchor[] {
+  return points.map(({ x, y }) => {
+    const xBoundary: -1 | 1 | undefined = x > MAX_WIRE_COORDINATE ? 1 : x < -MAX_WIRE_COORDINATE ? -1 : undefined;
+    const yBoundary: -1 | 1 | undefined = y > MAX_WIRE_COORDINATE ? 1 : y < -MAX_WIRE_COORDINATE ? -1 : undefined;
+    return {
+      x: xBoundary ? x - xBoundary * MAX_WIRE_COORDINATE : x,
+      y: yBoundary ? y - yBoundary * MAX_WIRE_COORDINATE : y,
+      ...(xBoundary ? { xBoundary } : {}),
+      ...(yBoundary ? { yBoundary } : {}),
+    };
+  });
+}
+
+/** Restores generated route anchors to grid coordinates for terminal-aware routing. */
+export function decodeWireRouteAnchors(anchors: readonly CircuitRouteAnchor[]): Point[] {
+  return anchors.map(({ x, y, xBoundary, yBoundary }) => ({
+    x: xBoundary ? xBoundary * MAX_WIRE_COORDINATE + x : x,
+    y: yBoundary ? yBoundary * MAX_WIRE_COORDINATE + y : y,
+  }));
+}
+
 function approachStubWaypoint(firstStub: Point, target: Point, continuation: Point, offset: Point): Point[] {
   const sign = (continuation.x - target.x) * offset.x + (continuation.y - target.y) * offset.y > 0 ? -1 : 1;
   const approachOffset = { x: sign * offset.x, y: sign * offset.y };
@@ -904,8 +931,32 @@ function routeThroughWaypoints(start: RouteEnd, end: RouteEnd, waypoints: readon
   return preserveWaypoints ? route : simplifyManualRoute(route);
 }
 
+/** Interprets legacy implicit waypoints and generates their terminal approaches once. */
+export function routeWireThroughWaypoints(start: RouteEnd, end: RouteEnd, waypoints: readonly Point[]): Point[] {
+  return routeThroughWaypoints(start, end, waypoints);
+}
+
+/** Checks a finished orthogonal route; new legacy candidates additionally need outward terminal leads. */
+export function isExplicitWireRoute(start: RouteEnd, end: RouteEnd, points: readonly Point[], requireOutwardLeads = true): boolean {
+  const route = simplifyManualRoute([start.point, ...points, end.point]);
+  return route.every((point, index) => {
+    const next = route[index + 1];
+    return !next || point.x === next.x || point.y === next.y;
+  }) && (!requireOutwardLeads || outwardLead(start, route[1]) && outwardLead(end, route.at(-2)));
+}
+
+function literalWireRoute(start: RouteEnd, end: RouteEnd, points: readonly Point[], preserveWaypoints = false): Point[] {
+  const route = [start.point, ...points, end.point];
+  return preserveWaypoints ? route : simplifyManualRoute(route);
+}
+
 function equalRoutes(first: readonly Point[], second: readonly Point[]) {
   return first.length === second.length && first.every((point, index) => samePoint(point, second[index]));
+}
+
+/** Checks legacy waypoint storage against the complete finished polyline, including both terminal approaches. */
+export function wireRouteMatchesWaypoints(route: readonly Point[], start: RouteEnd, end: RouteEnd, waypoints: readonly Point[]): boolean {
+  return equalRoutes(simplifyManualRoute(route), routeThroughWaypoints(start, end, waypoints));
 }
 
 /** Long straight runs need only their first and last internal anchors. */
@@ -972,12 +1023,46 @@ function explicitPinAnchors(route: readonly Point[], start: RouteEnd, end: Route
   return result;
 }
 
+function replayBoundedAnchors(anchors: readonly Point[], rendered: readonly Point[], start: RouteEnd, end: RouteEnd): Point[] | undefined {
+  if (!anchors.length) { return; }
+  const candidates = compactStraightRunAnchors(anchors);
+  const protectedPins = [start, end].filter((terminal) => terminal.direction).map((terminal) => terminal.point);
+  const compact = compactRouteAnchors(candidates, 0, candidates.length - 1, protectedPins);
+  return equalRoutes(routeThroughWaypoints(start, end, compact), rendered) ? compact : undefined;
+}
+
+function boundedRouteAnchors(original: readonly Point[], rendered: readonly Point[], start: RouteEnd, end: RouteEnd): Point[] | undefined {
+  const bounded = original.filter(withinWireCoordinates);
+  if (bounded.length === original.length) { return; }
+  // A junction endpoint can anchor an entire terminal approach. Keep generated lead corners
+  // beyond the serialized coordinate limit implicit when a boundary part is split.
+  const compact = replayBoundedAnchors(bounded, rendered, start, end);
+  if (compact) { return compact; }
+  for (const terminal of [start, end]) {
+    if (terminal.direction) { continue; }
+    const anchor = { ...terminal.point };
+    const anchors = terminal === start ? [anchor, ...bounded] : [...bounded, anchor];
+    const anchored = replayBoundedAnchors(anchors, rendered, start, end);
+    if (anchored) { return anchored; }
+    if (equalRoutes(routeThroughWaypoints(start, end, [anchor]), rendered)) { return [anchor]; }
+  }
+}
+
 /** Stores a rendered route with implicit orthogonal bends, preserving its exact geometry. */
-export function compactWireRouteWaypoints(route: readonly Point[], start: RouteEnd, end: RouteEnd): Point[] {
+export function compactWireRouteWaypoints(route: readonly Point[], start: RouteEnd, end: RouteEnd, authoredWaypoints?: readonly Point[]): Point[] {
   const rendered = simplifyManualRoute(route);
+  // Splitting changes the implicit final dog-leg. Try the original authored anchors before
+  // replacing them with generated corners, which may exceed an already-full stored route.
+  if (authoredWaypoints?.length && equalRoutes(routeThroughWaypoints(start, end, authoredWaypoints), rendered)) {
+    return authoredWaypoints.map((point) => ({ ...point }));
+  }
   // A user may explicitly route back through a pin. Collinear simplification
   // must retain that intent when the protected interior segments are replayed.
   const original = explicitPinAnchors(rendered, start, end).slice(1, -1);
+  // Hidden authored anchors can encode the intervening bends more compactly than their
+  // rendered corners. Retain them when removing boundary-only generated lead corners.
+  const bounded = boundedRouteAnchors(explicitPinAnchors(route, start, end).slice(1, -1), rendered, start, end);
+  if (bounded) { return bounded; }
   if (rendered.length === 2) {
     // An empty list selects automatic routing, which may detour around a wire added before this
     // split segment. Keep one anchor even for a straight segment; use the outward stub where a
@@ -1010,7 +1095,9 @@ export function routeDocumentWires(document: CircuitDocument, options: { preserv
     if (!from || !to) { continue; }
     const start = routeEnd(from, wire.from.terminal);
     const end = routeEnd(to, wire.to.terminal);
-    const route = wire.waypoints?.length
+    const route = wire.routeAnchors?.length
+      ? literalWireRoute(start, end, decodeWireRouteAnchors(wire.routeAnchors), options.preserveWaypoints)
+      : wire.waypoints?.length
       ? routeThroughWaypoints(start, end, wire.waypoints, options.preserveWaypoints)
       : from.id === to.id && terminalsOf(from.kind).length >= 2
         ? routeTiedPins(from, wire.from.terminal, wire.to.terminal, occupied)
@@ -1042,7 +1129,7 @@ export function contentBounds(document: CircuitDocument): GridRect | null {
   let maxX = Math.max(...rects.map((rect) => rect.maxX));
   let maxY = Math.max(...rects.map((rect) => rect.maxY));
   for (const wire of document.wires) {
-    for (const point of wire.waypoints ?? []) {
+    for (const point of wire.routeAnchors?.length ? decodeWireRouteAnchors(wire.routeAnchors) : wire.waypoints ?? []) {
       minX = Math.min(minX, point.x);
       minY = Math.min(minY, point.y);
       maxX = Math.max(maxX, point.x);
