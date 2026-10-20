@@ -6,7 +6,7 @@ import { circuitPartCatalog, type CircuitPart } from "../../circuit-model.js";
 import { analyzeCircuit } from "../../circuit-solver.js";
 import { CircuitInspector } from "../CircuitInspector.js";
 import { CircuitPreviewPanel } from "../CircuitPreviewPanel.js";
-import { NumericInput } from "../NumericInput.js";
+import { NumericInput, useNumericDraft } from "../NumericInput.js";
 
 const mounted: Array<{ root: Root; container: HTMLElement }> = [];
 beforeEach(() => vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true));
@@ -54,6 +54,39 @@ function inputValue(input: HTMLInputElement, value: string) {
 }
 
 describe("numeric drafts after external domain updates", () => {
+  it("notifies a return to the original value while a host defers its controlled update", () => {
+    const pending: number[] = [];
+    const ui = mount(10, (value) => <NumericInput value={value} onValueChange={(next) => pending.push(next)} />);
+    const input = ui.container.querySelector("input")!;
+
+    inputValue(input, "20");
+    inputValue(input, "10");
+
+    expect(pending).toEqual([20, 10]);
+    expect(input.value).toBe("10");
+    expect(ui.value).toBe(10);
+  });
+
+  it("commits a return to the original value when changes are batched", () => {
+    let change: ((text: string) => void) | undefined;
+    function Field({ value, update }: { value: number; update: (value: number) => void }) {
+      const draft = useNumericDraft({ value, onValueChange: update });
+      change = draft.change;
+      return <output>{draft.text}</output>;
+    }
+    const ui = mount(10, (value, update) => <Field value={value} update={update} />);
+    const changeDraft = change;
+    if (!changeDraft) { throw new Error("Missing draft callback"); }
+
+    act(() => {
+      changeDraft("20");
+      changeDraft("10");
+    });
+
+    expect(ui.value).toBe(10);
+    expect(ui.container.querySelector("output")?.textContent).toBe("10");
+  });
+
   it.each(["inspector", "preview"] as const)("repairs a malformed own numeric value by entering the catalog default in %s", (view) => {
     const initial: CircuitPart = { id: "load", kind: "resistor", x: 0, y: 0, ...circuitPartCatalog.resistor.defaults };
     Object.defineProperty(initial, "resistanceOhms", { value: null, enumerable: true, configurable: true });

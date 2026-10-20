@@ -13,6 +13,10 @@ export interface Point {
   y: number;
 }
 
+function copyPoint({ x, y }: Point): Point {
+  return { x, y };
+}
+
 export interface GridRect {
   minX: number;
   minY: number;
@@ -277,7 +281,7 @@ export function moveWireSegment(
   start?: RouteEnd,
   end?: RouteEnd,
 ): Point[] {
-  const unchanged = () => route.map((point) => ({ ...point }));
+  const unchanged = () => route.map(copyPoint);
   if (!Number.isFinite(coordinate) || !Number.isInteger(segmentIndex) ||
     segmentIndex < 0 || segmentIndex >= route.length - 1) {
     return unchanged();
@@ -299,14 +303,14 @@ export function moveWireSegment(
     // Fold-backs leave adjacent segments on the same line. Retain their original corner
     // and add a perpendicular connector instead of joining the shifted corner diagonally.
     const collinear = neighbor && (horizontal ? neighbor.y === point.y : neighbor.x === point.x);
-    return collinear ? [{ ...point }, shifted] : [shifted];
+    return collinear ? [copyPoint(point), shifted] : [shifted];
   };
   const isFirstSegment = segmentIndex === 0;
   const isLastSegment = segmentIndex + 1 === route.length - 1;
-  const moved: Point[] = route.slice(0, segmentIndex).map((point) => ({ ...point }));
+  const moved: Point[] = route.slice(0, segmentIndex).map(copyPoint);
 
   if (isFirstSegment) {
-    moved.push({ ...first });
+    moved.push(copyPoint(first));
     if (start?.direction) {
       const firstStub = stub(start);
       moved.push(firstStub, moveToLane(firstStub));
@@ -320,15 +324,15 @@ export function moveWireSegment(
   if (isLastSegment) {
     if (end?.direction) {
       const lastStub = stub(end);
-      moved.push(moveToLane(lastStub), lastStub, { ...last });
+      moved.push(moveToLane(lastStub), lastStub, copyPoint(last));
     } else {
-      moved.push(moveToLane(last), { ...last });
+      moved.push(moveToLane(last), copyPoint(last));
     }
   } else {
     moved.push(...laneConnector(last, route[segmentIndex + 2]).reverse());
   }
 
-  moved.push(...route.slice(segmentIndex + 2).map((point) => ({ ...point })));
+  moved.push(...route.slice(segmentIndex + 2).map(copyPoint));
   return restoreMovedTerminalLeads(moved, start, end);
 }
 
@@ -731,7 +735,7 @@ function simplifyManualRoute(points: readonly Point[]): Point[] {
       if (!continuesStraight(before, middle, point)) { break; }
       route.pop();
     }
-    route.push({ ...point });
+    route.push(copyPoint(point));
   }
   return route;
 }
@@ -739,7 +743,7 @@ function simplifyManualRoute(points: readonly Point[]): Point[] {
 function appendRoute(target: Point[], points: readonly Point[]) {
   for (const point of points) {
     const previous = target.at(-1);
-    if (!previous || previous.x !== point.x || previous.y !== point.y) { target.push({ ...point }); }
+    if (!previous || previous.x !== point.x || previous.y !== point.y) { target.push(copyPoint(point)); }
   }
 }
 
@@ -784,7 +788,7 @@ function approachStubWaypoint(firstStub: Point, target: Point, continuation: Poi
 }
 
 function routeLeadAroundOccupied(lead: readonly Point[], occupied: readonly (readonly Point[])[], protectedPins: readonly Point[]) {
-  const route = lead.slice(0, 2).map((point) => ({ ...point }));
+  const route = lead.slice(0, 2).map(copyPoint);
   // Generated approach corners are movable. Only the final user waypoint may
   // deliberately coincide with a pin; an intermediate corner must avoid it.
   const corners = lead.slice(2).filter((point, index, points) => index === points.length - 1 ||
@@ -802,7 +806,7 @@ function routeLeadAroundOccupied(lead: readonly Point[], occupied: readonly (rea
 
 function terminalLead(start: RouteEnd, target: Point, continuation: Point, occupied: readonly (readonly Point[])[], protectedPins: readonly Point[], firstStub = stub(start)): Point[] {
   if (!start.direction) { return routeAvoidingTerminalPoints(start, { point: target, direction: null }, occupied, protectedPins); }
-  const lead = [{ ...start.point }, firstStub];
+  const lead = [copyPoint(start.point), firstStub];
   if (samePoint(target, firstStub)) { return lead; }
   const offset = {
     x: -start.direction.y * 2,
@@ -826,7 +830,7 @@ function terminalLead(start: RouteEnd, target: Point, continuation: Point, occup
 
   if (progress > 0 && perpendicularDistance === 0) {
     if (samePoint(target, continuation)) {
-      return [{ ...start.point }, { ...target }];
+      return [copyPoint(start.point), copyPoint(target)];
     }
     // Fractional waypoints may lie within the outward stub. Approach them perpendicular to
     // the stub so the lead is not retraced on the way back to the waypoint.
@@ -1002,7 +1006,7 @@ function compactRouteAnchors(route: readonly Point[], first: number, last: numbe
     }
   }
   const anchors: Point[] = [];
-  for (let index = last; index >= first; index = previous[index]) { anchors.push({ ...route[index] }); }
+  for (let index = last; index >= first; index = previous[index]) { anchors.push(copyPoint(route[index])); }
   return anchors.reverse();
 }
 
@@ -1040,7 +1044,7 @@ function boundedRouteAnchors(original: readonly Point[], rendered: readonly Poin
   if (compact) { return compact; }
   for (const terminal of [start, end]) {
     if (terminal.direction) { continue; }
-    const anchor = { ...terminal.point };
+    const anchor = copyPoint(terminal.point);
     const anchors = terminal === start ? [anchor, ...bounded] : [...bounded, anchor];
     const anchored = replayBoundedAnchors(anchors, rendered, start, end);
     if (anchored) { return anchored; }
@@ -1054,7 +1058,7 @@ export function compactWireRouteWaypoints(route: readonly Point[], start: RouteE
   // Splitting changes the implicit final dog-leg. Try the original authored anchors before
   // replacing them with generated corners, which may exceed an already-full stored route.
   if (authoredWaypoints?.length && equalRoutes(routeThroughWaypoints(start, end, authoredWaypoints), rendered)) {
-    return authoredWaypoints.map((point) => ({ ...point }));
+    return authoredWaypoints.map(copyPoint);
   }
   // A user may explicitly route back through a pin. Collinear simplification
   // must retain that intent when the protected interior segments are replayed.

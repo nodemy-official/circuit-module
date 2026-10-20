@@ -28,6 +28,8 @@ import {
   type CircuitWire,
 } from "./circuit-model.js";
 import { validateCircuitFragment, validateCircuitRouteAnchors } from "./circuit-serialization.js";
+import { circuitDocumentStorageIssue } from "./circuit-storage.js";
+import { copyCircuitRecord } from "./circuit-copy.js";
 
 export interface CircuitSelection {
   parts: string[];
@@ -62,6 +64,13 @@ export type CircuitWireRoutePoints = Point[] & CircuitWireRouteHint;
 export type EditResult<T = object> =
   | ({ ok: true; document: CircuitDocument } & T)
   | { ok: false; reason: string };
+
+/** Check completed edits, rather than temporary junctions and split candidates. */
+function checkedEdit<T>(original: CircuitDocument, result: EditResult<T>): EditResult<T> {
+  if (!result.ok || result.document === original) { return result; }
+  const reason = circuitDocumentStorageIssue(result.document);
+  return reason ? { ok: false, reason } : result;
+}
 
 export function nextId(prefix: string, ids: readonly string[]) {
   const taken = new Set(ids);
@@ -166,6 +175,10 @@ export function addPart(
   kind: CircuitPartKind,
   at: Point,
 ): EditResult<{ id: string }> {
+  return checkedEdit(document, addPartCandidate(document, kind, at));
+}
+
+function addPartCandidate(document: CircuitDocument, kind: CircuitPartKind, at: Point): EditResult<{ id: string }> {
   if (!at) { return { ok: false, reason: coordinateError }; }
   const point = copyPoint(at);
   if (!validCoordinate(point)) { return { ok: false, reason: coordinateError }; }
@@ -184,7 +197,7 @@ export function addPart(
   if (!canPlace(document, [part])) {
     return { ok: false, reason: "そこには置けません。ほかの部品と重なります。" };
   }
-  return { ok: true, id, document: { ...document, parts: [...document.parts, part] } };
+  return { ok: true, id, document: copyCircuitRecord(document, { parts: [...document.parts, part] }) };
 }
 
 /** Moves parts without checking; pair with {@link canPlace} to validate. */
@@ -196,10 +209,9 @@ export function shiftParts(
 ) {
   const moving = new Set(ids);
   const originalParts = new Map(document.parts.map((part) => [part.id, part]));
-  const next = {
-    ...document,
+  const next = copyCircuitRecord(document, {
     parts: document.parts.map((part) =>
-      moving.has(part.id) ? { ...part, x: part.x + dx, y: part.y + dy } : part,
+      moving.has(part.id) ? copyCircuitRecord(part, { x: part.x + dx, y: part.y + dy }) : part,
     ),
     wires: document.wires.map((wire) => {
       if ((!wire.waypoints && !wire.routeAnchors) ||
@@ -207,8 +219,7 @@ export function shiftParts(
         (dx === 0 && dy === 0)) {
         return wire;
       }
-      return {
-        ...wire,
+      return copyCircuitRecord(wire, {
         ...(wire.waypoints ? {
           waypoints: wire.waypoints.map((point) => ({ x: point.x + dx, y: point.y + dy })),
         } : {}),
@@ -217,9 +228,9 @@ export function shiftParts(
             ? translatedRouteAnchors(wire, originalParts, dx, dy)
             : encodeWireRouteAnchors(decodeWireRouteAnchors(wire.routeAnchors).map((point) => ({ x: point.x + dx, y: point.y + dy }))),
         } : {}),
-      };
+      });
     }),
-  };
+  });
   // Rigid translations preserve intentional inward terminal visits. Still check their
   // orthogonality: (part + delta) + pinOffset can round differently from (part + pinOffset) + delta.
   return repairExplicitRoutes(next,
@@ -244,7 +255,7 @@ export function moveParts(
   if (waypointIssue) { return { ok: false, reason: waypointIssue }; }
   if (!canPlace(next, moved)) { return { ok: false, reason: "その位置にはほかの部品があります。" }; }
   if (moved.length === 0 || (dx === 0 && dy === 0)) { return { ok: true, document }; }
-  return { ok: true, document: next };
+  return checkedEdit(document, { ok: true, document: next });
 }
 
 export function rotateParts(document: CircuitDocument, ids: readonly string[]): EditResult {
@@ -252,19 +263,18 @@ export function rotateParts(document: CircuitDocument, ids: readonly string[]): 
   if (!document.parts.some((part) => rotating.has(part.id) && part.kind !== "junction")) {
     return { ok: true, document };
   }
-  const next = repairExplicitRoutes({
-    ...document,
+  const next = repairExplicitRoutes(copyCircuitRecord(document, {
     parts: document.parts.map((part) =>
       rotating.has(part.id) && part.kind !== "junction"
-        ? { ...part, rotation: nextRotation(part.rotation) }
+        ? copyCircuitRecord(part, { rotation: nextRotation(part.rotation) })
         : part,
     ),
-  }, (wire) => rotating.has(wire.from.partId) || rotating.has(wire.to.partId));
+  }), (wire) => rotating.has(wire.from.partId) || rotating.has(wire.to.partId));
   const routeIssue = wireWaypointError(next.wires);
   if (routeIssue) { return { ok: false, reason: routeIssue }; }
   const rotated = next.parts.filter((part) => rotating.has(part.id));
   if (!canPlace(next, rotated)) { return { ok: false, reason: "回転するとほかの部品と重なります。" }; }
-  return { ok: true, document: next };
+  return checkedEdit(document, { ok: true, document: next });
 }
 
 export function removeSelection(
@@ -295,11 +305,10 @@ export function removeSelection(
       )
       .map((part) => part.id),
   );
-  return {
-    ...document,
+  return copyCircuitRecord(document, {
     parts: document.parts.filter((part) => !parts.has(part.id) && !orphanedJunctions.has(part.id)),
     wires: remainingWires,
-  };
+  });
 }
 
 export function copyFragment(
@@ -322,13 +331,12 @@ export function copyFragment(
   if (captured.ok) { return captured.fragment; }
   // Preserve malformed host input for paste validation instead of repairing it.
   return {
-    parts: selected.parts.map((part) => ({ ...part })),
+    parts: selected.parts.map((part) => copyCircuitRecord(part)),
     wires: selected.wires
-      .map((wire) => ({
-        ...wire,
-        from: { ...wire.from },
-        to: { ...wire.to },
-        ...(wire.waypoints ? { waypoints: wire.waypoints.map((point) => ({ ...point })) } : {}),
+      .map((wire) => copyCircuitRecord(wire, {
+        from: copyCircuitRecord(wire.from),
+        to: copyCircuitRecord(wire.to),
+        ...(wire.waypoints ? { waypoints: wire.waypoints.map((point) => copyCircuitRecord(point)) } : {}),
         ...(wire.routeAnchors ? { routeAnchors: copyRouteAnchors(wire.routeAnchors) } : {}),
       })),
   };
@@ -338,7 +346,7 @@ function copyRouteAnchors(anchors: readonly CircuitRouteAnchor[]): CircuitRouteA
   const captured = validateCircuitRouteAnchors(anchors);
   // Keep malformed host input available for paste validation, while valid own data
   // retains nonenumerable coordinates and markers in the detached copy.
-  return captured.ok ? captured.routeAnchors : anchors.map((point) => ({ ...point }));
+  return captured.ok ? captured.routeAnchors : anchors.map((point) => copyCircuitRecord(point));
 }
 
 function uniqueCopyLabel(label: string, labels: Set<string>) {
@@ -359,10 +367,9 @@ function renumber(document: CircuitDocument, fragment: CircuitFragment, dx: numb
     const id = nextId("part", partIds);
     partIds.push(id);
     mapping.set(part.id, id);
-    return { ...part, id, label: uniqueCopyLabel(part.label, labels), x: part.x + dx, y: part.y + dy };
+    return copyCircuitRecord(part, { id, label: uniqueCopyLabel(part.label, labels), x: part.x + dx, y: part.y + dy });
   });
-  const endpoint = (end: CircuitEndpoint) => ({
-    ...end,
+  const endpoint = (end: CircuitEndpoint) => copyCircuitRecord(end, {
     partId: mapping.get(end.partId) ?? end.partId,
   });
   const wires = fragment.wires.map((wire) => {
@@ -380,7 +387,7 @@ function renumber(document: CircuitDocument, fragment: CircuitFragment, dx: numb
       } : {}),
     };
   });
-  const repaired = repairExplicitRoutes({ ...document, parts, wires }, () => true, () => false);
+  const repaired = repairExplicitRoutes(copyCircuitRecord(document, { parts, wires }), () => true, () => false);
   return { parts, wires: repaired.wires };
 }
 
@@ -396,20 +403,19 @@ export function pasteFragment(
   for (let step = 1; step <= 12; step += 1) {
     const copy = renumber(document, source, step * 2, step * 2);
     if (wireWaypointError(copy.wires)) { continue; }
-    const next = {
-      ...document,
+    const next = copyCircuitRecord(document, {
       parts: [...document.parts, ...copy.parts],
       wires: [...document.wires, ...copy.wires],
-    };
+    });
     if (canPlace(next, copy.parts)) {
-      return {
+      return checkedEdit(document, {
         ok: true,
         document: next,
         selection: {
           parts: copy.parts.map((part) => part.id),
           wires: copy.wires.map((wire) => wire.id),
         },
-      };
+      });
     }
   }
   return { ok: false, reason: "貼り付ける場所が見つかりません。" };
@@ -541,7 +547,7 @@ function splitWiresAtJunction(
     const divided = route && junctionPoint ? splitRouteAtPoint(route, junctionPoint) : undefined;
     const authored = wire.waypoints ?? [];
     const candidates = route && divided ? splitAuthoredWaypoints(route, divided, authored) : undefined;
-    const firstWire = { ...wire, to: junction };
+    const firstWire = copyCircuitRecord(wire, { to: junction });
     const secondWire = { id, from: junction, to: wire.to };
     const storeHalf = (halfWire: CircuitWire, half: Point[], candidate?: readonly Point[]) => {
       if (wire.routeAnchors?.length) { return withExplicitRoute(halfWire, half); }
@@ -559,12 +565,11 @@ function splitWiresAtJunction(
     ];
   });
   return {
-    document: {
-      ...document,
+    document: copyCircuitRecord(document, {
       // Routing depends on wire order. Keep each split in its original position so later
       // automatic routes still avoid these segments instead of collapsing on top of them.
       wires: document.wires.flatMap((wire) => replacements.get(wire.id) ?? [wire]),
-    },
+    }),
     splitWires,
   };
 }
@@ -574,6 +579,10 @@ export function connect(
   from: CircuitEndpoint,
   to: CircuitEndpoint,
 ): EditResult<{ id: string }> {
+  return checkedEdit(document, connectCandidate(document, from, to));
+}
+
+function connectCandidate(document: CircuitDocument, from: CircuitEndpoint, to: CircuitEndpoint): EditResult<{ id: string }> {
   const fromEndpoint = copyEndpoint(from);
   const toEndpoint = from === to ? fromEndpoint : copyEndpoint(to);
   const reason = connectionError(document, fromEndpoint, toEndpoint);
@@ -582,27 +591,26 @@ export function connect(
     "wire",
     document.wires.map((wire) => wire.id),
   );
-  return { ok: true, id, document: { ...document, wires: [...document.wires, { id, from: fromEndpoint, to: toEndpoint }] } };
+  return { ok: true, id, document: copyCircuitRecord(document, { wires: [...document.wires, { id, from: fromEndpoint, to: toEndpoint }] }) };
 }
 
 export type CircuitWireEnd = "from" | "to";
 
 function withWireWaypoints(wire: CircuitWire, waypoints?: readonly Point[]): CircuitWire {
   if (waypoints && waypoints.length > 0) {
-    return { ...withoutWireRoute(wire), waypoints: waypoints.map((point) => ({ x: point.x, y: point.y })) };
+    return copyCircuitRecord(withoutWireRoute(wire), { waypoints: waypoints.map((point) => ({ x: point.x, y: point.y })) });
   }
   return withoutWireRoute(wire);
 }
 
 function withoutWireRoute(wire: CircuitWire): CircuitWire {
-  const { waypoints: _waypoints, routeAnchors: _routeAnchors, ...copy } = wire;
-  return copy;
+  return copyCircuitRecord(wire, {}, ["waypoints", "routeAnchors"]);
 }
 
 function withExplicitRoute(wire: CircuitWire, route: readonly Point[]): CircuitWire {
   const points = routeWaypoints(route);
   // A straight half with no internal vertex still needs one anchor to remain explicit.
-  return { ...withoutWireRoute(wire), routeAnchors: encodeWireRouteAnchors(points.length ? points : [route[0]!]) };
+  return copyCircuitRecord(withoutWireRoute(wire), { routeAnchors: encodeWireRouteAnchors(points.length ? points : [route[0]!]) });
 }
 
 function alignTranslatedTerminal(points: Point[], original: readonly Point[], before: Point, after: Point, reversed: boolean) {
@@ -637,7 +645,7 @@ function translatedRouteAnchors(wire: CircuitWire, parts: ReadonlyMap<string, Ci
     if (!part) { return null; }
     return {
       before: terminalPoint(part, endpoint.terminal),
-      after: terminalPoint({ ...part, x: part.x + dx, y: part.y + dy }, endpoint.terminal),
+      after: terminalPoint(copyCircuitRecord(part, { x: part.x + dx, y: part.y + dy }), endpoint.terminal),
     };
   });
   // Preserve equality of the old connection axes, rather than comparing rounded coordinates
@@ -668,8 +676,7 @@ function repairExplicitRoutes(
   requireOutwardLeads: (wire: CircuitWire) => boolean = () => true,
 ): CircuitDocument {
   const parts = new Map(document.parts.map((part) => [part.id, part]));
-  return {
-    ...document,
+  return copyCircuitRecord(document, {
     wires: document.wires.map((wire) => {
       if (!wire.routeAnchors?.length || !affected(wire)) { return wire; }
       const from = parts.get(wire.from.partId);
@@ -682,7 +689,7 @@ function repairExplicitRoutes(
         ? wire
         : withExplicitRoute(wire, routeWireThroughWaypoints(start, end, points));
     }),
-  };
+  });
 }
 
 /** Repairs explicit terminal approaches after changing part geometry, rejecting any route that exceeds its storage limits. */
@@ -690,7 +697,7 @@ export function repairWireRoutes(document: CircuitDocument, partIds: readonly st
   const changed = new Set(partIds);
   const next = repairExplicitRoutes(document, (wire) => changed.has(wire.from.partId) || changed.has(wire.to.partId));
   const reason = wireWaypointError(next.wires);
-  return reason ? { ok: false, reason } : { ok: true, document: next };
+  return reason ? { ok: false, reason } : checkedEdit(document, { ok: true, document: next });
 }
 
 /** Replaces a wire's intermediate route points, or clears them to restore automatic routing. */
@@ -726,13 +733,12 @@ export function setWireWaypoints(
       point.x === nextPoints?.[index]?.x && point.y === nextPoints?.[index]?.y,
     );
   if (unchanged) { return { ok: true, document }; }
-  return {
+  return checkedEdit(document, {
     ok: true,
-    document: {
-      ...document,
+    document: copyCircuitRecord(document, {
       wires: document.wires.map((item) => item.id === wireId ? withWireWaypoints(item, nextPoints) : item),
-    },
-  };
+    }),
+  });
 }
 
 function captureRoutePoints(waypoints: readonly Point[], count: number): { ok: true; points: Point[] } | { ok: false; reason: string } {
@@ -777,8 +783,8 @@ function restoreStoredWireRoute(document: CircuitDocument, wire: CircuitWire, va
   if (!isExplicitWireRoute(routeEnd(from, wire.from.terminal), routeEnd(to, wire.to.terminal), decodeWireRouteAnchors(routeAnchors), false)) {
     return { ok: false, reason: "復元する導線の経路は端子まで直交させてください。" };
   }
-  return { ok: true, document: { ...document, wires: document.wires.map((item) => item.id === wire.id
-    ? { ...withoutWireRoute(item), routeAnchors } : item) } };
+  return checkedEdit(document, { ok: true, document: copyCircuitRecord(document, { wires: document.wires.map((item) => item.id === wire.id
+    ? copyCircuitRecord(withoutWireRoute(item), { routeAnchors }) : item) }) });
 }
 
 type GeneratedRouteMode = NonNullable<CircuitWireRouteHint["generatedRoute"]>["kind"];
@@ -865,15 +871,14 @@ export function setWireRoute(document: CircuitDocument, wireId: string, waypoint
   if (!validated.ok) { return validated; }
   const { routeAnchors } = validated;
   if (sameStoredRoute(wire, routeAnchors)) { return { ok: true, document }; }
-  return {
+  return checkedEdit(document, {
     ok: true,
-    document: {
-      ...document,
+    document: copyCircuitRecord(document, {
       wires: document.wires.map((item) => item.id === wireId
-        ? { ...withoutWireRoute(item), routeAnchors }
+        ? copyCircuitRecord(withoutWireRoute(item), { routeAnchors })
         : item),
-    },
-  };
+    }),
+  });
 }
 
 function connectionError(
@@ -902,7 +907,7 @@ function pruneOrphanJunction(document: CircuitDocument, partId: string) {
   )) {
     return document;
   }
-  return { ...document, parts: document.parts.filter((item) => item.id !== partId) };
+  return copyCircuitRecord(document, { parts: document.parts.filter((item) => item.id !== partId) });
 }
 
 /** Reconnects one end of an existing wire while preserving its ID and position. */
@@ -912,6 +917,10 @@ export function reconnectWire(
   end: CircuitWireEnd,
   target: CircuitEndpoint,
 ): EditResult<{ id: string }> {
+  return checkedEdit(document, reconnectWireCandidate(document, wireId, end, target));
+}
+
+function reconnectWireCandidate(document: CircuitDocument, wireId: string, end: CircuitWireEnd, target: CircuitEndpoint): EditResult<{ id: string }> {
   const wire = document.wires.find((item) => item.id === wireId);
   if (!wire) { return { ok: false, reason: "導線が見つかりません。" }; }
   const current = wire[end];
@@ -926,9 +935,9 @@ export function reconnectWire(
   if (reason) { return { ok: false, reason }; }
 
   const wires = document.wires.map((item) => item.id === wireId
-    ? { ...item, [end]: targetEndpoint }
+    ? copyCircuitRecord(item, { [end]: targetEndpoint })
     : item);
-  const next = repairExplicitRoutes({ ...document, wires }, (item) => item.id === wireId);
+  const next = repairExplicitRoutes(copyCircuitRecord(document, { wires }), (item) => item.id === wireId);
   const routeIssue = wireWaypointError(next.wires);
   if (routeIssue) { return { ok: false, reason: routeIssue }; }
   return {
@@ -960,7 +969,7 @@ function preparePointConnection(
   const crossedWires = wiresCrossingPoint(document, point, existing, ignoredWireId);
   if (existing) { return { ok: true, document, endpoint: existing, crossedWires }; }
 
-  const placed = addPart(document, "junction", point);
+  const placed = addPartCandidate(document, "junction", point);
   if (!placed.ok) { return placed; }
   return {
     ok: true,
@@ -981,7 +990,7 @@ export function connectToPoint(
   const prepared = preparePointConnection(document, target, terminalAt(document, target));
   if (!prepared.ok) { return prepared; }
   const { document: baseDocument, endpoint, crossedWires } = prepared;
-  if (crossedWires.length === 0) { return connect(baseDocument, fromEndpoint, endpoint); }
+  if (crossedWires.length === 0) { return checkedEdit(document, connectCandidate(baseDocument, fromEndpoint, endpoint)); }
   if (sameEndpoint(fromEndpoint, endpoint)) {
     return connect(document, fromEndpoint, endpoint);
   }
@@ -992,8 +1001,8 @@ export function connectToPoint(
   const attached = splitWires.find(
     (wire) => sameEndpoint(wire.from, fromEndpoint) || sameEndpoint(wire.to, fromEndpoint),
   );
-  if (attached) { return { ok: true, id: attached.id, document: splitDocument }; }
-  return connect(splitDocument, fromEndpoint, endpoint);
+  if (attached) { return checkedEdit(document, { ok: true, id: attached.id, document: splitDocument }); }
+  return checkedEdit(document, connectCandidate(splitDocument, fromEndpoint, endpoint));
 }
 
 /** Reconnects one wire end to a terminal or point on the board, splitting crossed wires. */
@@ -1014,14 +1023,14 @@ export function reconnectWireToPoint(
   const prepared = preparePointConnection(document, target, existing, wireId);
   if (!prepared.ok) { return prepared; }
   const { document: baseDocument, endpoint, crossedWires } = prepared;
-  const reconnected = reconnectWire(baseDocument, wireId, end, endpoint);
-  if (!reconnected.ok || crossedWires.length === 0) { return reconnected; }
+  const reconnected = reconnectWireCandidate(baseDocument, wireId, end, endpoint);
+  if (!reconnected.ok || crossedWires.length === 0) { return checkedEdit(document, reconnected); }
   // Reserve the edited connection before splitting so an identical new segment reuses it.
   // Routes still come from the displayed document, before the reconnect can reroute anything.
   const split = splitWiresAtJunction(reconnected.document, crossedWires, endpoint, routeDocumentWires(baseDocument, { preserveWaypoints: true }));
   const splitIssue = wireWaypointError(split.splitWires);
   if (splitIssue) { return { ok: false, reason: splitIssue }; }
-  return { ...reconnected, document: split.document };
+  return checkedEdit(document, { ...reconnected, document: split.document });
 }
 
 /** Number of wires attached to a terminal. */

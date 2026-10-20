@@ -4,7 +4,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CircuitDocument, CircuitPart } from "../../circuit-model.js";
 import { MAX_WIRE_COORDINATE } from "../../circuit-geometry.js";
-import { parseCircuitDocument } from "../../circuit-serialization.js";
+import { MAX_CIRCUIT_DOCUMENT_JSON_LENGTH, parseCircuitDocument, serializeCircuitDocument } from "../../circuit-serialization.js";
 import { CircuitEditor } from "../CircuitEditor.js";
 import type { CircuitEditorController } from "../useCircuitEditor.js";
 
@@ -48,6 +48,52 @@ function mount(initialDocument = fixture()) {
 }
 
 describe("part property updates", () => {
+  it.each(["title", "label", "numeric", "geometry", "move", "rotate", "add", "route"] as const)
+  ("rejects a %s edit over the JSON limit without changing references or undo/redo", (operation) => {
+    const initial = fixture();
+    initial.title = "";
+    initial.wires[0]!.routeAnchors = [{ x: 5, y: 0 }];
+    const compact = JSON.stringify(JSON.parse(serializeCircuitDocument(initial)));
+    initial.title = "T".repeat(MAX_CIRCUIT_DOCUMENT_JSON_LENGTH - compact.length);
+    const ui = mount(initial);
+    expect(ui.editor.exportDocument()).toHaveLength(MAX_CIRCUIT_DOCUMENT_JSON_LENGTH);
+    act(() => {
+      ui.editor.setTitle("redo");
+      ui.editor.endEdit();
+      ui.editor.undo();
+      ui.editor.startReconnect("wire", "from");
+      ui.editor.selectPart("a");
+    });
+    const before = ui.editor;
+
+    act(() => {
+      switch (operation) {
+        case "title": ui.editor.setTitle(`${initial.title}X`); break;
+        case "label": ui.editor.updatePart("a", { label: "AA" }); break;
+        case "numeric": ui.editor.updatePart("a", { resistanceOhms: 100 }); break;
+        case "geometry": ui.editor.updatePart("a", { y: 1 }); break;
+        case "move": ui.editor.movePart("a", 0, 1); break;
+        case "rotate": ui.editor.rotateSelected(); break;
+        case "add": ui.editor.add("junction", { x: 20, y: 10 }); break;
+        case "route": ui.editor.updateWireRoute("wire", [{ x: 5, y: 0 }, { x: 5, y: 1 }, { x: 7, y: 1 }, { x: 7, y: 0 }]); break;
+      }
+    });
+
+    expect(ui.editor.error).toContain(String(MAX_CIRCUIT_DOCUMENT_JSON_LENGTH));
+    expect(ui.editor.document).toBe(before.document);
+    expect(ui.editor.selection).toBe(before.selection);
+    expect(ui.editor.pendingEndpoint).toBe(before.pendingEndpoint);
+    expect(ui.editor.pendingWire).toBe(before.pendingWire);
+    expect(ui.editor.documentVersion).toBe(before.documentVersion);
+    expect(ui.editor.canUndo).toBe(false);
+    expect(ui.editor.canRedo).toBe(true);
+    expect(ui.editor.exportDocument()).toHaveLength(MAX_CIRCUIT_DOCUMENT_JSON_LENGTH);
+    act(() => ui.editor.redo());
+    expect(ui.editor.document.title).toBe("redo");
+    act(() => ui.editor.undo());
+    expect(ui.editor.document).toBe(before.document);
+  });
+
   it.each((["x", "y"] as const).flatMap((axis) =>
     [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, MAX_WIRE_COORDINATE + 1, -MAX_WIRE_COORDINATE - 1]
       .map((value) => ({ axis, value }))))

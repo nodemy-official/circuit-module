@@ -33,8 +33,10 @@ export function useNumericDraft({ value, onValueChange, min, max, exclusiveMin, 
     const next = nextText.trim() === "" ? Number.NaN : Number(nextText);
     const parsed = circuitNumericValueSchema({ min, max, exclusiveMin, exclusiveMax, integer }).safeParse(next);
     if (!parsed.success) { return; }
+    const previous = emittedValue.current;
     emittedValue.current = parsed.data;
-    if (!Object.is(parsed.data, value)) { onValueChange(parsed.data); }
+    // A return to the rendered value still supersedes an earlier queued edit.
+    if (!Object.is(parsed.data, value) || !Object.is(parsed.data, previous)) { onValueChange(parsed.data); }
   };
   const restore = () => {
     emittedValue.current = value;

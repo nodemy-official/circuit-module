@@ -714,6 +714,7 @@ function CircuitPartArtwork({
     canToggleReadOnlySwitch(part, readOnly, onSwitchToggle),
   );
   const labelLayout = circuitPartLabelLayout(part);
+  const label = typeof part.label === "string" ? part.label : part.id;
 
   return (
     <g
@@ -739,12 +740,12 @@ function CircuitPartArtwork({
       onDoubleClick={onInspectPart ? (event) => { event.preventDefault(); event.stopPropagation(); inspect(event.currentTarget); } : undefined}
       onKeyDown={(event) => handleCircuitPartKeyDown(event, part, readOnly, onInspectPart, onSwitchToggle, inspect, onKeyDown)}
     >
-      <title>{`${part.label}（${partDescriptions[part.kind]}）${meter ? `：${meter.text}${meter.phaseText ? ` · ${meter.phaseText}` : ""}\n${meter.note}` : ""}${inspectionAccessibility.titleHint}`}</title>
+      <title>{`${label}（${partDescriptions[part.kind]}）${meter ? `：${meter.text}${meter.phaseText ? ` · ${meter.phaseText}` : ""}\n${meter.note}` : ""}${inspectionAccessibility.titleHint}`}</title>
       <circle {...circuitSlot("circuit-board__part-hit", slotProps?.partHit)} r="23" />
       <rect {...circuitSlot("circuit-board__selection-halo", slotProps?.selectionHalo)} x="-25" y="-24" width="50" height="48" rx="5" />
       <CircuitPartSymbol part={part} selected={isSelected} renderPart={renderPart} analysis={analysis} slotProps={slotProps} />
       <text {...circuitSlot("circuit-board__part-label", slotProps?.partLabel)} fontSize="var(--circuit-board-label-size, 10px)" x={labelLayout.x} y={labelLayout.labelY} textAnchor={labelLayout.textAnchor}>
-        {readOnly && Array.from(part.label).length > 12 ? `${Array.from(part.label).slice(0, 11).join("")}…` : part.label}
+        {readOnly && Array.from(label).length > 12 ? `${Array.from(label).slice(0, 11).join("")}…` : label}
       </text>
       <CircuitPartDetail part={part} meter={meter} slotProps={slotProps} />
     </g>

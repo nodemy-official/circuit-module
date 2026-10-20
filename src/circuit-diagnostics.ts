@@ -135,8 +135,13 @@ function terminalIsValid(part: IndexedPart, terminal: string): terminal is Circu
   return part.terminals.includes(terminal as CircuitTerminal);
 }
 
+function trimmedPartLabel(part: CircuitPart): string {
+  const label = Object.getOwnPropertyDescriptor(part, "label")?.value;
+  return typeof label === "string" ? label.trim() : "";
+}
+
 function partLabel(part: CircuitPart) {
-  return part.label.trim() || part.id;
+  return trimmedPartLabel(part) || part.id;
 }
 
 function indexParts(document: CircuitDocument, diagnostics: CircuitDiagnostic[]) {
@@ -327,7 +332,7 @@ function reportDuplicateLabels(indexedParts: readonly IndexedPart[], diagnostics
   const labels = new Map<string, IndexedPart[]>();
   for (const item of indexedParts) {
     if (item.part.kind === "ground") { continue; }
-    const label = item.part.label.trim();
+    const label = trimmedPartLabel(item.part);
     if (!label) { continue; }
     const entries = labels.get(label) ?? [];
     entries.push(item);

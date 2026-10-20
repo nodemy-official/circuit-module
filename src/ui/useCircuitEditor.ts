@@ -26,6 +26,8 @@ import { createCircuitExample, type CircuitExampleKind } from "../circuit-exampl
 import { analyzeCircuit, type CircuitAnalysisOptions } from "../circuit-solver.js";
 import { inspectCircuit } from "../circuit-diagnostics.js";
 import { parseCircuitDocument, serializeCircuitDocument } from "../circuit-serialization.js";
+import { circuitDocumentStorageIssue } from "../circuit-storage.js";
+import { copyCircuitRecord } from "../circuit-copy.js";
 import { snapshotSimulationArray, snapshotSimulationRecord, validatedSimulationDocument } from "../simulation-input.js";
 import {
   createEmptyCircuit,
@@ -59,6 +61,17 @@ function patchedGeometryIssue(part: CircuitPart, patch: object): string | null {
     return "回転角度は0、90、180、270のいずれかで指定してください。";
   }
   return null;
+}
+
+function samePartPatch(part: CircuitPart, patch: object): boolean {
+  return Object.entries(patch).every(([key, value]) => {
+    const descriptor = Object.getOwnPropertyDescriptor(part, key);
+    return descriptor ? Object.hasOwn(descriptor, "value") && Object.is(descriptor.value, value) : value === undefined;
+  });
+}
+
+function partGeometryChanged(before: CircuitPart, after: CircuitPart): boolean {
+  return before.x !== after.x || before.y !== after.y || (before.rotation ?? 0) !== (after.rotation ?? 0);
 }
 
 function editableWire(wire: CircuitWire): CircuitWire {
@@ -416,23 +429,27 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
     }
     const geometryIssue = patchedGeometryIssue(nextPart, values);
     if (geometryIssue) { setError(geometryIssue); return; }
-    if (Object.entries(values).every(([key, value]) => {
-      const descriptor = Object.getOwnPropertyDescriptor(part, key);
-      return descriptor ? Object.hasOwn(descriptor, "value") && Object.is(descriptor.value, value) : value === undefined;
-    })) { return; }
+    if (samePartPatch(part, values)) { return; }
     let next = copyEditableDocument(document, document.parts.map((existingPart) => existingPart.id === id ? nextPart : existingPart));
-    if (nextPart.x !== part.x || nextPart.y !== part.y || (nextPart.rotation ?? 0) !== (part.rotation ?? 0)) {
+    if (partGeometryChanged(part, nextPart)) {
       const repaired = repairWireRoutes(next, [id]);
       if (!repaired.ok) { setError(repaired.reason); return; }
       next = repaired.document;
     }
+    const storageIssue = circuitDocumentStorageIssue(next);
+    if (storageIssue) { setError(storageIssue); return; }
     setDocument(next, "initiallyClosed" in values ? undefined : `property:${id}:${Object.keys(values).sort().join(",")}`);
     setError(null);
   }
 
   function setTitle(title: string) {
     const document = historyRef.current.present;
-    if (title !== document.title) { setDocument({ ...document, title }, "title"); }
+    if (title === document.title) { return; }
+    const next = copyCircuitRecord(document, { title });
+    const storageIssue = circuitDocumentStorageIssue(next);
+    if (storageIssue) { setError(storageIssue); return; }
+    setDocument(next, "title");
+    setError(null);
   }
 
   function reset() {

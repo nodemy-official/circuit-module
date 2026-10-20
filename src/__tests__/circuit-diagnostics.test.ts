@@ -277,6 +277,71 @@ describe("inspectCircuit", () => {
     }));
   });
 
+  it.each([null, undefined, 42, false, {}, [], Symbol("label"), 10n])("keeps structural findings for a malformed own label (%s)", (label) => {
+    const first = part("r1", "resistor");
+    const second = part("r2", "resistor");
+    for (const item of [first, second]) {
+      Object.defineProperty(item, "label", { value: label, enumerable: false, writable: false, configurable: false });
+      Object.freeze(item);
+    }
+    const input = document([first, second]);
+    Object.freeze(input.parts);
+    Object.freeze(input.wires);
+    Object.freeze(input);
+    const firstLabel = Object.getOwnPropertyDescriptor(first, "label");
+    const secondLabel = Object.getOwnPropertyDescriptor(second, "label");
+
+    const diagnostics = inspectCircuit(input);
+
+    expect(diagnostics.filter(({ code }) => code === "isolated-part")).toMatchObject([
+      { partIds: ["r1"], message: expect.stringContaining("r1") },
+      { partIds: ["r2"], message: expect.stringContaining("r2") },
+    ]);
+    expect(diagnostics.some(({ code }) => code === "duplicate-label")).toBe(false);
+    expect(inspectCircuit(input)).toEqual(diagnostics);
+    expect(Object.getOwnPropertyDescriptor(first, "label")).toEqual(firstLabel);
+    expect(Object.getOwnPropertyDescriptor(second, "label")).toEqual(secondLabel);
+  });
+
+  it("does not evaluate an own label accessor while reporting structural findings", () => {
+    const resistor = part("r1", "resistor");
+    let reads = 0;
+    const getter = () => { reads += 1; throw new Error("Label accessors must not run"); };
+    Object.defineProperty(resistor, "label", { get: getter, enumerable: false, configurable: false });
+    Object.freeze(resistor);
+    const input = document([resistor]);
+
+    const diagnostics = inspectCircuit(input);
+
+    expect(diagnostics).toContainEqual(expect.objectContaining({
+      code: "isolated-part", partIds: ["r1"], message: expect.stringContaining("r1"),
+    }));
+    expect(inspectCircuit(input)).toEqual(diagnostics);
+    expect(reads).toBe(0);
+    expect(Object.getOwnPropertyDescriptor(resistor, "label")?.get).toBe(getter);
+  });
+
+  it("uses nonenumerable own string labels for duplicate findings and display names", () => {
+    const first = part("r1", "resistor");
+    const second = part("r2", "resistor");
+    Object.defineProperty(first, "label", { value: " 抵抗 ", enumerable: false, writable: false, configurable: false });
+    Object.defineProperty(second, "label", { value: "抵抗", enumerable: false, writable: false, configurable: false });
+    Object.freeze(first);
+    Object.freeze(second);
+
+    const diagnostics = inspectCircuit(document([first, second]));
+
+    expect(diagnostics).toContainEqual(expect.objectContaining({
+      code: "duplicate-label", partIds: ["r1", "r2"], message: expect.stringContaining("抵抗"),
+    }));
+    expect(diagnostics.filter(({ code }) => code === "isolated-part")).toMatchObject([
+      { partIds: ["r1"], message: expect.stringContaining("抵抗") },
+      { partIds: ["r2"], message: expect.stringContaining("抵抗") },
+    ]);
+    expect(first.label).toBe(" 抵抗 ");
+    expect(second.label).toBe("抵抗");
+  });
+
   it("allows multiple GND parts with the shared GND label", () => {
     const diagnostics = inspectCircuit(document([
       part("g1", "ground", "GND"),

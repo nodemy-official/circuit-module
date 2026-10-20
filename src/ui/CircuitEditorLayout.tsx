@@ -636,8 +636,8 @@ export function CircuitEditorLayout({
     previewGenerationRef.current += 1;
     setPreviewDocument((current) => !partId || !current
       ? copyEditableDocument(editor.document)
-      : { ...current, parts: current.parts.map((item) => item.id === partId
-        ? copyEditablePart(editor.document.parts.find((initial) => initial.id === partId) ?? item) : item) });
+      : copyEditableDocument(current, current.parts.map((item) => item.id === partId
+        ? copyEditablePart(editor.document.parts.find((initial) => initial.id === partId) ?? item) : item)));
   }
 
   function openPreviewDialog(partId: string | null) {
@@ -665,10 +665,8 @@ export function CircuitEditorLayout({
   }
 
   function changePreviewPart(partId: string, patch: Partial<CircuitPart>) {
-    setPreviewDocument((current) => current && {
-      ...current,
-      parts: current.parts.map((item) => item.id === partId ? copyEditablePart(item, patch) : item),
-    });
+    setPreviewDocument((current) => current && copyEditableDocument(current,
+      current.parts.map((item) => item.id === partId ? copyEditablePart(item, patch) : item)));
   }
 
   useEffect(() => {
@@ -734,11 +732,9 @@ export function CircuitEditorLayout({
   function togglePreviewSwitch(partId: string) {
     // A delayed board click belongs to the preview in which it was scheduled.
     if (previewGeneration !== previewGenerationRef.current) { return; }
-    setPreviewDocument((current) => current && {
-      ...current,
-      parts: current.parts.map((item) => item.id === partId && item.kind === "switch"
-        ? copyEditablePart(item, { initiallyClosed: partSwitchValue(item) !== true }) : item),
-    });
+    setPreviewDocument((current) => current && copyEditableDocument(current,
+      current.parts.map((item) => item.id === partId && item.kind === "switch"
+        ? copyEditablePart(item, { initiallyClosed: partSwitchValue(item) !== true }) : item)));
   }
 
   function resetSample(kind: CircuitExampleKind) {

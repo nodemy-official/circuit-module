@@ -3,6 +3,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { circuitPartCatalog, type CircuitDocument, type CircuitPart } from "../../circuit-model.js";
+import { parseCircuitDocument } from "../../circuit-serialization.js";
 import { CircuitEditor } from "../CircuitEditor.js";
 import { CircuitInspector } from "../CircuitInspector.js";
 import type { CircuitEditorController } from "../useCircuitEditor.js";
@@ -27,7 +28,7 @@ function fixture(kind: "battery" | "switch", getter?: () => unknown) {
   return { document, part, key };
 }
 
-function mount(initialDocument: CircuitDocument) {
+function mount(initialDocument: CircuitDocument, showInspector = true) {
   const container = document.createElement("div");
   document.body.append(container);
   const root = createRoot(container);
@@ -35,7 +36,7 @@ function mount(initialDocument: CircuitDocument) {
   mounted.push({ root, container });
   act(() => root.render(<CircuitEditor initialDocument={initialDocument}>{(editor) => {
     latest = editor;
-    return <CircuitInspector part={editor.document.parts[0]} onChange={editor.updatePart} />;
+    return showInspector ? <CircuitInspector part={editor.document.parts[0]} onChange={editor.updatePart} /> : null;
   }}</CircuitEditor>));
   return { container, get editor() { if (!latest) { throw new Error("Missing editor"); } return latest; } };
 }
@@ -47,6 +48,61 @@ function inputValue(input: HTMLInputElement, value: string) {
     input.dispatchEvent(new Event("input", { bubbles: true }));
   });
 }
+
+it("renames an invalid hidden frozen document before repairing its label and retains history", () => {
+  const resistor: CircuitPart = { id: "r", kind: "resistor", label: "R", x: 0, y: 0, resistanceOhms: 10 };
+  Object.defineProperty(resistor, "label", { value: null, enumerable: false, configurable: false, writable: false });
+  Object.freeze(resistor);
+  const metadata = { owner: "host" };
+  const initialDocument: CircuitDocument = {
+    title: "Original title",
+    parts: [resistor, { id: "j", kind: "junction", label: "J", x: 10, y: 0 }],
+    wires: [{ id: "w", from: { partId: "r", terminal: "b" }, to: { partId: "j", terminal: "a" } }],
+  };
+  Object.defineProperty(initialDocument, "retained", { value: metadata, enumerable: false });
+  for (const key of Object.getOwnPropertyNames(initialDocument)) {
+    Object.defineProperty(initialDocument, key, { enumerable: false, configurable: false, writable: false });
+  }
+  Object.freeze(initialDocument.parts);
+  Object.freeze(initialDocument.wires);
+  Object.freeze(initialDocument);
+  const ui = mount(initialDocument, false);
+  const original = ui.editor.document;
+  expect(ui.editor.analysis.status).toBe("invalid");
+  expect(ui.editor.diagnostics).toContainEqual(expect.objectContaining({ code: "unconnected-terminal", partIds: ["r"] }));
+
+  act(() => ui.editor.setTitle("Renamed title"));
+
+  expect(ui.editor.document.title).toBe("Renamed title");
+  expect(ui.editor.document.parts[0]?.label).toBeNull();
+  expect(ui.editor.document.wires).toEqual(initialDocument.wires);
+  expect(Object.getOwnPropertyDescriptor(ui.editor.document, "retained")?.value).toBe(metadata);
+  expect(ui.editor.analysis.status).toBe("invalid");
+  expect(ui.editor.error).toBeNull();
+  act(() => ui.editor.updatePart("r", { label: "Repaired resistor" }));
+  const repaired = ui.editor.document;
+  const saved = ui.editor.exportDocument();
+  expect(parseCircuitDocument(saved)).toMatchObject({
+    ok: true,
+    document: { title: "Renamed title", parts: [{ id: "r", label: "Repaired resistor", resistanceOhms: 10 }, { id: "j" }], wires: initialDocument.wires },
+  });
+  expect(ui.editor.analysis.status).not.toBe("invalid");
+  act(() => ui.editor.undo());
+  expect(ui.editor.document.title).toBe("Renamed title");
+  expect(ui.editor.document.parts[0]?.label).toBeNull();
+  expect(ui.editor.analysis.status).toBe("invalid");
+  act(() => ui.editor.undo());
+  expect(ui.editor.document).toBe(original);
+  act(() => ui.editor.redo());
+  expect(ui.editor.document.title).toBe("Renamed title");
+  act(() => ui.editor.redo());
+  expect(ui.editor.document).toBe(repaired);
+  expect(ui.editor.exportDocument()).toBe(saved);
+  expect(ui.editor.document.wires).toEqual(initialDocument.wires);
+  expect(Object.getOwnPropertyDescriptor(ui.editor.document, "retained")?.value).toBe(metadata);
+  expect(initialDocument.title).toBe("Original title");
+  expect(resistor.label).toBeNull();
+});
 
 describe.each(["battery", "switch"] as const)("%s editor accessor repair", (kind) => {
   it("repairs through Inspector and preserves hidden own fields through undo and redo", () => {
