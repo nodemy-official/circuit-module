@@ -39,6 +39,17 @@ describe("CircuitBoard own input fields", () => {
     expect(ui.container.querySelector(".circuit-board__part-detail")?.textContent).toBe(`${resistanceOhms ?? 10} Ω`);
   });
 
+  it.each([null, "10", false, "accessor"])("does not display a malformed own resistance as a valid setting (%s)", (resistanceOhms) => {
+    const part: CircuitPart = { id: "load", kind: "resistor", label: "抵抗", x: 0, y: 0 };
+    Object.defineProperty(part, "resistanceOhms", resistanceOhms === "accessor"
+      ? { get() { throw new Error("Resistance getters must not run"); }, enumerable: true }
+      : { value: resistanceOhms, enumerable: true });
+
+    const ui = mount(part);
+
+    expect(ui.container.querySelector(".circuit-board__part-detail")?.textContent).toBe("— Ω");
+  });
+
   it("refreshes the label when an own resistance changes behind a stable Proxy value", () => {
     const part: CircuitPart = { id: "load", kind: "resistor", label: "抵抗", x: 0, y: 0, resistanceOhms: 100 };
     const ui = mount(new Proxy(part, {

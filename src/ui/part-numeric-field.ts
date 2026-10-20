@@ -1,5 +1,10 @@
-import { circuitPartCatalog, type CircuitPart, type CircuitPartNumericField } from "../circuit-model.js";
-import { simulationRecordField } from "../simulation-input.js";
+import { circuitPartCatalog, type CircuitPart, type CircuitPartNumericField, type CircuitPartNumericKey } from "../circuit-model.js";
+import { simulationNumericField, simulationRecordField } from "../simulation-input.js";
+
+/** Only omitted values use defaults; malformed own values must remain repairable. */
+export function partNumericValue(part: CircuitPart, key: CircuitPartNumericKey): number | undefined {
+  return simulationNumericField(part, key) ?? circuitPartCatalog[part.kind].defaults[key] as number | undefined;
+}
 
 /** Include the other supply rail in the numeric domain used by both editing views. */
 export function partNumericField(part: CircuitPart, field: CircuitPartNumericField): CircuitPartNumericField & { exclusiveMax?: boolean } {

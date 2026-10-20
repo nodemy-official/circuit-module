@@ -3,6 +3,7 @@ import { StrictMode, act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CircuitDocument, CircuitPart } from "../../circuit-model.js";
+import { MAX_WIRE_COORDINATE } from "../../circuit-geometry.js";
 import { parseCircuitDocument } from "../../circuit-serialization.js";
 import { CircuitEditor } from "../CircuitEditor.js";
 import type { CircuitEditorController } from "../useCircuitEditor.js";
@@ -47,6 +48,61 @@ function mount(initialDocument = fixture()) {
 }
 
 describe("part property updates", () => {
+  it.each((["x", "y"] as const).flatMap((axis) =>
+    [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, MAX_WIRE_COORDINATE + 1, -MAX_WIRE_COORDINATE - 1]
+      .map((value) => ({ axis, value }))))
+  ("rejects an unsavable $axis coordinate ($value) without changing history or connections", ({ axis, value }) => {
+    const ui = mount();
+    act(() => {
+      ui.editor.setTitle("redo");
+      ui.editor.undo();
+      ui.editor.startReconnect("wire", "from");
+    });
+    const before = ui.editor;
+
+    act(() => ui.editor.updatePart("a", { [axis]: value, label: "rejected" }));
+
+    expect(ui.editor.error).toContain("座標");
+    expect(ui.editor.document).toBe(before.document);
+    expect(ui.editor.selection).toBe(before.selection);
+    expect(ui.editor.pendingEndpoint).toBe(before.pendingEndpoint);
+    expect(ui.editor.pendingWire).toBe(before.pendingWire);
+    expect(ui.editor.documentVersion).toBe(before.documentVersion);
+    expect(ui.editor.canUndo).toBe(false);
+    expect(ui.editor.canRedo).toBe(true);
+    expect(parseCircuitDocument(ui.editor.exportDocument())).toEqual({ ok: true, document: before.document });
+  });
+
+  it.each([null, 45, Number.NaN])("rejects an unsavable rotation (%s) even when it looks like the default", (rotation) => {
+    const ui = mount();
+    const initial = ui.editor.document;
+    const patch: Partial<CircuitPart> = {};
+    Object.defineProperty(patch, "rotation", { value: rotation, enumerable: true });
+
+    act(() => ui.editor.updatePart("a", patch));
+
+    expect(ui.editor.error).toContain("回転");
+    expect(ui.editor.document).toBe(initial);
+    expect(ui.editor.canUndo).toBe(false);
+  });
+
+  it.each((["x", "y"] as const).flatMap((axis) =>
+    [-MAX_WIRE_COORDINATE, MAX_WIRE_COORDINATE].map((value) => ({ axis, value }))))
+  ("keeps the exact $axis coordinate boundary ($value) savable and undoable", ({ axis, value }) => {
+    const ui = mount();
+    const initial = ui.editor.document;
+
+    act(() => ui.editor.updatePart("a", { [axis]: value }));
+
+    expect(ui.editor.error).toBeNull();
+    expect(ui.editor.document.parts[0]?.[axis]).toBe(value);
+    expect(parseCircuitDocument(ui.editor.exportDocument())).toEqual({ ok: true, document: ui.editor.document });
+    act(() => ui.editor.undo());
+    expect(ui.editor.document).toBe(initial);
+    act(() => ui.editor.redo());
+    expect(ui.editor.document.parts[0]?.[axis]).toBe(value);
+  });
+
   it.each([10, 22])("uses the same captured patch for change detection, storage, and history (%s Ω)", (resistanceOhms) => {
     const ui = mount();
     act(() => { ui.editor.setTitle("redo"); ui.editor.undo(); });

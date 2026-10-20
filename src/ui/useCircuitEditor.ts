@@ -1,5 +1,6 @@
 import { useCallback, useMemo, useRef, useState, type SetStateAction } from "react";
 import { editorHistoryReducer, type EditorHistory, type HistoryAction } from "./editor-history.js";
+import { copyEditableDocument, copyEditablePart, normalizeEditableAccessors } from "./editable-circuit-copy.js";
 import {
   addPart,
   connect,
@@ -20,7 +21,7 @@ import {
   type CircuitWireRouteHint,
   type EditResult,
 } from "../circuit-edit.js";
-import type { Point } from "../circuit-geometry.js";
+import { MAX_WIRE_COORDINATE, rotations, type Point } from "../circuit-geometry.js";
 import { createCircuitExample, type CircuitExampleKind } from "../circuit-examples.js";
 import { analyzeCircuit, type CircuitAnalysisOptions } from "../circuit-solver.js";
 import { inspectCircuit } from "../circuit-diagnostics.js";
@@ -46,6 +47,18 @@ export const MAX_CIRCUIT_EDITOR_WIRES = 1024;
 
 function toggleId(ids: string[], id: string) {
   return ids.includes(id) ? ids.filter((item) => item !== id) : [...ids, id];
+}
+
+function patchedGeometryIssue(part: CircuitPart, patch: object): string | null {
+  if (!["x", "y", "rotation"].some((key) => Object.hasOwn(patch, key))) { return null; }
+  if (!Number.isFinite(part.x) || !Number.isFinite(part.y) ||
+      Math.abs(part.x) > MAX_WIRE_COORDINATE || Math.abs(part.y) > MAX_WIRE_COORDINATE) {
+    return `座標は±${MAX_WIRE_COORDINATE}セル以内の有限な値で指定してください。`;
+  }
+  if (part.rotation !== undefined && !rotations.includes(part.rotation)) {
+    return "回転角度は0、90、180、270のいずれかで指定してください。";
+  }
+  return null;
 }
 
 function editableWire(wire: CircuitWire): CircuitWire {
@@ -84,14 +97,22 @@ function editableWireWaypoints(wire: CircuitWire): CircuitWire {
 function editableDocument(document: CircuitDocument) {
   // Preserve every own data field before edits use ordinary object spreads.
   // Keep malformed input intact so analysis can still report it as invalid.
-  const copied = validatedSimulationDocument(document);
-  if (typeof copied === "string") { return document; }
+  const editable = normalizeEditableAccessors(document);
+  const copied = validatedSimulationDocument(editable);
+  if (typeof copied === "string") { return editable; }
   // Simulation snapshots do not copy layout-only route points. Editor history
   // must retain its own route even when the caller later changes that input.
   return {
     ...copied,
     wires: copied.wires.map(editableWire),
   };
+}
+
+function editableHistory(history: EditorHistory): EditorHistory {
+  const present = normalizeEditableAccessors(history.present);
+  // Rebuild own data fields too: later movement/copy spreads must retain
+  // a non-enumerable accessor's invalid replacement instead of using a default.
+  return present === history.present ? history : { ...history, present: editableDocument(present) };
 }
 
 /** Commands can compose synchronously while React batches their rendered state. */
@@ -148,7 +169,7 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
 
   function dispatch(action: HistoryAction) {
     const previousDocument = historyRef.current.present;
-    setHistory((current) => editorHistoryReducer(current, action));
+    setHistory((current) => editableHistory(editorHistoryReducer(current, action)));
     // A pressed pointer may not have produced its first accepted edit yet.
     // Cancel its pending events even when there is no history group to restore.
     if (action.type === "cancel-group") {
@@ -386,18 +407,20 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
     const part = document.parts.find((item) => item.id === id);
     if (!part) { return; }
     const values = { ...patch };
-    const nextPart = { ...part, ...values };
+    const nextPart = copyEditablePart(part, values);
     // JavaScript callers and full-object patches can still include these fields. Changing
     // either would invalidate existing wire endpoints and the editor's active references.
     if (nextPart.id !== part.id || nextPart.kind !== part.kind) {
       setError("部品の ID と種類は変更できません。");
       return;
     }
-    if (Object.entries(values).every(([key, value]) => part[key as keyof CircuitPart] === value)) { return; }
-    let next = {
-      ...document,
-      parts: document.parts.map((existingPart) => existingPart.id === id ? nextPart : existingPart),
-    };
+    const geometryIssue = patchedGeometryIssue(nextPart, values);
+    if (geometryIssue) { setError(geometryIssue); return; }
+    if (Object.entries(values).every(([key, value]) => {
+      const descriptor = Object.getOwnPropertyDescriptor(part, key);
+      return descriptor ? Object.hasOwn(descriptor, "value") && Object.is(descriptor.value, value) : value === undefined;
+    })) { return; }
+    let next = copyEditableDocument(document, document.parts.map((existingPart) => existingPart.id === id ? nextPart : existingPart));
     if (nextPart.x !== part.x || nextPart.y !== part.y || (nextPart.rotation ?? 0) !== (part.rotation ?? 0)) {
       const repaired = repairWireRoutes(next, [id]);
       if (!repaired.ok) { setError(repaired.reason); return; }
@@ -439,7 +462,7 @@ export function useCircuitEditor(initialDocument?: CircuitDocument) {
     if (next === history) { return; }
     cancelConnection();
     invalidateDocument();
-    setHistory(next);
+    setHistory(editableHistory(next));
     setSelection(noSelection());
   }
 

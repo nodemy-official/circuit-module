@@ -50,10 +50,8 @@ function fail(reason: string): ValidationResult {
 }
 
 function checkString(value: unknown, description: string, allowEmpty: boolean): string | null {
-  const schema = z.string({ error: `${description}は文字列で指定してください。` })
-    .refine((text) => allowEmpty || text.trim().length > 0, { error: `${description}を空にできません。` });
-  const parsed = schema.safeParse(value);
-  return parsed.success ? null : parsed.error.issues[0]!.message;
+  if (typeof value !== "string") { return `${description}は文字列で指定してください。`; }
+  return allowEmpty || value.trim().length > 0 ? null : `${description}を空にできません。`;
 }
 
 const allNumericKeys = new Set<CircuitPartNumericKey>(
@@ -178,6 +176,9 @@ function unorderedWireKey(from: CircuitEndpoint, to: CircuitEndpoint) {
   return JSON.stringify(keys);
 }
 
+const opAmpRailsSchema = z.object({ positiveRailVolts: z.number().default(15), negativeRailVolts: z.number().default(-15) })
+  .refine((part) => part.negativeRailVolts < part.positiveRailVolts);
+
 function validateOptionalPartValues(candidate: Record<string, unknown>, kind: CircuitPartKind, label: string): string | null {
   const numberIssue = validateNumericPartFields(candidate, kind, label);
   if (numberIssue) { return numberIssue; }
@@ -185,9 +186,7 @@ function validateOptionalPartValues(candidate: Record<string, unknown>, kind: Ci
     return `${label}のスイッチ状態は真偽値で指定してください。`;
   }
   if (kind === "op-amp") {
-    const parsed = z.object({ positiveRailVolts: z.number().default(15), negativeRailVolts: z.number().default(-15) })
-      .refine((part) => part.negativeRailVolts < part.positiveRailVolts)
-      .safeParse(candidate);
+    const parsed = opAmpRailsSchema.safeParse(candidate);
     if (!parsed.success) { return `${label}の負側電源は正側電源より低くしてください。`; }
   }
   return null;
@@ -200,19 +199,22 @@ function coordinateSchema(description: string) {
     .max(MAX_CIRCUIT_DOCUMENT_COORDINATE, { error });
 }
 
+// Reuse schemas across large documents; labels are only needed on failure.
+const partShapeSchema = z.object({
+  kind: simulationPartKindSchema,
+  x: coordinateSchema(" x 座標"),
+  y: coordinateSchema(" y 座標"),
+  label: z.string({ error: "ラベルは文字列で指定してください。" }),
+  rotation: rotationSchema.optional(),
+});
+
 function validatePartShape(candidate: Record<string, unknown>, label: string): string | null {
-  const parsed = z.object({
-    kind: simulationPartKindSchema,
-    x: coordinateSchema(`${label}の x 座標`),
-    y: coordinateSchema(`${label}の y 座標`),
-    label: z.string({ error: `${label}のラベルは文字列で指定してください。` }),
-    rotation: rotationSchema.optional(),
-  }).safeParse(candidate);
+  const parsed = partShapeSchema.safeParse(candidate);
   if (!parsed.success) {
     const issue = parsed.error.issues[0]!;
     if (issue.path[0] === "kind") { return `${label}の種類が不明です。`; }
     if (issue.path[0] === "rotation") { return `${label}の回転角度は0、90、180、270のいずれかで指定してください。`; }
-    return issue.message;
+    return `${label}の${issue.message}`;
   }
   return validateOptionalPartValues(candidate, parsed.data.kind, label);
 }
@@ -264,6 +266,8 @@ function normalizeParts(value: unknown, snapshot: SavedSnapshot): { parts?: Circ
   return { parts };
 }
 
+const waypointSchema = z.object({ x: coordinateSchema("x座標"), y: coordinateSchema("y座標") });
+
 function normalizeWireWaypoints(value: unknown, label: string, snapshot: SavedSnapshot): { waypoints?: { x: number; y: number }[]; reason?: string } {
   if (value === undefined) { return {}; }
   const captured = snapshotSavedArray(value, MAX_CIRCUIT_DOCUMENT_WIRE_WAYPOINTS,
@@ -274,11 +278,8 @@ function normalizeWireWaypoints(value: unknown, label: string, snapshot: SavedSn
     const waypointLabel = `${label}の経由点${index + 1}`;
     const candidate = snapshotSavedRecord(pointValue, ["x", "y"], snapshot);
     if (!candidate) { return { reason: `${waypointLabel}の形式が正しくありません。` }; }
-    const point = z.object({
-      x: coordinateSchema(`${waypointLabel}のx座標`),
-      y: coordinateSchema(`${waypointLabel}のy座標`),
-    }).safeParse(candidate);
-    if (!point.success) { return { reason: point.error.issues[0]!.message }; }
+    const point = waypointSchema.safeParse(candidate);
+    if (!point.success) { return { reason: `${waypointLabel}の${point.error.issues[0]!.message}` }; }
     waypoints.push(point.data);
   }
   return waypoints.length > 0 ? { waypoints } : {};

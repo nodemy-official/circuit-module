@@ -2,7 +2,7 @@ import type { CircuitDocument, CircuitPart } from "./circuit-model.js";
 import type { CircuitExactComplex, CircuitExactNormalizedTerm, CircuitExactRational } from "./circuit-reading.js";
 import { addExactRational, exactRationalToNumber, multiplyExactRational, numberToExactRational, subtractExactRational, type ExactRational } from "./exact-linear-algebra.js";
 import { matchingExactExpressions, type ExactExpressionNode } from "./exact-expression.js";
-import { simulationRecordField } from "./simulation-input.js";
+import { simulationNumericField } from "./simulation-input.js";
 import type { TransientPartReading, TransientSample } from "./transient-solver.js";
 
 export interface TransientEnergySample {
@@ -36,8 +36,11 @@ const HALF = numberToExactRational(0.5)!;
 const ZERO = numberToExactRational(0)!;
 
 function coefficient(part: CircuitPart) {
-  if (part.kind === "capacitor") { return (simulationRecordField(part, "capacitanceFarads") as number | undefined) ?? 1e-6; }
-  if (part.kind === "inductor") { return (simulationRecordField(part, "inductanceHenries") as number | undefined) ?? 0.01; }
+  if (part.kind !== "capacitor" && part.kind !== "inductor") { return; }
+  // Invalid own values must invalidate derived metadata instead of matching
+  // a cache created while the coefficient was omitted and used its default.
+  return simulationNumericField(part, part.kind === "capacitor" ? "capacitanceFarads" : "inductanceHenries")
+    ?? (part.kind === "capacitor" ? 1e-6 : 0.01);
 }
 
 function snapshotComplex(value: CircuitExactComplex | undefined): CircuitExactComplex | undefined {

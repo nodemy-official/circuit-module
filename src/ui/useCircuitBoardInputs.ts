@@ -3,7 +3,8 @@ import type { CircuitSelection } from "../circuit-edit.js";
 import { routeDocumentWires } from "../circuit-geometry.js";
 import { circuitPartNumericFields, type CircuitDocument } from "../circuit-model.js";
 import type { CircuitAnalysis } from "../circuit-solver.js";
-import { simulationRecordField } from "../simulation-input.js";
+import { partNumericValue } from "./part-numeric-field.js";
+import { partSwitchValue } from "./part-switch-value.js";
 
 /** Retain immutable comparison evidence even when a host mutates its arrays. */
 function useContentSnapshot<T>(values: readonly T[]): readonly T[] {
@@ -31,8 +32,8 @@ export function useCircuitBoardInputs(document: CircuitDocument, selection: Circ
   const partIds = useContentSnapshot(readOnly ? [] : selection?.parts ?? []);
   const wireIds = useContentSnapshot(readOnly ? [] : selection?.wires ?? []);
   const parts = useContentSnapshot(document.parts.flatMap((part) => [
-    part, part.id, part.kind, part.label, part.x, part.y, part.rotation, simulationRecordField(part, "initiallyClosed"),
-    ...circuitPartNumericFields(part.kind).map(({ key }) => simulationRecordField(part, key)),
+    part, part.id, part.kind, part.label, part.x, part.y, part.rotation, partSwitchValue(part),
+    ...circuitPartNumericFields(part.kind).map(({ key }) => partNumericValue(part, key)),
   ]));
   const geometry = useContentSnapshot(document.parts.flatMap((part) => [part.id, part.kind, part.x, part.y, part.rotation]));
   const connections = useContentSnapshot(document.wires.flatMap((wire) => [

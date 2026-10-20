@@ -21,6 +21,8 @@ import { EditorAnalysisStatus, EditorSidebar, type EditorSidebarTab } from "./Ed
 import { useCircuitEditorContext } from "./CircuitEditor.js";
 import type { CircuitStyleProps } from "./style-props.js";
 import { resolvePreviewFeatures, type CircuitPreviewFeatures, type ResolvedPreviewFeatures } from "./preview-features.js";
+import { copyEditableDocument, copyEditablePart } from "./editable-circuit-copy.js";
+import { partSwitchValue } from "./part-switch-value.js";
 
 export type { CircuitPreviewFeatures } from "./preview-features.js";
 
@@ -569,7 +571,7 @@ export function CircuitEditorLayout({
   const [tool, setTool] = useState<"select" | "pan">("select");
   const [sidebarTab, setSidebarTab] = useState<EditorSidebarTab>("properties");
   const [previewDocument, setPreviewDocument] = useState<CircuitDocument | null>(() => previewOnly
-    ? { ...editor.document, parts: editor.document.parts.map((item) => ({ ...item })) }
+    ? copyEditableDocument(editor.document)
     : null);
   const previewSourceDocumentRef = useRef(editor.document);
   const previewGenerationRef = useRef(0);
@@ -624,7 +626,7 @@ export function CircuitEditorLayout({
     // imports and history changes that do not go through the file controls.
     previewGenerationRef.current += 1;
     setPreviewDocument(previewOnly
-      ? { ...editor.document, parts: editor.document.parts.map((item) => ({ ...item })) }
+      ? copyEditableDocument(editor.document)
       : null);
     setPreviewPanelOpen(false);
     setPreviewPartId(null);
@@ -633,9 +635,9 @@ export function CircuitEditorLayout({
   function resetPreview(partId?: string) {
     previewGenerationRef.current += 1;
     setPreviewDocument((current) => !partId || !current
-      ? { ...editor.document, parts: editor.document.parts.map((item) => ({ ...item })) }
+      ? copyEditableDocument(editor.document)
       : { ...current, parts: current.parts.map((item) => item.id === partId
-        ? { ...(editor.document.parts.find((initial) => initial.id === partId) ?? item) } : item) });
+        ? copyEditablePart(editor.document.parts.find((initial) => initial.id === partId) ?? item) : item) });
   }
 
   function openPreviewDialog(partId: string | null) {
@@ -665,7 +667,7 @@ export function CircuitEditorLayout({
   function changePreviewPart(partId: string, patch: Partial<CircuitPart>) {
     setPreviewDocument((current) => current && {
       ...current,
-      parts: current.parts.map((item) => item.id === partId ? { ...item, ...patch } : item),
+      parts: current.parts.map((item) => item.id === partId ? copyEditablePart(item, patch) : item),
     });
   }
 
@@ -735,7 +737,7 @@ export function CircuitEditorLayout({
     setPreviewDocument((current) => current && {
       ...current,
       parts: current.parts.map((item) => item.id === partId && item.kind === "switch"
-        ? { ...item, initiallyClosed: !(item.initiallyClosed ?? circuitPartCatalog.switch.defaults.initiallyClosed ?? false) } : item),
+        ? copyEditablePart(item, { initiallyClosed: partSwitchValue(item) !== true }) : item),
     });
   }
 

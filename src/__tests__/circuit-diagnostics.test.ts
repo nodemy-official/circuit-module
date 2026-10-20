@@ -92,6 +92,31 @@ describe("inspectCircuit", () => {
     }));
   });
 
+  it.each([
+    ["junction", "ground"],
+    ["ground", "ground"],
+  ] as const)("does not require a source for wires between %s and %s symbols", (firstKind, secondKind) => {
+    const diagnostics = inspectCircuit(document(
+      [part("first", firstKind), part("second", secondKind)],
+      [wire("wire-1", endpoint("first", "a"), endpoint("second", "a"))],
+    ));
+
+    expect(diagnostics.some(({ code }) => code === "unpowered-component")).toBe(false);
+  });
+
+  it("still reports a grounded load without a source", () => {
+    const diagnostics = inspectCircuit(document(
+      [part("r1", "resistor"), part("gnd", "ground")],
+      [wire("wire-1", endpoint("r1", "a"), endpoint("gnd", "a"))],
+    ));
+
+    expect(diagnostics).toContainEqual(expect.objectContaining({
+      code: "unpowered-component",
+      partIds: ["gnd", "r1"],
+      wireIds: ["wire-1"],
+    }));
+  });
+
   it("keeps findings distinct when part and wire IDs contain separators", () => {
     const input = document(
       [part("a", "resistor"), part("b,c,d", "resistor"), part("a,b", "resistor"), part("c,d", "resistor")],

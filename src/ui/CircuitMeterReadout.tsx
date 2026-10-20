@@ -2,6 +2,7 @@ import type { CircuitPartKind } from "../circuit-model.js";
 import type { CircuitAnalysis, CircuitPartReading } from "../circuit-solver.js";
 import { formatCircuitNumber } from "../number-format.js";
 import type { ComponentPropsWithoutRef } from "react";
+import { analysisReadingsAvailable } from "./analysis-readings.js";
 
 export type CircuitMeterStatus = "connected" | "unconnected" | "floating" | "unmeasured" | "invalid" | "short";
 
@@ -58,6 +59,7 @@ function resolveStatus(
 ): CircuitMeterStatus {
   if (analysisStatus === "invalid") { return "invalid"; }
   if (analysisStatus === "short") { return "short"; }
+  if (!analysisReadingsAvailable(analysisStatus)) { return "unmeasured"; }
   if (reading?.meterStatus === "unconnected") { return "unconnected"; }
   if (reading?.meterStatus === "floating") { return "floating"; }
   if (!reading || measurement === undefined || !Number.isFinite(measurement)) { return "unmeasured"; }

@@ -1,13 +1,14 @@
 import { circuitPartCatalog, circuitPartNumericFields, type CircuitPart, type CircuitPartNumericKey, type CircuitWire } from "../circuit-model.js";
 import type { CircuitAnalysis, CircuitPartReading } from "../circuit-solver.js";
 import { formatCircuitNumber } from "../number-format.js";
-import { simulationRecordField } from "../simulation-input.js";
 import { circuitSlot, type CircuitStyleProps } from "./style-props.js";
 import { CircuitIcon } from "./CircuitIcon.js";
 import { measurementLabels } from "./measurement-labels.js";
 import { CircuitMeterReadout, getMeterDisplay } from "./CircuitMeterReadout.js";
 import { NumericInput } from "./NumericInput.js";
-import { partNumericField } from "./part-numeric-field.js";
+import { partNumericField, partNumericValue } from "./part-numeric-field.js";
+import { partSwitchValue } from "./part-switch-value.js";
+import { analysisReadingsAvailable } from "./analysis-readings.js";
 import { useId, type ComponentPropsWithoutRef, type ReactNode } from "react";
 
 export type CircuitInspectorSlot =
@@ -217,11 +218,10 @@ function InspectorFields({
 }) {
   const change = (patch: Partial<CircuitPart>) => onChange?.(part.id, patch);
   const inputId = useId();
-  const defaults = circuitPartCatalog[part.kind].defaults;
-  const initiallyClosed = (simulationRecordField(part, "initiallyClosed") as boolean | undefined) ?? defaults.initiallyClosed ?? false;
+  const initiallyClosed = partSwitchValue(part);
   const numericFields = circuitPartNumericFields(part.kind).map((field) => partNumericField(part, field));
   const numeric = (key: CircuitPartNumericKey, label: string, unit: string, min?: number, max?: number, step?: number, exclusiveMin?: boolean, exclusiveMax?: boolean) => {
-    const value = (simulationRecordField(part, key) as number | undefined) ?? defaults[key] ?? 0;
+    const value = partNumericValue(part, key) ?? 0;
     return (
       <label {...circuitSlot("circuit-field", slotProps?.field)} key={key} data-field={key} htmlFor={`${inputId}-${key}`}>
         <span {...circuitSlot("circuit-field__label", slotProps?.fieldLabel)}>{label}</span>
@@ -265,15 +265,16 @@ function InspectorFields({
         <label {...circuitSlot("circuit-switch", slotProps?.switch)} data-field="initiallyClosed">
           <span {...circuitSlot(undefined, slotProps?.switchText)}>
             <strong {...circuitSlot(undefined, slotProps?.switchLabel)}>スイッチ</strong>
-            <small {...circuitSlot(undefined, slotProps?.switchDescription)}>回路を閉じる</small>
+            <small {...circuitSlot(undefined, slotProps?.switchDescription)}>{initiallyClosed === null ? "値を確認して切り替えてください" : "回路を閉じる"}</small>
           </span>
           <input
             {...circuitSlot(undefined, slotProps?.switchInput)}
             type="checkbox"
             role="switch"
             aria-label="スイッチを閉じる"
-            aria-checked={initiallyClosed}
-            checked={initiallyClosed}
+            aria-checked={initiallyClosed === true}
+            aria-invalid={initiallyClosed === null || undefined}
+            checked={initiallyClosed === true}
             onChange={(event) => change({ initiallyClosed: event.target.checked })}
             disabled={!onChange}
             data-field="initiallyClosed"
@@ -308,7 +309,7 @@ function InspectorReadings({
       </div>
     );
   }
-  if (!reading) { return null; }
+  if (!reading || !analysisReadingsAvailable(analysisStatus)) { return null; }
   const labels = measurementLabels(kind);
   const isAc = reading.voltagePhaseDegrees !== undefined || reading.currentPhaseDegrees !== undefined || reading.reactivePowerVars !== undefined;
   return (

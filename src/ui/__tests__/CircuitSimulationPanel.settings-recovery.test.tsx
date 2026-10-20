@@ -17,7 +17,7 @@ afterEach(() => {
 });
 
 describe("analysis settings after failed AC analysis", () => {
-  it.each((["ac", "auto"] as const).flatMap((mode) => [0, -1, Number.NaN].map((frequencyHz) => ({ mode, frequencyHz }))))
+  it.each((["ac", "auto"] as const).flatMap((mode) => [0, -1, Number.NaN, null, "1000", "accessor"].map((frequencyHz) => ({ mode, frequencyHz }))))
   ("allows correcting an invalid frequency in $mode mode ($frequencyHz Hz)", ({ mode, frequencyHz }) => {
     const circuit = createCircuitExample("ac");
     const container = document.createElement("div");
@@ -26,7 +26,11 @@ describe("analysis settings after failed AC analysis", () => {
     mounted.push({ root, container });
     let latestAnalysis: CircuitAnalysis | undefined;
     function Harness() {
-      const [options, setOptions] = useState<CircuitAnalysisOptions>({ mode, frequencyHz });
+      const initialOptions: CircuitAnalysisOptions = { mode };
+      Object.defineProperty(initialOptions, "frequencyHz", frequencyHz === "accessor"
+        ? { get() { throw new Error("Frequency getters must not run"); }, enumerable: true }
+        : { value: frequencyHz, enumerable: true });
+      const [options, setOptions] = useState(initialOptions);
       latestAnalysis = analyzeCircuit(circuit, {}, options);
       return <CircuitSimulationPanel document={circuit} analysis={latestAnalysis} options={options} onChange={setOptions} showLearningPanels={false} />;
     }
@@ -45,7 +49,7 @@ describe("analysis settings after failed AC analysis", () => {
     expect(frequency?.value).toBe("1000");
   });
 
-  it.each((["dc", "auto"] as const).flatMap((mode) => [0, -1, Number.NaN].map((frequencyHz) => ({ mode, frequencyHz }))))
+  it.each((["dc", "auto"] as const).flatMap((mode) => [0, -1, Number.NaN, null, "1000", "accessor"].map((frequencyHz) => ({ mode, frequencyHz }))))
   ("clears an invalid frequency when changing $mode mode without an AC source ($frequencyHz Hz)", ({ mode, frequencyHz }) => {
     const circuit = createCircuitExample("dc");
     const container = document.createElement("div");
@@ -54,7 +58,11 @@ describe("analysis settings after failed AC analysis", () => {
     mounted.push({ root, container });
     let latestAnalysis: CircuitAnalysis | undefined;
     function Harness() {
-      const [options, setOptions] = useState<CircuitAnalysisOptions>({ mode, frequencyHz });
+      const initialOptions: CircuitAnalysisOptions = { mode };
+      Object.defineProperty(initialOptions, "frequencyHz", frequencyHz === "accessor"
+        ? { get() { throw new Error("Frequency getters must not run"); }, enumerable: true }
+        : { value: frequencyHz, enumerable: true });
+      const [options, setOptions] = useState(initialOptions);
       latestAnalysis = analyzeCircuit(circuit, {}, options);
       return <CircuitSimulationPanel document={circuit} analysis={latestAnalysis} options={options} onChange={setOptions} showLearningPanels={false} />;
     }

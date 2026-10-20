@@ -1,14 +1,15 @@
 import { useId, useState, type ReactNode } from "react";
-import { circuitPartCatalog, circuitPartNumericFields, type CircuitDocument, type CircuitPart, type CircuitPartNumericKey } from "../circuit-model.js";
+import { circuitPartNumericFields, type CircuitDocument, type CircuitPart, type CircuitPartNumericKey } from "../circuit-model.js";
 import type { CircuitAnalysis } from "../circuit-solver.js";
 import { formatCircuitNumber } from "../number-format.js";
-import { simulationRecordField } from "../simulation-input.js";
 import { CircuitPartIcon } from "./CircuitPalette.js";
 import { getMeterDisplay, CircuitMeterReadout } from "./CircuitMeterReadout.js";
 import { measurementLabels } from "./measurement-labels.js";
 import { Button, Input, Switch, Tabs, TabsContent, TabsList, TabsTrigger } from "./primitives.js";
-import { partNumericField } from "./part-numeric-field.js";
+import { partNumericField, partNumericValue } from "./part-numeric-field.js";
+import { partSwitchValue } from "./part-switch-value.js";
 import { useNumericDraft } from "./NumericInput.js";
+import { analysisPartReading } from "./analysis-readings.js";
 
 type AdjustableValue = CircuitPartNumericKey | "initiallyClosed";
 
@@ -30,9 +31,9 @@ function adjustableValues(part: CircuitPart): AdjustableValue[] {
   return part.kind === "switch" ? ["initiallyClosed", ...numeric] : numeric;
 }
 
-function comparableValue(part: CircuitPart, key: AdjustableValue): number | boolean | undefined {
-  if (key === "initiallyClosed") { return (simulationRecordField(part, key) as boolean | undefined) ?? circuitPartCatalog.switch.defaults.initiallyClosed ?? false; }
-  return (simulationRecordField(part, key) as number | undefined) ?? circuitPartCatalog[part.kind].defaults[key] as number | undefined;
+function comparableValue(part: CircuitPart, key: AdjustableValue): number | boolean | null | undefined {
+  if (key === "initiallyClosed") { return partSwitchValue(part); }
+  return partNumericValue(part, key);
 }
 
 function isValidNumericValue(key: CircuitPartNumericKey, value: number, part: CircuitPart) {
@@ -114,6 +115,28 @@ function previewChanges(parts: CircuitPart[], initialDocument?: CircuitDocument)
   return { changedPartIds, changedValueCount };
 }
 
+function PreviewSwitchField({ part, id, onChange }: {
+  part: CircuitPart;
+  id: string;
+  onChange: CircuitPreviewPanelProps["onChange"];
+}) {
+  const closed = partSwitchValue(part);
+  return (
+    <label className="circuit-preview__switch" htmlFor={id}>
+      <span>スイッチ</span>
+      <small className="circuit-preview__switch-hint">押して切り替え</small>
+      <Switch
+        id={id}
+        aria-label={`${part.label}のON / OFF`}
+        aria-invalid={closed === null || undefined}
+        checked={closed === true}
+        onCheckedChange={(checked) => onChange(part.id, { initiallyClosed: checked })}
+      />
+      <strong>{closed === null ? "値を確認" : closed ? "ON" : "OFF"}</strong>
+    </label>
+  );
+}
+
 function PreviewNumericField({ part, field, onChange }: {
   part: CircuitPart;
   field: ReturnType<typeof partNumericField>;
@@ -122,7 +145,7 @@ function PreviewNumericField({ part, field, onChange }: {
   const id = useId();
   const { key, label, min, max, step, exclusiveMin, exclusiveMax } = field;
   const unit = key === "wiperPosition" ? "0–1" : field.unit;
-  const committedValue = (simulationRecordField(part, key) as number | undefined) ?? circuitPartCatalog[part.kind].defaults[key] as number | undefined;
+  const committedValue = partNumericValue(part, key);
   const draft = useNumericDraft({
     value: committedValue ?? 0,
     min, max, exclusiveMin, exclusiveMax,
@@ -204,19 +227,7 @@ export function CircuitPreviewPanel({
             {controls.map((part) => (
               <section className="circuit-preview__part" key={part.id} data-part-id={part.id} data-changed={changedPartIds.has(part.id)}>
                 {partHeading(part)}
-                {part.kind === "switch" && (
-                  <label className="circuit-preview__switch" htmlFor={`${id}-${part.id}-switch`}>
-                    <span>スイッチ</span>
-                    <small className="circuit-preview__switch-hint">押して切り替え</small>
-                    <Switch
-                      id={`${id}-${part.id}-switch`}
-                      aria-label={`${part.label}のON / OFF`}
-                      checked={Boolean(comparableValue(part, "initiallyClosed"))}
-                      onCheckedChange={(checked) => onChange(part.id, { initiallyClosed: checked })}
-                    />
-                    <strong>{comparableValue(part, "initiallyClosed") ? "ON" : "OFF"}</strong>
-                  </label>
-                )}
+                {part.kind === "switch" && <PreviewSwitchField part={part} id={`${id}-${part.id}-switch`} onChange={onChange} />}
                 {circuitPartNumericFields(part.kind).map((field) => <PreviewNumericField
                   key={`${field.key}:${resetVersion}`}
                   part={part}
@@ -244,7 +255,7 @@ export function CircuitPreviewPanel({
               : "直流の電圧・電流は端子の向きに対する符号付き値です。"}
         </p>
         {readings.map((part) => {
-          const reading = analysis.parts[part.id];
+          const reading = analysisPartReading(analysis, part.id);
           const labels = measurementLabels(part.kind);
           const meter = getMeterDisplay(part.kind, reading, analysis.status);
           return (

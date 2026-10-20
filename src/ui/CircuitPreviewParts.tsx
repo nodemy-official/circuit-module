@@ -2,11 +2,13 @@ import { useId, useState } from "react";
 import { circuitPartCatalog, circuitPartNumericFields, type CircuitDocument, type CircuitPart } from "../circuit-model.js";
 import type { CircuitAnalysis } from "../circuit-solver.js";
 import { formatCircuitQuantity } from "../circuit-visualization.js";
-import { simulationRecordField } from "../simulation-input.js";
 import { CircuitIcon } from "./CircuitIcon.js";
 import { getMeterDisplay } from "./CircuitMeterReadout.js";
 import { CircuitPartIcon } from "./CircuitPalette.js";
 import { measurementLabels } from "./measurement-labels.js";
+import { partNumericValue } from "./part-numeric-field.js";
+import { partSwitchValue } from "./part-switch-value.js";
+import { analysisPartReading } from "./analysis-readings.js";
 import { Button } from "./primitives.js";
 import { previewPartChanged } from "./preview-part-changes.js";
 
@@ -23,10 +25,11 @@ function setting(part: CircuitPart) {
   const fields = circuitPartNumericFields(part.kind);
   const field = part.kind === "led" ? fields.find(({ key }) => key === "ratedCurrentAmps") : fields[0];
   if (!field) { return; }
-  const value = (simulationRecordField(part, field.key) as number | undefined) ?? circuitPartCatalog[part.kind].defaults[field.key];
+  const value = partNumericValue(part, field.key);
   return {
     label: field.label,
-    value: field.unit === "°" ? `${value ?? "—"}°` : field.unit ? formatCircuitQuantity(value, field.unit) : String(value ?? "—"),
+    value: value === undefined || !Number.isFinite(value) ? "—"
+      : field.unit === "°" ? `${value}°` : field.unit ? formatCircuitQuantity(value, field.unit) : String(value),
   };
 }
 
@@ -34,7 +37,7 @@ function PartReadings({ part, analysis }: { part: CircuitPart; analysis: Circuit
   if (part.kind === "ground" || part.kind === "junction") {
     return <p className="circuit-preview-parts__note">{part.kind === "ground" ? "回路の電位の基準" : "導線をつなぐ接続点"}</p>;
   }
-  const reading = analysis.parts[part.id];
+  const reading = analysisPartReading(analysis, part.id);
   const meter = getMeterDisplay(part.kind, reading, analysis.status);
   if (meter) {
     return <div className="circuit-preview-parts__meter" data-status={meter.status}>
@@ -43,17 +46,16 @@ function PartReadings({ part, analysis }: { part: CircuitPart; analysis: Circuit
       {meter.phaseText && <small>{meter.phaseText}</small>}
     </div>;
   }
-  const measurable = analysis.status !== "invalid" && analysis.status !== "short";
   const labels = measurementLabels(part.kind);
   return <dl className="circuit-preview-parts__readings">
-    <div><dt>{labels.voltage}</dt><dd>{formatCircuitQuantity(measurable ? reading?.voltageVolts : undefined, "V")}</dd></div>
-    <div><dt>{labels.current}</dt><dd>{formatCircuitQuantity(measurable ? reading?.currentAmps : undefined, "A")}</dd></div>
+    <div><dt>{labels.voltage}</dt><dd>{formatCircuitQuantity(reading?.voltageVolts, "V")}</dd></div>
+    <div><dt>{labels.current}</dt><dd>{formatCircuitQuantity(reading?.currentAmps, "A")}</dd></div>
   </dl>;
 }
 
 function LightStatus({ part, analysis }: { part: CircuitPart; analysis: CircuitAnalysis }) {
   if (part.kind !== "bulb" && part.kind !== "led") { return null; }
-  const brightness = analysis.status === "invalid" || analysis.status === "short" ? undefined : analysis.parts[part.id]?.brightness;
+  const brightness = analysisPartReading(analysis, part.id)?.brightness;
   const lit = brightness !== undefined && brightness > 0;
   return <span className="circuit-preview-parts__light" data-lit={lit}>{brightness === undefined ? "点灯状態未計測" : lit ? "点灯" : "消灯"}</span>;
 }
@@ -78,8 +80,8 @@ export function CircuitPreviewParts({ document, initialDocument, analysis, onIns
         <ul className="circuit-preview-parts__grid">
           {document.parts.map((part) => {
             const value = setting(part);
-            const reading = analysis.parts[part.id];
-            const closed = reading?.switchClosed ?? (simulationRecordField(part, "initiallyClosed") as boolean | undefined) ?? circuitPartCatalog.switch.defaults.initiallyClosed ?? false;
+            const reading = analysisPartReading(analysis, part.id);
+            const closed = reading?.switchClosed ?? partSwitchValue(part);
             return <li className="circuit-preview-parts__card" key={part.id} data-part-id={part.id} data-kind={part.kind} data-changed={changedIds.has(part.id)}>
               <div className="circuit-preview-parts__identity">
                 <span className="circuit-preview-parts__icon"><CircuitPartIcon kind={part.kind} aria-hidden="true" /></span>
@@ -87,8 +89,8 @@ export function CircuitPreviewParts({ document, initialDocument, analysis, onIns
                 {changedIds.has(part.id) && <span className="circuit-preview-parts__changed">変更済み</span>}
               </div>
               <div className="circuit-preview-parts__configuration">
-                {part.kind === "switch" ? <button type="button" className="circuit-preview-parts__switch" aria-label={`${part.label}のON / OFF`} aria-pressed={closed} onClick={() => onSwitchToggle(part.id)}>
-                  <span className="circuit-preview-parts__switch-track" aria-hidden="true"><span /></span><strong>{closed ? "ON" : "OFF"}</strong>
+                {part.kind === "switch" ? <button type="button" className="circuit-preview-parts__switch" aria-label={`${part.label}のON / OFF`} aria-pressed={closed === true} aria-invalid={closed === null || undefined} onClick={() => onSwitchToggle(part.id)}>
+                  <span className="circuit-preview-parts__switch-track" aria-hidden="true"><span /></span><strong>{closed === null ? "値を確認" : closed ? "ON" : "OFF"}</strong>
                 </button> : value && <div className="circuit-preview-parts__setting"><span>{value.label}</span><strong>{value.value}</strong></div>}
                 <LightStatus part={part} analysis={analysis} />
               </div>

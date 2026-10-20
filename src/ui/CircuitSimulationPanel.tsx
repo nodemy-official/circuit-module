@@ -2,7 +2,7 @@ import { useCallback, useId, useMemo, useState, type ComponentPropsWithoutRef } 
 import type { CircuitDocument } from "../circuit-model.js";
 import { analyzeCircuit, type CircuitAnalysis, type CircuitAnalysisOptions } from "../circuit-solver.js";
 import { analysisAtTransientFrame, type CircuitTransientFrame } from "../circuit-visualization.js";
-import { simulationRecordField, validatedSimulationDocument } from "../simulation-input.js";
+import { simulationNumericField, simulationRecordField, validatedSimulationDocument } from "../simulation-input.js";
 import { CircuitEnergyPanel } from "./CircuitEnergyPanel.js";
 import { CircuitAcPanel } from "./CircuitAcPanel.js";
 import { CircuitComparisonPanel } from "./CircuitComparisonPanel.js";
@@ -207,7 +207,7 @@ export function CircuitSimulationPanel({
   ...props
 }: CircuitSimulationPanelProps) {
   const mode = simulationRecordField(inputOptions, "mode") as CircuitAnalysisOptions["mode"];
-  const frequencyHz = simulationRecordField(inputOptions, "frequencyHz") as number | undefined;
+  const frequencyHz = simulationNumericField(inputOptions, "frequencyHz");
   // Keep edits and settings on the same own data fields as the solver,
   // including non-enumerable values and absent fields supplied by a Proxy.
   const options = useMemo(() => ({ mode, frequencyHz }), [mode, frequencyHz]);
@@ -228,7 +228,7 @@ export function CircuitSimulationPanel({
     onFrameChange?.(next);
   }, [transientDocument, transientInputsKey, onFrameChange]);
   const source = document.parts.find((part) => part.kind === "ac-source");
-  const sourceFrequencyHz = source ? simulationRecordField(source, "frequencyHz") as number | undefined : undefined;
+  const sourceFrequencyHz = source ? simulationNumericField(source, "frequencyHz") : undefined;
   const frequency = options.frequencyHz ?? sourceFrequencyHz ?? 1000;
   const ariaLabel = props["aria-label"] ?? (showAnalysisSettings ? "解析の設定" : "解析結果と学習ビュー");
   if (!showAnalysisSettings && !showTransient && !showEnergy && !showAc && !showComparison) { return null; }

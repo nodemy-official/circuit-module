@@ -7,9 +7,9 @@ import { addExactRational, exactRationalToNumber, multiplyExactRational, numberT
 import { complexFromExact, exactComplexValue } from "../exact-numeric-state.js";
 import { formatCircuitNumber } from "../number-format.js";
 import { formatCircuitQuantity, type CircuitTransientFrame } from "../circuit-visualization.js";
-import { simulationRecordField } from "../simulation-input.js";
 import type { TransientPartReading, TransientSample } from "../transient-solver.js";
 import { matchingTransientEnergy, type TransientEnergySample } from "../transient-energy.js";
+import { partNumericValue } from "./part-numeric-field.js";
 
 const sourceKinds = new Set(["battery", "ac-source", "current-source"]);
 const reactiveKinds = new Set(["capacitor", "inductor"]);
@@ -31,9 +31,9 @@ function storedEnergy(
 ): number | null {
   if (part.kind !== "capacitor" && part.kind !== "inductor") { return null; }
   const capacitive = part.kind === "capacitor";
-  const coefficient = (simulationRecordField(part, capacitive ? "capacitanceFarads" : "inductanceHenries") as number | undefined) ?? (capacitive ? 1e-6 : 0.01);
+  const coefficient = partNumericValue(part, capacitive ? "capacitanceFarads" : "inductanceHenries");
   const scalar = capacitive ? reading.voltageVolts : reading.currentAmps;
-  if (!finite(coefficient) || coefficient < 0 || !finite(scalar)) { return null; }
+  if (!finite(coefficient) || coefficient <= 0 || !finite(scalar)) { return null; }
   const phase = capacitive ? "voltagePhaseDegrees" in reading ? reading.voltagePhaseDegrees : undefined
     : "currentPhaseDegrees" in reading ? reading.currentPhaseDegrees : undefined;
   const retained = restoredReadingComplex(readOptionalPrecision(() => capacitive ? reading.exactVoltage : reading.exactTerminalCurrents?.a), scalar, phase, ac, expressions);

@@ -66,4 +66,23 @@ describe("energy coefficient snapshots", () => {
     // The sampled state is still one, while the current own coefficient is two.
     expect(markup).toContain('data-energy-joules="1"');
   });
+
+  it.each((["capacitor", "inductor"] as const).flatMap((kind) =>
+    [null, "1", 0, "accessor"].map((coefficient) => ({ kind, coefficient }))))
+  ("does not invent energy after a $kind coefficient becomes malformed ($coefficient)", ({ kind, coefficient }) => {
+    const { document, storage, key } = circuit(kind, undefined, 1);
+    const analysis = analyzeCircuit(document);
+    const transient = simulateTransient(document, { durationSeconds: 1, timeStepSeconds: 1, startFromOperatingPoint: true });
+    expect(transient.status, transient.message).toBe("valid");
+    Object.defineProperty(storage, key, coefficient === "accessor"
+      ? { get() { throw new Error("Coefficient getters must not run"); }, enumerable: true }
+      : { value: coefficient, enumerable: true });
+    expect(analyzeCircuit(document).status).toBe("invalid");
+
+    for (const frame of [undefined, { analysis: transient, sampleIndex: 0 }]) {
+      const markup = renderToStaticMarkup(<CircuitEnergyPanel document={document} analysis={analysis} frame={frame} />);
+
+      expect(markup).not.toContain("data-energy-joules=");
+    }
+  });
 });

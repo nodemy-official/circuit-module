@@ -7,7 +7,9 @@ import { useWireRouteDrag } from "./useWireRouteDrag.js";
 import { useDocumentGestureBoundary, type DocumentGestureToken, type DocumentGestureVersion } from "./useDocumentGestureBoundary.js";
 import { useIsomorphicLayoutEffect } from "./useIsomorphicLayoutEffect.js";
 import { useCircuitBoardInputs } from "./useCircuitBoardInputs.js";
-import { simulationRecordField } from "../simulation-input.js";
+import { partSwitchValue } from "./part-switch-value.js";
+import { partNumericValue } from "./part-numeric-field.js";
+import { analysisPartReading } from "./analysis-readings.js";
 import { CircuitFlowLegend, CircuitWireFlow, wireFlowCurrent, wireFlowLabel, type FlowDisplay } from "./CircuitFlow.js";
 import { closestWirePoint, connectionTargetAt, wireMidpoint, type ConnectionTarget } from "./connection-target.js";
 import { circuitSlot, type CircuitStyleProps } from "./style-props.js";
@@ -35,7 +37,6 @@ import {
 } from "../circuit-geometry.js";
 import type { CircuitSelection, CircuitWireEnd, CircuitWireRoutePoints } from "../circuit-edit.js";
 import {
-  circuitPartCatalog,
   circuitPartNumericFields,
   endpointName,
   terminalName,
@@ -246,8 +247,9 @@ const partDetailKeys: Partial<Record<CircuitPartKind, readonly CircuitPartNumeri
 };
 
 function formatPartDetail(part: CircuitPart, key: CircuitPartNumericKey, unit: string) {
-  const value = (simulationRecordField(part, key) as number | undefined) ?? circuitPartCatalog[part.kind].defaults[key];
+  const value = partNumericValue(part, key);
   if (value === undefined) { return ""; }
+  if (!Number.isFinite(value)) { return unit ? `— ${unit}` : "—"; }
   if (key === "wiperPosition") { return `${Math.round(value * 100)}%`; }
   const prefix = key === "currentGain" ? "β " : key === "thresholdVolts" ? "Vth " : key === "openLoopGain" ? "A₀ " : "";
   const suffix = key === "voltageVolts" && part.kind === "ac-source" ? " RMS" : key === "ratedCurrentAmps" ? " 定格" : "";
@@ -308,13 +310,14 @@ function StandardPartArt({ part, brightness = 0, switchClosed, slotProps }: { pa
         </g>
       );
     case "switch": {
-      const closed = switchClosed ?? (simulationRecordField(part, "initiallyClosed") as boolean | undefined) ?? circuitPartCatalog.switch.defaults.initiallyClosed ?? false;
+      const closed = switchClosed ?? partSwitchValue(part);
       return (
         <g {...symbol}>
           <path d="M -20 0 H -9 M 9 0 H 20" />
           <circle {...circuitSlot("circuit-board__contact", slotProps?.contact)} cx="-9" cy="0" r="2.7" />
           <circle {...circuitSlot("circuit-board__contact", slotProps?.contact)} cx="9" cy="0" r="2.7" />
-          <path d={closed ? "M -9 0 L 9 0" : "M -9 0 L 7 -10"} />
+          <path d={closed === true ? "M -9 0 L 9 0" : "M -9 0 L 7 -10"} />
+          {closed === null && <text {...circuitSlot("circuit-board__polarity", slotProps?.polarity)} x="0" y="-18" textAnchor="middle">?</text>}
         </g>
       );
     }
@@ -539,17 +542,23 @@ function keyDownOnCircuitPart(
   handlePartKeyDown(event, part);
 }
 
+function switchToggleLabel(part: CircuitPart, closed: boolean | null) {
+  return closed === null ? `${part.label}の値を確認して切り替え` : `${part.label}を${closed ? "開く" : "閉じる"}`;
+}
+
 function circuitPartAccessibility(part: CircuitPart, isSelected: boolean, readOnly: boolean, onSwitchToggle?: (id: string) => void, switchClosed?: boolean) {
   const canToggleSwitch = readOnly && part.kind === "switch" && onSwitchToggle !== undefined;
-  const closed = switchClosed ?? (simulationRecordField(part, "initiallyClosed") as boolean | undefined) ?? circuitPartCatalog.switch.defaults.initiallyClosed ?? false;
+  const closed = switchClosed ?? partSwitchValue(part);
+  const invalidSwitch = part.kind === "switch" && closed === null;
   return {
     canToggleSwitch,
     role: readOnly ? canToggleSwitch ? "button" : undefined : "button",
     tabIndex: readOnly ? canToggleSwitch ? 0 : undefined : 0,
     ariaLabel: canToggleSwitch
-      ? `${part.label}を${closed ? "開く" : "閉じる"}`
-      : `${part.label}、${partDescriptions[part.kind]}`,
-    ariaPressed: readOnly ? canToggleSwitch ? closed : undefined : isSelected,
+      ? switchToggleLabel(part, closed)
+      : `${part.label}、${partDescriptions[part.kind]}${invalidSwitch ? "、値を確認" : ""}`,
+    ariaPressed: readOnly ? canToggleSwitch ? closed === true : undefined : isSelected,
+    ariaInvalid: invalidSwitch || undefined,
   };
 }
 
@@ -576,6 +585,7 @@ function CircuitPartSymbol({
   analysis?: CircuitAnalysis;
   slotProps?: CircuitBoardSlotProps;
 }) {
+  const reading = analysisPartReading(analysis, part.id);
   return (
     <g transform={`rotate(${part.rotation ?? 0})`}>
       {part.kind !== "junction" && (
@@ -589,8 +599,8 @@ function CircuitPartSymbol({
       )}
       {renderPart ? renderPart(part, selected) : <StandardPartArt
         part={part}
-        brightness={analysis?.parts[part.id]?.brightness}
-        switchClosed={analysis?.parts[part.id]?.switchClosed}
+        brightness={reading?.brightness}
+        switchClosed={reading?.switchClosed}
         slotProps={slotProps}
       />}
     </g>
@@ -694,8 +704,9 @@ function CircuitPartArtwork({
     element.focus({ preventScroll: true });
     onInspectPart(part.id);
   };
-  const meter = getMeterDisplay(part.kind, analysis?.parts[part.id], analysis?.status);
-  const accessibility = circuitPartAccessibility(part, isSelected, readOnly, onSwitchToggle, analysis?.parts[part.id]?.switchClosed);
+  const reading = analysisPartReading(analysis, part.id);
+  const meter = getMeterDisplay(part.kind, reading, analysis?.status);
+  const accessibility = circuitPartAccessibility(part, isSelected, readOnly, onSwitchToggle, reading?.switchClosed);
   const inspectionAccessibility = partInspectionAccessibility(
     part,
     readOnly,
@@ -716,6 +727,7 @@ function CircuitPartArtwork({
       tabIndex={onInspectPart ? 0 : accessibility.tabIndex}
       aria-label={meter ? `${accessibility.ariaLabel}、${meter.text}` : accessibility.ariaLabel}
       aria-pressed={accessibility.ariaPressed}
+      aria-invalid={accessibility.ariaInvalid}
       aria-haspopup={onInspectPart ? "dialog" : undefined}
       aria-keyshortcuts={inspectionAccessibility.keyShortcuts}
       onPointerDown={(event) => onPointerDown(event, part)}

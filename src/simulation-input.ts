@@ -178,6 +178,15 @@ export function simulationRecordField(record: object, key: string) {
   return descriptor && Object.hasOwn(descriptor, "value") ? descriptor.value : undefined;
 }
 
+/** Keep malformed own numeric values distinct from omitted fields without calling accessors. */
+export function simulationNumericField(record: object, key: string): number | undefined {
+  const descriptor = Object.getOwnPropertyDescriptor(record, key);
+  if (!descriptor) { return; }
+  if (!Object.hasOwn(descriptor, "value")) { return Number.NaN; }
+  const value = descriptor.value;
+  return value === undefined || typeof value === "number" ? value : Number.NaN;
+}
+
 /** Includes non-enumerable own data fields in validation and snapshots. */
 export function simulationRecordEntries(record: object): [string, unknown][] {
   return Object.getOwnPropertyNames(record).map((key) => [key, simulationRecordField(record, key)]);

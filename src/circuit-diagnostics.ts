@@ -418,7 +418,7 @@ function reportUnpoweredComponents(
       entries.some(({ part }) =>
         part.kind === "battery" || part.kind === "ac-source" || part.kind === "current-source" || part.kind === "op-amp",
       ) ||
-      !entries.some(({ part }) => part.kind !== "junction")
+      !entries.some(({ part }) => part.kind !== "junction" && part.kind !== "ground")
     ) { continue; }
     diagnostics.push(makeDiagnostic(
       "unpowered-component",

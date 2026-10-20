@@ -15,12 +15,18 @@ interface NumericInputOptions {
 export function useNumericDraft({ value, onValueChange, min, max, exclusiveMin, exclusiveMax, integer }: NumericInputOptions) {
   const [text, setText] = useState(String(value));
   const emittedValue = useRef(value);
+  const previousDomain = useRef([min, max, exclusiveMin, exclusiveMax, integer] as const);
   useEffect(() => {
-    if (!Object.is(emittedValue.current, value)) {
+    const domain = [min, max, exclusiveMin, exclusiveMax, integer] as const;
+    const domainChanged = domain.some((bound, index) => !Object.is(previousDomain.current[index], bound));
+    previousDomain.current = domain;
+    // A formerly invalid draft can become valid after an external bounds update.
+    // Restore the committed value so that displayed input still matches the model.
+    if (domainChanged || !Object.is(emittedValue.current, value)) {
       emittedValue.current = value;
       setText(String(value));
     }
-  }, [value]);
+  }, [value, min, max, exclusiveMin, exclusiveMax, integer]);
 
   const change = (nextText: string) => {
     setText(nextText);
