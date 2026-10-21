@@ -700,6 +700,14 @@ export function repairWireRoutes(document: CircuitDocument, partIds: readonly st
   return reason ? { ok: false, reason } : checkedEdit(document, { ok: true, document: next });
 }
 
+function capturePointCount(points: readonly Point[]): number | undefined {
+  try {
+    const count = points.length;
+    // A Proxy must not extend capture beyond the maximum JavaScript array length.
+    return Number.isInteger(count) && count >= 0 && count <= 0xff_ff_ff_ff ? count : undefined;
+  } catch { return undefined; }
+}
+
 /** Replaces a wire's intermediate route points, or clears them to restore automatic routing. */
 export function setWireWaypoints(
   document: CircuitDocument,
@@ -711,8 +719,8 @@ export function setWireWaypoints(
   if (waypoints !== undefined && !Array.isArray(waypoints)) {
     return { ok: false, reason: "導線の経由点は座標の配列で指定してください。" };
   }
-  const count = waypoints === undefined ? 0 : waypoints.length;
-  if (!Number.isInteger(count) || count < 0) {
+  const count = waypoints === undefined ? 0 : capturePointCount(waypoints);
+  if (count === undefined) {
     return { ok: false, reason: "導線の経由点数は0以上の整数で指定してください。" };
   }
   if (count > MAX_CIRCUIT_WIRE_WAYPOINTS) { return { ok: false, reason: waypointCountError }; }
@@ -741,7 +749,11 @@ export function setWireWaypoints(
   });
 }
 
-function captureRoutePoints(waypoints: readonly Point[], count: number): { ok: true; points: Point[] } | { ok: false; reason: string } {
+function captureRoutePoints(waypoints: readonly Point[], countedPoints: readonly Point[], capturedCount: number): { ok: true; points: Point[] } | { ok: false; reason: string } {
+  // A shared callback/generated array must use the same length that was validated.
+  // Generated geometry can exceed the stored limit when compaction removes its redundant points.
+  const count = waypoints === countedPoints ? capturedCount : capturePointCount(waypoints);
+  if (count === undefined) { return { ok: false, reason: "生成経路のアンカー数は0以上の整数で指定してください。" }; }
   const snapshots = new Map<Point, Point>();
   const points: Point[] = [];
   for (let index = 0; index < count; index += 1) {
@@ -838,15 +850,15 @@ export function setWireRoute(document: CircuitDocument, wireId: string, waypoint
   if (!wire) { return { ok: false, reason: "導線が見つかりません。" }; }
   if (waypoints === undefined) { return setWireWaypoints(document, wireId); }
   if (!Array.isArray(waypoints)) { return { ok: false, reason: "導線の経由点は座標の配列で指定してください。" }; }
-  const count = waypoints.length;
-  if (!Number.isInteger(count) || count < 0 || count > MAX_CIRCUIT_WIRE_ROUTE_ANCHORS) {
+  const count = capturePointCount(waypoints);
+  if (count === undefined || count > MAX_CIRCUIT_WIRE_ROUTE_ANCHORS) {
     return { ok: false, reason: `生成経路のアンカーは${MAX_CIRCUIT_WIRE_ROUTE_ANCHORS}個以下にしてください。` };
   }
   const hint = captureWireRouteHint(waypoints);
   if (!hint.ok) { return hint; }
   if (hint.snapshot !== undefined) { return restoreStoredWireRoute(document, wire, hint.snapshot); }
   if (hint.mode === undefined && count === 0) { return setWireWaypoints(document, wireId); }
-  const captured = captureRoutePoints(hint.points, hint.points.length);
+  const captured = captureRoutePoints(hint.points, waypoints, count);
   if (!captured.ok) { return captured; }
   const { points } = captured;
   const from = document.parts.find((part) => part.id === wire.from.partId);

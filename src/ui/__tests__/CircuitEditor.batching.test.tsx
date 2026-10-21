@@ -48,6 +48,65 @@ function mount(initialDocument = fixture()) {
 }
 
 describe("part property updates", () => {
+  it("accepts a free geometry patch and retains its repaired route across undo and redo", () => {
+    const initial = fixture();
+    initial.wires[0]!.routeAnchors = [{ x: 5, y: 0 }];
+    const ui = mount(initial);
+    const before = ui.editor.document;
+
+    act(() => ui.editor.updatePart("a", { x: 1, y: 3, rotation: 90 }));
+
+    expect(ui.editor.error).toBeNull();
+    expect(ui.editor.document.parts[0]).toMatchObject({ x: 1, y: 3, rotation: 90 });
+    const after = ui.editor.document;
+    expect(parseCircuitDocument(ui.editor.exportDocument())).toEqual({ ok: true, document: after });
+    act(() => ui.editor.undo());
+    expect(ui.editor.document).toBe(before);
+    act(() => ui.editor.redo());
+    expect(ui.editor.document).toBe(after);
+  });
+
+  it("allows property repair when the initial document already contains overlapping parts", () => {
+    const initial = fixture();
+    initial.parts[1]!.x = 0;
+    const ui = mount(initial);
+
+    act(() => ui.editor.updatePart("a", { ...ui.editor.document.parts[0]!, resistanceOhms: 22 }));
+
+    expect(ui.editor.error).toBeNull();
+    expect(ui.editor.document.parts[0]?.resistanceOhms).toBe(22);
+    act(() => ui.editor.updatePart("a", { x: -10 }));
+    expect(ui.editor.error).toBeNull();
+    expect(ui.editor.document.parts[0]?.x).toBe(-10);
+  });
+
+  it.each(["move", "rotate"] as const)("rejects an overlapping geometry patch (%s) without changing editor state or history", (operation) => {
+    const initial = fixture();
+    if (operation === "rotate") { initial.parts[1]!.x = 0; initial.parts[1]!.y = 2.5; }
+    const ui = mount(initial);
+    act(() => {
+      ui.editor.setTitle("redo");
+      ui.editor.undo();
+      ui.editor.startReconnect("wire", "from");
+    });
+    const before = ui.editor;
+
+    act(() => ui.editor.updatePart("a", operation === "move"
+      ? { x: 10, label: "rejected" }
+      : { rotation: 90, label: "rejected" }));
+
+    expect(ui.editor.error).toContain("重な");
+    expect(ui.editor.document).toBe(before.document);
+    expect(ui.editor.selection).toBe(before.selection);
+    expect(ui.editor.pendingEndpoint).toBe(before.pendingEndpoint);
+    expect(ui.editor.pendingWire).toBe(before.pendingWire);
+    expect(ui.editor.documentVersion).toBe(before.documentVersion);
+    expect(ui.editor.canUndo).toBe(false);
+    expect(ui.editor.canRedo).toBe(true);
+    act(() => ui.editor.redo());
+    expect(ui.editor.document.title).toBe("redo");
+  });
+
   it.each(["title", "label", "numeric", "geometry", "move", "rotate", "add", "route"] as const)
   ("rejects a %s edit over the JSON limit without changing references or undo/redo", (operation) => {
     const initial = fixture();

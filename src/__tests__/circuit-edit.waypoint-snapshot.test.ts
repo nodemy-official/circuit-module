@@ -84,4 +84,27 @@ describe("wire waypoint snapshots", () => {
     expect(parseCircuitDocument(serializeCircuitDocument(result.document))).toEqual({ ok: true, document: result.document });
     expect(document).toEqual(before);
   });
+
+  it("rejects a throwing waypoint count without changing the document", () => {
+    const document: CircuitDocument = {
+      title: "経由点数の読み取り例外",
+      parts: [
+        { id: "left", kind: "junction", x: 0, y: 0, label: "左" },
+        { id: "right", kind: "junction", x: 10, y: 0, label: "右" },
+      ],
+      wires: [{ id: "wire", from: { partId: "left", terminal: "a" }, to: { partId: "right", terminal: "a" }, waypoints: [{ x: 5, y: 5 }] }],
+    };
+    const before = structuredClone(document);
+    let reads = 0;
+    const waypoints = new Proxy([{ x: 3, y: 3 }], {
+      get(target, key, receiver) {
+        if (key === "length") { reads += 1; throw new Error("Invalid count"); }
+        return Reflect.get(target, key, receiver);
+      },
+    });
+
+    expect(setWireWaypoints(document, "wire", waypoints)).toMatchObject({ ok: false });
+    expect(reads).toBe(1);
+    expect(document).toEqual(before);
+  });
 });

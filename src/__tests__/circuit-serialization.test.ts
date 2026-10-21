@@ -322,21 +322,21 @@ describe("circuit document serialization", () => {
     expect(parseCircuitDocument(serializeCircuitDocument(document))).toEqual({ ok: true, document: expected });
   });
 
-  it("captures each saved descriptor once before numeric validation and normalization", () => {
+  it("reuses each saved descriptor for normalization before verifying its stability", () => {
     let captures = 0;
     const resistor = new Proxy(part("resistor", "resistor", { resistanceOhms: 20 }), {
       getOwnPropertyDescriptor(target, key) {
         const descriptor = Reflect.getOwnPropertyDescriptor(target, key);
         if (key === "resistanceOhms" && descriptor) {
           captures += 1;
-          return { ...descriptor, value: captures === 1 ? 20 : 100 };
+          return descriptor;
         }
         return descriptor;
       },
     });
     const restored = parseCircuitDocument(serializeCircuitDocument({ title: "", parts: [resistor], wires: [] }));
     expect(restored.ok && restored.document.parts[0]!.resistanceOhms).toBe(20);
-    expect(captures).toBe(1);
+    expect(captures).toBe(2);
   });
 
   it.each(["document", "fragment"] as const)("rejects a shared endpoint's self-connection while capturing a %s", (kind) => {
@@ -375,10 +375,12 @@ describe("circuit document serialization", () => {
 
   it("shares captured route values within a save and refreshes them on the next save", () => {
     let captures = 0;
-    const point = new Proxy({ x: 3, y: 4 }, {
+    const coordinates = { x: 1, y: 4 };
+    const point = new Proxy(coordinates, {
       getOwnPropertyDescriptor(target, key) {
         const descriptor = Reflect.getOwnPropertyDescriptor(target, key);
-        return key === "x" && descriptor ? { ...descriptor, value: ++captures } : descriptor;
+        if (key === "x") { captures += 1; }
+        return descriptor;
       },
     });
     const waypoints = [point, point];
@@ -393,12 +395,13 @@ describe("circuit document serialization", () => {
     };
 
     for (const x of [1, 2]) {
+      coordinates.x = x;
       const saved = parseCircuitDocument(serializeCircuitDocument(document));
       if (!saved.ok) { throw new Error(saved.reason); }
       for (const wire of saved.document.wires) {
         expect(wire.waypoints).toEqual([{ x, y: 4 }, { x, y: 4 }]);
       }
-      expect(captures).toBe(x);
+      expect(captures).toBe(x * 2);
     }
   });
 

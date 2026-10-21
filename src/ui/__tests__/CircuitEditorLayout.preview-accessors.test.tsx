@@ -106,9 +106,12 @@ it.each(["resistor", "switch"] as const)("preserves hidden frozen document field
     if (!value) { throw new Error("Missing preview document"); }
     return value;
   };
+  const capturedWires = latestDocument().wires;
+  expect(capturedWires).not.toBe(initialDocument.wires);
+  expect(capturedWires).toEqual(initialDocument.wires);
   const expectRetainedDocument = () => {
     expect(latestDocument().title).toBe(initialDocument.title);
-    expect(latestDocument().wires).toBe(initialDocument.wires);
+    expect(latestDocument().wires).toBe(capturedWires);
     expect(Object.getOwnPropertyDescriptor(latestDocument(), "retained")?.value).toBe(metadata);
     expect(Object.getOwnPropertyDescriptor(latestDocument(), "unreadMetadata")?.get).toBe(metadataGetter);
     expect(container.querySelectorAll('.circuit-board__wire[data-wire-id="w"]')).toHaveLength(1);

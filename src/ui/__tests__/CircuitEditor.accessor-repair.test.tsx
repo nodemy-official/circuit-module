@@ -105,6 +105,29 @@ it("renames an invalid hidden frozen document before repairing its label and ret
 });
 
 describe.each(["battery", "switch"] as const)("%s editor accessor repair", (kind) => {
+  it.each(["map", "iterator", "ordinary metadata"])("normalizes editable accessors while retaining array metadata (%s)", (metadataKind) => {
+    const getter = vi.fn(() => { throw new Error("Editable getters must not run"); });
+    const arrayGetter = vi.fn(() => { throw new Error("Array getters must not run"); });
+    const source = fixture(kind, getter);
+    const metadata = { owner: "host" };
+    Object.defineProperty(source.document.parts, "retained", { value: metadata, enumerable: false });
+    Object.defineProperty(source.document.parts, metadataKind === "iterator" ? Symbol.iterator : metadataKind === "map" ? "map" : "unknown", { get: arrayGetter });
+    const ui = mount(source.document, false);
+    const before = ui.editor.document;
+    expect(before.parts[0]![source.key]).toBe(kind === "battery" ? Number.NaN : null);
+    expect(Object.getOwnPropertyDescriptor(before.parts, "retained")?.value).toBe(metadata);
+
+    act(() => { ui.editor.selectPart("part"); ui.editor.movePart("part", 1, 0); ui.editor.endEdit(); });
+    expect(ui.editor.document.parts[0]!.x).toBe(4);
+    expect(ui.editor.analysis.status).toBe("invalid");
+    act(() => ui.editor.undo());
+    expect(ui.editor.document).toBe(before);
+    act(() => ui.editor.redo());
+    expect(ui.editor.document.parts[0]![source.key]).toBe(kind === "battery" ? Number.NaN : null);
+    expect(getter).not.toHaveBeenCalled();
+    expect(arrayGetter).not.toHaveBeenCalled();
+  });
+
   it("repairs through Inspector and preserves hidden own fields through undo and redo", () => {
     const getter = vi.fn(() => { throw new Error("Editable getters must not run"); });
     const source = fixture(kind, getter);

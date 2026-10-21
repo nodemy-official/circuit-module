@@ -59,14 +59,80 @@ const allNumericKeys = new Set<CircuitPartNumericKey>(
 );
 const savedPartKeys = ["id", "kind", "x", "y", "label", "rotation", "initiallyClosed", ...allNumericKeys];
 
-type SavedSnapshot = WeakMap<object, Map<string, PropertyDescriptor | undefined>>;
+interface SavedCapture {
+  source: object;
+  fields: Map<string, PropertyDescriptor | undefined>;
+  arrayIndexes?: string[];
+}
+
+interface SavedSnapshot {
+  records: WeakMap<object, SavedCapture>;
+  captures: SavedCapture[];
+}
+
+function createSavedSnapshot(): SavedSnapshot {
+  return { records: new WeakMap(), captures: [] };
+}
+
+function savedCapture(value: object, snapshot: SavedSnapshot) {
+  let capture = snapshot.records.get(value);
+  if (!capture) {
+    capture = { source: value, fields: new Map() };
+    snapshot.records.set(value, capture);
+    snapshot.captures.push(capture);
+  }
+  return capture;
+}
 
 /** Shared records and arrays must describe one value throughout a save. */
 function savedDescriptor(value: object, key: string, snapshot: SavedSnapshot) {
-  let fields = snapshot.get(value);
-  if (!fields) { fields = new Map(); snapshot.set(value, fields); }
+  const { fields } = savedCapture(value, snapshot);
   if (!fields.has(key)) { fields.set(key, Object.getOwnPropertyDescriptor(value, key)); }
   return fields.get(key);
+}
+
+function isArrayIndex(key: PropertyKey): key is string {
+  if (typeof key !== "string") { return false; }
+  const index = Number(key);
+  return Number.isInteger(index) && index >= 0 && index < 0xff_ff_ff_ff && String(index) === key;
+}
+
+function arrayIndexes(value: object) {
+  return Reflect.ownKeys(value).filter(isArrayIndex).sort((first, second) => Number(first) - Number(second));
+}
+
+function savedArrayIndexes(value: object, snapshot: SavedSnapshot) {
+  const capture = savedCapture(value, snapshot);
+  capture.arrayIndexes ??= arrayIndexes(value);
+  return capture.arrayIndexes;
+}
+
+function sameSavedDescriptor(first: PropertyDescriptor | undefined, second: PropertyDescriptor | undefined) {
+  if (first === undefined || second === undefined) { return first === second; }
+  return Object.hasOwn(first, "value") && Object.hasOwn(second, "value") &&
+    Object.is(first.value, second.value) && first.enumerable === second.enumerable &&
+    first.configurable === second.configurable && first.writable === second.writable;
+}
+
+function savedSnapshotIsStable(snapshot: SavedSnapshot) {
+  try {
+    // Later records can change previously captured records from descriptor traps.
+    // Verify earlier records last, and never read caller-owned property values.
+    for (let index = snapshot.captures.length - 1; index >= 0; index -= 1) {
+      const capture = snapshot.captures[index]!;
+      if (capture.arrayIndexes) {
+        const currentIndexes = arrayIndexes(capture.source);
+        if (currentIndexes.length !== capture.arrayIndexes.length ||
+            currentIndexes.some((key, keyIndex) => key !== capture.arrayIndexes![keyIndex])) { return false; }
+      }
+      for (const [key, descriptor] of [...capture.fields].reverse()) {
+        if (!sameSavedDescriptor(descriptor, Object.getOwnPropertyDescriptor(capture.source, key))) { return false; }
+      }
+    }
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** Capture only persisted own data fields; unknown getters and Proxy get traps never run. */
@@ -94,6 +160,8 @@ function snapshotSavedArray(value: unknown, max: number, arrayError: string, lim
     const length: unknown = lengthDescriptor && Object.hasOwn(lengthDescriptor, "value") ? lengthDescriptor.value : undefined;
     if (typeof length !== "number" || !Number.isInteger(length) || length < 0) { return { reason: arrayError }; }
     if (length > max) { return { reason: limitError }; }
+    const indexes = savedArrayIndexes(value, snapshot);
+    if (indexes.length !== length || indexes.some((key, index) => Number(key) !== index)) { return { reason: arrayError }; }
     const values: unknown[] = [];
     for (let index = 0; index < length; index += 1) {
       const descriptor = savedDescriptor(value, String(index), snapshot);
@@ -348,7 +416,10 @@ function normalizeRouteAnchors(value: unknown, label: string, snapshot: SavedSna
 export function validateCircuitRouteAnchors(input: unknown):
   | { ok: true; routeAnchors: CircuitRouteAnchor[] }
   | { ok: false; reason: string } {
-  return normalizeRouteAnchors(input, "導線のルートアンカー", new WeakMap());
+  const snapshot = createSavedSnapshot();
+  const result = normalizeRouteAnchors(input, "導線のルートアンカー", snapshot);
+  return result.ok && !savedSnapshotIsStable(snapshot)
+    ? { ok: false, reason: "導線のルートアンカーが取得中に変更されました。" } : result;
 }
 
 function routeAnchorConnectionIssue(routeAnchors: readonly CircuitRouteAnchor[], from: Point, to: Point, label: string): string | null {
@@ -436,7 +507,10 @@ function normalizeWires(value: unknown, parts: readonly CircuitPart[], snapshot:
 export function validateCircuitFragment(input: unknown):
   | { ok: true; fragment: Pick<CircuitDocument, "parts" | "wires"> }
   | { ok: false; reason: string } {
-  return validateFragment(input, new WeakMap());
+  const snapshot = createSavedSnapshot();
+  const result = validateFragment(input, snapshot);
+  return result.ok && !savedSnapshotIsStable(snapshot)
+    ? { ok: false, reason: "コピーした回路データが取得中に変更されました。" } : result;
 }
 
 function validateFragment(input: unknown, snapshot: SavedSnapshot): ReturnType<typeof validateCircuitFragment> {
@@ -454,13 +528,14 @@ function validateFragment(input: unknown, snapshot: SavedSnapshot): ReturnType<t
 }
 
 function validateDocument(input: unknown): ValidationResult {
-  const snapshot: SavedSnapshot = new WeakMap();
+  const snapshot = createSavedSnapshot();
   const value = snapshotSavedRecord(input, ["title", "parts", "wires"], snapshot);
   if (!value) { return fail("回路データはオブジェクトで指定してください。"); }
   const titleIssue = checkString(value.title, "回路名", true);
   if (titleIssue) { return fail(titleIssue); }
   const fragmentResult = validateFragment(value, snapshot);
   if (!fragmentResult.ok) { return fragmentResult; }
+  if (!savedSnapshotIsStable(snapshot)) { return fail("回路データが取得中に変更されました。"); }
   return { ok: true, document: { title: value.title as string, ...fragmentResult.fragment } };
 }
 

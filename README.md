@@ -165,6 +165,8 @@ headless で生成済みの導線形状を保存する場合は `setWireRoute(do
 
 `updatePart(id, patch)` は表示名・数値・スイッチ状態などの属性を更新します。部品の ID と種類を変更する操作には対応していません。これらを変更する patch は拒否し、文書・選択・接続中の状態・履歴を保ったまま `error` に理由を設定します。
 
+`initialDocument` の `parts` と `wires` は、欠番のない配列として own データ属性で渡してください。要素の getter や欠番など、一覧を安全に読み取れない場合は getter を実行せず `TypeError` で拒否します。`map`・`every`・`Symbol.iterator` など、配列の標準処理を上書きする属性は初期コピーから除外します。
+
 ### 標準の見た目を使う
 
 標準レイアウトは preset として分離されています。利用するアプリだけが CSS と preset を明示的に import します。

@@ -154,14 +154,16 @@ describe("generated wire route anchor serialization", () => {
     expect(() => serializeCircuitDocument(documentWithAnchors(new Array(2)))).toThrow(TypeError);
   });
 
-  it("captures arrays, shared points, and markers once without invoking Proxy get traps", () => {
+  it("reuses captured arrays, shared points, and markers before verifying stability without Proxy get traps", () => {
     let reads = 0;
     let captures = 0;
-    const point = new Proxy({ x: 2, y: 3, xBoundary: 1 as const }, {
+    const coordinates = { x: 1, y: 3, xBoundary: 1 as const };
+    const point = new Proxy(coordinates, {
       get() { reads += 1; throw new Error("Property reads must not run"); },
       getOwnPropertyDescriptor(target, key) {
         const descriptor = Reflect.getOwnPropertyDescriptor(target, key);
-        return key === "x" && descriptor ? { ...descriptor, value: ++captures } : descriptor;
+        if (key === "x") { captures += 1; }
+        return descriptor;
       },
     });
     const values = new Proxy([point, point], { get() { reads += 1; throw new Error("Array reads must not run"); } });
@@ -169,12 +171,13 @@ describe("generated wire route anchor serialization", () => {
     document.parts.push({ id: "other", kind: "junction", x: 20, y: 3, label: "O" });
     document.wires.push({ id: "other", from: { partId: "source", terminal: "a" }, to: { partId: "other", terminal: "a" }, routeAnchors: values });
     for (const x of [1, 2]) {
+      coordinates.x = x;
       const restored = parseCircuitDocument(serializeCircuitDocument(document));
       if (!restored.ok) { throw new Error(restored.reason); }
       for (const wire of restored.document.wires) {
         expect(wire.routeAnchors).toEqual([{ x, y: 3, xBoundary: 1 }, { x, y: 3, xBoundary: 1 }]);
       }
-      expect(captures).toBe(x);
+      expect(captures).toBe(x * 2);
     }
     expect(reads).toBe(0);
   });

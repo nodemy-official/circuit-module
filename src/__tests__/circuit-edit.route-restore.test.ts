@@ -90,6 +90,102 @@ describe("stored wire route restoration", () => {
     expect(document).toEqual(fixture());
   });
 
+  it.each((["generated", "routeAnchors"] as const).flatMap((kind) =>
+    [-1, 0.5, Number.NaN, Number.POSITIVE_INFINITY, "1", undefined].map((length) => ({ kind, length })),
+  ))("rejects an invalid $kind point count ($length) without changing the stored route", ({ kind, length }) => {
+    const document = fixture();
+    document.parts[1]!.y = 0;
+    const before = serializeCircuitDocument(document);
+    const vertices = new Proxy([{ x: 3, y: 0 }], {
+      get(target, key, receiver) { return key === "length" ? length : Reflect.get(target, key, receiver); },
+    });
+    const points = Object.defineProperty([{ x: 3, y: 0 }], "generatedRoute", { value: { kind, points: vertices } });
+
+    expect(setWireRoute(document, "wire", points)).toMatchObject({ ok: false });
+    expect(serializeCircuitDocument(document)).toBe(before);
+  });
+
+  it.each((["generated", "routeAnchors"] as const).flatMap((kind) =>
+    [2 ** 32, 2 ** 53, Number.MAX_VALUE, 0xff_ff_ff_ff + 1].map((length) => ({ kind, length })),
+  ))("rejects an impossible $kind array length ($length) before reading points", ({ kind, length }) => {
+    const document = fixture();
+    let lengthReads = 0;
+    let pointReads = 0;
+    const vertices = new Proxy([{ x: 3, y: 0 }], {
+      get(_target, key) {
+        if (key === "length") { lengthReads += 1; return length; }
+        pointReads += 1;
+        throw new Error("Points must not be read");
+      },
+    });
+    const points = Object.defineProperty([{ x: 3, y: 0 }], "generatedRoute", { value: { kind, points: vertices } });
+
+    expect(setWireRoute(document, "wire", points)).toMatchObject({ ok: false });
+    expect(lengthReads).toBe(1);
+    expect(pointReads).toBe(0);
+    expect(document).toEqual(fixture());
+  });
+
+  it.each(["generated", "routeAnchors"] as const)("rejects a throwing %s point count", (kind) => {
+    const document = fixture();
+    let reads = 0;
+    const vertices = new Proxy([{ x: 3, y: 0 }], {
+      get(target, key, receiver) {
+        if (key === "length") { reads += 1; throw new Error("Invalid count"); }
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    const points = Object.defineProperty([{ x: 3, y: 0 }], "generatedRoute", { value: { kind, points: vertices } });
+
+    expect(setWireRoute(document, "wire", points)).toMatchObject({ ok: false });
+    expect(reads).toBe(1);
+    expect(document).toEqual(fixture());
+  });
+
+  it.each([
+    { mode: undefined, shared: true },
+    { mode: "generated", shared: false },
+    { mode: "generated", shared: true },
+    { mode: "routeAnchors", shared: false },
+    { mode: "routeAnchors", shared: true },
+  ] as const)("captures the point count once (mode=$mode, shared=$shared)", ({ mode, shared }) => {
+    const document = fixture();
+    const vertices = [{ x: 4, y: 0 }, { x: 4, y: 6 }, { x: 10, y: 6 }];
+    let reads = 0;
+    const captured = new Proxy(vertices, {
+      get(target, key, receiver) {
+        if (key === "length") { reads += 1; return reads === 1 ? 3 : Number.NaN; }
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    const points = mode === undefined ? captured : Object.defineProperty(shared ? captured : [{ x: 4, y: 6 }], "generatedRoute", {
+      value: { kind: mode, points: captured },
+    });
+
+    const result = setWireRoute(document, "wire", points);
+    if (!result.ok) { throw new Error(result.reason); }
+    expect(reads).toBe(1);
+    expect(routeDocumentWires(result.document).get("wire")).toEqual([
+      { x: 2, y: 0 }, ...vertices, { x: 10, y: 10 },
+    ]);
+    expect(document).toEqual(fixture());
+  });
+
+  it("rejects a throwing callback point count", () => {
+    const document = fixture();
+    let reads = 0;
+    const points = new Proxy([{ x: 3, y: 0 }], {
+      get(target, key, receiver) {
+        if (key === "length") { reads += 1; throw new Error("Invalid count"); }
+        return Reflect.get(target, key, receiver);
+      },
+    });
+
+    expect(setWireRoute(document, "wire", points)).toMatchObject({ ok: false });
+    expect(reads).toBe(1);
+    expect(document).toEqual(fixture());
+  });
+
   it.each(["generatedRoute", "kind", "points"])("rejects a generated %s accessor without invoking it", (field) => {
     let reads = 0;
     const accessor = { get() { reads += 1; throw new Error("Accessor must not run"); } };
