@@ -4,6 +4,7 @@ import type { CircuitAnalysis } from "../circuit-solver.js";
 import { formatCircuitQuantity } from "../circuit-visualization.js";
 import { CircuitIcon } from "./CircuitIcon.js";
 import { getMeterDisplay } from "./CircuitMeterReadout.js";
+import { readOptionalPrecision } from "../circuit-reading.js";
 import { CircuitPartIcon } from "./CircuitPalette.js";
 import { measurementLabels } from "./measurement-labels.js";
 import { partNumericValue } from "./part-numeric-field.js";
@@ -38,7 +39,7 @@ function PartReadings({ part, analysis }: { part: CircuitPart; analysis: Circuit
     return <p className="circuit-preview-parts__note">{part.kind === "ground" ? "回路の電位の基準" : "導線をつなぐ接続点"}</p>;
   }
   const reading = analysisPartReading(analysis, part.id);
-  const meter = getMeterDisplay(part.kind, reading, analysis.status);
+  const meter = getMeterDisplay(part.kind, reading, analysis.status, readOptionalPrecision(() => analysis.precisionExpressions));
   if (meter) {
     return <div className="circuit-preview-parts__meter" data-status={meter.status}>
       <span>{part.kind === "ammeter" ? "計測電流" : "計測電圧"}</span>

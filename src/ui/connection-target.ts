@@ -15,12 +15,16 @@ export function closestWirePoint(route: readonly Point[], point: Point): Point |
     const from = route[index - 1];
     const to = route[index];
     if (!from || !to) { continue; }
-    const candidate = {
+    const snapped = {
       x: Math.max(Math.min(from.x, to.x), Math.min(Math.max(from.x, to.x), Math.round(point.x))),
       y: Math.max(Math.min(from.y, to.y), Math.min(Math.max(from.y, to.y), Math.round(point.y))),
     };
-    const nextDistance = Math.hypot(point.x - candidate.x, point.y - candidate.y);
-    if (nextDistance < distance) { closest = candidate; distance = nextDistance; }
+    // A fractional endpoint can be closer than an interior grid cell, or than
+    // the opposite endpoint of a segment shorter than one cell.
+    for (const candidate of [snapped, from, to]) {
+      const nextDistance = Math.hypot(point.x - candidate.x, point.y - candidate.y);
+      if (nextDistance < distance) { closest = { x: candidate.x, y: candidate.y }; distance = nextDistance; }
+    }
   }
   return closest;
 }

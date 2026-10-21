@@ -65,9 +65,28 @@ describe("connection target snapping", () => {
   });
 
   it.each([
+    { route: [{ x: 0.1, y: 0.25 }, { x: 0.2, y: 0.25 }], point: { x: 0.19, y: 0.25 }, expected: { x: 0.2, y: 0.25 } },
+    { route: [{ x: 0.1, y: 0.25 }, { x: 6.1, y: 0.25 }], point: { x: 0.51, y: 0.25 }, expected: { x: 0.1, y: 0.25 } },
+    { route: [{ x: -0.25, y: -6.1 }, { x: -0.25, y: -0.1 }], point: { x: -0.25, y: -0.51 }, expected: { x: -0.25, y: -0.1 } },
+  ])("compares fractional segment endpoints with the nearest grid point ($point)", ({ route, point, expected }) => {
+    for (const candidate of [route, [...route].reverse()]) {
+      expect(closestWirePoint(candidate, point)).toEqual(expected);
+    }
+  });
+
+  it("snaps to a nearby fractional endpoint even when the rounded grid point is outside the radius", () => {
+    const route = [{ x: 0.1, y: 0.25 }, { x: 0.2, y: 0.25 }];
+    const routes = new Map([["wire", route]]);
+    expect(connectionTargetAt(empty, routes, { x: 0.19, y: 0.24 }, 0.02)).toEqual({
+      point: { x: 0.2, y: 0.25 }, wireId: "wire",
+    });
+  });
+
+  it.each([
     { route: [{ x: 0.25, y: 0.25 }, { x: 6.25, y: 0.25 }], expected: { x: 3, y: 0.25 } },
     { route: [{ x: -0.25, y: -6.25 }, { x: -0.25, y: -0.25 }], expected: { x: -0.25, y: -3 } },
-    { route: [{ x: 0.1, y: 0.25 }, { x: 0.2, y: 0.25 }], expected: { x: 0.1, y: 0.25 } },
+    // The binary64 midpoint is 0.15000000000000002, slightly nearer 0.2.
+    { route: [{ x: 0.1, y: 0.25 }, { x: 0.2, y: 0.25 }], expected: { x: 0.2, y: 0.25 } },
   ])("keeps a keyboard landing point on a fractional wire ($route)", ({ route, expected }) => {
     expect(wireMidpoint(route)).toEqual(expected);
   });

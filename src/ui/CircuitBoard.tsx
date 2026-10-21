@@ -3,6 +3,7 @@ import { flushSync } from "react-dom";
 import { CircuitIcon } from "./CircuitIcon.js";
 import { CircuitPotentialControls, CircuitPotentialOverlay, useCircuitPotentialView } from "./CircuitPotentialView.js";
 import { getMeterDisplay } from "./CircuitMeterReadout.js";
+import { readOptionalPrecision } from "../circuit-reading.js";
 import { useWireRouteDrag } from "./useWireRouteDrag.js";
 import { useDocumentGestureBoundary, type DocumentGestureToken, type DocumentGestureVersion } from "./useDocumentGestureBoundary.js";
 import { useIsomorphicLayoutEffect } from "./useIsomorphicLayoutEffect.js";
@@ -705,7 +706,7 @@ function CircuitPartArtwork({
     onInspectPart(part.id);
   };
   const reading = analysisPartReading(analysis, part.id);
-  const meter = getMeterDisplay(part.kind, reading, analysis?.status);
+  const meter = getMeterDisplay(part.kind, reading, analysis?.status, readOptionalPrecision(() => analysis?.precisionExpressions));
   const accessibility = circuitPartAccessibility(part, isSelected, readOnly, onSwitchToggle, reading?.switchClosed);
   const inspectionAccessibility = partInspectionAccessibility(
     part,

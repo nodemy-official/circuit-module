@@ -10,8 +10,9 @@ import type { CircuitAnalysis, CircuitPartReading } from "./circuit-solver.js";
 import { acAnalysisFrequency, isAcReactiveConductive } from "./ac-reactive.js";
 import { formatCircuitNumber } from "./number-format.js";
 import type { TransientAnalysis } from "./transient-solver.js";
-import { optionalPrecisionFailureToken, readOptionalPrecision, retainedComplexIsNonzero, restoredReadingComplex, type CircuitExactComplex } from "./circuit-reading.js";
-import { exactExpressionsAreImmutable, type ExactExpressionNode } from "./exact-expression.js";
+import { optionalPrecisionFailureToken, readOptionalPrecision, retainedComplex, retainedComplexIsNonzero, restoredReadingComplex, type CircuitExactComplex } from "./circuit-reading.js";
+import type { ExactExpressionNode } from "./exact-expression.js";
+import { appendExactComplexSnapshot, appendExpressionTableSnapshot } from "./circuit-reading-snapshot.js";
 import { simulationRecordField } from "./simulation-input.js";
 
 export interface CircuitPotentialContext {
@@ -31,6 +32,15 @@ export interface CircuitNodeCurrent {
   /** Positive is leaving the net and entering the component. AC is an RMS magnitude. */
   amps: number;
   phaseDegrees?: number;
+  /** Retained before the scalar reading is rounded; use for relative visual scales. */
+  exactCurrent?: CircuitExactComplex;
+}
+
+export interface CircuitPotentialReading {
+  volts: number;
+  phaseDegrees: number;
+  /** Retained before the scalar reading is rounded; expressions come from the analysis context. */
+  exactVoltage?: CircuitExactComplex;
 }
 
 export interface CircuitNode {
@@ -356,8 +366,13 @@ function nodeReading(endpoints: CircuitEndpoint[], document: CircuitDocument, an
     const amps = reading?.terminalCurrents?.[endpoint.terminal];
     const phaseDegrees = reading?.terminalCurrentPhasesDegrees?.[endpoint.terminal];
     if (!finite(amps) || reading?.meterStatus === "floating" || (analysis.mode === "ac" && !finite(phaseDegrees))) { complete = false; continue; }
-    currents.push({ endpoint, label: endpointName(part, endpoint.terminal), amps, phaseDegrees });
     const value = restoredReadingComplex(readOptionalPrecision(() => reading?.exactTerminalCurrents?.[endpoint.terminal]), amps, phaseDegrees, analysis.mode === "ac", readOptionalPrecision(() => analysis.precisionExpressions)) ?? phasor(amps, phaseDegrees);
+    const exactCurrent = retainedComplex(value);
+    // Keep the regenerated precision projection and its paired phase in the
+    // same canonical turn, including transported angles such as 397 degrees.
+    currents.push({ endpoint, label: endpointName(part, endpoint.terminal), amps,
+      phaseDegrees: analysis.mode === "ac" ? complexPhaseDegrees(value) : phaseDegrees,
+      ...(exactCurrent ? { exactCurrent } : {}) });
     current = complexAdd(current, value);
   }
   return {
@@ -452,11 +467,7 @@ function preciseBranchVoltage(
 ) {
   const voltage = preciseBranchPhasor(pair, context);
   if (!voltage) { return; }
-  if (context.analysis.mode !== "ac") { return { volts: voltage.real, phaseDegrees: 0 }; }
-  const volts = complexMagnitude(voltage);
-  return Number.isFinite(volts)
-    ? { volts, phaseDegrees: complexPhaseDegrees(voltage) }
-    : undefined;
+  return potentialReading(voltage, context.analysis.mode === "ac");
 }
 
 interface ComplexPotential {
@@ -622,90 +633,6 @@ function appendTerminalDifferencesSnapshot(snapshot: unknown[], reading: Circuit
   for (const difference of differences ?? []) {
     snapshot.push(difference, difference.fromTerminal, difference.toTerminal, difference.voltageVolts, difference.voltagePhaseDegrees);
     appendExactComplexSnapshot(snapshot, readOptionalPrecision(() => difference.exactVoltage));
-  }
-}
-
-function appendExactComponentSnapshot(snapshot: unknown[], value: unknown) {
-  snapshot.push(value);
-  if (typeof value === "object" && value !== null) {
-    snapshot.push("numerator" in value ? value.numerator : undefined,
-      "denominator" in value ? value.denominator : undefined,
-      "expression" in value ? value.expression : undefined,
-      "sign" in value ? value.sign : undefined);
-  }
-}
-
-function appendProjectionSnapshot(snapshot: unknown[], projection: unknown) {
-  snapshot.push(projection);
-  if (typeof projection === "object" && projection !== null) {
-    snapshot.push("real" in projection ? projection.real : undefined,
-      "magnitude" in projection ? projection.magnitude : undefined,
-      "phaseDegrees" in projection ? projection.phaseDegrees : undefined);
-  }
-}
-
-function appendNormalizedTermsSnapshot(snapshot: unknown[], terms: unknown) {
-  snapshot.push(terms);
-  if (!Array.isArray(terms)) { return; }
-  snapshot.push(terms.length);
-  // Exact reading restoration uses indexed terms, not a custom iterator.
-  for (const term of Array.from({ length: terms.length }, (_, index): unknown => terms[index])) {
-    snapshot.push(term);
-    if (typeof term !== "object" || term === null) { continue; }
-    appendExactComponentSnapshot(snapshot, "real" in term ? term.real : undefined);
-    appendExactComponentSnapshot(snapshot, "imaginary" in term ? term.imaginary : undefined);
-    appendExactComponentSnapshot(snapshot, "magnitudeNormalizationSquared" in term ? term.magnitudeNormalizationSquared : undefined);
-  }
-}
-
-function appendNormalizedFractionSnapshot(snapshot: unknown[], value: unknown) {
-  snapshot.push(value);
-  if (typeof value !== "object" || value === null) { return; }
-  appendNormalizedTermsSnapshot(snapshot, "numerator" in value ? value.numerator : undefined);
-  appendNormalizedTermsSnapshot(snapshot, "denominator" in value ? value.denominator : undefined);
-}
-
-function appendExpressionTableSnapshot(snapshot: unknown[], expressions: readonly ExactExpressionNode[] | undefined) {
-  snapshot.push(expressions);
-  // Solver-owned histories are frozen recursively. Reuse their identity rather
-  // than scanning thousands of expressions for every displayed wire or terminal.
-  if (exactExpressionsAreImmutable(expressions)) { return; }
-  try {
-    if (!Array.isArray(expressions)) { return; }
-    snapshot.push(expressions.length);
-    for (const node of Array.from({ length: expressions.length }, (_, index) => expressions[index])) {
-      snapshot.push(node, node?.operation);
-      if (!node) { continue; }
-      if (node.operation === "literal") {
-        snapshot.push(node.numerator, node.denominator);
-        continue;
-      }
-      snapshot.push(node.arguments);
-      if (!Array.isArray(node.arguments)) { continue; }
-      snapshot.push(node.arguments.length);
-      for (const argument of Array.from({ length: node.arguments.length }, (_, index) => node.arguments[index])) {
-        snapshot.push(argument);
-      }
-    }
-  } catch {
-    // Unreadable optional metadata must use the scalar fallback, never a
-    // path cached from a previous usable table. A new token prevents reuse.
-    snapshot.push({});
-  }
-}
-
-function appendExactComplexSnapshot(snapshot: unknown[], value: unknown) {
-  snapshot.push(value);
-  if (typeof value === "object" && value !== null) {
-    try {
-      appendExactComponentSnapshot(snapshot, "real" in value ? value.real : undefined);
-      appendExactComponentSnapshot(snapshot, "imaginary" in value ? value.imaginary : undefined);
-      appendExactComponentSnapshot(snapshot, "magnitudeNormalizationSquared" in value ? value.magnitudeNormalizationSquared : undefined);
-      appendNormalizedFractionSnapshot(snapshot, "normalizedFraction" in value ? value.normalizedFraction : undefined);
-      appendProjectionSnapshot(snapshot, "projection" in value ? value.projection : undefined);
-    } catch {
-      snapshot.push({});
-    }
   }
 }
 
@@ -940,7 +867,7 @@ function precisePathPotential(
   reference: CircuitNode,
   context: CircuitPotentialContext,
   cache: PotentialContextCache,
-): { volts: number; phaseDegrees: number } | undefined {
+): CircuitPotentialReading | undefined {
   if (node.id === reference.id) { return undefined; }
   let tree = cache.trees.get(reference.id);
   if (!tree) {
@@ -956,20 +883,14 @@ function precisePathPotential(
     value = complexSubtract(value, predecessor.difference);
     currentId = predecessor.nodeId;
   }
-  if (context.analysis.mode !== "ac") {
-    return Number.isFinite(value.real) ? { volts: value.real, phaseDegrees: 0 } : undefined;
-  }
-  const volts = complexMagnitude(value);
-  return Number.isFinite(volts)
-    ? { volts, phaseDegrees: complexPhaseDegrees(value) }
-    : undefined;
+  return potentialReading(value, context.analysis.mode === "ac");
 }
 
 function precisePartPotential(
   node: CircuitNode,
   reference: CircuitNode,
   context: CircuitPotentialContext | undefined,
-): { volts: number; phaseDegrees: number } | undefined {
+): CircuitPotentialReading | undefined {
   if (!context || node.id === reference.id) { return undefined; }
   const cache = potentialContextCache(context);
   for (const pair of sharedPartTerminalPairs(node, reference)) {
@@ -979,8 +900,12 @@ function precisePartPotential(
   return precisePathPotential(node, reference, context, cache);
 }
 
-function finitePotential(volts: number, phaseDegrees: number) {
-  return finite(volts) ? { volts, phaseDegrees } : null;
+function potentialReading(value: ComplexPotential, ac: boolean): CircuitPotentialReading | undefined {
+  const volts = ac ? complexMagnitude(value) : value.real;
+  if (!finite(volts)) { return; }
+  const exactVoltage = retainedComplex(value);
+  return { volts, phaseDegrees: ac ? complexPhaseDegrees(value) : 0,
+    ...(exactVoltage ? { exactVoltage } : {}) };
 }
 
 /** AC differences subtract complex phasors, never their RMS magnitudes. */
@@ -999,25 +924,31 @@ export function circuitPotential(
   if (!ac) {
     const difference = complexSubtract((context && restoredReadingComplex(readOptionalPrecision(() => node.exactVoltage), node.voltageVolts, undefined, false, expressions)) || complex(node.voltageVolts),
       (context && restoredReadingComplex(readOptionalPrecision(() => reference.exactVoltage), reference.voltageVolts, undefined, false, expressions)) || complex(reference.voltageVolts));
-    return finitePotential(difference.real, 0);
+    return potentialReading(difference, false) ?? null;
   }
   if (!finite(node.voltagePhaseDegrees) || !finite(reference.voltagePhaseDegrees)) { return null; }
   const first = (context && restoredReadingComplex(readOptionalPrecision(() => node.exactVoltage), node.voltageVolts, node.voltagePhaseDegrees, true, expressions)) || phasor(node.voltageVolts, node.voltagePhaseDegrees);
   const second = (context && restoredReadingComplex(readOptionalPrecision(() => reference.exactVoltage), reference.voltageVolts, reference.voltagePhaseDegrees, true, expressions)) || phasor(reference.voltageVolts, reference.voltagePhaseDegrees);
   const value = complexSubtract(first, second);
-  const volts = complexMagnitude(value);
-  return finitePotential(volts, complexPhaseDegrees(value));
+  return potentialReading(value, true) ?? null;
 }
 
-export function circuitPotentialColor(volts: number, scale: number) {
+/** Accept a retained potential to finish the color ratio before rounding its voltage. */
+export function circuitPotentialColor(voltage: number | CircuitPotentialReading, scale: number, ac = false, expressions?: readonly ExactExpressionNode[]) {
+  const volts = typeof voltage === "number" ? voltage : voltage.volts;
+  const value = typeof voltage === "number" ? undefined
+    : restoredReadingComplex(readOptionalPrecision(() => voltage.exactVoltage), volts, voltage.phaseDegrees, ac, expressions);
   const upper = scale > 0 ? scale : Math.max(scale, 1e-12);
   const magnitude = Math.abs(volts);
-  const ratio = finite(magnitude) && finite(upper)
+  const ratio = value && finite(upper)
+    ? complexMagnitude(complexDivide(value, complex(upper)))
+    : finite(magnitude) && finite(upper)
     ? exactProductQuotient([magnitude], upper)
     : magnitude / upper;
   // Color percentages are the display boundary; every positive finite scale uses the same ratio.
   const amount = Math.min(1, ratio);
-  return `hsl(${volts < 0 ? 218 : 18} ${Math.round(amount * 80)}% ${Math.round(55 - amount * 12)}%)`;
+  const negative = volts < 0 || !ac && volts === 0 && value && Math.abs(complexPhaseDegrees(value)) > 90;
+  return `hsl(${negative ? 218 : 18} ${Math.round(amount * 80)}% ${Math.round(55 - amount * 12)}%)`;
 }
 
 export function formatCircuitQuantity(value: number | undefined, unit: string): string {

@@ -10,6 +10,8 @@ import { partNumericField, partNumericValue } from "./part-numeric-field.js";
 import { partSwitchValue } from "./part-switch-value.js";
 import { useNumericDraft } from "./NumericInput.js";
 import { analysisPartReading } from "./analysis-readings.js";
+import { nonzeroAcMeasurement } from "./ac-reading-phase.js";
+import { readOptionalPrecision } from "../circuit-reading.js";
 
 type AdjustableValue = CircuitPartNumericKey | "initiallyClosed";
 
@@ -245,6 +247,7 @@ export function CircuitPreviewPanel({
   }
 
   function renderReadings() {
+    const expressions = readOptionalPrecision(() => analysis.precisionExpressions);
     return readings.length > 0 ? (
       <div className="circuit-preview__parts">
         <p className="circuit-preview__measurement-note">
@@ -257,17 +260,17 @@ export function CircuitPreviewPanel({
         {readings.map((part) => {
           const reading = analysisPartReading(analysis, part.id);
           const labels = measurementLabels(part.kind);
-          const meter = getMeterDisplay(part.kind, reading, analysis.status);
+          const meter = getMeterDisplay(part.kind, reading, analysis.status, expressions);
           return (
             <section className="circuit-preview__part" key={part.id} data-part-id={part.id} data-changed={changedPartIds.has(part.id)}>
               {partHeading(part)}
-              {meter ? <CircuitMeterReadout kind={part.kind} reading={reading} analysisStatus={analysis.status} /> : <dl className="circuit-preview__readings">
+              {meter ? <CircuitMeterReadout kind={part.kind} reading={reading} analysisStatus={analysis.status} precisionExpressions={expressions} /> : <dl className="circuit-preview__readings">
                 <div data-measurement="voltage"><dt>{labels.voltage}</dt><dd>{format(reading?.voltageVolts, "V")}</dd></div>
                 <div data-measurement="current"><dt>{labels.current}</dt><dd>{format(reading?.currentAmps, "A")}</dd></div>
                 <div data-measurement="power"><dt>電力</dt><dd>{format(reading?.powerWatts, "W")}</dd></div>
                 {analysis.mode === "ac" && <>
-                  {reading && Math.abs(reading.voltageVolts) > 0 && <div data-measurement="voltage-phase"><dt>電圧位相</dt><dd>{format(reading.voltagePhaseDegrees, "°")}</dd></div>}
-                  {reading && Math.abs(reading.currentAmps) > 0 && <div data-measurement="current-phase"><dt>電流位相</dt><dd>{format(reading.currentPhaseDegrees, "°")}</dd></div>}
+                  {reading && nonzeroAcMeasurement(part.kind, reading, "voltage", expressions) && <div data-measurement="voltage-phase"><dt>電圧位相</dt><dd>{format(reading.voltagePhaseDegrees, "°")}</dd></div>}
+                  {reading && nonzeroAcMeasurement(part.kind, reading, "current", expressions) && <div data-measurement="current-phase"><dt>電流位相</dt><dd>{format(reading.currentPhaseDegrees, "°")}</dd></div>}
                   <div data-measurement="reactive-power"><dt>無効電力</dt><dd>{format(reading?.reactivePowerVars, "var")}</dd></div>
                 </>}
               </dl>}

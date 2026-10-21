@@ -1,4 +1,5 @@
 import { useId, useState } from "react";
+import { exactProductQuotient } from "../analog-math.js";
 import type { CircuitAnalysis } from "../circuit-solver.js";
 import type { CircuitDocument, CircuitPart } from "../circuit-model.js";
 import { formatCircuitNumber } from "../number-format.js";
@@ -189,7 +190,13 @@ function comparisonRows(baseline: Snapshot, current: Snapshot, canCompare: boole
       const delta = before !== undefined && after !== undefined ? after - before : undefined;
       return [key, canCompare && sameKind && isFiniteValue(delta) ? delta : undefined];
     })) as Record<ComparisonMetric, number | undefined>;
-    const changed = canCompare && sameKind && metrics.some(({ key }) => deltas[key] !== undefined && deltas[key] !== 0);
+    const changed = canCompare && sameKind && metrics.some(({ key }) => {
+      const before = beforeValues[key];
+      const after = afterValues[key];
+      // A finite measurement can change even when its difference exceeds the
+      // display range. Keep change detection independent of delta formatting.
+      return before !== undefined && after !== undefined && before !== after;
+    });
     return { id, beforePart, afterPart, status, sameKind, beforeValues, afterValues, deltas, changed };
   });
   const maxAbsDelta = Math.max(0, ...rows.map((row) => Math.abs(row.deltas[metric] ?? 0)));
@@ -271,7 +278,7 @@ function ComparisonRow({
   afterMode: "dc" | "ac";
 }) {
   const delta = row.deltas[metric];
-  const deltaPercent = delta === undefined || maxAbsDelta === 0 ? 0 : Math.abs(delta) / maxAbsDelta * 50;
+  const deltaPercent = delta === undefined || maxAbsDelta === 0 ? 0 : exactProductQuotient([Math.abs(delta), 50], maxAbsDelta);
   const statusLabel = partStatusLabel(row.status);
   return (
     <tr data-part-id={row.id} data-row-status={row.status} data-changed={row.changed}>

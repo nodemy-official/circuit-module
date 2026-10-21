@@ -110,7 +110,11 @@ function undoHistory(state: EditorHistory): EditorHistory {
 function redoHistory(state: EditorHistory): EditorHistory {
   const current = endHistoryGroup(state);
   const next = current.future[0];
-  if (!next) { return current.present === state.present ? state : current; }
+  if (!next) {
+    // An unavailable redo leaves a real edit group open. An unchanged group can
+    // restore its history even when its last edit reused the original document.
+    return current.present === state.present && current.past === state.past && current.future === state.future ? state : current;
+  }
   return { past: [...current.past, current.present], present: next, future: current.future.slice(1) };
 }
 

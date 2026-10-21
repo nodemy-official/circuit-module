@@ -92,4 +92,17 @@ describe("potential color scale drafts", () => {
       expect(colors()).toEqual(normalColors);
     }
   });
+
+  it("preserves the AC legend's intermediate color before its displayed voltage is rounded", () => {
+    const ui = mount("ac");
+    const colors = () => [...ui.container.querySelectorAll<HTMLElement>(".circuit-potential__legend i")]
+      .map((item) => item.style.backgroundColor);
+    inputValue(ui.input, "1");
+    const normalColors = colors();
+    expect(new Set(normalColors).size).toBe(3);
+    for (const scale of [Number.MIN_VALUE, 3 * Number.MIN_VALUE, 5 * Number.MIN_VALUE]) {
+      inputValue(ui.input, String(scale));
+      expect(colors()).toEqual(normalColors);
+    }
+  });
 });

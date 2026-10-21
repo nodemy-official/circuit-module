@@ -1,6 +1,10 @@
 import { useEffect, useId, useRef, useState, type ComponentPropsWithoutRef, type Dispatch, type SetStateAction } from "react";
 import { exactProductSumQuotient, scaledProduct } from "../analog-math.js";
 import type { CircuitDocument } from "../circuit-model.js";
+import { optionalPrecisionFailureToken, readOptionalPrecision, restoredReadingComplex } from "../circuit-reading.js";
+import { appendExactComplexSnapshot, appendExpressionTableSnapshot } from "../circuit-reading-snapshot.js";
+import { addExactRational, divideExactRational, exactRationalToNumber, multiplyExactRational, numberToExactRational, subtractExactRational, type ExactRational } from "../exact-linear-algebra.js";
+import { exactComplexValue } from "../exact-numeric-state.js";
 import { formatCircuitNumber } from "../number-format.js";
 import type { CircuitTransientFrame } from "../circuit-visualization.js";
 import { simulateTransient, type TransientAnalysis, type TransientSample } from "../transient-solver.js";
@@ -72,8 +76,19 @@ function useStopPlaybackWhenInactive(
   }, [active, analysis, setPlaying]);
 }
 
-function valuesFor(samples: readonly TransientSample[], partId: string, quantity: Quantity) {
-  return samples.map((sample) => measuredReading(sample, partId)?.[quantity]);
+function valuesFor(analysis: TransientAnalysis | undefined, part: WaveformPart, quantity: Quantity) {
+  if (analysis?.status !== "valid") { return []; }
+  const expressions = readOptionalPrecision(() => analysis.precisionExpressions);
+  return analysis.samples.map((sample) => {
+    const reading = measuredReading(sample, part.id);
+    const scalar = reading?.[quantity];
+    if (scalar === undefined || !Number.isFinite(scalar)) { return null; }
+    const precision = readOptionalPrecision(() => quantity === "voltageVolts" ? reading?.exactVoltage
+      : reading?.exactTerminalCurrents?.[part.kind === "op-amp" ? "c" : "a"]);
+    const retained = restoredReadingComplex(precision, scalar, undefined, false, expressions);
+    return retained ? exactComplexValue(retained)?.real ?? numberToExactRational(scalar)!
+      : numberToExactRational(scalar)!;
+  });
 }
 
 function measuredReading(sample: TransientSample | undefined, partId: string) {
@@ -81,10 +96,10 @@ function measuredReading(sample: TransientSample | undefined, partId: string) {
   return reading?.meterStatus === "floating" || reading?.meterStatus === "unconnected" ? undefined : reading;
 }
 
-function lineSegments(samples: readonly TransientSample[], values: readonly (number | undefined)[], x: (time: number) => number, y: (value: number) => number) {
+function lineSegments(samples: readonly TransientSample[], values: readonly (ExactRational | null)[], x: (time: number) => number, y: (value: ExactRational) => number) {
   return samples.reduce<string[][]>((segments, sample, index) => {
     const value = values[index];
-    if (value === undefined || !Number.isFinite(value)) {
+    if (!value) {
       if (segments.at(-1)?.length) { segments.push([]); }
       return segments;
     }
@@ -94,44 +109,98 @@ function lineSegments(samples: readonly TransientSample[], values: readonly (num
   }, []).filter((segment) => segment.length > 0);
 }
 
-function Waveform({
-  analysis,
-  baselineAnalysis,
-  baselineDocument,
-  parts,
-  quantity,
-  sampleIndex,
-}: {
+interface WaveformInputs {
   analysis: TransientAnalysis;
   baselineAnalysis?: TransientAnalysis;
   baselineDocument?: CircuitDocument;
   parts: readonly WaveformPart[];
   quantity: Quantity;
-  sampleIndex: number;
-}) {
+}
+
+function waveformInputSnapshot({ analysis, baselineAnalysis, baselineDocument, parts, quantity }: WaveformInputs) {
+  const snapshot: unknown[] = [analysis, baselineAnalysis, quantity];
+  const compatibleParts = parts.filter((part) => baselineDocument?.parts.some((candidate) => candidate.id === part.id && candidate.kind === part.kind));
+  for (const part of parts) { snapshot.push(part.id, part.kind, compatibleParts.includes(part)); }
+  for (const [source, selected] of [[analysis, parts], [baselineAnalysis, compatibleParts]] as const) {
+    snapshot.push(source?.status);
+    if (source?.status !== "valid") { continue; }
+    appendExpressionTableSnapshot(snapshot, readOptionalPrecision(() => source.precisionExpressions));
+    snapshot.push(source.samples.length);
+    // The plotted arrays use indexed map/reduce; caller iterators cannot omit
+    // values from the evidence used to reuse those curves.
+    for (const sample of Array.from({ length: source.samples.length }, (_, index) => source.samples[index]!)) {
+      snapshot.push(sample.timeSeconds);
+      for (const part of selected) {
+        const reading = measuredReading(sample, part.id);
+        snapshot.push(reading?.[quantity]);
+        appendExactComplexSnapshot(snapshot, readOptionalPrecision(() => quantity === "voltageVolts" ? reading?.exactVoltage
+          : reading?.exactTerminalCurrents?.[part.kind === "op-amp" ? "c" : "a"]));
+      }
+    }
+  }
+  snapshot.push(optionalPrecisionFailureToken());
+  return snapshot;
+}
+
+function matchingWaveformSnapshot(first: readonly unknown[], second: readonly unknown[]) {
+  return first.length === second.length && first.every((value, index) => Object.is(value, second[index]));
+}
+
+function createWaveformPlot({ analysis, baselineAnalysis, baselineDocument, parts, quantity }: WaveformInputs) {
+  const series = parts.map((part) => ({
+    part,
+    current: valuesFor(analysis, part, quantity),
+    baseline: baselineDocument?.parts.some((candidate) => candidate.id === part.id && candidate.kind === part.kind)
+      ? valuesFor(baselineAnalysis, part, quantity)
+      : [],
+  }));
+  const scaleValues = series.flatMap(({ current, baseline }) => [...current, ...baseline])
+    .filter((value): value is ExactRational => value !== null);
+  const zero = numberToExactRational(0)!;
+  const top = numberToExactRational(16)!;
+  const height = numberToExactRational(112)!;
+  let low = zero;
+  let high = zero;
+  for (const value of scaleValues) {
+    if (value.numerator < 0n && subtractExactRational(value, low).numerator < 0n) { low = value; }
+    if (value.numerator > 0n && subtractExactRational(value, high).numerator > 0n) { high = value; }
+  }
+  const span = subtractExactRational(high, low);
+  const coordinates = new WeakMap<ExactRational, number>();
+  // Keep signed sample values through the shared scale and completed SVG
+  // coordinate. Public numbers may all be zero while a decay remains nonzero.
+  const y = (value: ExactRational) => {
+    const previous = coordinates.get(value);
+    if (previous !== undefined) { return previous; }
+    const coordinate = span.numerator === 0n ? 72
+      : exactRationalToNumber(addExactRational(top, multiplyExactRational(height,
+        divideExactRational(subtractExactRational(high, value), span)!)));
+    coordinates.set(value, coordinate);
+    return coordinate;
+  };
+  // Curves are independent of the cursor. Preserve their finished coordinates
+  // across playback, while snapshots still observe scalar and precision edits.
+  return { series, zero, low, high, y };
+}
+
+function useWaveformPlot(inputs: WaveformInputs) {
+  const cached = useRef<{ snapshot: unknown[]; plot: ReturnType<typeof createWaveformPlot> } | null>(null);
+  const snapshot = waveformInputSnapshot(inputs);
+  if (cached.current && matchingWaveformSnapshot(cached.current.snapshot, snapshot)) { return cached.current.plot; }
+  const plot = createWaveformPlot(inputs);
+  // Optional metadata accessors can change earlier fields while restoring a
+  // later sample. Cache only a plot whose capture remained stable throughout.
+  cached.current = matchingWaveformSnapshot(snapshot, waveformInputSnapshot(inputs)) ? { snapshot, plot } : null;
+  return plot;
+}
+
+function Waveform({ analysis, baselineAnalysis, baselineDocument, parts, quantity, sampleIndex }: WaveformInputs & { sampleIndex: number }) {
   const id = useId();
   const samples = analysis.samples;
   const baselineSamples = baselineAnalysis?.status === "valid" ? baselineAnalysis.samples : [];
   const duration = samples.at(-1)?.timeSeconds ?? 1;
-  const series = parts.map((part) => ({
-    part,
-    current: valuesFor(samples, part.id, quantity),
-    baseline: baselineDocument?.parts.some((candidate) => candidate.id === part.id && candidate.kind === part.kind)
-      ? valuesFor(baselineSamples, part.id, quantity)
-      : [],
-  }));
-  const scaleValues = series.flatMap(({ current, baseline }) => [...current, ...baseline])
-    .filter((value): value is number => value !== undefined && Number.isFinite(value));
-  const low = Math.min(0, ...scaleValues);
-  const high = Math.max(0, ...scaleValues);
-  const magnitude = Math.max(Math.abs(low), Math.abs(high));
-  const normalizedMagnitude = magnitude || 1;
-  const scaledHigh = high / normalizedMagnitude;
-  const span = scaledHigh - low / normalizedMagnitude || 1;
+  const { series, zero, low, high, y } = useWaveformPlot({ analysis, baselineAnalysis, baselineDocument, parts, quantity });
   const x = (time: number) => 48 + time / (duration || 1) * 298;
-  const y = (value: number) => magnitude === 0
-    ? 72
-    : 16 + (scaledHigh - value / normalizedMagnitude) / span * 112;
   const cursorSample = samples[sampleIndex];
   const unit = quantity === "voltageVolts" ? "V" : "A";
   const title = quantity === "voltageVolts" ? "電圧" : "電流";
@@ -141,9 +210,9 @@ function Waveform({
     <svg viewBox="0 0 360 155" role="img" aria-labelledby={`${id}-title`}>
       <title id={`${id}-title`}>{title}の時間波形。選択した部品を同じ時間軸と数値尺度で表示します。</title>
       <path d="M48 16V128H346" className="circuit-waveform__axis" />
-      <path d={`M48 ${y(0)}H346`} className="circuit-waveform__grid" />
-      <text x="44" y="20" textAnchor="end">{format(high)}</text>
-      <text x="44" y="130" textAnchor="end">{format(low)}</text>
+      <path d={`M48 ${y(zero)}H346`} className="circuit-waveform__grid" />
+      <text x="44" y="20" textAnchor="end">{format(exactRationalToNumber(high))}</text>
+      <text x="44" y="130" textAnchor="end">{format(exactRationalToNumber(low))}</text>
       <text x="48" y="147">0 s</text>
       <text x="346" y="147" textAnchor="end">{format(duration)} s</text>
       <text x="48" y="10">{unit}</text>
@@ -155,10 +224,10 @@ function Waveform({
         return <g key={part.id} data-series-index={seriesIndex}>
           {baselineSegments.map((points) => <polyline key={`baseline-${points[0]}`} points={points.join(" ")} className="circuit-waveform__trace" data-source="baseline" strokeDasharray="5 4" />)}
           {currentSegments.map((points) => <polyline key={`current-${points[0]}`} points={points.join(" ")} className="circuit-waveform__trace" data-source="current" />)}
-          {cursorSample && currentValue !== undefined && Number.isFinite(currentValue) && <circle
+          {cursorSample && currentValue && <circle
             cx={x(cursorSample.timeSeconds)} cy={y(currentValue)} r="3" className="circuit-waveform__series-dot" data-source="current"
           />}
-          {cursorSample && baselineValue !== undefined && Number.isFinite(baselineValue) && baselineSamples[sampleIndex] && <circle
+          {cursorSample && baselineValue && baselineSamples[sampleIndex] && <circle
             cx={x(cursorSample.timeSeconds)} cy={y(baselineValue)} r="2.5" className="circuit-waveform__series-dot" data-source="baseline"
           />}
         </g>;
@@ -461,6 +530,7 @@ export function CircuitTransientPanel({
   };
 
   const togglePlayback = () => {
+    if (!active) { return; }
     setShowTransientFrame(true);
     if (sampleIndex >= maxSampleIndex) { setSampleIndex(0); }
     setPlaying((value) => !value);

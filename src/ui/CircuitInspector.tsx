@@ -9,6 +9,7 @@ import { NumericInput } from "./NumericInput.js";
 import { partNumericField, partNumericValue } from "./part-numeric-field.js";
 import { partSwitchValue } from "./part-switch-value.js";
 import { analysisReadingsAvailable } from "./analysis-readings.js";
+import { nonzeroAcMeasurement } from "./ac-reading-phase.js";
 import { useId, type ComponentPropsWithoutRef, type ReactNode } from "react";
 
 export type CircuitInspectorSlot =
@@ -66,6 +67,8 @@ export interface CircuitInspectorProps extends Omit<ComponentPropsWithoutRef<"se
   /** Time in seconds for transient readings; omitted for steady-state analysis. */
   readingTimeSeconds?: number;
   analysisStatus?: CircuitAnalysis["status"];
+  /** Optional expression table accompanying transported exact readings. */
+  precisionExpressions?: CircuitAnalysis["precisionExpressions"];
   wire?: CircuitWire;
   /** Human-readable connection, for example "電池の−端子 → 抵抗の端子A". */
   wireLabel?: string;
@@ -290,22 +293,24 @@ function InspectorReadings({
   reading,
   readingTimeSeconds,
   analysisStatus,
+  precisionExpressions,
   slotProps,
 }: {
   kind: CircuitPart["kind"];
   reading?: CircuitPartReading;
   readingTimeSeconds?: number;
   analysisStatus?: CircuitAnalysis["status"];
+  precisionExpressions?: CircuitAnalysis["precisionExpressions"];
   slotProps?: CircuitInspectorProps["slotProps"];
 }) {
-  const meterDisplay = getMeterDisplay(kind, reading, analysisStatus);
+  const meterDisplay = getMeterDisplay(kind, reading, analysisStatus, precisionExpressions);
   const timeNote = formatTimeNote(readingTimeSeconds);
   if (meterDisplay) {
     return (
       <div {...circuitSlot("circuit-inspector__readings", slotProps?.readings)}>
         <h3 {...circuitSlot(undefined, slotProps?.readingsTitle)}>計測値</h3>
         {timeNote && <p {...circuitSlot("circuit-inspector__reading-note", slotProps?.readingNote)}>{timeNote}</p>}
-        <CircuitMeterReadout kind={kind} reading={reading} analysisStatus={analysisStatus} />
+        <CircuitMeterReadout kind={kind} reading={reading} analysisStatus={analysisStatus} precisionExpressions={precisionExpressions} />
       </div>
     );
   }
@@ -332,11 +337,11 @@ function InspectorReadings({
           <dd {...circuitSlot(undefined, slotProps?.readingValue)}><span>{format(reading.powerWatts)}</span><small {...circuitSlot(undefined, slotProps?.readingUnit)}>W</small></dd>
         </div>
         {isAc && <>
-          {Math.abs(reading.voltageVolts) > 0 && <div {...circuitSlot(undefined, slotProps?.readingRow)} data-measurement="voltage-phase">
+          {nonzeroAcMeasurement(kind, reading, "voltage", precisionExpressions) && <div {...circuitSlot(undefined, slotProps?.readingRow)} data-measurement="voltage-phase">
             <dt {...circuitSlot(undefined, slotProps?.readingLabel)}>電圧位相</dt>
             <dd {...circuitSlot(undefined, slotProps?.readingValue)}><span>{format(reading.voltagePhaseDegrees)}</span><small {...circuitSlot(undefined, slotProps?.readingUnit)}>°</small></dd>
           </div>}
-          {Math.abs(reading.currentAmps) > 0 && <div {...circuitSlot(undefined, slotProps?.readingRow)} data-measurement="current-phase">
+          {nonzeroAcMeasurement(kind, reading, "current", precisionExpressions) && <div {...circuitSlot(undefined, slotProps?.readingRow)} data-measurement="current-phase">
             <dt {...circuitSlot(undefined, slotProps?.readingLabel)}>電流位相</dt>
             <dd {...circuitSlot(undefined, slotProps?.readingValue)}><span>{format(reading.currentPhaseDegrees)}</span><small {...circuitSlot(undefined, slotProps?.readingUnit)}>°</small></dd>
           </div>}
@@ -356,6 +361,7 @@ function PartInspector({
   reading,
   readingTimeSeconds,
   analysisStatus,
+  precisionExpressions,
   onChange,
   onRotate,
   onDelete,
@@ -365,6 +371,7 @@ function PartInspector({
   reading?: CircuitPartReading;
   readingTimeSeconds?: number;
   analysisStatus?: CircuitAnalysis["status"];
+  precisionExpressions?: CircuitAnalysis["precisionExpressions"];
   onChange?: CircuitInspectorProps["onChange"];
   onRotate?: () => void;
   onDelete?: () => void;
@@ -377,7 +384,7 @@ function PartInspector({
         <span {...circuitSlot(undefined, slotProps?.selectionLabel)}>{part.label || "名称未設定"}</span>
       </div>
       <InspectorFields part={part} onChange={onChange} slotProps={slotProps} />
-      <InspectorReadings kind={part.kind} reading={reading} readingTimeSeconds={readingTimeSeconds} analysisStatus={analysisStatus} slotProps={slotProps} />
+      <InspectorReadings kind={part.kind} reading={reading} readingTimeSeconds={readingTimeSeconds} analysisStatus={analysisStatus} precisionExpressions={precisionExpressions} slotProps={slotProps} />
       <div {...circuitSlot("circuit-inspector__actions", slotProps?.actions)}>
         <button {...circuitSlot(undefined, slotProps?.rotateButton)} type="button" onClick={onRotate} disabled={!onRotate || part.kind === "junction"}>
           <CircuitIcon name="rotate" {...circuitSlot(undefined, slotProps?.rotateIcon)} />回転
@@ -396,6 +403,7 @@ export function CircuitInspector({
   reading,
   readingTimeSeconds,
   analysisStatus,
+  precisionExpressions,
   wire,
   wireLabel,
   wireEndpoints,
@@ -423,5 +431,5 @@ export function CircuitInspector({
   if (!part && !wire) { return <EmptyInspector shell={shell} />; }
   if (!part && wire) { return <WireInspector shell={shell} wire={wire} wireLabel={wireLabel} wireEndpoints={wireEndpoints} onReconnect={onReconnect} onResetWireRoute={onResetWireRoute} onDelete={onDelete} />; }
   if (!part) { return null; }
-  return <PartInspector shell={shell} part={part} reading={reading} readingTimeSeconds={readingTimeSeconds} analysisStatus={analysisStatus} onChange={onChange} onRotate={onRotate} onDelete={onDelete} />;
+  return <PartInspector shell={shell} part={part} reading={reading} readingTimeSeconds={readingTimeSeconds} analysisStatus={analysisStatus} precisionExpressions={precisionExpressions} onChange={onChange} onRotate={onRotate} onDelete={onDelete} />;
 }

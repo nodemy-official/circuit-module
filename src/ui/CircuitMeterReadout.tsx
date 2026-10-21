@@ -3,6 +3,7 @@ import type { CircuitAnalysis, CircuitPartReading } from "../circuit-solver.js";
 import { formatCircuitNumber } from "../number-format.js";
 import type { ComponentPropsWithoutRef } from "react";
 import { analysisReadingsAvailable } from "./analysis-readings.js";
+import { nonzeroAcMeasurement } from "./ac-reading-phase.js";
 
 export type CircuitMeterStatus = "connected" | "unconnected" | "floating" | "unmeasured" | "invalid" | "short";
 
@@ -99,6 +100,7 @@ export function getMeterDisplay(
   kind: CircuitPartKind,
   reading?: CircuitPartReading,
   analysisStatus?: CircuitAnalysis["status"],
+  precisionExpressions?: CircuitAnalysis["precisionExpressions"],
 ): CircuitMeterDisplay | undefined {
   if (!isMeter(kind)) { return undefined; }
 
@@ -113,7 +115,8 @@ export function getMeterDisplay(
   const text = status === "connected" && measurement !== undefined
     ? `${formatEngineering(measurement, unit, !isAc)}${isAc ? "（実効値）" : ""}`
     : `— ${unit} · ${statusLabel(status)}`;
-  const phaseText = status === "connected" && isAc && phase !== undefined && measurement !== 0
+  const phaseText = status === "connected" && isAc && phase !== undefined &&
+    nonzeroAcMeasurement(kind, reading, kind === "ammeter" ? "current" : "voltage", precisionExpressions)
     ? phaseLabel(meterKind, phase)
     : undefined;
 
@@ -124,6 +127,8 @@ export interface CircuitMeterReadoutProps extends Omit<ComponentPropsWithoutRef<
   kind: CircuitPartKind;
   reading?: CircuitPartReading;
   analysisStatus?: CircuitAnalysis["status"];
+  /** Optional expression table accompanying transported exact readings. */
+  precisionExpressions?: CircuitAnalysis["precisionExpressions"];
 }
 
 /** Large, instrument-specific readout for a selected or previewed meter. */
@@ -131,12 +136,13 @@ export function CircuitMeterReadout({
   kind,
   reading,
   analysisStatus,
+  precisionExpressions,
   className = "",
   style,
   "aria-label": ariaLabel,
   ...sectionProps
 }: CircuitMeterReadoutProps) {
-  const display = getMeterDisplay(kind, reading, analysisStatus);
+  const display = getMeterDisplay(kind, reading, analysisStatus, precisionExpressions);
   if (!display) { return null; }
 
   const quantity = kind === "ammeter" ? "計測電流" : "計測電圧";

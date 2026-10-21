@@ -1,7 +1,10 @@
 import type { CircuitDocument, CircuitPart } from "./circuit-model.js";
-import type { CircuitExactComplex, CircuitExactNormalizedTerm, CircuitExactRational } from "./circuit-reading.js";
+import { retainedComplex, restoredReadingComplex, type CircuitExactComplex, type CircuitExactNormalizedTerm, type CircuitExactRational } from "./circuit-reading.js";
+import { appendExactComponentSnapshot } from "./circuit-reading-snapshot.js";
+import type { ComplexValue } from "./analog-math.js";
+import { complexFromExact } from "./exact-numeric-state.js";
 import { addExactRational, exactRationalToNumber, multiplyExactRational, numberToExactRational, subtractExactRational, type ExactRational } from "./exact-linear-algebra.js";
-import { matchingExactExpressions, type ExactExpressionNode } from "./exact-expression.js";
+import { exactExpressionsAreImmutable, matchingExactExpressions, type ExactExpressionNode } from "./exact-expression.js";
 import { simulationNumericField } from "./simulation-input.js";
 import type { TransientPartReading, TransientSample } from "./transient-solver.js";
 
@@ -14,11 +17,15 @@ export interface TransientEnergySample {
   readonly exactCurrent?: CircuitExactComplex;
   readonly storedJoules?: number | null;
   readonly dissipatedJoules?: number | null;
+  readonly exactStoredJoules?: CircuitExactRational;
+  readonly exactDissipatedJoules?: CircuitExactRational;
 }
 
 export interface TransientPartEnergy {
   readonly kind: CircuitPart["kind"];
   readonly coefficient?: number;
+  /** Real projections are already snapshotted by the sample's scalar readings. */
+  readonly precisionSnapshot?: "real";
   readonly samples: readonly TransientEnergySample[];
 }
 
@@ -46,7 +53,6 @@ function coefficient(part: CircuitPart) {
 function snapshotComplex(value: CircuitExactComplex | undefined): CircuitExactComplex | undefined {
   if (!value) { return; }
   return { real: { ...value.real }, imaginary: { ...value.imaginary },
-    ...(value.projection ? { projection: { ...value.projection } } : {}),
     ...(value.magnitudeNormalizationSquared ? { magnitudeNormalizationSquared: { ...value.magnitudeNormalizationSquared } } : {}),
     ...(value.normalizedFraction ? { normalizedFraction: {
       numerator: Array.from({ length: value.normalizedFraction.numerator.length }, (_, index) =>
@@ -66,11 +72,67 @@ function finiteProjection(value: ExactRational): number | null {
   return Number.isFinite(result) ? result : null;
 }
 
+interface RetainedEnergy {
+  value: ComplexValue;
+  snapshot: unknown[];
+  expressions?: readonly ExactExpressionNode[];
+}
+
+const retainedEnergies = new WeakMap<CircuitExactRational, RetainedEnergy>();
+const immutableExpressionMatches = new WeakMap<readonly ExactExpressionNode[], WeakMap<readonly ExactExpressionNode[], boolean>>();
+
+function matchingEnergyExpressions(first: readonly ExactExpressionNode[] | undefined, second: readonly ExactExpressionNode[] | undefined) {
+  if (first === second) { return true; }
+  if (!first || !second || !exactExpressionsAreImmutable(first) || !exactExpressionsAreImmutable(second)) { return matchingExactExpressions(first, second); }
+  const matches = immutableExpressionMatches.get(first) ?? new WeakMap<readonly ExactExpressionNode[], boolean>();
+  const cached = matches.get(second);
+  if (cached !== undefined) { return cached; }
+  const match = matchingExactExpressions(first, second);
+  matches.set(second, match);
+  immutableExpressionMatches.set(first, matches);
+  return match;
+}
+
+/** Bind solver-owned retained energies to the expression table captured with them. */
+export function registerTransientEnergyExpressions(readings: TransientEnergyReadings | undefined, expressions: readonly ExactExpressionNode[]) {
+  if (!readings) { return; }
+  for (const entry of Object.values(readings)) {
+    for (const sample of entry.samples) {
+      const metadata = sample.exactStoredJoules ?? sample.exactDissipatedJoules;
+      const retained = metadata && retainedEnergies.get(metadata);
+      if (retained) { retained.expressions = expressions; }
+    }
+  }
+}
+
+/** Reuse an unchanged solver value; transported or edited metadata is restored normally. */
+export function restoredTransientEnergy(metadata: CircuitExactRational | undefined, scalar: number, expressions?: readonly ExactExpressionNode[]) {
+  const retained = metadata && retainedEnergies.get(metadata);
+  try {
+    if (retained && retained.value.real === scalar && matchingEnergyExpressions(expressions, retained.expressions)) {
+      const snapshot: unknown[] = [];
+      appendExactComponentSnapshot(snapshot, metadata);
+      if (snapshot.length === retained.snapshot.length && snapshot.every((value, index) => Object.is(value, retained.snapshot[index]))) { return retained.value; }
+    }
+  } catch { /* Malformed optional components use the ordinary restoration fallback. */ }
+  return restoredReadingComplex(metadata && { real: metadata, imaginary: { numerator: "0", denominator: "1" } }, scalar, undefined, false, expressions);
+}
+
+function retainedEnergy(value: ExactRational, projection: number | null): CircuitExactRational | undefined {
+  if (projection === null) { return; }
+  const exact = complexFromExact({ real: value, imaginary: ZERO });
+  const metadata = retainedComplex(exact)?.real ?? { numerator: `0x${value.numerator.toString(16)}`, denominator: `0x${value.denominator.toString(16)}` };
+  const snapshot: unknown[] = [];
+  appendExactComponentSnapshot(snapshot, metadata);
+  retainedEnergies.set(metadata, { value: exact, snapshot });
+  return metadata;
+}
+
 export function createTransientEnergyCollector(document: CircuitDocument) {
   const targets = document.parts.filter((part) => ["capacitor", "inductor", "resistor", "bulb"].includes(part.kind));
-  const entries = Object.create(null) as Record<string, { kind: CircuitPart["kind"]; coefficient?: number; samples: TransientEnergySample[] }>;
+  const entries = Object.create(null) as Record<string, { kind: CircuitPart["kind"]; coefficient?: number; precisionSnapshot: "real"; samples: TransientEnergySample[] }>;
   const states = new Map<string, EnergyState>();
-  for (const part of targets) { entries[part.id] = { kind: part.kind, coefficient: coefficient(part), samples: [] }; }
+  for (const part of targets) { entries[part.id] = { kind: part.kind, coefficient: coefficient(part), precisionSnapshot: "real", samples: [] }; }
   return {
     readings: entries as TransientEnergyReadings,
     append(sample: TransientSample, capacitorVoltages: ReadonlyMap<string, ExactRational>, inductorCurrents: ReadonlyMap<string, ExactRational>, resistivePowers: ReadonlyMap<string, ExactRational>) {
@@ -84,7 +146,8 @@ export function createTransientEnergyCollector(document: CircuitDocument) {
         const stored = part.kind === "capacitor" ? capacitorVoltages.get(part.id) : inductorCurrents.get(part.id);
         if (stored && entry.coefficient !== undefined) {
           const energy = multiplyExactRational(multiplyExactRational(HALF, numberToExactRational(entry.coefficient)!), multiplyExactRational(stored, stored));
-          entry.samples.push({ ...basis, storedJoules: finiteProjection(energy) });
+          const storedJoules = finiteProjection(energy);
+          entry.samples.push({ ...basis, storedJoules, exactStoredJoules: retainedEnergy(energy, storedJoules) });
           continue;
         }
         const power = resistivePowers.get(part.id);
@@ -95,7 +158,7 @@ export function createTransientEnergyCollector(document: CircuitDocument) {
         )) : ZERO;
         const projected = previous?.unavailable ? null : finiteProjection(accumulated);
         states.set(part.id, { previousTime: time, previousPower: power, accumulated, unavailable: projected === null });
-        entry.samples.push({ ...basis, dissipatedJoules: projected });
+        entry.samples.push({ ...basis, dissipatedJoules: projected, exactDissipatedJoules: retainedEnergy(accumulated, projected) });
       }
     },
   };
@@ -109,13 +172,21 @@ function matchingRational(first: CircuitExactRational | undefined, second: Circu
   return first.numerator === second.numerator && first.denominator === second.denominator;
 }
 
-function matchingComplex(first: CircuitExactComplex | undefined, second: CircuitExactComplex | undefined): boolean {
+function matchingRealProjection(value: CircuitExactComplex["projection"], scalar: number, real: CircuitExactRational) {
+  const negative = "expression" in real ? real.sign === -1 : real.numerator.startsWith("-");
+  return value === undefined || typeof value === "object" && value !== null &&
+    value.real === scalar && value.magnitude === Math.abs(scalar) &&
+    (negative ? Math.abs(value.phaseDegrees) === 180 : value.phaseDegrees === 0);
+}
+
+function matchingComplex(first: CircuitExactComplex | undefined, second: CircuitExactComplex | undefined, scalar: number, compact: boolean): boolean {
   if (!first || !second) { return first === second; }
   return matchingRational(first.real, second.real) && matchingRational(first.imaginary, second.imaginary) &&
     matchingRational(first.magnitudeNormalizationSquared, second.magnitudeNormalizationSquared) &&
     matchingNormalizedFraction(first.normalizedFraction, second.normalizedFraction) &&
-    first.projection?.real === second.projection?.real && first.projection?.magnitude === second.projection?.magnitude &&
-    first.projection?.phaseDegrees === second.projection?.phaseDegrees;
+    (compact ? matchingRealProjection(second.projection, scalar, second.real)
+      : first.projection?.real === second.projection?.real && first.projection?.magnitude === second.projection?.magnitude &&
+        first.projection?.phaseDegrees === second.projection?.phaseDegrees);
 }
 
 function matchingNormalizedFraction(first: CircuitExactComplex["normalizedFraction"], second: CircuitExactComplex["normalizedFraction"]): boolean {
@@ -142,10 +213,11 @@ function hasExpressionReference(value: CircuitExactComplex | undefined): boolean
     .some((component) => component && "expression" in component);
 }
 
-function matchingSample(energy: TransientEnergySample | undefined, sample: TransientSample, reading: TransientPartReading | undefined): boolean {
+function matchingSample(energy: TransientEnergySample | undefined, sample: TransientSample, reading: TransientPartReading | undefined, compact: boolean): boolean {
   return Boolean(energy && reading && energy.timeSeconds === sample.timeSeconds && energy.voltageVolts === reading.voltageVolts &&
     energy.currentAmps === reading.currentAmps && energy.powerWatts === reading.powerWatts &&
-    matchingComplex(energy.exactVoltage, reading.exactVoltage) && matchingComplex(energy.exactCurrent, reading.exactTerminalCurrents?.a) &&
+    matchingComplex(energy.exactVoltage, reading.exactVoltage, reading.voltageVolts, compact) &&
+    matchingComplex(energy.exactCurrent, reading.exactTerminalCurrents?.a, reading.currentAmps, compact) &&
     (energy.storedJoules === undefined || energy.storedJoules === null || Number.isFinite(energy.storedJoules) && energy.storedJoules >= 0) &&
     (energy.dissipatedJoules === undefined || energy.dissipatedJoules === null || Number.isFinite(energy.dissipatedJoules) && energy.dissipatedJoules >= 0));
 }
@@ -162,7 +234,7 @@ export function matchingTransientEnergy(part: CircuitPart, samples: readonly Tra
     return Array.from({ length: samples.length }, (_, index) => index).every((index) => {
       const sample = samples[index];
       return sample && energy.samples[index]?.[quantity] !== undefined &&
-        matchingSample(energy.samples[index], sample, sample.parts[part.id]);
+        matchingSample(energy.samples[index], sample, sample.parts[part.id], energy.precisionSnapshot === "real");
     }) ? energy.samples : undefined;
   } catch {
     // Optional derived metadata never prevents the exact-reading fallback.

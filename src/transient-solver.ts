@@ -24,7 +24,7 @@ import { SimulationSnapshotContext, simulationRecordField, snapshotSimulationRec
 import { circuitNumericValueSchema, simulationBooleanSchema, transientAnalysisOptionsSchema } from "./circuit-validation.js";
 import { readingPrecision, terminalVoltageDifferences, type CircuitReadingPrecision, type CircuitTerminalVoltageDifference } from "./circuit-reading.js";
 import { createExactExpressionCapture, freezeCapturedExactExpressions, snapshotExactExpressions, withExactExpressionCapture, type ExactExpressionNode } from "./exact-expression.js";
-import { createTransientEnergyCollector, type TransientEnergyReadings } from "./transient-energy.js";
+import { createTransientEnergyCollector, registerTransientEnergyExpressions, type TransientEnergyReadings } from "./transient-energy.js";
 
 export const MAX_TRANSIENT_STEPS = 2000;
 /** Maximum estimated dense MNA scalar operations across every sample. */
@@ -1130,6 +1130,7 @@ export function simulateTransient(
   const result = withExactExpressionCapture(capture, () => simulateTransientFromInput(document, options));
   if (capture.nodes.length === 0) { return result; }
   const precisionExpressions = freezeCapturedExactExpressions(capture);
+  registerTransientEnergyExpressions(result.energyReadings, precisionExpressions);
   return { ...result, precisionExpressions,
     ...(result.energyReadings ? { energyPrecisionExpressions: snapshotExactExpressions(precisionExpressions) } : {}),
   };

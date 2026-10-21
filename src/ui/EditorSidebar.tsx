@@ -2,6 +2,7 @@ import { useRef } from "react";
 import type { CircuitPart } from "../circuit-model.js";
 import { endpointName } from "../circuit-model.js";
 import type { CircuitAnalysis } from "../circuit-solver.js";
+import { readOptionalPrecision } from "../circuit-reading.js";
 import { formatCircuitQuantity, type CircuitTransientFrame } from "../circuit-visualization.js";
 import { CircuitAnalysisPanel, type CircuitAnalysisPanelProps } from "./CircuitAnalysisPanel.js";
 import { CircuitDiagnosticsPanel } from "./CircuitDiagnosticsPanel.js";
@@ -64,6 +65,7 @@ function EditorProperties({ editor, part, wire, analysis, inspectorProps }: {
       reading={part ? analysis.parts[part.id] : undefined}
       readingTimeSeconds={analysis.timeSeconds}
       analysisStatus={analysis.status}
+      precisionExpressions={readOptionalPrecision(() => analysis.precisionExpressions)}
     />}
     {editor.document.parts.length > 0 && <section className="circuit-editor__outline" aria-label="回路内の部品">
       <h2>回路内の部品<span>{editor.document.parts.length}</span></h2>
